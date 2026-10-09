@@ -679,6 +679,7 @@ internal sealed class ShaderProgramCache
                     PixelCustomInterpolationMask = info.CustomInterpolationMask,
                     SupportsPerVertexPixelInputs = _host.PerVertexPixelInputsSupported,
                     PixelInputAddress = options.PixelInputAddress,
+                    PixelFrontFaceAllBits = info.FrontFaceAllBits,
                     PixelInputCntl = interpolators,
                     MipStatisticsSubgroupReduction = _host.MipStatisticsSubgroupReduction,
                 };
