@@ -419,6 +419,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             stage.WriteDispatchThreadLimits(shaderData);
             stage.WriteTessellationData(shaderData);
+            stage.WriteObjectId(shaderData);
             if (layout.UsesRenderScale)
             {
                 ulong scaledImages = 0;
