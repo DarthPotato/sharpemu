@@ -152,6 +152,9 @@ public readonly record struct Gen5PixelOutputBinding(
     // The fragment output index: 1 is the second source of dual-source blending, which
     // shares its location with the first and is not a render target.
     public uint Index { get; init; }
+
+    // The slot receives the object ID plus the primitive ID instead of an export.
+    public bool ObjectPrimitiveId { get; init; }
 }
 
 public readonly record struct Gen5ComputeSystemRegisters(

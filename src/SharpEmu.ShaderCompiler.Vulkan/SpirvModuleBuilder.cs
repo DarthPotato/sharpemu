@@ -191,6 +191,7 @@ public enum SpirvCapability : uint
     FragmentBarycentricKhr = 5284,
     ClipDistance = 32,
     CullDistance = 33,
+    Tessellation = 3,
     SampledImageArrayDynamicIndexing = 29,
     StorageImageArrayDynamicIndexing = 31,
     SampleRateShading = 35,
@@ -291,6 +292,7 @@ public enum SpirvBuiltIn : uint
     SampleId = 18,
     SampleMask = 20,
     FragDepth = 22,
+    PrimitiveId = 7,
 }
 
 public enum SpirvImageDim : uint

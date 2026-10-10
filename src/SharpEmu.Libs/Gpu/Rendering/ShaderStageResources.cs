@@ -80,6 +80,20 @@ public readonly record struct ShaderStageResources(ShaderProgramInfo? Program, R
 
     public DispatchThreadLimits? ThreadLimits { get; init; }
 
+    // VGT_OBJECT_ID of the draw, for a pixel program that writes an object/primitive ID target.
+    public uint ObjectId { get; init; }
+
+    public void WriteObjectId(Span<uint> shaderData)
+    {
+        if (Program?.Bindings is not { UsesObjectId: true } layout) return;
+        if (shaderData.Length != layout.ShaderDataDwordCount)
+        {
+            throw SubmissionScheduler.Fatal("The draw has invalid shader data for its object ID dword.");
+        }
+
+        shaderData[(int)layout.ObjectIdDword] = ObjectId;
+    }
+
     public void WriteDispatchThreadLimits(Span<uint> shaderData)
     {
         if (Program?.Bindings is not { UsesDispatchThreadLimits: true } layout) return;

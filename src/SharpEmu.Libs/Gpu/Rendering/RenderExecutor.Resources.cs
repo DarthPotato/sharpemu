@@ -219,7 +219,9 @@ public sealed partial class RenderExecutor
         try
         {
             vertexBindings = PrepareBindings(vertexInput.Stage);
-            pixelBindings = state.PixelActive ? PrepareBindings(pixelInput.Stage) : null;
+            pixelBindings = state.PixelActive
+                ? PrepareBindings(pixelInput.Stage with { ObjectId = banks.UserConfig.ObjectId })
+                : null;
         }
         catch (DrawImageTypeMismatchException rejection)
         {
