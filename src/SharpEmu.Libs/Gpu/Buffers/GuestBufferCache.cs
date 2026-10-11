@@ -1641,17 +1641,13 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             if (_hotWindows.TryGetValue(key, out var hot) && _batchSerial - hot.LastHit <= HotWindowLifetime)
             {
                 _eagerCandidates.Add(key);
-                HotWritePending = true;
             }
         }
     }
 
-    public bool HotWritePending { get; private set; }
-
     public void OnBatchSubmitted()
     {
         _batchSerial++;
-        HotWritePending = false;
         if (AsyncReadback is not { } readback)
         {
             return;
