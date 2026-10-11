@@ -1167,7 +1167,19 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
         return false;
     }
 
+    bool IRenderHost.IsHtile(ulong address)
+    {
+        _ = address;
+        return false;
+    }
+
     bool IRenderHost.ClearMetadata(ulong address)
+    {
+        _ = address;
+        return false;
+    }
+
+    bool IRenderHost.ExpandMetadata(ulong address)
     {
         _ = address;
         return false;

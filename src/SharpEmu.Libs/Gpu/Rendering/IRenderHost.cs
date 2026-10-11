@@ -180,7 +180,12 @@ public interface IRenderHost
 
     bool IsMetadata(ulong address);
 
+    bool IsHtile(ulong address);
+
     bool ClearMetadata(ulong address);
+
+    // Drops the pending clear of metadata a fill proved expanded (its words no longer say cleared).
+    bool ExpandMetadata(ulong address);
 
     bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear);
 
