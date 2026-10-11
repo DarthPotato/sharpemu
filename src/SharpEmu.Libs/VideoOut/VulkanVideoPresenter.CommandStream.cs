@@ -306,6 +306,15 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void RunPendingCommands()
         {
+            // The interpreter calls this per packet; the relay is usually empty, so a full
+            // drain would only pay the call and the profiling scope tens of thousands of
+            // times per frame. A post always wakes the render loop, so skipping the empty
+            // case cannot lose a command.
+            if (!_relay.HasPendingCommands)
+            {
+                return;
+            }
+
             using var relayScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay);
             _relay.RunPendingCommands();
         }
