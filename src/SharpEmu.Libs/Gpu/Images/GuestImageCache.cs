@@ -416,7 +416,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             var address = request.Description.Metadata.Range.Address;
             if (!_surfaceMetadata.TryGetValue(address, out var metadata))
             {
-                _surfaceMetadata.Add(address, new SurfaceMetadata { Kind = SurfaceMetadataKind.HTile, ClearMask = image.Description.HtileClearMask });
+                metadata = new SurfaceMetadata { Kind = SurfaceMetadataKind.HTile, ClearMask = image.Description.HtileClearMask };
+                _surfaceMetadata.Add(address, metadata);
             }
             else if (metadata.Kind == SurfaceMetadataKind.PendingDcc)
             {
@@ -430,6 +431,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             {
                 throw SubmissionScheduler.Fatal($"A depth target reuses metadata that is not HTile: address=0x{address:X16} kind={metadata.Kind}.");
             }
+
+            metadata.Size = request.Description.Metadata.Range.Size;
+            metadata.Layers = Math.Max(request.Description.TransferLayers, 1u);
         }
 
         if (request.Description.HasStencil)

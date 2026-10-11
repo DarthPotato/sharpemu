@@ -52,4 +52,11 @@ public sealed class SurfaceMetadata
         (_upperSlices ??= new System.Collections.BitArray((int)(MaxSlices - 32)))[(int)(slice - 32)] = isClear;
         return true;
     }
+
+    // HTile slices of the depth target, so a rewrite can be read back slice by slice.
+    public uint Layers = 1;
+
+    // A dispatch rewrote these HTile words in place; their clear state is read from the
+    // words before the depth target is next bound.
+    public bool RewrittenByGpu;
 }
