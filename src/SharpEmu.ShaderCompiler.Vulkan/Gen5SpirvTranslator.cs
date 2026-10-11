@@ -3813,7 +3813,7 @@ public static partial class Gen5SpirvTranslator
             for (uint index = 0; index < sizeof(uint); index++)
             {
                 var address = index == 0 ? componentAddress : IAdd(componentAddress, UInt(index));
-                var word = LoadDeviceBufferWord(baseAddress, size, address, accessAllowed);
+                var word = LoadDeviceBufferElementWord(baseAddress, size, address, accessAllowed);
                 var shift = ShiftLeftLogical(BitwiseAnd(address, UInt(3)), UInt(3));
                 var value = BitwiseAnd(ShiftRightLogical(word, shift), UInt(0xFF));
                 packed = BitwiseOr(packed, ShiftLeftLogical(value, UInt(index * 8)));
