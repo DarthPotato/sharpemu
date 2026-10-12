@@ -298,5 +298,8 @@
   "Trophies.Total": "Total",
   "Trophies.Games": "Games",
   "Trophies.Open": "View trophies",
+  "Trophies.Completed": "complete",
+  "Trophies.EarnedTotal": "earned",
+  "Trophies.HubSummary": "{0} of {1} trophies earned across {2} games",
   "Trophies.RevealHint": "Click to reveal"
 }

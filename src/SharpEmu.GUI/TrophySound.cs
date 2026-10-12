@@ -6,26 +6,40 @@ using System.Runtime.InteropServices;
 namespace SharpEmu.GUI;
 
 /// <summary>
-/// The chime played with a trophy notification. It is synthesized here, so no third-party audio
-/// ships with the launcher: a few bell tones rising in an E major arpeggio, one more for each grade.
+/// The sound of an unlocked trophy, synthesized here so no third-party audio ships with the launcher.
+/// A filtered whoosh rises while the medal spins; when it lands a soft thump and an E major chord
+/// struck like mallets ring out, with sparkles above them, all in a small stereo room.
+/// Rarer grades get a fuller chord, more sparkles and a longer tail.
 /// </summary>
 /// <remarks>
 /// It plays through its own waveOut device rather than PlaySound, which the title music already
-/// holds; a chime must not stop the music. Like the title music, this is Windows-only.
+/// holds; a trophy must not stop the music. Like the title music, this is Windows-only.
 /// </remarks>
 internal static class TrophySound
 {
-    private const int SampleRate = 44100;
-    private const double Volume = 0.42;
+    /// <summary>Seconds from <see cref="Play"/> to the impact; the notification lands its medal then.</summary>
+    public const double ImpactDelaySeconds = 1.0;
 
-    // E6, G#6, B6, E7 and B5 below them: the platinum starts lower and climbs further.
-    private static readonly double[] BronzeNotes = [1318.51, 1975.53];
-    private static readonly double[] GoldNotes = [1318.51, 1661.22, 1975.53];
-    private static readonly double[] PlatinumNotes = [987.77, 1318.51, 1661.22, 1975.53, 2637.02];
+    private const int SampleRate = 48000;
 
     private static readonly Dictionary<int, byte[]> Rendered = [];
 
     public static bool Enabled { get; set; } = true;
+
+    /// <summary>Renders the four sounds in the background so the first trophy plays without delay.</summary>
+    public static void Prepare()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            _ = Task.Run(() =>
+            {
+                for (var grade = 1; grade <= 4; grade++)
+                {
+                    Get(grade);
+                }
+            });
+        }
+    }
 
     public static void Play(int grade)
     {
@@ -34,77 +48,213 @@ internal static class TrophySound
             return;
         }
 
-        byte[] pcm;
-        lock (Rendered)
-        {
-            if (!Rendered.TryGetValue(grade, out pcm!))
-            {
-                pcm = Render(grade);
-                Rendered[grade] = pcm;
-            }
-        }
-
-        _ = Task.Run(() => PlayPcm(pcm));
+        _ = Task.Run(() => PlayPcm(Get(grade)));
     }
 
-    // 16-bit mono PCM. Each note is a struck bell: a few harmonics that die away, the higher ones
-    // faster, with a short attack so the onset does not click.
+    private static byte[] Get(int grade)
+    {
+        lock (Rendered)
+        {
+            if (!Rendered.TryGetValue(grade, out var pcm))
+            {
+                pcm = Render(Math.Clamp(grade, 1, 4));
+                Rendered[grade] = pcm;
+            }
+
+            return pcm;
+        }
+    }
+
+    // 16-bit stereo PCM.
     internal static byte[] Render(int grade)
     {
-        var notes = grade switch { 1 => PlatinumNotes, 2 => GoldNotes, _ => BronzeNotes };
-        var spacing = grade == 1 ? 0.085 : 0.075;
-        var ring = grade switch { 1 => 1.9, 2 => 1.3, 3 => 1.1, _ => 1.0 };
-        // Silver and platinum ring a little brighter than bronze and gold.
-        var brightness = grade is 1 or 3 ? 1.35 : 1.0;
-        var length = (int)((spacing * (notes.Length - 1) + ring) * SampleRate);
-        var mix = new double[length];
-        for (var n = 0; n < notes.Length; n++)
+        var tail = grade switch { 1 => 3.2, 2 => 2.6, _ => 2.2 };
+        var length = (int)((ImpactDelaySeconds + tail) * SampleRate);
+        var left = new double[length];
+        var right = new double[length];
+        var random = new Random(1234 + grade);
+        var impact = (int)(ImpactDelaySeconds * SampleRate);
+
+        AddWhoosh(left, right, impact, random, grade == 1 ? 0.22 : 0.16);
+        AddThump(left, right, impact, grade == 1 ? 0.9 : grade == 2 ? 0.6 : 0.45);
+
+        // E major, voiced upward; each grade adds voices on top.
+        double[] chord = grade switch
         {
-            var start = (int)(n * spacing * SampleRate);
-            // The last note of the arpeggio is the one that rings.
-            var decay = n == notes.Length - 1 ? 3.2 / ring : 7.0;
-            AddBell(mix, start, notes[n], decay, brightness, n == notes.Length - 1 ? 1.0 : 0.8);
+            1 => [164.81, 246.94, 329.63, 493.88, 659.25, 830.61, 987.77, 1318.51],
+            2 => [329.63, 493.88, 659.25, 830.61, 987.77, 1318.51],
+            3 => [329.63, 493.88, 659.25, 830.61, 987.77],
+            _ => [329.63, 493.88, 659.25, 830.61],
+        };
+        for (var i = 0; i < chord.Length; i++)
+        {
+            // A quick strum from the bottom; low voices ring longest, high ones are quieter.
+            var start = impact + (int)(i * 0.016 * SampleRate);
+            var gain = 0.34 * Math.Pow(0.86, i);
+            var decay = 1.6 - i * 0.12;
+            var pan = chord.Length == 1 ? 0 : -0.45 + 0.9 * i / (chord.Length - 1);
+            AddMallet(left, right, start, chord[i], gain, decay, pan);
+        }
+
+        var sparkles = grade switch { 1 => 18, 2 => 10, 3 => 5, _ => 0 };
+        double[] pentatonic = [1975.53, 2217.46, 2489.02, 2959.96, 3322.44, 3951.07];
+        for (var i = 0; i < sparkles; i++)
+        {
+            var start = impact + (int)((0.05 + random.NextDouble() * (grade == 1 ? 1.1 : 0.6)) * SampleRate);
+            AddMallet(left, right, start, pentatonic[random.Next(pentatonic.Length)], 0.05 + random.NextDouble() * 0.04, 6.5,
+                random.NextDouble() * 1.6 - 0.8);
         }
 
         if (grade == 1)
         {
-            // A soft E5 underneath gives the platinum some body.
-            AddBell(mix, 0, 659.25, 1.6, 0.5, 0.35);
+            // The platinum climbs once more after the chord.
+            double[] climb = [1318.51, 1661.22, 1975.53, 2637.02];
+            for (var i = 0; i < climb.Length; i++)
+            {
+                AddMallet(left, right, impact + (int)((0.38 + i * 0.075) * SampleRate), climb[i], 0.12, 3.0, -0.3 + i * 0.2);
+            }
         }
 
-        var peak = mix.Max(Math.Abs);
-        var scale = peak == 0 ? 0 : Volume / peak * short.MaxValue;
-        var pcm = new byte[length * 2];
-        for (var i = 0; i < length; i++)
+        Reverb(left, right, grade == 1 ? 0.34 : 0.26);
+        return ToPcm(left, right);
+    }
+
+    // Noise through a low-pass that opens as it swells, panned left to right, cut just before the impact.
+    private static void AddWhoosh(double[] left, double[] right, int impact, Random random, double gain)
+    {
+        var start = (int)(impact * 0.08);
+        var state = 0.0;
+        for (var i = start; i < impact; i++)
         {
-            // Fade the last 30 ms so the buffer ends on silence.
-            var tail = Math.Min(1.0, (length - i) / (0.03 * SampleRate));
-            var sample = (short)Math.Clamp(mix[i] * scale * tail, short.MinValue, short.MaxValue);
-            pcm[i * 2] = (byte)sample;
-            pcm[i * 2 + 1] = (byte)(sample >> 8);
+            var progress = (i - start) / (double)(impact - start);
+            var cutoff = 300 * Math.Pow(30, progress);
+            var alpha = 1 - Math.Exp(-2 * Math.PI * cutoff / SampleRate);
+            state += alpha * (random.NextDouble() * 2 - 1 - state);
+            var envelope = progress * progress * Math.Min(1, (1 - progress) * 14);
+            var sample = state * envelope * gain * 2.2;
+            var pan = -0.7 + 1.4 * progress;
+            left[i] += sample * (1 - pan) / 2;
+            right[i] += sample * (1 + pan) / 2;
+        }
+    }
+
+    // A short sine that drops in pitch: felt more than heard.
+    private static void AddThump(double[] left, double[] right, int start, double gain)
+    {
+        var phase = 0.0;
+        for (var i = start; i < Math.Min(left.Length, start + SampleRate / 2); i++)
+        {
+            var t = (i - start) / (double)SampleRate;
+            phase += 2 * Math.PI * (55 + 75 * Math.Exp(-t * 28)) / SampleRate;
+            var sample = gain * Math.Min(1, t / 0.002) * Math.Exp(-t * 11) * Math.Sin(phase);
+            left[i] += sample;
+            right[i] += sample;
+        }
+    }
+
+    // A struck bar: fundamental and soft overtones, two slightly detuned copies spread in stereo.
+    private static void AddMallet(double[] left, double[] right, int start, double frequency, double gain, double decay, double pan)
+    {
+        ReadOnlySpan<(double Ratio, double Amplitude, double Damping)> partials = [(1.0, 1.0, 1.0), (2.0, 0.28, 2.2), (3.0, 0.08, 3.5), (4.0, 0.03, 5.0)];
+        const double detune = 0.0018;
+        for (var i = start; i < left.Length; i++)
+        {
+            var t = (i - start) / (double)SampleRate;
+            var envelope = Math.Min(1, t / 0.003);
+            if (t > 0.02 && Math.Exp(-t * decay) < 0.0005)
+            {
+                break;
+            }
+
+            double l = 0, r = 0;
+            foreach (var (ratio, amplitude, damping) in partials)
+            {
+                var level = amplitude * Math.Exp(-t * decay * damping);
+                var w = 2 * Math.PI * frequency * ratio * t;
+                l += level * Math.Sin(w * (1 - detune));
+                r += level * Math.Sin(w * (1 + detune));
+            }
+
+            left[i] += gain * envelope * l * (1 - pan * 0.6);
+            right[i] += gain * envelope * r * (1 + pan * 0.6);
+        }
+    }
+
+    // A small room: four damped combs and two all-passes per side, the right side slightly longer.
+    private static void Reverb(double[] left, double[] right, double wet)
+    {
+        int[] combs = [1557, 1617, 1491, 1422];
+        int[] allpasses = [556, 441];
+        var wetLeft = Room(left, combs, allpasses, 0);
+        var wetRight = Room(right, combs, allpasses, 23);
+        for (var i = 0; i < left.Length; i++)
+        {
+            left[i] += wet * wetLeft[i];
+            right[i] += wet * wetRight[i];
+        }
+    }
+
+    private static double[] Room(double[] input, int[] combs, int[] allpasses, int spread)
+    {
+        var output = new double[input.Length];
+        foreach (var length in combs)
+        {
+            var buffer = new double[length + spread];
+            var index = 0;
+            var filter = 0.0;
+            for (var i = 0; i < input.Length; i++)
+            {
+                var delayed = buffer[index];
+                filter = delayed * 0.75 + filter * 0.25;
+                buffer[index] = input[i] * 0.25 + filter * 0.82;
+                output[i] += delayed;
+                index = (index + 1) % buffer.Length;
+            }
+        }
+
+        foreach (var length in allpasses)
+        {
+            var buffer = new double[length + spread];
+            var index = 0;
+            for (var i = 0; i < output.Length; i++)
+            {
+                var delayed = buffer[index];
+                var value = output[i] + delayed * 0.5;
+                buffer[index] = value;
+                output[i] = delayed - value * 0.5;
+                index = (index + 1) % buffer.Length;
+            }
+        }
+
+        return output;
+    }
+
+    private static byte[] ToPcm(double[] left, double[] right)
+    {
+        var peak = 1e-9;
+        for (var i = 0; i < left.Length; i++)
+        {
+            peak = Math.Max(peak, Math.Max(Math.Abs(left[i]), Math.Abs(right[i])));
+        }
+
+        // About -5 dBFS at the loudest point, with a soft knee instead of a hard clip.
+        var scale = 0.62 / peak;
+        var pcm = new byte[left.Length * 4];
+        for (var i = 0; i < left.Length; i++)
+        {
+            var fade = Math.Min(1.0, (left.Length - i) / (0.08 * SampleRate));
+            WriteSample(pcm, i * 4, Math.Tanh(left[i] * scale * 1.15) * fade);
+            WriteSample(pcm, i * 4 + 2, Math.Tanh(right[i] * scale * 1.15) * fade);
         }
 
         return pcm;
     }
 
-    private static void AddBell(double[] mix, int start, double frequency, double decay, double brightness, double gain)
+    private static void WriteSample(byte[] pcm, int offset, double value)
     {
-        ReadOnlySpan<(double Ratio, double Amplitude)> partials = [(1.0, 1.0), (2.0, 0.32), (3.0, 0.11), (4.2, 0.05)];
-        const double attack = 0.004;
-        for (var i = start; i < mix.Length; i++)
-        {
-            var t = (i - start) / (double)SampleRate;
-            var envelope = Math.Min(1.0, t / attack);
-            var sum = 0.0;
-            for (var p = 0; p < partials.Length; p++)
-            {
-                var (ratio, amplitude) = partials[p];
-                var level = p == 0 ? amplitude : amplitude * brightness;
-                sum += level * Math.Exp(-t * decay * (1 + p * 0.9)) * Math.Sin(2 * Math.PI * frequency * ratio * t);
-            }
-
-            mix[i] += gain * envelope * sum;
-        }
+        var sample = (short)Math.Clamp(value * short.MaxValue, short.MinValue, short.MaxValue);
+        pcm[offset] = (byte)sample;
+        pcm[offset + 1] = (byte)(sample >> 8);
     }
 
     private static void PlayPcm(byte[] pcm)
@@ -112,10 +262,10 @@ internal static class TrophySound
         var format = new WaveFormat
         {
             FormatTag = 1,
-            Channels = 1,
+            Channels = 2,
             SamplesPerSecond = SampleRate,
-            AverageBytesPerSecond = SampleRate * 2,
-            BlockAlign = 2,
+            AverageBytesPerSecond = SampleRate * 4,
+            BlockAlign = 4,
             BitsPerSample = 16,
         };
         if (waveOutOpen(out var device, WaveMapper, ref format, 0, 0, 0) != 0)
@@ -138,7 +288,7 @@ internal static class TrophySound
             if (waveOutWrite(device, header, size) == 0)
             {
                 // Wait for the device to finish the buffer, with a margin in case it never reports.
-                var deadline = Environment.TickCount64 + pcm.Length * 1000L / (SampleRate * 2) + 2000;
+                var deadline = Environment.TickCount64 + pcm.Length * 1000L / (SampleRate * 4) + 2000;
                 while ((Marshal.PtrToStructure<WaveHeader>(header).Flags & WaveHeaderDone) == 0 &&
                        Environment.TickCount64 < deadline)
                 {

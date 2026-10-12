@@ -6,13 +6,15 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Threading;
+using SharpEmu.GUI.Controls;
 using SharpEmu.Libs.Np;
 
 namespace SharpEmu.GUI;
 
 /// <summary>
-/// The launcher's trophy overview, laid out like the console's: every game with trophies, its
-/// completion and how many of each grade were earned. Picking a game opens its trophy list.
+/// The launcher's trophy collection: every game with trophies as a card with its cover,
+/// completion and earned medals, under totals for the whole library. Picking a game opens its list.
 /// </summary>
 public partial class TrophyHubWindow : Window
 {
@@ -20,16 +22,17 @@ public partial class TrophyHubWindow : Window
     {
         public int Earned => Trophies.Count(t => t.Unlocked);
 
-        public int Percent => Trophies.Count == 0 ? 0 : Earned * 100 / Trophies.Count;
+        public double Percent => Trophies.Count == 0 ? 0 : Earned * 100.0 / Trophies.Count;
 
         public int EarnedOf(int grade) => Trophies.Count(t => t.Grade == grade && t.Unlocked);
+
+        public int TotalOf(int grade) => Trophies.Count(t => t.Grade == grade);
     }
 
-    private static readonly IBrush RowBrush = new SolidColorBrush(Color.Parse("#14FFFFFF"));
-    private static readonly IBrush RowSelectedBrush = new SolidColorBrush(Color.Parse("#26FFFFFF"));
-
     private readonly IReadOnlyList<GameEntry> _games;
-    private readonly List<(Border Row, GameSummary Summary)> _rows = [];
+    private readonly List<(Border Card, GameSummary Summary)> _cards = [];
+    private readonly DispatcherTimer _idle = new() { Interval = TimeSpan.FromMilliseconds(16) };
+    private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private int _selected = -1;
     private bool _animated;
 
@@ -43,7 +46,18 @@ public partial class TrophyHubWindow : Window
         InitializeComponent();
         _games = games;
         Opened += async (_, _) => await LoadAsync();
+        Closed += (_, _) => _idle.Stop();
         KeyDown += OnKeyDown;
+
+        // The collection's medal turns to face the viewer, then catches the light now and then.
+        _idle.Tick += (_, _) =>
+        {
+            var t = _clock.Elapsed.TotalSeconds;
+            HeroMedal.Spin = t < 1.4 ? (1 - (1 - Math.Pow(1 - t / 1.4, 4))) * Math.PI * 4 : 0;
+            var cycle = (t - 1.2) % 4.5;
+            HeroMedal.Glint = t > 1.2 && cycle < 0.9 ? cycle / 0.9 : -1;
+        };
+        _idle.Start();
     }
 
     private async Task LoadAsync()
@@ -57,25 +71,26 @@ public partial class TrophyHubWindow : Window
                 entry.Directory!,
                 TrophyCatalog.Load(entry.Directory!, entry.Game.TitleId!, includeIcons: false)))
             .Where(summary => summary.Trophies.Count > 0)
-            .OrderBy(summary => summary.Game.Name, StringComparer.CurrentCultureIgnoreCase)
+            .OrderByDescending(summary => summary.Trophies.Where(t => t.UnlockedAtUtc is not null).Select(t => t.UnlockedAtUtc).DefaultIfEmpty().Max())
+            .ThenBy(summary => summary.Game.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList());
 
         RenderTotals(summaries);
         GameList.Children.Clear();
-        _rows.Clear();
+        _cards.Clear();
         foreach (var summary in summaries)
         {
-            var row = BuildRow(summary);
-            _rows.Add((row, summary));
-            GameList.Children.Add(row);
+            var card = BuildCard(summary);
+            _cards.Add((card, summary));
+            GameList.Children.Add(card);
         }
 
-        if (_rows.Count == 0)
+        if (_cards.Count == 0)
         {
             GameList.Children.Add(new TextBlock
             {
                 Text = Localization.Instance.Get("Trophies.None"),
-                Foreground = (IBrush)this.FindResource("MutedBrush")!,
+                Foreground = new SolidColorBrush(Color.Parse("#8E89A6")),
                 FontSize = 15,
             });
             return;
@@ -83,72 +98,45 @@ public partial class TrophyHubWindow : Window
 
         if (!_animated)
         {
-            _animated = true;
-            TrophyUi.StaggerIn(_rows.Select(r => (Control)r.Row).ToList());
+            TrophyUi.StaggerIn(_cards.Select(c => (Control)c.Card).ToList());
         }
 
-        Select(0);
+        _animated = true;
+        Select(Math.Max(0, _selected));
     }
 
     private void RenderTotals(IReadOnlyList<GameSummary> summaries)
     {
         var earned = summaries.Sum(s => s.Earned);
         var total = summaries.Sum(s => s.Trophies.Count);
-        // The totals count up the first time the overview opens.
-        if (_animated)
-        {
-            TotalEarnedText.Text = earned.ToString();
-        }
-        else
-        {
-            TrophyUi.Animate(0, earned, TimeSpan.FromMilliseconds(900), value => TotalEarnedText.Text = ((int)Math.Round(value)).ToString());
-        }
-
-        TotalOfText.Text = $"{Localization.Instance.Get("Trophies.Total")} {total}";
+        var percent = total == 0 ? 0 : earned * 100.0 / total;
+        TotalOfText.Text = Localization.Instance.Format("Trophies.HubSummary", earned, total, summaries.Count);
+        var duration = TimeSpan.FromMilliseconds(_animated ? 400 : 1300);
+        TrophyUi.Animate(_animated ? earned : 0, earned, duration, value => TotalEarnedText.Text = ((int)Math.Round(value)).ToString());
+        TrophyUi.Animate(_animated ? percent : 0, percent, duration, value => TotalRing.Value = value);
         TotalGrades.Children.Clear();
         for (var grade = 1; grade <= 4; grade++)
         {
-            TotalGrades.Children.Add(BuildCount(grade, summaries.Sum(s => s.EarnedOf(grade)), 26, 22, bold: true));
+            TotalGrades.Children.Add(TrophyUi.GradeChip(grade, summaries.Sum(s => s.EarnedOf(grade)), summaries.Sum(s => s.TotalOf(grade))));
         }
     }
 
-    private static Control BuildCount(int grade, int count, double cupSize, double textSize, bool bold)
+    private Border BuildCard(GameSummary summary)
     {
-        return new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 6,
-            VerticalAlignment = VerticalAlignment.Center,
-            Children =
-            {
-                TrophyUi.Cup(grade, cupSize),
-                new TextBlock
-                {
-                    Text = count.ToString(),
-                    FontSize = textSize,
-                    FontWeight = bold ? FontWeight.SemiBold : FontWeight.Normal,
-                    VerticalAlignment = VerticalAlignment.Center,
-                },
-            },
-        };
-    }
-
-    private Border BuildRow(GameSummary summary)
-    {
-        var muted = (IBrush)this.FindResource("MutedBrush")!;
         var cover = new Border
         {
-            Width = 76,
-            Height = 76,
-            CornerRadius = new CornerRadius(4),
+            Width = 92,
+            Height = 92,
+            CornerRadius = new CornerRadius(16),
             ClipToBounds = true,
             Background = summary.Game.PlaceholderBrush,
+            BoxShadow = new BoxShadows(new BoxShadow { OffsetY = 8, Blur = 18, Color = Color.FromArgb(120, 0, 0, 0) }),
             Child = summary.Game.Cover is { } bitmap
                 ? new Image { Source = bitmap, Stretch = Stretch.UniformToFill }
                 : new TextBlock
                 {
                     Text = summary.Game.Initials,
-                    FontSize = 24,
+                    FontSize = 26,
                     FontWeight = FontWeight.Bold,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center,
@@ -158,99 +146,127 @@ public partial class TrophyHubWindow : Window
         var name = new TextBlock
         {
             Text = summary.Game.Name,
-            FontSize = 18,
+            FontSize = 19,
+            FontWeight = FontWeight.SemiBold,
             TextTrimming = TextTrimming.CharacterEllipsis,
-            VerticalAlignment = VerticalAlignment.Center,
         };
-
+        var counts = new TextBlock
+        {
+            Text = Localization.Instance.Format("Trophies.Progress", summary.Earned, summary.Trophies.Count, (int)Math.Round(summary.Percent)),
+            Foreground = new SolidColorBrush(Color.Parse("#B8B4CC")),
+            FontSize = 13,
+        };
         var bar = new ProgressBar
         {
             Minimum = 0,
             Maximum = 100,
-            Value = summary.Percent,
-            Height = 4,
-            Foreground = Brushes.White,
-            Background = new SolidColorBrush(Color.Parse("#33FFFFFF")),
-        };
-        if (!_animated)
-        {
-            // The bars fill as the rows come in.
-            TrophyUi.Animate(0, summary.Percent, TimeSpan.FromMilliseconds(900), value => bar.Value = value);
-        }
-
-        var progress = new StackPanel
-        {
-            Spacing = 6,
-            Width = 150,
-            VerticalAlignment = VerticalAlignment.Center,
-            Children =
+            Height = 6,
+            MinHeight = 6,
+            CornerRadius = new CornerRadius(3),
+            Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
+            Foreground = new LinearGradientBrush
             {
-                new TextBlock
+                StartPoint = new RelativePoint(0, 0.5, RelativeUnit.Relative),
+                EndPoint = new RelativePoint(1, 0.5, RelativeUnit.Relative),
+                GradientStops =
                 {
-                    Text = $"{summary.Percent} %",
-                    FontSize = 18,
-                    HorizontalAlignment = HorizontalAlignment.Right,
+                    new GradientStop(Color.Parse("#8FE3FF"), 0),
+                    new GradientStop(Color.Parse("#9B7CFF"), 0.6),
+                    new GradientStop(Color.Parse("#FF8FD8"), 1),
                 },
-                bar,
             },
         };
+        TrophyUi.Animate(_animated ? summary.Percent : 0, summary.Percent, TimeSpan.FromMilliseconds(_animated ? 1 : 1100), value => bar.Value = value);
 
-        // One column per grade, always present so the counts line up from row to row.
-        var counts = new Grid { ColumnDefinitions = new ColumnDefinitions("72,72,72,72"), VerticalAlignment = VerticalAlignment.Center };
+        var medals = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 14 };
         for (var grade = 1; grade <= 4; grade++)
         {
-            var count = BuildCount(grade, summary.EarnedOf(grade), 22, 16, bold: false);
-            if (grade == 1 && summary.Trophies.All(t => t.Grade != 1))
+            var total = summary.TotalOf(grade);
+            if (total == 0)
             {
-                count.Opacity = 0.25;
+                continue;
             }
 
-            Grid.SetColumn(count, grade - 1);
-            counts.Children.Add(count);
+            var earned = summary.EarnedOf(grade);
+            medals.Children.Add(new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 5,
+                Children =
+                {
+                    new TrophyMedal { Width = 22, Height = 22, Grade = grade, Locked = earned == 0 },
+                    new TextBlock { Text = earned.ToString(), FontSize = 14, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center },
+                },
+            });
         }
 
-        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto,Auto"), ColumnSpacing = 28 };
-        grid.Children.Add(cover);
-        Grid.SetColumn(name, 1);
-        grid.Children.Add(name);
-        Grid.SetColumn(progress, 2);
-        grid.Children.Add(progress);
-        Grid.SetColumn(counts, 3);
-        grid.Children.Add(counts);
-
-        var row = new Border
+        var middle = new StackPanel
         {
-            Background = RowBrush,
-            BorderThickness = new Thickness(2),
-            BorderBrush = Brushes.Transparent,
-            Padding = new Thickness(14, 12, 24, 12),
+            Spacing = 7,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { name, counts, bar, medals },
+        };
+
+        var ring = new Grid { Width = 74, Height = 74, VerticalAlignment = VerticalAlignment.Center };
+        var progressRing = new TrophyProgressRing { Thickness = 7 };
+        TrophyUi.Animate(_animated ? summary.Percent : 0, summary.Percent, TimeSpan.FromMilliseconds(_animated ? 1 : 1100), value => progressRing.Value = value);
+        ring.Children.Add(progressRing);
+        ring.Children.Add(new TextBlock
+        {
+            Text = $"{Math.Round(summary.Percent)}%",
+            FontSize = 15,
+            FontWeight = FontWeight.Bold,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+
+        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto"), ColumnSpacing = 22 };
+        grid.Children.Add(cover);
+        Grid.SetColumn(middle, 1);
+        grid.Children.Add(middle);
+        Grid.SetColumn(ring, 2);
+        grid.Children.Add(ring);
+
+        var card = new Border
+        {
+            CornerRadius = new CornerRadius(22),
+            Padding = new Thickness(16),
+            BorderThickness = new Thickness(1),
+            Background = new LinearGradientBrush
+            {
+                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+                EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
+                GradientStops =
+                {
+                    new GradientStop(Color.FromArgb(30, 255, 255, 255), 0),
+                    new GradientStop(Color.FromArgb(12, 255, 255, 255), 1),
+                },
+            },
+            BorderBrush = new SolidColorBrush(Color.FromArgb(30, 255, 255, 255)),
             Cursor = new Cursor(StandardCursorType.Hand),
             Child = grid,
         };
-        TrophyUi.SmoothHover(row);
-        ToolTip.SetTip(row, Localization.Instance.Get("Trophies.Open"));
-        row.PointerEntered += (_, _) => Select(_rows.FindIndex(r => r.Row == row));
-        row.PointerPressed += (_, _) => Open(summary);
-        _ = muted;
-        return row;
+        TrophyUi.Lift(card);
+        ToolTip.SetTip(card, Localization.Instance.Get("Trophies.Open"));
+        card.PointerEntered += (_, _) => _selected = _cards.FindIndex(c => c.Card == card);
+        card.PointerPressed += (_, _) => Open(summary);
+        return card;
     }
 
     private void Select(int index)
     {
-        if (index < 0 || index >= _rows.Count)
+        if (index < 0 || index >= _cards.Count)
         {
             return;
         }
 
         _selected = index;
-        for (var i = 0; i < _rows.Count; i++)
+        for (var i = 0; i < _cards.Count; i++)
         {
-            var selected = i == index;
-            _rows[i].Row.Background = selected ? RowSelectedBrush : RowBrush;
-            _rows[i].Row.BorderBrush = selected ? Brushes.White : Brushes.Transparent;
+            _cards[i].Card.BorderBrush = new SolidColorBrush(i == index ? Color.FromArgb(150, 255, 255, 255) : Color.FromArgb(30, 255, 255, 255));
         }
 
-        _rows[index].Row.BringIntoView();
+        _cards[index].Card.BringIntoView();
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
@@ -258,15 +274,15 @@ public partial class TrophyHubWindow : Window
         switch (e.Key)
         {
             case Key.Down:
-                Select(Math.Min(_rows.Count - 1, _selected + 1));
+                Select(Math.Min(_cards.Count - 1, _selected + 1));
                 e.Handled = true;
                 break;
             case Key.Up:
                 Select(Math.Max(0, _selected - 1));
                 e.Handled = true;
                 break;
-            case Key.Enter when _selected >= 0:
-                Open(_rows[_selected].Summary);
+            case Key.Enter when _selected >= 0 && _selected < _cards.Count:
+                Open(_cards[_selected].Summary);
                 e.Handled = true;
                 break;
             case Key.Escape:
@@ -278,8 +294,8 @@ public partial class TrophyHubWindow : Window
 
     private async void Open(GameSummary summary)
     {
-        await new TrophiesWindow(summary.Game.Name, summary.Directory, summary.Game.TitleId!).ShowDialog(this);
-        // Progress may have changed while the detail was open.
+        await new TrophiesWindow(summary.Game.Name, summary.Directory, summary.Game.TitleId!, summary.Game).ShowDialog(this);
+        // Progress may have changed while the list was open.
         await LoadAsync();
     }
 }

@@ -6,46 +6,71 @@ SPDX-License-Identifier: GPL-2.0-or-later
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:SharpEmu.GUI"
+        xmlns:controls="clr-namespace:SharpEmu.GUI.Controls"
         x:Class="SharpEmu.GUI.TrophyHubWindow"
         Width="1120"
-        Height="820"
-        MinWidth="820"
-        MinHeight="520"
+        Height="840"
+        MinWidth="840"
+        MinHeight="560"
         CanResize="True"
         WindowStartupLocation="CenterOwner"
-        Background="{StaticResource BgBrush}"
+        Background="#0E0B1A"
         Title="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}">
-  <Grid Margin="48,36,48,28" RowDefinitions="Auto,*">
+  <Grid>
+    <!-- Two soft lights, violet and cyan, over the indigo. -->
+    <Border IsHitTestVisible="False">
+      <Border.Background>
+        <RadialGradientBrush Center="8%,0%" GradientOrigin="8%,0%" RadiusX="75%" RadiusY="65%">
+          <GradientStop Color="#557C5CFC" Offset="0" />
+          <GradientStop Color="#007C5CFC" Offset="1" />
+        </RadialGradientBrush>
+      </Border.Background>
+    </Border>
+    <Border IsHitTestVisible="False">
+      <Border.Background>
+        <RadialGradientBrush Center="100%,100%" GradientOrigin="100%,100%" RadiusX="70%" RadiusY="60%">
+          <GradientStop Color="#3341C9E8" Offset="0" />
+          <GradientStop Color="#0041C9E8" Offset="1" />
+        </RadialGradientBrush>
+      </Border.Background>
+    </Border>
 
-    <!-- Header, laid out like the console: title on the left, earned totals on the right. -->
-    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="0,0,0,26">
-      <TextBlock Text="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}"
-                 FontSize="30"
-                 FontWeight="Light"
-                 VerticalAlignment="Center" />
-      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="30" VerticalAlignment="Center">
-        <StackPanel Orientation="Horizontal" Spacing="14" VerticalAlignment="Center">
-          <Border Width="52" Height="52" CornerRadius="26" Background="#1AFFFFFF">
-            <TextBlock x:Name="TotalCupGlyph"
-                       Classes="materialSymbol"
-                       Text="emoji_events"
-                       FontSize="30"
-                       LineHeight="34"
-                       Foreground="#8FD8F2" />
+    <Grid Margin="44,36,44,24" RowDefinitions="Auto,*">
+      <!-- Hero: the collection's medal, totals and overall completion. -->
+      <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="26" Margin="0,0,0,28">
+        <Grid Width="120" Height="120">
+          <Border Width="150" Height="150" CornerRadius="75" IsHitTestVisible="False">
+            <Border.Background>
+              <RadialGradientBrush>
+                <GradientStop Color="#669ED8F2" Offset="0" />
+                <GradientStop Color="#009ED8F2" Offset="1" />
+              </RadialGradientBrush>
+            </Border.Background>
           </Border>
-          <StackPanel VerticalAlignment="Center">
-            <TextBlock x:Name="TotalEarnedText" FontSize="30" FontWeight="SemiBold" />
-            <TextBlock x:Name="TotalOfText"
-                       FontSize="12"
-                       Foreground="{StaticResource MutedBrush}" />
-          </StackPanel>
+          <controls:TrophyMedal x:Name="HeroMedal" Grade="1" Width="112" Height="112" />
+        </Grid>
+        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="6">
+          <TextBlock Text="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}"
+                     FontSize="34"
+                     FontWeight="Bold" />
+          <TextBlock x:Name="TotalOfText" Foreground="#B8B4CC" FontSize="14" />
+          <WrapPanel x:Name="TotalGrades" Orientation="Horizontal" Margin="0,8,0,0" />
         </StackPanel>
-        <StackPanel x:Name="TotalGrades" Orientation="Horizontal" Spacing="26" VerticalAlignment="Center" />
-      </StackPanel>
-    </Grid>
+        <Grid Grid.Column="2" Width="128" Height="128" VerticalAlignment="Center">
+          <controls:TrophyProgressRing x:Name="TotalRing" Thickness="10" />
+          <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+            <TextBlock x:Name="TotalEarnedText" FontSize="30" FontWeight="Bold" HorizontalAlignment="Center" />
+            <TextBlock Text="{Binding [Trophies.EarnedTotal], Source={x:Static local:Localization.Instance}}"
+                       Foreground="#B8B4CC"
+                       FontSize="11"
+                       HorizontalAlignment="Center" />
+          </StackPanel>
+        </Grid>
+      </Grid>
 
-    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
-      <StackPanel x:Name="GameList" Spacing="6" Margin="0,0,10,0" />
-    </ScrollViewer>
+      <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel x:Name="GameList" Spacing="12" Margin="0,0,12,12" />
+      </ScrollViewer>
+    </Grid>
   </Grid>
 </Window>
