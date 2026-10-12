@@ -1,5 +1,6 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
+// Portions adapted from YoteiPC (at9_api.c) by llnternet, GPL-2.0.
+// SPDX-License-Identifier: GPL-2.0-only
 
 using System.Buffers.Binary;
 using LibAtrac9;
@@ -613,7 +614,7 @@ internal sealed class Atrac9DecodeState
     private bool TryDecodeExtendedNoLock(Atrac9StreamInfo info)
     {
         // Multichannel block ordering and consumed-byte traversal follow
-        // YoteiPC's at9_api.c (GPL-2.0), adapted to the stateful LibAtrac9 API.
+        // YoteiPC (llnternet) at9_api.c, GPL-2.0, adapted to the stateful LibAtrac9 API.
         if (_extendedDecoders is null || _planarPcm is null || _compressed is null)
         {
             return false;
