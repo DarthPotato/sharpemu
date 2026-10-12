@@ -695,8 +695,24 @@ public sealed unsafe class GpuTiler : IDisposable
         var targetBase = tiledOffset & (StorageAlignment - 1);
         var dispatches = new List<TransferDispatch>();
         Prepare(true, tiledCapacity, linearCapacity, transfers, 0, targetBase, dispatches);
-        var linear = AllocateScratch((linearCapacity + 3) & ~3UL);
-        image.DownloadToBuffer(regions, linear.Buffer, 0, linear.Size);
+        // The download comes first in the ring like an upload: a dropped image published every frame
+        // otherwise created and freed a pooled scratch the size of the image each time. A swapped
+        // download keeps its own scratch, so the swap output taken from the ring cannot wrap onto it.
+        var linear = swap == ColorChannelSwap.SwapBgra16
+            ? AllocateScratch((linearCapacity + 3) & ~3UL)
+            : AllocateUploadScratch(linearCapacity);
+        if (linear.Offset != 0)
+        {
+            var shifted = regions.ToArray();
+            for (var index = 0; index < shifted.Length; index++)
+            {
+                shifted[index].BufferOffset += linear.Offset;
+            }
+
+            regions = shifted;
+        }
+
+        image.DownloadToBuffer(regions, linear.Buffer, linear.Offset, linear.Size);
         var source = linear;
         if (swap == ColorChannelSwap.SwapBgra16)
         {

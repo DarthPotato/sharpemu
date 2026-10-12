@@ -374,7 +374,9 @@ public sealed partial class GuestImageCacheTests
     }
 
     [Fact]
-    public void Pressure_CompletesTiledReadbackBatchesBeforeAllocatingMoreScratch()
+    // Tiled readbacks of dropped images download through the tiler's ring, so a collection under
+    // pressure holds no pooled scratch for them and need not end the tick to bound it.
+    public void Pressure_TiledReadbacksOfDroppedImagesHoldNoScratch()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
@@ -400,14 +402,11 @@ public sealed partial class GuestImageCacheTests
             harness.Images.TilerForTest.OutstandingScratchBudget = 1;
             harness.Images.SetCollectionThresholds(0, 0, ulong.MaxValue, 2);
             harness.Images.ResetRecency(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(images), 2);
-            var tick = harness.Scheduler.CurrentTick;
             harness.Images.RunGarbageCollector();
-            Assert.True(harness.Scheduler.CurrentTick > tick);
             Assert.All(images, image => Assert.False(harness.Images.Contains(image)));
+            Assert.Equal(0UL, harness.Images.TilerForTest.OutstandingScratchBytes);
             Assert.Equal(0UL, harness.Images.TilerForTest.PooledScratchBytes);
         });
-        // Earlier batches have already published; the final batch may be pending.
-        Assert.Contains(clear, harness.Read(address, (int)size).Chunk(4).Select(bytes => BitConverter.ToUInt32(bytes)));
         harness.Finish();
         for (var index = 0; index < 3; index++)
         {
