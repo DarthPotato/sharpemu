@@ -3326,8 +3326,9 @@ public partial class MainWindow : Window
         TrophyToast.Show(new TrophyToastContent(notice.Name, entry?.Description ?? string.Empty, notice.Grade, entry?.IconPng));
     }
 
-    // SHARPEMU_TROPHY_TOAST_TEST=1 shows one notification per grade (=list opens the trophy list), using the first library game
-    // that has trophies, so the notification can be checked without earning anything.
+    // SHARPEMU_TROPHY_TOAST_TEST=1 adds a "Test trophy notification" button to the launcher; each
+    // click shows the notification for the next grade, using the first library game that has
+    // trophies. =list opens that game's trophy list instead. Nothing needs to be earned.
     private async void StartTrophyToastPreview()
     {
         var preview = Environment.GetEnvironmentVariable("SHARPEMU_TROPHY_TOAST_TEST");
@@ -3337,8 +3338,7 @@ public partial class MainWindow : Window
         }
 
         await Task.Delay(TimeSpan.FromSeconds(3));
-        var games = _visibleGames.Where(g => !string.IsNullOrWhiteSpace(g.TitleId)).ToArray();
-        foreach (var game in games)
+        foreach (var game in _visibleGames.Where(g => !string.IsNullOrWhiteSpace(g.TitleId)).ToArray())
         {
             var directory = Path.GetDirectoryName(game.Path);
             if (directory is null)
@@ -3358,18 +3358,27 @@ public partial class MainWindow : Window
                 return;
             }
 
-            foreach (var grade in new[] { 4, 3, 2, 1 })
+            var next = 0;
+            var button = new Button
             {
-                if (catalog.FirstOrDefault(t => t.Grade == grade) is { } trophy)
-                {
-                    TrophyToast.Show(new TrophyToastContent(trophy.Name, trophy.Description, grade, trophy.IconPng));
-                }
-            }
-
+                Content = "Test trophy notification",
+                Classes = { "accent" },
+                HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right,
+                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Bottom,
+                Margin = new Thickness(0, 0, 28, 28),
+                Padding = new Thickness(20, 10),
+                ZIndex = 1000,
+            };
+            Grid.SetRowSpan(button, 2);
+            button.Click += (_, _) =>
+            {
+                var grade = new[] { 4, 3, 2, 1 }[next++ % 4];
+                var trophy = catalog.FirstOrDefault(t => t.Grade == grade) ?? catalog[0];
+                TrophyToast.Show(new TrophyToastContent(trophy.Name, trophy.Description, trophy.Grade, trophy.IconPng));
+            };
+            RootLayout.Children.Add(button);
             return;
         }
-
-        TrophyToast.Show(new TrophyToastContent("Sample trophy", "No library game with trophies was found.", 2, null));
     }
 
     private async void OpenSelectedGameTrophies()
