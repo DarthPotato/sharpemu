@@ -97,7 +97,7 @@ internal static class TrophyUi
             Spacing = 8,
             Children =
             {
-                new TrophyMedal { Width = 26, Height = 26, Grade = grade, Locked = earned == 0 },
+                new TrophyMedal { Width = 26, Height = 26, Grade = grade, Opacity = earned == 0 ? 0.6 : 1 },
                 new TextBlock
                 {
                     Inlines =

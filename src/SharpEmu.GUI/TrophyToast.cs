@@ -35,8 +35,9 @@ internal sealed record TrophyToastContent(
 /// </remarks>
 internal sealed class TrophyToast : Window
 {
-    private const double WindowWidth = 780;
-    private const double WindowHeight = 360;
+    // Wide and tall enough that the confetti fades out before it reaches an edge.
+    private const double WindowWidth = 1000;
+    private const double WindowHeight = 720;
     private const double CardWidth = 600;
     private const double CardHeight = 158;
     private const double CardMargin = 28;
@@ -123,7 +124,8 @@ internal sealed class TrophyToast : Window
     {
         _content = content;
         (_light, _mid, _dark) = TrophyMedal.Palette(content.Grade);
-        _leaveAt = Impact + content.Grade switch { 1 => 7.5, 2 => 5.5, 3 => 4.8, _ => 4.3 };
+        // About four seconds on screen in all; the platinum stays a moment longer.
+        _leaveAt = content.Grade == 1 ? 4.0 : 3.5;
 
         Width = WindowWidth;
         Height = WindowHeight;
@@ -654,9 +656,9 @@ internal sealed class TrophyToast : Window
         var origin = MedalCenter;
         for (var i = 0; i < count; i++)
         {
-            // Mostly up and out to the left, away from the screen edge.
-            var angle = -Math.PI / 2 + (_random.NextDouble() - 0.62) * Math.PI * 1.5;
-            var speed = (260 + _random.NextDouble() * 420) * strength;
+            // Out to the left and down, into the screen: above the card there is no room.
+            var angle = Math.PI * (0.55 + _random.NextDouble() * 0.65);
+            var speed = (200 + _random.NextDouble() * 360) * strength;
             var round = _random.NextDouble() < 0.25;
             var width = round ? 5 + _random.NextDouble() * 3 : 6 + _random.NextDouble() * 6;
             var height = round ? width : 3 + _random.NextDouble() * 3;
@@ -680,7 +682,7 @@ internal sealed class TrophyToast : Window
                 Y = origin.Y,
                 Vx = Math.Cos(angle) * speed,
                 Vy = Math.Sin(angle) * speed,
-                Life = 1.4 + _random.NextDouble() * 1.2,
+                Life = 1.1 + _random.NextDouble() * 0.9,
                 Spin = (_random.NextDouble() - 0.5) * 720,
                 TumbleSpeed = 6 + _random.NextDouble() * 10,
                 Phase = _random.NextDouble() * Math.PI * 2,

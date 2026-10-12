@@ -344,7 +344,7 @@ public partial class TrophiesWindow : Window
         var status = trophy.UnlockedAtUtc is { } at
             ? TrophyUi.StatusChip("check_circle", at.ToLocalTime().ToString("g"), Color.Parse("#7EF0B0"))
             : TrophyUi.StatusChip("hourglass_empty", Localization.Instance.Get("Trophies.Locked"), Color.Parse("#8E89A6"));
-        var medal = new TrophyMedal { Width = 44, Height = 44, Grade = trophy.Grade, Locked = !trophy.Unlocked };
+        var medal = new TrophyMedal { Width = 44, Height = 44, Grade = trophy.Grade, Opacity = trophy.Unlocked ? 1 : 0.55 };
         var grade = new TextBlock
         {
             Text = TrophyUi.GradeName(trophy.Grade),

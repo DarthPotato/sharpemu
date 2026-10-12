@@ -194,7 +194,7 @@ public partial class TrophyHubWindow : Window
                 Spacing = 5,
                 Children =
                 {
-                    new TrophyMedal { Width = 22, Height = 22, Grade = grade, Locked = earned == 0 },
+                    new TrophyMedal { Width = 22, Height = 22, Grade = grade, Opacity = earned == 0 ? 0.55 : 1 },
                     new TextBlock { Text = earned.ToString(), FontSize = 14, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center },
                 },
             });
