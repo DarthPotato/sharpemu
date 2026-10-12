@@ -27,6 +27,34 @@ internal static class TrophyUi
         Foreground = GradeBrush(grade),
     };
 
+    /// <summary>Fades the rows in one after another; used once, when a list first opens.</summary>
+    public static void StaggerIn(IReadOnlyList<Avalonia.Controls.Control> rows)
+    {
+        foreach (var row in rows)
+        {
+            row.Opacity = 0;
+            row.Transitions = [new Avalonia.Animation.DoubleTransition { Property = Avalonia.Controls.Control.OpacityProperty, Duration = TimeSpan.FromMilliseconds(320) }];
+        }
+
+        var next = 0;
+        var timer = new Avalonia.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(28) };
+        timer.Tick += (_, _) =>
+        {
+            // Rows past the first screenful appear together; nobody waits on them.
+            var batch = next < 10 ? 1 : rows.Count;
+            for (var i = 0; i < batch && next < rows.Count; i++)
+            {
+                rows[next++].Opacity = 1;
+            }
+
+            if (next >= rows.Count)
+            {
+                timer.Stop();
+            }
+        };
+        timer.Start();
+    }
+
     public static string GradeName(int grade) =>
         Localization.Instance.Get($"Trophies.Grade.{Math.Clamp(grade, 1, 4)}");
 

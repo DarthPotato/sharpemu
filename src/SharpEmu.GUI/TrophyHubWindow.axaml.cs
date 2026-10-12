@@ -31,6 +31,7 @@ public partial class TrophyHubWindow : Window
     private readonly IReadOnlyList<GameEntry> _games;
     private readonly List<(Border Row, GameSummary Summary)> _rows = [];
     private int _selected = -1;
+    private bool _animated;
 
     public TrophyHubWindow()
         : this([])
@@ -78,6 +79,12 @@ public partial class TrophyHubWindow : Window
                 FontSize = 15,
             });
             return;
+        }
+
+        if (!_animated)
+        {
+            _animated = true;
+            TrophyUi.StaggerIn(_rows.Select(r => (Control)r.Row).ToList());
         }
 
         Select(0);

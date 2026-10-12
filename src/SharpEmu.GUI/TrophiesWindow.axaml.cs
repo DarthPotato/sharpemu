@@ -28,6 +28,7 @@ public partial class TrophiesWindow : Window
     private readonly HashSet<int> _revealed = [];
     private IReadOnlyList<TrophyEntry> _trophies = [];
     private string _lastSignature = string.Empty;
+    private bool _animated;
 
     public TrophiesWindow()
         : this(string.Empty, string.Empty, string.Empty)
@@ -139,6 +140,12 @@ public partial class TrophiesWindow : Window
         foreach (var trophy in _trophies.OrderByDescending(t => t.Unlocked).ThenBy(t => t.Id))
         {
             TrophyList.Children.Add(BuildRow(trophy));
+        }
+
+        if (!_animated && TrophyList.Children.Count > 0)
+        {
+            _animated = true;
+            TrophyUi.StaggerIn(TrophyList.Children.ToList());
         }
     }
 
