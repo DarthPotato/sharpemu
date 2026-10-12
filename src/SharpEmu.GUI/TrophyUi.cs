@@ -30,7 +30,7 @@ internal static class TrophyUi
         try
         {
             using var stream = new MemoryStream(png);
-            return new Bitmap(stream);
+            return Bitmap.DecodeToWidth(stream, 192);
         }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or NotSupportedException)
         {

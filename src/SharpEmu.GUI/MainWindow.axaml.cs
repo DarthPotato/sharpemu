@@ -1032,6 +1032,7 @@ public partial class MainWindow : Window
 
     private async Task OnOpenedAsync()
     {
+        StartTrophyToastPreview();
         var version = Assembly.GetExecutingAssembly().GetName().Version;
         var display = version is not null ? $"v{version.ToString(3)}" : "v0.0.1";
         display += BuildInfo.CommitSha is null
@@ -3312,16 +3313,63 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void ShowTrophyToast(SharpEmu.Libs.Np.TrophyUnlockNotice notice, string? ebootPath)
+    private static async void ShowTrophyToast(SharpEmu.Libs.Np.TrophyUnlockNotice notice, string? ebootPath)
     {
-        byte[]? icon = null;
+        SharpEmu.Libs.Np.TrophyEntry? entry = null;
         if (Path.GetDirectoryName(ebootPath) is { } gameDirectory)
         {
-            icon = SharpEmu.Libs.Np.TrophyCatalog.Load(gameDirectory, notice.TitleId)
-                .FirstOrDefault(t => t.Id == notice.TrophyId)?.IconPng;
+            var titleId = notice.TitleId;
+            entry = (await Task.Run(() => SharpEmu.Libs.Np.TrophyCatalog.Load(gameDirectory, titleId)))
+                .FirstOrDefault(t => t.Id == notice.TrophyId);
         }
 
-        TrophyToast.Show(notice, icon);
+        TrophyToast.Show(new TrophyToastContent(notice.Name, entry?.Description ?? string.Empty, notice.Grade, entry?.IconPng));
+    }
+
+    // SHARPEMU_TROPHY_TOAST_TEST=1 shows one notification per grade (=list opens the trophy list), using the first library game
+    // that has trophies, so the notification can be checked without earning anything.
+    private async void StartTrophyToastPreview()
+    {
+        var preview = Environment.GetEnvironmentVariable("SHARPEMU_TROPHY_TOAST_TEST");
+        if (preview is not ("1" or "list"))
+        {
+            return;
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(3));
+        var games = _visibleGames.Where(g => !string.IsNullOrWhiteSpace(g.TitleId)).ToArray();
+        foreach (var game in games)
+        {
+            var directory = Path.GetDirectoryName(game.Path);
+            if (directory is null)
+            {
+                continue;
+            }
+
+            var catalog = await Task.Run(() => SharpEmu.Libs.Np.TrophyCatalog.Load(directory, game.TitleId!));
+            if (catalog.Count == 0)
+            {
+                continue;
+            }
+
+            if (preview == "list")
+            {
+                new TrophiesWindow(game.Name, directory, game.TitleId!).Show();
+                return;
+            }
+
+            foreach (var grade in new[] { 4, 3, 2, 1 })
+            {
+                if (catalog.FirstOrDefault(t => t.Grade == grade) is { } trophy)
+                {
+                    TrophyToast.Show(new TrophyToastContent(trophy.Name, trophy.Description, grade, trophy.IconPng));
+                }
+            }
+
+            return;
+        }
+
+        TrophyToast.Show(new TrophyToastContent("Sample trophy", "No library game with trophies was found.", 2, null));
     }
 
     private async void OpenSelectedGameTrophies()

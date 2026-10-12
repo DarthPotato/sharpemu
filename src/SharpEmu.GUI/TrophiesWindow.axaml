@@ -7,52 +7,74 @@ SPDX-License-Identifier: GPL-2.0-or-later
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:SharpEmu.GUI"
         x:Class="SharpEmu.GUI.TrophiesWindow"
-        Width="720"
-        Height="640"
-        MinWidth="520"
-        MinHeight="420"
+        Width="1040"
+        Height="820"
+        MinWidth="720"
+        MinHeight="520"
         CanResize="True"
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource BgBrush}"
         Title="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}">
-  <Grid Margin="24" RowDefinitions="Auto,Auto,*,Auto">
-    <StackPanel Grid.Row="0" Spacing="2">
-      <TextBlock Text="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}"
-                 FontSize="24"
-                 FontWeight="Bold" />
-      <TextBlock x:Name="GameNameText"
-                 Foreground="{StaticResource MutedBrush}"
-                 TextTrimming="CharacterEllipsis" />
-    </StackPanel>
+  <Grid Margin="32,28,32,24" RowDefinitions="Auto,Auto,*,Auto">
 
-    <Border Grid.Row="1" Classes="card" Margin="0,16,0,12" Padding="16">
-      <StackPanel Spacing="10">
-        <Grid ColumnDefinitions="*,Auto">
-          <TextBlock x:Name="ProgressText" FontWeight="SemiBold" />
-          <TextBlock x:Name="GradeCountsText"
-                     Grid.Column="1"
-                     Foreground="{StaticResource SecondaryTextBrush}" />
+    <!-- Hero: big percentage, game name, per-grade counts -->
+    <Border Grid.Row="0" Classes="card" Padding="28">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+          <GradientStop Color="#241B45" Offset="0" />
+          <GradientStop Color="#161616" Offset="0.65" />
+        </LinearGradientBrush>
+      </Border.Background>
+      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="28">
+        <Grid Width="132" Height="132" VerticalAlignment="Center">
+          <Ellipse Stroke="{StaticResource ElevatedBrush}" StrokeThickness="10" />
+          <Path x:Name="ProgressArc"
+                Stroke="{StaticResource AccentBrush}"
+                StrokeThickness="10"
+                StrokeLineCap="Round" />
+          <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+            <TextBlock x:Name="PercentText"
+                       FontSize="36"
+                       FontWeight="Bold"
+                       HorizontalAlignment="Center" />
+          </StackPanel>
         </Grid>
-        <ProgressBar x:Name="ProgressBar"
-                     Minimum="0"
-                     Maximum="100"
-                     Height="6"
-                     Foreground="{StaticResource AccentBrush}"
-                     Background="{StaticResource ElevatedBrush}" />
-      </StackPanel>
+        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="6">
+          <TextBlock Text="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}"
+                     Foreground="{StaticResource AccentHoverBrush}"
+                     FontSize="13"
+                     FontWeight="SemiBold" />
+          <TextBlock x:Name="GameNameText"
+                     FontSize="28"
+                     FontWeight="Bold"
+                     TextTrimming="CharacterEllipsis" />
+          <TextBlock x:Name="ProgressText"
+                     Foreground="{StaticResource SecondaryTextBrush}"
+                     FontSize="15" />
+          <WrapPanel x:Name="GradeChips" Margin="0,8,0,0" />
+        </StackPanel>
+      </Grid>
     </Border>
 
+    <!-- Filters -->
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="0,20,0,14">
+      <Button x:Name="FilterAll" Classes="accent" />
+      <Button x:Name="FilterEarned" Classes="ghost" />
+      <Button x:Name="FilterLocked" Classes="ghost" />
+    </StackPanel>
+
     <ScrollViewer Grid.Row="2" HorizontalScrollBarVisibility="Disabled">
-      <StackPanel x:Name="TrophyList" Spacing="8" />
+      <StackPanel x:Name="TrophyList" Spacing="10" Margin="0,0,12,0" />
     </ScrollViewer>
 
-    <Grid Grid.Row="3" Margin="0,16,0,0" ColumnDefinitions="Auto,*,Auto">
+    <Grid Grid.Row="3" Margin="0,18,0,0" ColumnDefinitions="Auto,*,Auto">
       <Button x:Name="RefreshButton"
               Classes="ghost"
               Content="{Binding [Trophies.Refresh], Source={x:Static local:Localization.Instance}}" />
       <Button x:Name="CloseButton"
               Grid.Column="2"
               Classes="accent"
+              Padding="28,8"
               Content="{Binding [Trophies.Close], Source={x:Static local:Localization.Instance}}" />
     </Grid>
   </Grid>

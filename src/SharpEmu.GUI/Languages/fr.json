@@ -253,7 +253,7 @@
   "Trophies.Refresh": "Actualiser",
   "Trophies.None": "Ce jeu n’a pas de trophées.",
   "Trophies.Hidden": "Trophée caché",
-  "Trophies.HiddenDescription": "Continuez à jouer pour révéler ce trophée.",
+  "Trophies.HiddenDescription": "Cliquez pour révéler ce trophée.",
   "Trophies.Locked": "Pas encore obtenu",
   "Trophies.Earned": "Obtenu le {0}",
   "Trophies.Progress": "{0} / {1} obtenus · {2} %",
@@ -261,5 +261,8 @@
   "Trophies.Grade.1": "Platine",
   "Trophies.Grade.2": "Or",
   "Trophies.Grade.3": "Argent",
-  "Trophies.Grade.4": "Bronze"
+  "Trophies.Grade.4": "Bronze",
+  "Trophies.Filter.All": "Tous",
+  "Trophies.Filter.Earned": "Obtenus",
+  "Trophies.Filter.Locked": "À obtenir"
 }
