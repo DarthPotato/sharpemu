@@ -28,16 +28,16 @@ internal sealed record TrophyToastContent(
 /// </summary>
 /// <remarks>
 /// The card swings in from the right in 3D. Its medal spins like a tossed coin while the sound
-/// rises, and lands on the sound's impact: a ring leaves it, confetti bursts out, a glint crosses
+/// rises, and lands on the sound's impact: a ring leaves it, glints burst out round it, a glint crosses
 /// it and the game's progress bar moves up. The card is tinted in the grade's metal, with light
-/// drifting across it; rarer grades get more confetti, and the platinum adds rays, an iridescent
+/// drifting across it; rarer grades get more glints, and the platinum adds rays, an iridescent
 /// edge and a second burst. With Windows animations turned off the toast only fades.
 /// </remarks>
 internal sealed class TrophyToast : Window
 {
-    // Wide and tall enough that the confetti fades out before it reaches an edge.
-    private const double WindowWidth = 1000;
-    private const double WindowHeight = 720;
+    // Room around the card for the glints, which go out well before the edges.
+    private const double WindowWidth = 840;
+    private const double WindowHeight = 340;
     private const double CardWidth = 600;
     private const double CardHeight = 158;
     private const double CardMargin = 28;
@@ -51,13 +51,16 @@ internal sealed class TrophyToast : Window
     private static readonly Queue<TrophyToastContent> Pending = new();
     private static bool _showing;
 
-    private sealed class Confetti
+    private sealed class Sparkle
     {
-        public Border Visual = null!;
+        public Control Visual = null!;
         public RotateTransform Rotation = null!;
-        public ScaleTransform Tumble = null!;
-        public double X, Y, Vx, Vy, Life, Age, Spin, TumbleSpeed, Phase, Width, Height;
+        public ScaleTransform Scale = null!;
+        public double X, Y, Vx, Vy, Life, Age, Spin, Twinkle, Size;
     }
+
+    private static readonly Geometry SparkleShape = Geometry.Parse(
+        "M50,0 C53,35 65,47 100,50 C65,53 53,65 50,100 C47,65 35,53 0,50 C35,47 47,35 50,0 Z");
 
     private readonly TrophyToastContent _content;
     private readonly Color _light, _mid, _dark;
@@ -66,7 +69,7 @@ internal sealed class TrophyToast : Window
     private readonly Stopwatch _clock = new();
     private readonly DispatcherTimer _frame = new() { Interval = TimeSpan.FromMilliseconds(15) };
     private readonly Random _random = new();
-    private readonly List<Confetti> _confetti = [];
+    private readonly List<Sparkle> _sparkles = [];
     private readonly Canvas _overlay = new() { IsHitTestVisible = false };
     private readonly Grid _cardHost = new();
     private readonly Rotate3DTransform _cardTilt = new() { Depth = 900 };
@@ -594,13 +597,13 @@ internal sealed class TrophyToast : Window
         if (sinceImpact >= 0 && !_burstDone)
         {
             _burstDone = true;
-            SpawnConfetti(_content.Grade switch { 1 => 90, 2 => 54, 3 => 32, _ => 22 }, 1.0);
+            SpawnSparkles(_content.Grade switch { 1 => 26, 2 => 18, 3 => 14, _ => 10 }, _content.Grade == 1 ? 1.25 : 1.0);
         }
 
         if (_content.Grade == 1 && sinceImpact >= 0.55 && !_secondBurstDone)
         {
             _secondBurstDone = true;
-            SpawnConfetti(50, 0.75);
+            SpawnSparkles(16, 0.8);
         }
 
         var ring = sinceImpact / 0.7;
@@ -645,78 +648,82 @@ internal sealed class TrophyToast : Window
             _edgeSpin.Angle = t * 40;
         }
 
-        StepConfetti(dt);
+        StepSparkles(dt);
     }
 
-    private void SpawnConfetti(int count, double strength)
+    // Four-pointed glints that burst from the medal all round, twinkle and go out near the card.
+    private void SpawnSparkles(int count, double reach)
     {
         Color[] colors = _content.Grade == 1
-            ? [_light, _mid, Colors.White, Color.Parse("#B79CFF"), Color.Parse("#FF9BDB")]
-            : [_light, _mid, Colors.White, TrophyMedal.Shade(_mid, 0.8)];
+            ? [_light, Colors.White, Color.Parse("#C9B8FF"), Color.Parse("#FFC4EC")]
+            : [_light, Colors.White, _light, _mid];
         var origin = MedalCenter;
         for (var i = 0; i < count; i++)
         {
-            // Out to the left and down, into the screen: above the card there is no room.
-            var angle = Math.PI * (0.55 + _random.NextDouble() * 0.65);
-            var speed = (200 + _random.NextDouble() * 360) * strength;
-            var round = _random.NextDouble() < 0.25;
-            var width = round ? 5 + _random.NextDouble() * 3 : 6 + _random.NextDouble() * 6;
-            var height = round ? width : 3 + _random.NextDouble() * 3;
-            var rotation = new RotateTransform(_random.NextDouble() * 360);
-            var tumble = new ScaleTransform();
-            var visual = new Border
-            {
-                Width = width,
-                Height = height,
-                CornerRadius = new CornerRadius(round ? width / 2 : 1),
-                Background = new SolidColorBrush(colors[_random.Next(colors.Length)]),
-                RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative),
-                RenderTransform = new TransformGroup { Children = { tumble, rotation } },
-            };
-            _confetti.Add(new Confetti
+            var angle = (i + _random.NextDouble() * 0.8) / count * Math.PI * 2;
+            var speed = (90 + _random.NextDouble() * 170) * reach;
+            var dot = _random.NextDouble() < 0.3;
+            var size = dot ? 3 + _random.NextDouble() * 2 : 9 + _random.NextDouble() * (_content.Grade == 1 ? 12 : 8);
+            var color = colors[_random.Next(colors.Length)];
+            var rotation = new RotateTransform(_random.NextDouble() * 45);
+            var scale = new ScaleTransform(0, 0);
+            Control visual = dot
+                ? new Border { Width = size, Height = size, CornerRadius = new CornerRadius(size / 2), Background = new SolidColorBrush(color) }
+                : new Avalonia.Controls.Shapes.Path
+                {
+                    Data = SparkleShape,
+                    Width = size,
+                    Height = size,
+                    Stretch = Stretch.Fill,
+                    Fill = new SolidColorBrush(color),
+                };
+            visual.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
+            visual.RenderTransform = new TransformGroup { Children = { scale, rotation } };
+            visual.Effect = new DropShadowEffect { BlurRadius = 8, OffsetX = 0, OffsetY = 0, Color = color, Opacity = 0.9 };
+            _sparkles.Add(new Sparkle
             {
                 Visual = visual,
                 Rotation = rotation,
-                Tumble = tumble,
+                Scale = scale,
                 X = origin.X + _cardShift.X,
                 Y = origin.Y,
                 Vx = Math.Cos(angle) * speed,
                 Vy = Math.Sin(angle) * speed,
-                Life = 1.1 + _random.NextDouble() * 0.9,
-                Spin = (_random.NextDouble() - 0.5) * 720,
-                TumbleSpeed = 6 + _random.NextDouble() * 10,
-                Phase = _random.NextDouble() * Math.PI * 2,
-                Width = width,
-                Height = height,
+                Life = 0.55 + _random.NextDouble() * 0.5,
+                Spin = (_random.NextDouble() - 0.5) * 240,
+                Twinkle = 14 + _random.NextDouble() * 12,
+                Size = size,
             });
             _overlay.Children.Add(visual);
         }
     }
 
-    private void StepConfetti(double dt)
+    private void StepSparkles(double dt)
     {
-        for (var i = _confetti.Count - 1; i >= 0; i--)
+        for (var i = _sparkles.Count - 1; i >= 0; i--)
         {
-            var p = _confetti[i];
+            var p = _sparkles[i];
             p.Age += dt;
             if (p.Age >= p.Life)
             {
                 _overlay.Children.Remove(p.Visual);
-                _confetti.RemoveAt(i);
+                _sparkles.RemoveAt(i);
                 continue;
             }
 
-            // Air slows the pieces quickly, so they burst and then flutter down.
-            p.Vy += 620 * dt;
-            p.Vx *= 1 - 2.2 * dt;
-            p.Vy *= 1 - 1.4 * dt;
-            p.X += p.Vx * dt + Math.Sin(p.Age * 5 + p.Phase) * 18 * dt;
+            // They shoot out, slow almost to a stop and drift up a touch while they fade.
+            p.Vx *= 1 - 5.5 * dt;
+            p.Vy = p.Vy * (1 - 5.5 * dt) - 30 * dt;
+            p.X += p.Vx * dt;
             p.Y += p.Vy * dt;
             p.Rotation.Angle += p.Spin * dt;
-            p.Tumble.ScaleY = Math.Cos(p.Age * p.TumbleSpeed + p.Phase);
-            Canvas.SetLeft(p.Visual, p.X - p.Width / 2);
-            Canvas.SetTop(p.Visual, p.Y - p.Height / 2);
-            p.Visual.Opacity = 1 - EaseInCubic(p.Age / p.Life);
+            var life = p.Age / p.Life;
+            var grow = Math.Min(1, life * 6);
+            var twinkle = 0.8 + 0.2 * Math.Sin(p.Age * p.Twinkle);
+            p.Scale.ScaleX = p.Scale.ScaleY = grow * twinkle * (1 - 0.5 * life);
+            Canvas.SetLeft(p.Visual, p.X - p.Size / 2);
+            Canvas.SetTop(p.Visual, p.Y - p.Size / 2);
+            p.Visual.Opacity = 1 - EaseInCubic(life);
         }
     }
 
