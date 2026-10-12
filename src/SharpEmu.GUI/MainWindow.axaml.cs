@@ -427,6 +427,7 @@ public partial class MainWindow : Window
             await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.TitleId);
         CtxGameSettings.Click += (_, _) => OpenSelectedGameSettings();
         CtxTrophies.Click += (_, _) => OpenSelectedGameTrophies();
+        InitializeTrophies();
         CtxRemove.Click += (_, _) => RemoveSelectedFromLibrary();
         CtxPackZar.Click += async (_, _) => await PackSelectedAsZarAsync();
 
@@ -1032,7 +1033,6 @@ public partial class MainWindow : Window
 
     private async Task OnOpenedAsync()
     {
-        StartTrophyToastPreview();
         var version = Assembly.GetExecutingAssembly().GetName().Version;
         var display = version is not null ? $"v{version.ToString(3)}" : "v0.0.1";
         display += BuildInfo.CommitSha is null
@@ -3311,87 +3311,6 @@ public partial class MainWindow : Window
             var ebootPath = _runningEbootPath;
             Dispatcher.UIThread.Post(() => ShowTrophyToast(notice, ebootPath));
         }
-    }
-
-    private static async void ShowTrophyToast(SharpEmu.Libs.Np.TrophyUnlockNotice notice, string? ebootPath)
-    {
-        SharpEmu.Libs.Np.TrophyEntry? entry = null;
-        if (Path.GetDirectoryName(ebootPath) is { } gameDirectory)
-        {
-            var titleId = notice.TitleId;
-            entry = (await Task.Run(() => SharpEmu.Libs.Np.TrophyCatalog.Load(gameDirectory, titleId)))
-                .FirstOrDefault(t => t.Id == notice.TrophyId);
-        }
-
-        TrophyToast.Show(new TrophyToastContent(notice.Name, entry?.Description ?? string.Empty, notice.Grade, entry?.IconPng));
-    }
-
-    // SHARPEMU_TROPHY_TOAST_TEST=1 adds a "Test trophy notification" button to the launcher; each
-    // click shows the notification for the next grade, using the first library game that has
-    // trophies. =list opens that game's trophy list instead. Nothing needs to be earned.
-    private async void StartTrophyToastPreview()
-    {
-        var preview = Environment.GetEnvironmentVariable("SHARPEMU_TROPHY_TOAST_TEST");
-        if (preview is not ("1" or "list"))
-        {
-            return;
-        }
-
-        await Task.Delay(TimeSpan.FromSeconds(3));
-        foreach (var game in _visibleGames.Where(g => !string.IsNullOrWhiteSpace(g.TitleId)).ToArray())
-        {
-            var directory = Path.GetDirectoryName(game.Path);
-            if (directory is null)
-            {
-                continue;
-            }
-
-            var catalog = await Task.Run(() => SharpEmu.Libs.Np.TrophyCatalog.Load(directory, game.TitleId!));
-            if (catalog.Count == 0)
-            {
-                continue;
-            }
-
-            if (preview == "list")
-            {
-                new TrophiesWindow(game.Name, directory, game.TitleId!).Show();
-                return;
-            }
-
-            var next = 0;
-            var button = new Button
-            {
-                Content = "Test trophy notification",
-                Classes = { "accent" },
-                HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right,
-                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Bottom,
-                Margin = new Thickness(0, 0, 28, 28),
-                Padding = new Thickness(20, 10),
-                ZIndex = 1000,
-            };
-            Grid.SetRowSpan(button, 2);
-            button.Click += (_, _) =>
-            {
-                var grade = new[] { 4, 3, 2, 1 }[next++ % 4];
-                var trophy = catalog.FirstOrDefault(t => t.Grade == grade) ?? catalog[0];
-                TrophyToast.Show(new TrophyToastContent(trophy.Name, trophy.Description, trophy.Grade, trophy.IconPng));
-            };
-            RootLayout.Children.Add(button);
-            return;
-        }
-    }
-
-    private async void OpenSelectedGameTrophies()
-    {
-        if (GameList.SelectedItem is not GameEntry game ||
-            string.IsNullOrWhiteSpace(game.TitleId) ||
-            Path.GetDirectoryName(game.Path) is not { } gameDirectory)
-        {
-            return;
-        }
-
-        var window = new TrophiesWindow(game.Name, gameDirectory, game.TitleId);
-        await window.ShowDialog(this);
     }
 
     private void OpenFileLog(string? titleId)

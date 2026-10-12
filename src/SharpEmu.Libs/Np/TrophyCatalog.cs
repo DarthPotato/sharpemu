@@ -21,8 +21,8 @@ public sealed record TrophyUnlockNotice(string TitleId, int TrophyId, int Grade,
 /// <summary>Read-only view of a title's trophies for the launcher, which runs in another process.</summary>
 public static class TrophyCatalog
 {
-    /// <summary>Lists the title's trophies with the progress saved for it; empty without a trophy package.</summary>
-    public static IReadOnlyList<TrophyEntry> Load(string gameDirectory, string titleId)
+    /// <summary>Lists the title trophies with the progress saved for it; empty without a trophy package. Icons are the large part, so overviews pass false.</summary>
+    public static IReadOnlyList<TrophyEntry> Load(string gameDirectory, string titleId, bool includeIcons = true)
     {
         try
         {
@@ -32,7 +32,7 @@ public static class TrophyCatalog
                 return [];
             }
 
-            var trophies = TrophyService.ReadTrophies(File.ReadAllBytes(packagePath), includeIcons: true);
+            var trophies = TrophyService.ReadTrophies(File.ReadAllBytes(packagePath), includeIcons);
             TrophyService.ApplyUnlocks(trophies, TrophyService.UnlockFilePath(titleId.ToUpperInvariant()));
             return trophies
                 .Select(t => new TrophyEntry(

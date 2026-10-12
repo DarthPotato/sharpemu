@@ -264,5 +264,13 @@
   "Trophies.Grade.4": "Bronze",
   "Trophies.Filter.All": "Tous",
   "Trophies.Filter.Earned": "Obtenus",
-  "Trophies.Filter.Locked": "À obtenir"
+  "Trophies.Filter.Locked": "À obtenir",
+  "Options.Env.Group.Trophies": "Trophées",
+  "Options.Env.TrophyTest.Label": "Tester la notification de trophée",
+  "Options.Env.TrophyTest.Desc": "Choisissez un jeu et un trophée, puis affichez sa notification. Rien n’est débloqué.",
+  "Options.Env.TrophyTest.Show": "Afficher la notification",
+  "Trophies.Total": "Total",
+  "Trophies.Games": "Jeux",
+  "Trophies.Open": "Voir les trophées",
+  "Trophies.RevealHint": "Cliquez pour révéler"
 }

@@ -17,6 +17,16 @@ internal static class TrophyUi
         _ => Color.Parse("#D9894B"),
     });
 
+    /// <summary>A trophy cup in the grade color: the console shows grades as cups, not as words.</summary>
+    public static Avalonia.Controls.TextBlock Cup(int grade, double size) => new()
+    {
+        Classes = { "materialSymbol" },
+        Text = "emoji_events",
+        FontSize = size,
+        LineHeight = size + 4,
+        Foreground = GradeBrush(grade),
+    };
+
     public static string GradeName(int grade) =>
         Localization.Instance.Get($"Trophies.Grade.{Math.Clamp(grade, 1, 4)}");
 

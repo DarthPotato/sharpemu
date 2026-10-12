@@ -288,5 +288,13 @@
   "Trophies.Grade.4": "Bronze",
   "Trophies.Filter.All": "All",
   "Trophies.Filter.Earned": "Earned",
-  "Trophies.Filter.Locked": "Locked"
+  "Trophies.Filter.Locked": "Locked",
+  "Options.Env.Group.Trophies": "Trophies",
+  "Options.Env.TrophyTest.Label": "Test the trophy notification",
+  "Options.Env.TrophyTest.Desc": "Pick a game and a trophy, then show its unlock notification. Nothing is earned.",
+  "Options.Env.TrophyTest.Show": "Show notification",
+  "Trophies.Total": "Total",
+  "Trophies.Games": "Games",
+  "Trophies.Open": "View trophies",
+  "Trophies.RevealHint": "Click to reveal"
 }

@@ -176,6 +176,13 @@ SPDX-License-Identifier: GPL-2.0-or-later
               </Slider>
             </StackPanel>
           </Border>
+          <Button x:Name="TrophiesButton"
+                  Classes="iconGhost"
+                  VerticalAlignment="Center"
+                  ToolTip.Tip="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}">
+            <TextBlock Classes="materialSymbol compact"
+                       Text="emoji_events" />
+          </Button>
           <Button x:Name="LibraryLayoutButton"
                   Classes="iconGhost"
                   VerticalAlignment="Center">
@@ -1628,6 +1635,23 @@ SPDX-License-Identifier: GPL-2.0-or-later
               <ScrollViewer x:Name="OptionsEnvironmentPanel"
                             Classes="optionsSectionPanel">
                 <StackPanel>
+                  <Border Classes="optionsGroup">
+                    <StackPanel Spacing="8">
+                      <TextBlock Classes="optionsGroupHeader" Text="{Binding [Options.Env.Group.Trophies], Source={x:Static local:Localization.Instance}}" />
+                      <local:SettingRow Classes="optionRow"
+                                        Label="{Binding [Options.Env.TrophyTest.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.Env.TrophyTest.Desc], Source={x:Static local:Localization.Instance}}">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                          <ComboBox x:Name="TrophyTestGameBox" Width="220" PlaceholderText="Game" />
+                          <ComboBox x:Name="TrophyTestTrophyBox" Width="260" PlaceholderText="Trophy" />
+                          <Button x:Name="TrophyTestButton"
+                                  Classes="accent"
+                                  Content="{Binding [Options.Env.TrophyTest.Show], Source={x:Static local:Localization.Instance}}" />
+                        </StackPanel>
+                      </local:SettingRow>
+                    </StackPanel>
+                  </Border>
+
                   <Border Classes="optionsGroup">
                     <StackPanel Spacing="8">
                       <TextBlock Classes="optionsGroupHeader" Text="{Binding [Options.Env.Group.Debug], Source={x:Static local:Localization.Instance}}" />

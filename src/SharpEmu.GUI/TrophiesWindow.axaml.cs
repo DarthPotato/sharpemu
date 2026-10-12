@@ -3,7 +3,6 @@
 
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Controls.Shapes;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -13,17 +12,14 @@ using SharpEmu.Libs.Np;
 
 namespace SharpEmu.GUI;
 
-/// <summary>Lists a game's trophies with the progress the emulator saved for it.</summary>
+/// <summary>
+/// One game's trophies, laid out like the console's list. A hidden trophy stays hidden, icon
+/// included, until its row is clicked.
+/// </summary>
 public partial class TrophiesWindow : Window
 {
-    private enum Filter
-    {
-        All,
-        Earned,
-        Locked,
-    }
-
-    private const double ArcRadius = 61;
+    private static readonly IBrush RowBrush = new SolidColorBrush(Color.Parse("#14FFFFFF"));
+    private static readonly IBrush RowHoverBrush = new SolidColorBrush(Color.Parse("#26FFFFFF"));
 
     private readonly string _gameDirectory;
     private readonly string _titleId;
@@ -31,7 +27,6 @@ public partial class TrophiesWindow : Window
     private readonly Dictionary<int, Bitmap?> _icons = [];
     private readonly HashSet<int> _revealed = [];
     private IReadOnlyList<TrophyEntry> _trophies = [];
-    private Filter _filter = Filter.All;
     private string _lastSignature = string.Empty;
 
     public TrophiesWindow()
@@ -45,15 +40,6 @@ public partial class TrophiesWindow : Window
         _gameDirectory = gameDirectory;
         _titleId = titleId;
         GameNameText.Text = gameName;
-        FilterAll.Content = Localization.Instance.Get("Trophies.Filter.All");
-        FilterEarned.Content = Localization.Instance.Get("Trophies.Filter.Earned");
-        FilterLocked.Content = Localization.Instance.Get("Trophies.Filter.Locked");
-
-        RefreshButton.Click += (_, _) => Reload(force: true);
-        CloseButton.Click += (_, _) => Close();
-        FilterAll.Click += (_, _) => SetFilter(Filter.All);
-        FilterEarned.Click += (_, _) => SetFilter(Filter.Earned);
-        FilterLocked.Click += (_, _) => SetFilter(Filter.Locked);
         // The game may earn a trophy while this window is open.
         _refreshTimer.Tick += (_, _) => Reload(force: false);
         Opened += (_, _) =>
@@ -62,18 +48,13 @@ public partial class TrophiesWindow : Window
             _refreshTimer.Start();
         };
         Closed += (_, _) => _refreshTimer.Stop();
-    }
-
-    private void SetFilter(Filter filter)
-    {
-        _filter = filter;
-        FilterAll.Classes.Set("accent", filter == Filter.All);
-        FilterAll.Classes.Set("ghost", filter != Filter.All);
-        FilterEarned.Classes.Set("accent", filter == Filter.Earned);
-        FilterEarned.Classes.Set("ghost", filter != Filter.Earned);
-        FilterLocked.Classes.Set("accent", filter == Filter.Locked);
-        FilterLocked.Classes.Set("ghost", filter != Filter.Locked);
-        RenderList();
+        KeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Escape)
+            {
+                Close();
+            }
+        };
     }
 
     private async void Reload(bool force)
@@ -110,60 +91,34 @@ public partial class TrophiesWindow : Window
     {
         var earned = _trophies.Count(t => t.Unlocked);
         var percent = _trophies.Count == 0 ? 0 : earned * 100 / _trophies.Count;
-        PercentText.Text = $"{percent}%";
+        PercentText.Text = $"{percent} %";
+        ProgressBar.Value = percent;
         ProgressText.Text = Localization.Instance.Format("Trophies.Progress", earned, _trophies.Count, percent);
-        ProgressArc.Data = BuildArc(_trophies.Count == 0 ? 0 : (double)earned / _trophies.Count);
-
-        GradeChips.Children.Clear();
+        GradeCounts.Children.Clear();
         for (var grade = 1; grade <= 4; grade++)
         {
-            var total = _trophies.Count(t => t.Grade == grade);
-            if (total == 0)
+            if (_trophies.All(t => t.Grade != grade))
             {
                 continue;
             }
 
-            var count = _trophies.Count(t => t.Grade == grade && t.Unlocked);
-            GradeChips.Children.Add(new Border
+            GradeCounts.Children.Add(new StackPanel
             {
-                Background = new SolidColorBrush(Color.Parse("#12FFFFFF")),
-                CornerRadius = new CornerRadius(14),
-                Padding = new Thickness(12, 5),
-                Margin = new Thickness(0, 0, 10, 0),
-                Child = new StackPanel
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                Children =
                 {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = 8,
-                    Children =
+                    TrophyUi.Cup(grade, 26),
+                    new TextBlock
                     {
-                        new Ellipse { Width = 10, Height = 10, Fill = TrophyUi.GradeBrush(grade), VerticalAlignment = VerticalAlignment.Center },
-                        new TextBlock { Text = $"{TrophyUi.GradeName(grade)}  {count}/{total}", FontSize = 13, FontWeight = FontWeight.SemiBold },
+                        Text = _trophies.Count(t => t.Grade == grade && t.Unlocked).ToString(),
+                        FontSize = 22,
+                        FontWeight = FontWeight.SemiBold,
+                        VerticalAlignment = VerticalAlignment.Center,
                     },
                 },
             });
         }
-    }
-
-    private static Geometry BuildArc(double fraction)
-    {
-        fraction = Math.Clamp(fraction, 0, 0.9999);
-        if (fraction <= 0)
-        {
-            return new StreamGeometry();
-        }
-
-        const double centre = 66;
-        var angle = fraction * 2 * Math.PI;
-        var start = new Point(centre, centre - ArcRadius);
-        var end = new Point(centre + ArcRadius * Math.Sin(angle), centre - ArcRadius * Math.Cos(angle));
-        var geometry = new StreamGeometry();
-        using (var context = geometry.Open())
-        {
-            context.BeginFigure(start, false);
-            context.ArcTo(end, new Size(ArcRadius, ArcRadius), 0, fraction > 0.5, SweepDirection.Clockwise);
-        }
-
-        return geometry;
     }
 
     private void RenderList()
@@ -176,22 +131,12 @@ public partial class TrophiesWindow : Window
                 Text = Localization.Instance.Get("Trophies.None"),
                 Foreground = (IBrush)this.FindResource("MutedBrush")!,
                 FontSize = 15,
-                Margin = new Thickness(0, 20),
             });
             return;
         }
 
         // Earned trophies first, then by id, so progress is visible without scrolling.
-        var shown = _trophies
-            .Where(t => _filter switch
-            {
-                Filter.Earned => t.Unlocked,
-                Filter.Locked => !t.Unlocked,
-                _ => true,
-            })
-            .OrderByDescending(t => t.Unlocked)
-            .ThenBy(t => t.Id);
-        foreach (var trophy in shown)
+        foreach (var trophy in _trophies.OrderByDescending(t => t.Unlocked).ThenBy(t => t.Id))
         {
             TrophyList.Children.Add(BuildRow(trophy));
         }
@@ -202,99 +147,120 @@ public partial class TrophiesWindow : Window
         var muted = (IBrush)this.FindResource("MutedBrush")!;
         var canReveal = trophy.Hidden && !trophy.Unlocked;
         var hidden = canReveal && !_revealed.Contains(trophy.Id);
-        var gradeBrush = TrophyUi.GradeBrush(trophy.Grade);
 
-        // Hidden trophies keep their icon; only the name and description are held back.
+        // While hidden, the icon, name and description all stay out of sight.
         _icons.TryGetValue(trophy.Id, out var bitmap);
+        Control iconContent = hidden
+            ? new TextBlock
+            {
+                Classes = { "materialSymbol" },
+                Text = "visibility_off",
+                FontSize = 30,
+                LineHeight = 34,
+                Foreground = muted,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            }
+            : new Image { Source = bitmap, Stretch = Stretch.UniformToFill, Opacity = trophy.Unlocked ? 1.0 : 0.55 };
         var icon = new Border
         {
-            Width = 80,
-            Height = 80,
-            CornerRadius = new CornerRadius(12),
+            Width = 76,
+            Height = 76,
+            CornerRadius = new CornerRadius(4),
             ClipToBounds = true,
-            Background = (IBrush)this.FindResource("ElevatedBrush")!,
-            BorderBrush = trophy.Unlocked ? gradeBrush : new SolidColorBrush(Color.Parse("#12FFFFFF")),
-            BorderThickness = new Thickness(2),
-            Child = new Image { Source = bitmap, Stretch = Stretch.UniformToFill, Opacity = trophy.Unlocked ? 1.0 : 0.5 },
-        };
-
-        var title = new TextBlock
-        {
-            Text = hidden ? Localization.Instance.Get("Trophies.Hidden") : trophy.Name,
-            FontSize = 17,
-            FontWeight = FontWeight.SemiBold,
-            TextTrimming = TextTrimming.CharacterEllipsis,
-        };
-        var description = new TextBlock
-        {
-            Text = hidden ? Localization.Instance.Get("Trophies.HiddenDescription") : trophy.Description,
-            Foreground = (IBrush)this.FindResource("SecondaryTextBrush")!,
-            TextWrapping = TextWrapping.Wrap,
-            FontSize = 14,
-        };
-        var status = new TextBlock
-        {
-            Text = trophy.UnlockedAtUtc is { } at
-                ? "✓  " + Localization.Instance.Format("Trophies.Earned", at.ToLocalTime().ToString("g"))
-                : "🔒  " + Localization.Instance.Get("Trophies.Locked"),
-            Foreground = trophy.Unlocked ? (IBrush)this.FindResource("SuccessBrush")! : muted,
-            FontSize = 12.5,
-            Margin = new Thickness(0, 4, 0, 0),
-        };
-        var grade = new Border
-        {
-            Background = new SolidColorBrush(((SolidColorBrush)gradeBrush).Color, 0.16),
-            BorderBrush = gradeBrush,
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(14),
-            Padding = new Thickness(14, 4),
-            VerticalAlignment = VerticalAlignment.Center,
-            Child = new TextBlock
-            {
-                Text = TrophyUi.GradeName(trophy.Grade),
-                Foreground = gradeBrush,
-                FontSize = 12.5,
-                FontWeight = FontWeight.SemiBold,
-            },
+            Background = new SolidColorBrush(Color.Parse("#22FFFFFF")),
+            Child = iconContent,
         };
 
         var text = new StackPanel
         {
-            Spacing = 3,
+            Spacing = 4,
             VerticalAlignment = VerticalAlignment.Center,
-            Children = { title, description, status },
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = hidden ? Localization.Instance.Get("Trophies.Hidden") : trophy.Name,
+                    FontSize = 18,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                },
+                new TextBlock
+                {
+                    Text = hidden ? Localization.Instance.Get("Trophies.HiddenDescription") : trophy.Description,
+                    Foreground = muted,
+                    TextWrapping = TextWrapping.Wrap,
+                    FontSize = 14,
+                },
+            },
         };
-        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto"), ColumnSpacing = 18 };
+
+        var side = new StackPanel
+        {
+            Spacing = 4,
+            MinWidth = 150,
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Children =
+            {
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 8,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Children =
+                    {
+                        new TextBlock
+                        {
+                            Text = TrophyUi.GradeName(trophy.Grade),
+                            Foreground = muted,
+                            FontSize = 14,
+                            VerticalAlignment = VerticalAlignment.Center,
+                        },
+                        TrophyUi.Cup(trophy.Grade, 30),
+                    },
+                },
+                new TextBlock
+                {
+                    Text = trophy.UnlockedAtUtc is { } at
+                        ? at.ToLocalTime().ToString("g")
+                        : Localization.Instance.Get("Trophies.Locked"),
+                    Foreground = trophy.Unlocked ? (IBrush)this.FindResource("SecondaryTextBrush")! : muted,
+                    FontSize = 12.5,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                },
+            },
+        };
+
+        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto"), ColumnSpacing = 24 };
         grid.Children.Add(icon);
         Grid.SetColumn(text, 1);
         grid.Children.Add(text);
-        Grid.SetColumn(grade, 2);
-        grid.Children.Add(grade);
+        Grid.SetColumn(side, 2);
+        grid.Children.Add(side);
 
-        var strip = new Border
+        var row = new Border
         {
-            Width = 5,
-            Background = trophy.Unlocked ? gradeBrush : new SolidColorBrush(Color.Parse("#22FFFFFF")),
-            HorizontalAlignment = HorizontalAlignment.Left,
+            Background = RowBrush,
+            BorderThickness = new Thickness(2),
+            BorderBrush = Brushes.Transparent,
+            Padding = new Thickness(14, 12, 24, 12),
+            Child = grid,
         };
-        var content = new Grid();
-        content.Children.Add(strip);
-        grid.Margin = new Thickness(22, 14, 18, 14);
-        content.Children.Add(grid);
-
-        var card = new Border
+        row.PointerEntered += (_, _) =>
         {
-            Classes = { "card" },
-            Padding = new Thickness(0),
-            ClipToBounds = true,
-            Opacity = trophy.Unlocked ? 1.0 : 0.85,
-            Child = content,
+            row.Background = RowHoverBrush;
+            row.BorderBrush = Brushes.White;
+        };
+        row.PointerExited += (_, _) =>
+        {
+            row.Background = RowBrush;
+            row.BorderBrush = Brushes.Transparent;
         };
         if (canReveal)
         {
             // Like the console: a hidden trophy stays a mystery until you choose to look.
-            card.Cursor = new Cursor(StandardCursorType.Hand);
-            card.PointerPressed += (_, _) =>
+            row.Cursor = new Cursor(StandardCursorType.Hand);
+            row.PointerPressed += (_, _) =>
             {
                 if (!_revealed.Remove(trophy.Id))
                 {
@@ -305,6 +271,6 @@ public partial class TrophiesWindow : Window
             };
         }
 
-        return card;
+        return row;
     }
 }

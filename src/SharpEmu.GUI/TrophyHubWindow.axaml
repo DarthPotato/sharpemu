@@ -1,0 +1,51 @@
+<!--
+Copyright (C) 2026 SharpEmu Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:SharpEmu.GUI"
+        x:Class="SharpEmu.GUI.TrophyHubWindow"
+        Width="1120"
+        Height="820"
+        MinWidth="820"
+        MinHeight="520"
+        CanResize="True"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource BgBrush}"
+        Title="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}">
+  <Grid Margin="48,36,48,28" RowDefinitions="Auto,*">
+
+    <!-- Header, laid out like the console: title on the left, earned totals on the right. -->
+    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="0,0,0,26">
+      <TextBlock Text="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}"
+                 FontSize="30"
+                 FontWeight="Light"
+                 VerticalAlignment="Center" />
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="30" VerticalAlignment="Center">
+        <StackPanel Orientation="Horizontal" Spacing="14" VerticalAlignment="Center">
+          <Border Width="52" Height="52" CornerRadius="26" Background="#1AFFFFFF">
+            <TextBlock x:Name="TotalCupGlyph"
+                       Classes="materialSymbol"
+                       Text="emoji_events"
+                       FontSize="30"
+                       LineHeight="34"
+                       Foreground="#8FD8F2" />
+          </Border>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock x:Name="TotalEarnedText" FontSize="30" FontWeight="SemiBold" />
+            <TextBlock x:Name="TotalOfText"
+                       FontSize="12"
+                       Foreground="{StaticResource MutedBrush}" />
+          </StackPanel>
+        </StackPanel>
+        <StackPanel x:Name="TotalGrades" Orientation="Horizontal" Spacing="26" VerticalAlignment="Center" />
+      </StackPanel>
+    </Grid>
+
+    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel x:Name="GameList" Spacing="6" Margin="0,0,10,0" />
+    </ScrollViewer>
+  </Grid>
+</Window>
