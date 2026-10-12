@@ -93,9 +93,6 @@ internal static unsafe partial class VulkanVideoPresenter
             var workerCount = Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
             var remaining = workerCount;
             var host = (IShaderPipelineHost)this;
-            // The workers create layouts that include the global set. Initialize
-            // it once on the device setup thread, before any worker can use it.
-            EnsureBindlessImageHeapForMode(host.UsesBindlessImages);
             Volatile.Write(ref _shaderPrewarmTotal, pending.Count);
             Volatile.Write(ref _shaderPrewarmProgress, 0);
             Console.Error.WriteLine(

@@ -622,17 +622,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private void EnsureBindlessImageHeap(params ShaderProgramInfo?[] programs)
-            => EnsureBindlessImageHeapForMode(programs.Any(program => program?.Bindings?.UsesBindlessImages == true));
-
-        private void EnsureBindlessImageHeapForMode(bool usesBindlessImages)
+        // Every translated program samples through this one set when the device supports it,
+        // and a draw binds its slots before it creates its pipeline. Create it with the stores.
+        private void CreateBindlessImageHeap()
         {
-            if (_bindlessImageHeap is not null)
-            {
-                return;
-            }
-
-            if (!usesBindlessImages)
+            if (!BindlessImageHeapEnabled)
             {
                 return;
             }
@@ -730,7 +724,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"The draw binds more color attachments than the device supports: count={description.Rendering.ColorCount} max={_maxColorAttachments}.");
             }
 
-            EnsureBindlessImageHeap(description.VertexStage, description.PixelStage);
             var usesBindlessImages = description.VertexStage.Bindings!.UsesBindlessImages ||
                 description.PixelStage?.Bindings?.UsesBindlessImages == true;
 
@@ -1197,7 +1190,6 @@ internal static unsafe partial class VulkanVideoPresenter
         public PipelineHandle CreateComputePipeline(ComputePipelineDescription description)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
-            EnsureBindlessImageHeap(description.Stage);
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
@@ -1336,7 +1328,6 @@ internal static unsafe partial class VulkanVideoPresenter
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            EnsureBindlessImageHeap(description.Stage);
             var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, description.Stage.Bindings!.UsesBindlessImages);
             var computeModule = new ShaderModule(description.Program.Module);
             if (computeModule.Handle == 0)

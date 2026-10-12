@@ -1474,6 +1474,7 @@ internal static unsafe partial class VulkanVideoPresenter
             CreateScheduler();
             CreateBufferCache();
             CreateImageCache();
+            CreateBindlessImageHeap();
             _descriptorHeap = new DescriptorHeap(_deviceInfo, _scheduler);
             CreateCommandStream();
             LoadDebugUtilsCommands();
