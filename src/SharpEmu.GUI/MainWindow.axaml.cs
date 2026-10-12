@@ -155,6 +155,7 @@ public partial class MainWindow : Window
     private readonly SndPreviewPlayer _sndPreview = new();
     private string? _emulatorExePath;
     private PendingLaunch? _pendingLaunch;
+    private string? _runningEbootPath;
     private bool _isRunning;
     private bool _isStopping;
     private int _autoScrollTicks;
@@ -425,6 +426,7 @@ public partial class MainWindow : Window
         CtxCopyTitleId.Click += async (_, _) =>
             await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.TitleId);
         CtxGameSettings.Click += (_, _) => OpenSelectedGameSettings();
+        CtxTrophies.Click += (_, _) => OpenSelectedGameTrophies();
         CtxRemove.Click += (_, _) => RemoveSelectedFromLibrary();
         CtxPackZar.Click += async (_, _) => await PackSelectedAsZarAsync();
 
@@ -2531,6 +2533,7 @@ public partial class MainWindow : Window
         CtxCopyTitleId.IsEnabled = game.TitleId is not null;
         CtxGameSettings.IsEnabled = !string.IsNullOrWhiteSpace(game.TitleId);
         CtxPackZar.IsEnabled = !ZArchive.IsArchivePath(game.Path);
+        CtxTrophies.IsEnabled = !string.IsNullOrWhiteSpace(game.TitleId);
     }
 
     // Packs the selected game's folder into a .zar chosen by the user, beside the folder by default.
@@ -3246,6 +3249,7 @@ public partial class MainWindow : Window
             var arguments = BuildEmulatorArguments(launch);
             _emulator = process;
             _pendingLaunch = null;
+            _runningEbootPath = launch.EbootPath;
             process.Start(
                 _emulatorExePath,
                 arguments,
@@ -3301,6 +3305,36 @@ public partial class MainWindow : Window
     private void OnEmulatorOutput(string line, bool isError)
     {
         _pendingLines.Enqueue((line, isError));
+        if (SharpEmu.Libs.Np.TrophyCatalog.TryParseUnlockLine(line, out var notice))
+        {
+            var ebootPath = _runningEbootPath;
+            Dispatcher.UIThread.Post(() => ShowTrophyToast(notice, ebootPath));
+        }
+    }
+
+    private static void ShowTrophyToast(SharpEmu.Libs.Np.TrophyUnlockNotice notice, string? ebootPath)
+    {
+        byte[]? icon = null;
+        if (Path.GetDirectoryName(ebootPath) is { } gameDirectory)
+        {
+            icon = SharpEmu.Libs.Np.TrophyCatalog.Load(gameDirectory, notice.TitleId)
+                .FirstOrDefault(t => t.Id == notice.TrophyId)?.IconPng;
+        }
+
+        TrophyToast.Show(notice, icon);
+    }
+
+    private async void OpenSelectedGameTrophies()
+    {
+        if (GameList.SelectedItem is not GameEntry game ||
+            string.IsNullOrWhiteSpace(game.TitleId) ||
+            Path.GetDirectoryName(game.Path) is not { } gameDirectory)
+        {
+            return;
+        }
+
+        var window = new TrophiesWindow(game.Name, gameDirectory, game.TitleId);
+        await window.ShowDialog(this);
     }
 
     private void OpenFileLog(string? titleId)

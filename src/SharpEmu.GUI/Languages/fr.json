@@ -246,5 +246,20 @@
   "Options.Env.BinkPlayback.Desc": "Hôte lit les vidéos Bink via le pont FFmpeg, mais certains jeux peuvent rencontrer des problèmes.\nInvité utilise le décodeur propre au moteur du jeu.\nIgnorer permet de passer les vidéos Bink, ce qui peut faciliter le développement.",
   "Options.Env.BinkPlayback.Host": "Hôte (FFmpeg)",
   "Options.Env.BinkPlayback.Guest": "Invité",
-  "Options.Env.BinkPlayback.Skip": "Ignorer"
+  "Options.Env.BinkPlayback.Skip": "Ignorer",
+  "Library.Context.Trophies": "Trophées…",
+  "Trophies.Title": "Trophées",
+  "Trophies.Close": "Fermer",
+  "Trophies.Refresh": "Actualiser",
+  "Trophies.None": "Ce jeu n’a pas de trophées.",
+  "Trophies.Hidden": "Trophée caché",
+  "Trophies.HiddenDescription": "Continuez à jouer pour révéler ce trophée.",
+  "Trophies.Locked": "Pas encore obtenu",
+  "Trophies.Earned": "Obtenu le {0}",
+  "Trophies.Progress": "{0} / {1} obtenus · {2} %",
+  "Trophies.Unlocked": "Trophée débloqué",
+  "Trophies.Grade.1": "Platine",
+  "Trophies.Grade.2": "Or",
+  "Trophies.Grade.3": "Argent",
+  "Trophies.Grade.4": "Bronze"
 }

@@ -28,6 +28,9 @@ internal static class TrophyService
 
     private const string UnlockTrophyEvent = "_UnlockTrophy";
 
+    /// <summary>Prefix of the log line the launcher turns into a notification: titleId|id|grade|name.</summary>
+    internal const string UnlockMarker = "[TROPHY][UNLOCK] ";
+
     private enum Comparison
     {
         None,
@@ -49,6 +52,7 @@ internal static class TrophyService
         internal ulong? StatId { get; init; }
         internal ulong? Target { get; init; }
         internal int Comparer { get; init; }
+        public byte[]? IconPng { get; init; }
         public bool Unlocked { get; set; }
 
         /// <summary>SceRtcTick of the unlock: microseconds since 0001-01-01.</summary>
@@ -194,7 +198,7 @@ internal static class TrophyService
         foreach (var trophy in unlockedNow)
         {
             Console.Error.WriteLine(
-                $"[LOADER][INFO] Trophy unlocked: {trophy.Name} ({GradeName(trophy.Grade)}, id {trophy.Id})");
+                $"{UnlockMarker}{KernelMemoryCompatExports.ApplicationTitleId}|{trophy.Id}|{trophy.Grade}|{trophy.Name}");
             Unlocked?.Invoke(GradeName(trophy.Grade), trophy);
         }
     }
@@ -254,12 +258,8 @@ internal static class TrophyService
             _trophies = File.Exists(trophyPath) ? ReadTrophies(File.ReadAllBytes(trophyPath)) : [];
             var udsPath = KernelMemoryCompatExports.ResolveGuestPath("/app0/sce_sys/uds/uds00.ucp");
             _rules = File.Exists(udsPath) ? ReadRules(File.ReadAllBytes(udsPath)) : [];
-            _unlockPath = Path.Combine(
-                Path.GetDirectoryName(SaveDataStorage.Root()) ?? SaveDataStorage.Root(),
-                "trophies",
-                KernelMemoryCompatExports.ApplicationTitleId,
-                "unlocks.json");
-            LoadUnlocks();
+            _unlockPath = UnlockFilePath(KernelMemoryCompatExports.ApplicationTitleId);
+            ApplyUnlocks(_trophies, _unlockPath);
         }
         catch (Exception ex) when (ex is IOException or JsonException or InvalidOperationException or ArgumentException
                                        or UnauthorizedAccessException)
@@ -268,14 +268,21 @@ internal static class TrophyService
         }
     }
 
-    private static void LoadUnlocks()
+    internal static string UnlockFilePath(string titleId) =>
+        Path.Combine(
+            Path.GetDirectoryName(SaveDataStorage.Root()) ?? SaveDataStorage.Root(),
+            "trophies",
+            titleId,
+            "unlocks.json");
+
+    internal static void ApplyUnlocks(Trophy[] trophies, string? unlockPath)
     {
-        if (_unlockPath is null || !File.Exists(_unlockPath))
+        if (unlockPath is null || !File.Exists(unlockPath))
         {
             return;
         }
 
-        using var document = JsonDocument.Parse(File.ReadAllBytes(_unlockPath));
+        using var document = JsonDocument.Parse(File.ReadAllBytes(unlockPath));
         if (!document.RootElement.TryGetProperty("unlocked", out var unlocked) ||
             unlocked.ValueKind != JsonValueKind.Object)
         {
@@ -286,7 +293,7 @@ internal static class TrophyService
         {
             if (int.TryParse(entry.Name, out var id) && entry.Value.TryGetInt64(out var at))
             {
-                var trophy = _trophies!.FirstOrDefault(t => t.Id == id);
+                var trophy = trophies.FirstOrDefault(t => t.Id == id);
                 if (trophy is not null)
                 {
                     trophy.Unlocked = true;
@@ -358,7 +365,7 @@ internal static class TrophyService
             ? JsonDocument.Parse(package.AsMemory(file.Offset, file.Length))
             : null;
 
-    private static Trophy[] ReadTrophies(byte[] package)
+    internal static Trophy[] ReadTrophies(byte[] package, bool includeIcons = false)
     {
         var files = ReadContainer(package);
         using var conf = ReadJson(package, files, "tropconf.json");
@@ -437,6 +444,9 @@ internal static class TrophyService
                 StatId = statId,
                 Target = target,
                 Comparer = (int)comparison,
+                IconPng = includeIcons && files.TryGetValue($"trop{id:D4}.png", out var icon)
+                    ? package.AsSpan(icon.Offset, icon.Length).ToArray()
+                    : null,
             };
         }
 

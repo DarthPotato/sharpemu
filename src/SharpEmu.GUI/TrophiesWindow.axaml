@@ -1,0 +1,59 @@
+<!--
+Copyright (C) 2026 SharpEmu Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:SharpEmu.GUI"
+        x:Class="SharpEmu.GUI.TrophiesWindow"
+        Width="720"
+        Height="640"
+        MinWidth="520"
+        MinHeight="420"
+        CanResize="True"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource BgBrush}"
+        Title="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}">
+  <Grid Margin="24" RowDefinitions="Auto,Auto,*,Auto">
+    <StackPanel Grid.Row="0" Spacing="2">
+      <TextBlock Text="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}"
+                 FontSize="24"
+                 FontWeight="Bold" />
+      <TextBlock x:Name="GameNameText"
+                 Foreground="{StaticResource MutedBrush}"
+                 TextTrimming="CharacterEllipsis" />
+    </StackPanel>
+
+    <Border Grid.Row="1" Classes="card" Margin="0,16,0,12" Padding="16">
+      <StackPanel Spacing="10">
+        <Grid ColumnDefinitions="*,Auto">
+          <TextBlock x:Name="ProgressText" FontWeight="SemiBold" />
+          <TextBlock x:Name="GradeCountsText"
+                     Grid.Column="1"
+                     Foreground="{StaticResource SecondaryTextBrush}" />
+        </Grid>
+        <ProgressBar x:Name="ProgressBar"
+                     Minimum="0"
+                     Maximum="100"
+                     Height="6"
+                     Foreground="{StaticResource AccentBrush}"
+                     Background="{StaticResource ElevatedBrush}" />
+      </StackPanel>
+    </Border>
+
+    <ScrollViewer Grid.Row="2" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel x:Name="TrophyList" Spacing="8" />
+    </ScrollViewer>
+
+    <Grid Grid.Row="3" Margin="0,16,0,0" ColumnDefinitions="Auto,*,Auto">
+      <Button x:Name="RefreshButton"
+              Classes="ghost"
+              Content="{Binding [Trophies.Refresh], Source={x:Static local:Localization.Instance}}" />
+      <Button x:Name="CloseButton"
+              Grid.Column="2"
+              Classes="accent"
+              Content="{Binding [Trophies.Close], Source={x:Static local:Localization.Instance}}" />
+    </Grid>
+  </Grid>
+</Window>
