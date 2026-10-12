@@ -33,7 +33,8 @@ internal static class TrophyUi
         foreach (var row in rows)
         {
             row.Opacity = 0;
-            row.Transitions = [new Avalonia.Animation.DoubleTransition { Property = Avalonia.Controls.Control.OpacityProperty, Duration = TimeSpan.FromMilliseconds(320) }];
+            row.Transitions ??= [];
+            row.Transitions.Add(new Avalonia.Animation.DoubleTransition { Property = Avalonia.Controls.Control.OpacityProperty, Duration = TimeSpan.FromMilliseconds(320) });
         }
 
         var next = 0;
@@ -53,6 +54,35 @@ internal static class TrophyUi
             }
         };
         timer.Start();
+    }
+
+    /// <summary>Eases a value from one number to another, for counters and progress bars.</summary>
+    public static void Animate(double from, double to, TimeSpan duration, Action<double> apply)
+    {
+        apply(from);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var timer = new Avalonia.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        timer.Tick += (_, _) =>
+        {
+            var t = Math.Min(1.0, clock.Elapsed.TotalMilliseconds / duration.TotalMilliseconds);
+            apply(from + (to - from) * (1 - Math.Pow(1 - t, 3)));
+            if (t >= 1)
+            {
+                timer.Stop();
+            }
+        };
+        timer.Start();
+    }
+
+    /// <summary>Hover feedback that fades instead of snapping.</summary>
+    public static void SmoothHover(Avalonia.Controls.Border row)
+    {
+        var duration = TimeSpan.FromMilliseconds(140);
+        row.Transitions =
+        [
+            new Avalonia.Animation.BrushTransition { Property = Avalonia.Controls.Border.BackgroundProperty, Duration = duration },
+            new Avalonia.Animation.BrushTransition { Property = Avalonia.Controls.Border.BorderBrushProperty, Duration = duration },
+        ];
     }
 
     public static string GradeName(int grade) =>

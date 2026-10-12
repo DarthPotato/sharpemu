@@ -1649,6 +1649,13 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                   Content="{Binding [Options.Env.TrophyTest.Show], Source={x:Static local:Localization.Instance}}" />
                         </StackPanel>
                       </local:SettingRow>
+                      <local:SettingRow Classes="optionRow"
+                                        Label="{Binding [Options.Env.TrophySound.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.Env.TrophySound.Desc], Source={x:Static local:Localization.Instance}}">
+                        <ToggleSwitch x:Name="TrophySoundToggle"
+                                      Classes="optionToggle"
+                                      IsChecked="True" />
+                      </local:SettingRow>
                     </StackPanel>
                   </Border>
 

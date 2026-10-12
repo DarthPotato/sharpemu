@@ -1456,6 +1456,8 @@ public partial class MainWindow : Window
         _titleMusicVolumeTimer.Stop();
         _sndPreview.Volume = _settings.TitleMusicVolume;
         UpdateTitleMusicMuteButton();
+        TrophySoundToggle.IsChecked = _settings.TrophySound;
+        TrophySound.Enabled = _settings.TrophySound;
         SetLibraryLayout(string.Equals(_settings.LibraryLayout, "Grid", StringComparison.OrdinalIgnoreCase));
         DiscordToggle.IsChecked = _settings.DiscordRichPresence;
         AutoUpdateToggle.IsChecked = _settings.CheckForUpdatesOnStartup;

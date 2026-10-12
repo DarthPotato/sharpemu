@@ -94,7 +94,16 @@ public partial class TrophyHubWindow : Window
     {
         var earned = summaries.Sum(s => s.Earned);
         var total = summaries.Sum(s => s.Trophies.Count);
-        TotalEarnedText.Text = earned.ToString();
+        // The totals count up the first time the overview opens.
+        if (_animated)
+        {
+            TotalEarnedText.Text = earned.ToString();
+        }
+        else
+        {
+            TrophyUi.Animate(0, earned, TimeSpan.FromMilliseconds(900), value => TotalEarnedText.Text = ((int)Math.Round(value)).ToString());
+        }
+
         TotalOfText.Text = $"{Localization.Instance.Get("Trophies.Total")} {total}";
         TotalGrades.Children.Clear();
         for (var grade = 1; grade <= 4; grade++)
@@ -154,6 +163,21 @@ public partial class TrophyHubWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
         };
 
+        var bar = new ProgressBar
+        {
+            Minimum = 0,
+            Maximum = 100,
+            Value = summary.Percent,
+            Height = 4,
+            Foreground = Brushes.White,
+            Background = new SolidColorBrush(Color.Parse("#33FFFFFF")),
+        };
+        if (!_animated)
+        {
+            // The bars fill as the rows come in.
+            TrophyUi.Animate(0, summary.Percent, TimeSpan.FromMilliseconds(900), value => bar.Value = value);
+        }
+
         var progress = new StackPanel
         {
             Spacing = 6,
@@ -167,15 +191,7 @@ public partial class TrophyHubWindow : Window
                     FontSize = 18,
                     HorizontalAlignment = HorizontalAlignment.Right,
                 },
-                new ProgressBar
-                {
-                    Minimum = 0,
-                    Maximum = 100,
-                    Value = summary.Percent,
-                    Height = 4,
-                    Foreground = Brushes.White,
-                    Background = new SolidColorBrush(Color.Parse("#33FFFFFF")),
-                },
+                bar,
             },
         };
 
@@ -211,6 +227,7 @@ public partial class TrophyHubWindow : Window
             Cursor = new Cursor(StandardCursorType.Hand),
             Child = grid,
         };
+        TrophyUi.SmoothHover(row);
         ToolTip.SetTip(row, Localization.Instance.Get("Trophies.Open"));
         row.PointerEntered += (_, _) => Select(_rows.FindIndex(r => r.Row == row));
         row.PointerPressed += (_, _) => Open(summary);

@@ -17,6 +17,11 @@ public partial class MainWindow
         TrophiesButton.Click += (_, _) => OpenTrophyHub();
         TrophyTestGameBox.SelectionChanged += (_, _) => LoadTrophyTestCatalog();
         TrophyTestButton.Click += (_, _) => ShowTrophyTestNotification();
+        TrophySoundToggle.IsCheckedChanged += (_, _) =>
+        {
+            _settings.TrophySound = TrophySoundToggle.IsChecked == true;
+            TrophySound.Enabled = _settings.TrophySound;
+        };
         // The game list can change while the launcher is open, so refresh it when the page is shown.
         OptionsEnvironmentNav.Click += (_, _) => RefreshTrophyTestGames();
     }

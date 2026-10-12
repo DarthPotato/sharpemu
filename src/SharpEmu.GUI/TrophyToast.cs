@@ -20,8 +20,9 @@ internal sealed record TrophyToastContent(string Name, string Description, int G
 /// </summary>
 /// <remarks>
 /// The motion is tiered like the console's: every trophy slides in on a spring, flips its icon in
-/// 3D and gets one light sweep; rarer grades add more sparks, and the platinum adds rotating rays
-/// and a longer stay. With Windows animations turned off the toast just fades in and out.
+/// 3D with a chime, sends a ring out as the icon lands and gets one light sweep; the text follows
+/// line by line. Rarer grades add more sparks and notes, and the platinum adds rotating rays and a
+/// longer stay. With Windows animations turned off the toast just fades in and out.
 /// </remarks>
 internal sealed class TrophyToast : Window
 {
@@ -62,7 +63,11 @@ internal sealed class TrophyToast : Window
     private readonly Border _timeBar = new();
     private readonly Canvas _rays = new() { IsHitTestVisible = false };
     private readonly RotateTransform _raysSpin = new();
+    private readonly Border _ring = new() { IsHitTestVisible = false };
+    private readonly ScaleTransform _ringScale = new();
+    private readonly List<(Control Line, TranslateTransform Shift, double Delay)> _lines = [];
     private bool _sparksSpawned;
+    private bool _chimed;
     private double _lastFrame;
 
     public static void Show(TrophyToastContent content)
@@ -196,6 +201,14 @@ internal sealed class TrophyToast : Window
             VerticalAlignment = VerticalAlignment.Center,
             Children = { header, name, description },
         };
+        // The lines slide in one after another once the card is up.
+        Control[] lines = [header, name, description];
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var shift = new TranslateTransform();
+            lines[i].RenderTransform = shift;
+            _lines.Add((lines[i], shift, 0.32 + i * 0.09));
+        }
         var row = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*"), ColumnSpacing = 20, Margin = new Thickness(18) };
         row.Children.Add(iconHost);
         Grid.SetColumn(text, 1);
@@ -263,6 +276,19 @@ internal sealed class TrophyToast : Window
         _cardHost.Children.Add(_glow);
         _cardHost.Children.Add(card);
 
+        // A ring in the grade color that leaves the icon as it lands.
+        _ring.Width = IconSize;
+        _ring.Height = IconSize;
+        _ring.CornerRadius = new CornerRadius(IconSize / 2);
+        _ring.BorderBrush = new SolidColorBrush(gradeColor);
+        _ring.BorderThickness = new Thickness(3);
+        _ring.Opacity = 0;
+        _ring.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
+        _ring.RenderTransform = _ringScale;
+        Canvas.SetLeft(_ring, (WindowWidth - CardWidth) / 2 + 18);
+        Canvas.SetTop(_ring, WindowHeight - CardBottomMargin - CardHeight / 2 - IconSize / 2);
+        _sparks.Children.Add(_ring);
+
         var root = new Grid { IsHitTestVisible = false };
         root.Children.Add(_sparks);
         root.Children.Add(_cardHost);
@@ -326,6 +352,7 @@ internal sealed class TrophyToast : Window
 
         if (_reducedMotion)
         {
+            Chime();
             Opacity = leaving ? 1 - leave : Math.Min(1, t / 0.25);
             _iconFlip.AngleY = 0;
             _iconScale.ScaleX = _iconScale.ScaleY = 1;
@@ -346,6 +373,31 @@ internal sealed class TrophyToast : Window
         var pop = 0.55 + 0.45 * flipEase;
         _iconScale.ScaleX = _iconScale.ScaleY = pop;
         _icon.Opacity = Math.Min(1, flip * 3);
+        if (t >= 0.30)
+        {
+            Chime();
+        }
+
+        // The text lines follow the icon, each sliding in from the right.
+        foreach (var (line, shift, delay) in _lines)
+        {
+            var progress = Math.Clamp((t - delay) / 0.35, 0, 1);
+            shift.X = (1 - EaseOutCubic(progress)) * 28;
+            line.Opacity = progress;
+        }
+
+        // The landing ring grows out of the icon and fades.
+        var ring = (t - 0.72) / 0.65;
+        if (ring is >= 0 and <= 1)
+        {
+            _ringScale.ScaleX = _ringScale.ScaleY = 1 + EaseOutCubic(ring) * (_content.Grade == 1 ? 1.5 : 0.9);
+            _ring.Opacity = 0.9 * (1 - ring);
+            Canvas.SetTop(_ring, WindowHeight - CardBottomMargin - CardHeight / 2 - IconSize / 2 + _cardShift.Y);
+        }
+        else
+        {
+            _ring.Opacity = 0;
+        }
 
         // One sweep of light once the icon has landed.
         var sweep = (t - 0.85) / 0.80;
@@ -374,6 +426,15 @@ internal sealed class TrophyToast : Window
 
         StepSparks(dt);
         _timeBar.Width = CardWidth * Math.Clamp(1 - (t - EnterSeconds) / _holdSeconds, 0, 1);
+    }
+
+    private void Chime()
+    {
+        if (!_chimed)
+        {
+            _chimed = true;
+            TrophySound.Play(_content.Grade);
+        }
     }
 
     private void SpawnSparks()

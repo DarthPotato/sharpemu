@@ -269,6 +269,8 @@
   "Options.Env.TrophyTest.Label": "Tester la notification de trophée",
   "Options.Env.TrophyTest.Desc": "Choisissez un jeu et un trophée, puis affichez sa notification. Rien n’est débloqué.",
   "Options.Env.TrophyTest.Show": "Afficher la notification",
+  "Options.Env.TrophySound.Label": "Son des trophées",
+  "Options.Env.TrophySound.Desc": "Joue un court carillon quand un trophée est débloqué.",
   "Trophies.Total": "Total",
   "Trophies.Games": "Jeux",
   "Trophies.Open": "Voir les trophées",
