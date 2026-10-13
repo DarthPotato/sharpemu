@@ -1785,19 +1785,10 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // SHARPEMU_EXEC_RUN=0 turns the shared EXEC test off; SHARPEMU_EXEC_RUN_MIN sets how many
-        // instructions a run needs before the branch pays for itself.
-        private static readonly bool ExecRunGrouping =
-            Environment.GetEnvironmentVariable("SHARPEMU_EXEC_RUN") != "0";
-
-        private static readonly int ExecRunMinimum =
-            ExecRunGrouping && int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_EXEC_RUN_MIN"), out var minimum) && minimum >= 2
-                ? minimum
-                : ExecRunGrouping ? DefaultExecRunMinimum : int.MaxValue;
-
-        // Six measured best on Silent Hill's volumetric fog: shorter runs pay for the branch more
+        // How many instructions a run needs before the shared EXEC test pays for itself. Six
+        // measured best on Silent Hill's volumetric fog: shorter runs pay for the branch more
         // often than they save, longer ones leave the short runs guarded.
-        private const int DefaultExecRunMinimum = 6;
+        private const int ExecRunMinimum = 6;
 
         // How many instructions from startIndex may share one EXEC test. The run stops at anything
         // the wave as a whole has to run even where this lane is masked off: every scalar result
@@ -1809,7 +1800,7 @@ public static partial class Gen5SpirvTranslator
             // Compute only. The same grouping measured 28% slower on Silent Hill's deferred
             // lighting pixel program (11.0 -> 14.1 ms per scope): a pixel wave already runs with
             // helper lanes and an extra branch per run costs it more than the selects it removes.
-            if (!ExecRunGrouping || _stage != Gen5SpirvStage.Compute)
+            if (_stage != Gen5SpirvStage.Compute)
             {
                 return 0;
             }
