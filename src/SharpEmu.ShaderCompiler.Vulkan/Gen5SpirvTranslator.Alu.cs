@@ -4050,28 +4050,16 @@ public static partial class Gen5SpirvTranslator
             {
                 targetLane = BitwiseAnd(targetLane, UInt(31));
             }
-            var shuffled = ShuffleGuestLaneOrSelf(value, targetLane, out var sourcePresent);
             if (control.FetchInactive)
             {
-                return shuffled;
+                return ReadUnobservableLane(value, targetLane);
             }
 
-            var activeWord = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                Load(_boolType, _exec),
-                UInt(1),
-                UInt(0));
-            var sourceActive = IsNotZero(
-                ShuffleGuestLaneOrSelf(activeWord, targetLane, out _));
+            var shuffled = ShuffleGuestLaneIfActive(value, targetLane, out var sourceUsable);
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    LogicalNot(sourcePresent),
-                    sourceActive),
+                sourceUsable,
                 shuffled,
                 UInt(0));
         }
@@ -4090,33 +4078,21 @@ public static partial class Gen5SpirvTranslator
             // operations are limited to a single half-wave for some encodings, so we 
             // must not clamp wave64 lanes to 31; use the full lane mask instead.
             safeTarget = BitwiseAnd(safeTarget, UInt(_waveLaneCount == 64 ? 63u : 31u));
-            var shuffled = ShuffleGuestLaneOrSelf(value, safeTarget, out var sourcePresent);
-
-            var sourceAvailable = inRange;
-            if (!control.FetchInactive)
+            if (control.FetchInactive)
             {
-                var activeWord = _module.AddInstruction(
+                return _module.AddInstruction(
                     SpirvOp.Select,
                     _uintType,
-                    Load(_boolType, _exec),
-                    UInt(1),
+                    inRange,
+                    ReadUnobservableLane(value, safeTarget),
                     UInt(0));
-                var shuffledActive = ShuffleGuestLaneOrSelf(activeWord, safeTarget, out _);
-                sourceAvailable = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    sourceAvailable,
-                    _module.AddInstruction(
-                        SpirvOp.LogicalOr,
-                        _boolType,
-                        LogicalNot(sourcePresent),
-                        IsNotZero(shuffledActive)));
             }
 
+            var shuffled = ShuffleGuestLaneIfActive(value, safeTarget, out var sourceUsable);
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                sourceAvailable,
+                _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, inRange, sourceUsable),
                 shuffled,
                 UInt(0));
         }
@@ -4284,9 +4260,28 @@ public static partial class Gen5SpirvTranslator
             var bankEnabled = IsNotZero(BitwiseAnd(
                 UInt(control.BankMask),
                 ShiftLeftLogical(UInt(1), bank)));
-            var sourceAllowsWrite = control.BoundControl
-                ? _module.ConstantBool(true)
-                : inRange;
+            // ISA: with BOUND_CTRL clear, a lane whose source is out of range, inactive
+            // (fetch-inactive off) or absent from the host subgroup keeps its old
+            // destination; with BOUND_CTRL set it is written with zero instead.
+            uint sourceAllowsWrite;
+            if (control.BoundControl)
+            {
+                sourceAllowsWrite = _module.ConstantBool(true);
+            }
+            else if (control.FetchInactive)
+            {
+                sourceAllowsWrite = inRange;
+            }
+            else
+            {
+                GetDppSourceLane(control, out var sourceLane, out _);
+                var safeSource = _module.AddInstruction(
+                    SpirvOp.Select, _uintType, inRange, sourceLane, lane);
+                safeSource = BitwiseAnd(safeSource, UInt(_waveLaneCount == 64 ? 63u : 31u));
+                ShuffleGuestLaneIfActive(UInt(0), safeSource, out var sourceUsable);
+                sourceAllowsWrite = _module.AddInstruction(
+                    SpirvOp.LogicalAnd, _boolType, inRange, sourceUsable);
+            }
             return _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,
@@ -5170,7 +5165,7 @@ public static partial class Gen5SpirvTranslator
             {
                 // A graphics wave is a group of up to 32 host lanes (GuestWaveLane). Read the
                 // selected lane of the invocation's own group, whatever its EXEC state.
-                var read = ShuffleGuestLaneOrSelf(sourceValue, selectedLane, out _);
+                var read = ReadUnobservableLane(sourceValue, selectedLane);
                 StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, read));
             }
             else
@@ -5234,31 +5229,19 @@ public static partial class Gen5SpirvTranslator
             }
 
             var targetLane = IAdd(rowBase, selector);
-            // Select a guest lane first; ShuffleGuestLaneOrSelf maps it to the host subgroup.
+            // Select a guest lane first; the shuffle helpers map it to the host subgroup.
             targetLane = BitwiseAnd(targetLane, UInt(_waveLaneCount == 64 ? 63u : 31u));
-            var shuffled = ShuffleGuestLaneOrSelf(value, targetLane, out var sourcePresent);
             var fetchInactive = (control.OperandSelect & 1) != 0;
             if (fetchInactive)
             {
-                return shuffled;
+                return ReadUnobservableLane(value, targetLane);
             }
 
-            var activeWord = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                Load(_boolType, _exec),
-                UInt(1),
-                UInt(0));
-            var sourceActive = IsNotZero(
-                ShuffleGuestLaneOrSelf(activeWord, targetLane, out _));
+            var shuffled = ShuffleGuestLaneIfActive(value, targetLane, out var sourceUsable);
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    LogicalNot(sourcePresent),
-                    sourceActive),
+                sourceUsable,
                 shuffled,
                 UInt(0));
         }

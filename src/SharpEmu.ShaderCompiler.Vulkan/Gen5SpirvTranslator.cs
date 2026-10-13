@@ -8687,16 +8687,68 @@ public static partial class Gen5SpirvTranslator
                 ? value
                 : _module.AddInstruction(SpirvOp.GroupNonUniformShuffle, _uintType, UInt(3), value, lane);
 
-        // Fragment subgroups are allowed to be only partly populated. The missing
-        // lanes still exist on the guest wave, while SPIR-V cannot shuffle from
-        // them. For a graphics guest wave, make that read a duplicate of the
-        // caller's value. This is neutral for the idempotent lane reductions used
-        // by the guest (min/max/and/or), unlike the undefined SPIR-V result or the
-        // old zero substitute. A physically present lane remains readable even if
-        // guest EXEC disabled it; callers decide whether that needs a zero result.
-        private uint ShuffleGuestLaneOrSelf(uint value, uint guestLane, out uint sourcePresent)
+        // Graphics subgroups (fragment especially) may be only partly populated:
+        // a guest lane whose host invocation does not exist cannot be shuffled
+        // from, and has no register value to read. Compute subgroups are full
+        // (see RequiresComputeSubgroup32), so every partner exists there.
+        private bool HostSubgroupMayBePartial =>
+            _stage != Gen5SpirvStage.Compute && _subgroupInvocationIdInput != 0;
+
+        // Fetch-inactive-off form: the partner must exist and be EXEC-active, else
+        // the ISA's invalid-source rule applies (judged by the guest EXEC bit for a
+        // lane absent from the host). sourceUsable is false for those lanes;
+        // the caller supplies the zero / keep-old-destination result.
+        private uint ShuffleGuestLaneIfActive(uint value, uint guestLane, out uint sourceUsable)
         {
-            if (_stage == Gen5SpirvStage.Compute || _subgroupInvocationIdInput == 0)
+            var shuffled = ShuffleGuestLaneIfPresent(value, guestLane, out var present);
+            var activeWord = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                Load(_boolType, _exec),
+                UInt(1),
+                UInt(0));
+            var active = IsNotZero(ShuffleGuestLaneIfPresent(activeWord, guestLane, out _));
+            if (!HostSubgroupMayBePartial)
+            {
+                sourceUsable = active;
+                return shuffled;
+            }
+
+            // An absent lane's EXEC state is still known: s126 is the guest wave's mask
+            // and keeps bits for lanes the host never launched. Clear means a genuinely
+            // inactive lane, so the ISA's invalid-source rule is exact. Set means the
+            // guest forced it on (s_or_saveexec -1) and its register is unobservable;
+            // the shuffle then yields the caller's own value, neutral only for
+            // idempotent reductions (the Yotei wave minimum).
+            var absentExec = IsNotZero(BitwiseAnd(
+                ShiftRightLogical(LoadS(126), BitwiseAnd(guestLane, UInt(31))),
+                UInt(1)));
+            sourceUsable = _module.AddInstruction(
+                SpirvOp.Select,
+                _boolType,
+                present,
+                active,
+                absentExec);
+            return shuffled;
+        }
+
+        // Register reads that the ISA defines as "that lane's register whatever its
+        // EXEC state": V_READLANE and the fetch-inactive forms of DPP/DPP8/PERMLANE. If
+        // the lane is present on the host this is exact. If it is absent its register
+        // does not exist, so no value is correct; the caller's own value is returned
+        // because the observed consumers (wave min/max/or reductions that force EXEC)
+        // are idempotent. Non-idempotent uses of an absent lane are a known limit.
+        private uint ReadUnobservableLane(uint value, uint guestLane) =>
+            ShuffleGuestLaneIfPresent(value, guestLane, out _);
+
+        // Shuffles from a guest lane, reporting whether that lane exists on the
+        // host. When it does not, the returned value is meaningless (the caller's
+        // own, only to keep the shuffle defined) and must be discarded by the
+        // caller in favour of the ISA rule for its op. A physically present lane
+        // is readable even if guest EXEC disabled it.
+        private uint ShuffleGuestLaneIfPresent(uint value, uint guestLane, out uint sourcePresent)
+        {
+            if (!HostSubgroupMayBePartial)
             {
                 sourcePresent = _module.ConstantBool(true);
                 return ShuffleHalfWaveLane(value, guestLane);
