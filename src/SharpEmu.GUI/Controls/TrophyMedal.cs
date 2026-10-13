@@ -12,9 +12,6 @@ internal sealed class TrophyMedal : Control
     public static readonly StyledProperty<int> GradeProperty =
         AvaloniaProperty.Register<TrophyMedal, int>(nameof(Grade), 4);
 
-    public static readonly StyledProperty<bool> LockedProperty =
-        AvaloniaProperty.Register<TrophyMedal, bool>(nameof(Locked));
-
     public static readonly StyledProperty<double> SpinProperty =
         AvaloniaProperty.Register<TrophyMedal, double>(nameof(Spin));
 
@@ -35,19 +32,13 @@ internal sealed class TrophyMedal : Control
 
     static TrophyMedal()
     {
-        AffectsRender<TrophyMedal>(GradeProperty, LockedProperty, SpinProperty, GlintProperty, IconProperty);
+        AffectsRender<TrophyMedal>(GradeProperty, SpinProperty, GlintProperty, IconProperty);
     }
 
     public int Grade
     {
         get => GetValue(GradeProperty);
         set => SetValue(GradeProperty, value);
-    }
-
-    public bool Locked
-    {
-        get => GetValue(LockedProperty);
-        set => SetValue(LockedProperty, value);
     }
 
     public double Spin
@@ -68,15 +59,13 @@ internal sealed class TrophyMedal : Control
         set => SetValue(GlintProperty, value);
     }
 
-    public static (Color Light, Color Mid, Color Dark) Palette(int grade, bool locked = false) => locked
-        ? (Color.Parse("#9AA1AE"), Color.Parse("#5D6370"), Color.Parse("#2C3039"))
-        : grade switch
-        {
-            1 => (Color.Parse("#F2FBFF"), Color.Parse("#9ED8F2"), Color.Parse("#4D6FA8")),
-            2 => (Color.Parse("#FFF4C2"), Color.Parse("#F2B93B"), Color.Parse("#94590C")),
-            3 => (Color.Parse("#FFFFFF"), Color.Parse("#C3CAD5"), Color.Parse("#6C7584")),
-            _ => (Color.Parse("#FFD9B0"), Color.Parse("#D0844A"), Color.Parse("#6E3714")),
-        };
+    public static (Color Light, Color Mid, Color Dark) Palette(int grade) => grade switch
+    {
+        1 => (Color.Parse("#F2FBFF"), Color.Parse("#9ED8F2"), Color.Parse("#4D6FA8")),
+        2 => (Color.Parse("#FFF4C2"), Color.Parse("#F2B93B"), Color.Parse("#94590C")),
+        3 => (Color.Parse("#FFFFFF"), Color.Parse("#C3CAD5"), Color.Parse("#6C7584")),
+        _ => (Color.Parse("#FFD9B0"), Color.Parse("#D0844A"), Color.Parse("#6E3714")),
+    };
 
     public override void Render(DrawingContext context)
     {
@@ -86,7 +75,7 @@ internal sealed class TrophyMedal : Control
             return;
         }
 
-        var (light, mid, dark) = Palette(Grade, Locked);
+        var (light, mid, dark) = Palette(Grade);
         var center = new Point(Bounds.Width / 2, Bounds.Height / 2);
         var radius = size / 2;
         var facing = Math.Cos(Spin);

@@ -83,8 +83,6 @@ internal static class TrophyService
     private static Dictionary<string, List<StatRule>> _rules = [];
     private static string? _unlockPath;
 
-    internal static event Action<string, Trophy>? Unlocked;
-
     internal static Trophy[] Trophies
     {
         get
@@ -178,7 +176,6 @@ internal static class TrophyService
         {
             Console.Error.WriteLine(
                 $"{UnlockMarker}{KernelMemoryCompatExports.ApplicationTitleId}|{trophy.Id}|{trophy.Grade}|{trophy.Name}");
-            Unlocked?.Invoke(GradeName(trophy.Grade), trophy);
         }
     }
 
@@ -188,14 +185,6 @@ internal static class TrophyService
         trophy.UnlockedAt = DateTime.UtcNow.Ticks / 10;
         unlockedNow.Add(trophy);
     }
-
-    private static string GradeName(int grade) => grade switch
-    {
-        1 => "platinum",
-        2 => "gold",
-        3 => "silver",
-        _ => "bronze",
-    };
 
     private static bool TryReadNumber(UdsObjectNode root, StatRule rule, out ulong value)
     {
