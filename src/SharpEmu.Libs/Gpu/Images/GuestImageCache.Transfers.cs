@@ -792,13 +792,12 @@ public sealed unsafe partial class GuestImageCache
         {
             for (; levels < info.Resources.Levels; levels++)
             {
-                var mip = info.MipLayout[(int)levels];
-                if (mip.Size == 0 || mip.Offset > available || mip.Size > available - mip.Offset)
+                if (info.MipLayout[(int)levels].Size == 0 || info.LevelEnd((int)levels) > available)
                 {
                     break;
                 }
 
-                copySize = Math.Max(copySize, mip.Offset + mip.Size);
+                copySize = Math.Max(copySize, info.LevelEnd((int)levels));
             }
         }
 
