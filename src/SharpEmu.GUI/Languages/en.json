@@ -307,5 +307,7 @@
   "Trophies.NoneYet": "No trophy earned yet",
   "Trophies.Sort.Recent": "Recent",
   "Trophies.Sort.Progress": "Progress",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Search games",
+  "Trophies.NoMatch": "No game matches your search."
 }

@@ -284,5 +284,7 @@
   "Trophies.NoneYet": "Пока нет полученных трофеев",
   "Trophies.Sort.Recent": "Недавние",
   "Trophies.Sort.Progress": "Прогресс",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Поиск игр",
+  "Trophies.NoMatch": "Ни одна игра не соответствует запросу."
 }

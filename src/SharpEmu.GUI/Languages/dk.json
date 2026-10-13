@@ -280,5 +280,7 @@
   "Trophies.NoneYet": "Endnu intet trofæ opnået",
   "Trophies.Sort.Recent": "Seneste",
   "Trophies.Sort.Progress": "Fremskridt",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Søg efter spil",
+  "Trophies.NoMatch": "Intet spil matcher din søgning."
 }

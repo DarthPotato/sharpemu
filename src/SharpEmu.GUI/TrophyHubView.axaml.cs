@@ -59,6 +59,7 @@ public partial class TrophyHubView : UserControl
     public TrophyHubView()
     {
         InitializeComponent();
+        SearchBox.TextChanged += (_, _) => RenderCards(stagger: false);
 
         _idle.Tick += (_, _) =>
         {
@@ -85,6 +86,7 @@ public partial class TrophyHubView : UserControl
     public async Task ShowAsync(IReadOnlyList<GameEntry> games)
     {
         _games = games;
+        SearchBox.PlaceholderText = Localization.Instance.Get("Trophies.SearchWatermark");
         BuildSortChips();
         await LoadAsync();
     }
@@ -153,16 +155,23 @@ public partial class TrophyHubView : UserControl
         _animated = true;
     }
 
-    private IEnumerable<GameSummary> Sorted() => _sort switch
+    private IEnumerable<GameSummary> Sorted()
     {
-        Sort.Progress => _summaries
-            .OrderByDescending(s => s.Percent)
-            .ThenBy(s => s.Game.Name, StringComparer.CurrentCultureIgnoreCase),
-        Sort.Name => _summaries.OrderBy(s => s.Game.Name, StringComparer.CurrentCultureIgnoreCase),
-        _ => _summaries
-            .OrderByDescending(s => s.Latest?.UnlockedAtUtc ?? DateTime.MinValue)
-            .ThenBy(s => s.Game.Name, StringComparer.CurrentCultureIgnoreCase),
-    };
+        var query = SearchBox.Text?.Trim();
+        var matching = string.IsNullOrEmpty(query)
+            ? _summaries
+            : _summaries.Where(s => s.Game.Name.Contains(query, StringComparison.CurrentCultureIgnoreCase));
+        return _sort switch
+        {
+            Sort.Progress => matching
+                .OrderByDescending(s => s.Percent)
+                .ThenBy(s => s.Game.Name, StringComparer.CurrentCultureIgnoreCase),
+            Sort.Name => matching.OrderBy(s => s.Game.Name, StringComparer.CurrentCultureIgnoreCase),
+            _ => matching
+                .OrderByDescending(s => s.Latest?.UnlockedAtUtc ?? DateTime.MinValue)
+                .ThenBy(s => s.Game.Name, StringComparer.CurrentCultureIgnoreCase),
+        };
+    }
 
     private void RenderCards(bool stagger)
     {
@@ -179,7 +188,7 @@ public partial class TrophyHubView : UserControl
         {
             GameList.Children.Add(new TextBlock
             {
-                Text = Localization.Instance.Get("Trophies.None"),
+                Text = Localization.Instance.Get(_summaries.Count == 0 ? "Trophies.None" : "Trophies.NoMatch"),
                 Foreground = new SolidColorBrush(Color.Parse("#8E89A6")),
                 FontSize = 15,
             });

@@ -280,5 +280,7 @@
   "Trophies.NoneYet": "獲得したトロフィーはまだありません",
   "Trophies.Sort.Recent": "最近",
   "Trophies.Sort.Progress": "進行状況",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "ゲームを検索",
+  "Trophies.NoMatch": "検索に一致するゲームはありません。"
 }

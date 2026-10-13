@@ -285,5 +285,7 @@
   "Trophies.NoneYet": "Ühtegi trofeed pole veel saadud",
   "Trophies.Sort.Recent": "Hiljutised",
   "Trophies.Sort.Progress": "Edenemine",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Otsi mänge",
+  "Trophies.NoMatch": "Sinu otsingule ei vasta ükski mäng."
 }

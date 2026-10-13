@@ -284,5 +284,7 @@
   "Trophies.NoneYet": "Henüz kupa kazanılmadı",
   "Trophies.Sort.Recent": "Son",
   "Trophies.Sort.Progress": "İlerleme",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Oyun ara",
+  "Trophies.NoMatch": "Aramanızla eşleşen oyun yok."
 }

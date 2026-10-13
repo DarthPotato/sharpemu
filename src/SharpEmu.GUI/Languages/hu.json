@@ -281,5 +281,7 @@
   "Trophies.NoneYet": "Még nincs megszerzett trófea",
   "Trophies.Sort.Recent": "Legutóbbi",
   "Trophies.Sort.Progress": "Előrehaladás",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Játékok keresése",
+  "Trophies.NoMatch": "Nincs a keresésnek megfelelő játék."
 }

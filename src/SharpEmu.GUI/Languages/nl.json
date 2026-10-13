@@ -280,5 +280,7 @@
   "Trophies.NoneYet": "Nog geen trofee behaald",
   "Trophies.Sort.Recent": "Recent",
   "Trophies.Sort.Progress": "Voortgang",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Games zoeken",
+  "Trophies.NoMatch": "Geen game komt overeen met je zoekopdracht."
 }

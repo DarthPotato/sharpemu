@@ -285,5 +285,7 @@
   "Trophies.NoneYet": "Nie zdobyto jeszcze żadnego trofeum",
   "Trophies.Sort.Recent": "Ostatnie",
   "Trophies.Sort.Progress": "Postęp",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Szukaj gier",
+  "Trophies.NoMatch": "Żadna gra nie pasuje do wyszukiwania."
 }

@@ -280,5 +280,7 @@
   "Trophies.NoneYet": "لم تُنل أي جائزة بعد",
   "Trophies.Sort.Recent": "الأحدث",
   "Trophies.Sort.Progress": "التقدّم",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "ابحث عن لعبة",
+  "Trophies.NoMatch": "لا توجد لعبة تطابق بحثك."
 }

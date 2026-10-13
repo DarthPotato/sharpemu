@@ -280,5 +280,7 @@
   "Trophies.NoneYet": "Hələ heç bir kubok qazanılmayıb",
   "Trophies.Sort.Recent": "Son",
   "Trophies.Sort.Progress": "İrəliləyiş",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "Oyun axtar",
+  "Trophies.NoMatch": "Axtarışınıza uyğun oyun tapılmadı."
 }

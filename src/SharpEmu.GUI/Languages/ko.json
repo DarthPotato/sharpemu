@@ -280,5 +280,7 @@
   "Trophies.NoneYet": "아직 획득한 트로피 없음",
   "Trophies.Sort.Recent": "최근",
   "Trophies.Sort.Progress": "진행률",
-  "Trophies.Sort.Name": "A–Z"
+  "Trophies.Sort.Name": "A–Z",
+  "Trophies.SearchWatermark": "게임 검색",
+  "Trophies.NoMatch": "검색과 일치하는 게임이 없습니다."
 }
