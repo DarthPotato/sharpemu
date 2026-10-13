@@ -59,7 +59,24 @@ public partial class TrophyHubView : UserControl
     public TrophyHubView()
     {
         InitializeComponent();
-        SearchBox.TextChanged += (_, _) => RenderCards(stagger: false);
+        SearchBox.TextChanged += (_, _) =>
+        {
+            SearchClear.IsVisible = !string.IsNullOrEmpty(SearchBox.Text);
+            RenderCards(stagger: false);
+        };
+        SearchClear.Click += (_, _) =>
+        {
+            SearchBox.Text = string.Empty;
+            SearchBox.Focus();
+        };
+        SearchBox.KeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Escape && !string.IsNullOrEmpty(SearchBox.Text))
+            {
+                SearchBox.Text = string.Empty;
+                e.Handled = true;
+            }
+        };
 
         _idle.Tick += (_, _) =>
         {
@@ -385,7 +402,6 @@ public partial class TrophyHubView : UserControl
             Child = layers,
         };
         TrophyUi.Lift(card);
-        ToolTip.SetTip(card, Localization.Instance.Get("Trophies.Open"));
         card.PointerEntered += (_, _) =>
         {
             _selected = _cards.FindIndex(c => c.Card == card);

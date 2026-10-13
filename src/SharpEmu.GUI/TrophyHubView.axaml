@@ -88,9 +88,75 @@ SPDX-License-Identifier: GPL-2.0-or-later
         </Grid>
       </Grid>
 
-      <Grid Grid.Row="1" ColumnDefinitions="*,Auto" Margin="0,0,0,16">
+      <Grid Grid.Row="1" ColumnDefinitions="*,Auto" Margin="0,0,12,16">
         <StackPanel x:Name="SortBar" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center" />
-        <TextBox x:Name="SearchBox" Grid.Column="1" Width="260" VerticalAlignment="Center" />
+        <Border x:Name="SearchFrame"
+                Grid.Column="1"
+                Width="260"
+                Height="38"
+                CornerRadius="19"
+                Padding="14,0,6,0"
+                VerticalAlignment="Center"
+                Background="#16FFFFFF"
+                BorderBrush="#26FFFFFF"
+                BorderThickness="1">
+          <Border.Styles>
+            <Style Selector="Border#SearchFrame:pointerover">
+              <Setter Property="Background" Value="#1FFFFFFF" />
+            </Style>
+            <Style Selector="Border#SearchFrame:focus-within">
+              <Setter Property="Width" Value="340" />
+              <Setter Property="Background" Value="#24FFFFFF" />
+              <Setter Property="BorderBrush" Value="#B39B7CFF" />
+              <Setter Property="BoxShadow" Value="0 0 22 0 #669B7CFF" />
+            </Style>
+            <Style Selector="TextBox#SearchBox /template/ Border#PART_BorderElement">
+              <Setter Property="Background" Value="Transparent" />
+              <Setter Property="BorderThickness" Value="0" />
+            </Style>
+            <Style Selector="TextBox#SearchBox:pointerover /template/ Border#PART_BorderElement">
+              <Setter Property="Background" Value="Transparent" />
+              <Setter Property="BorderThickness" Value="0" />
+            </Style>
+            <Style Selector="TextBox#SearchBox:focus /template/ Border#PART_BorderElement">
+              <Setter Property="Background" Value="Transparent" />
+              <Setter Property="BorderThickness" Value="0" />
+            </Style>
+          </Border.Styles>
+          <Border.Transitions>
+            <Transitions>
+              <DoubleTransition Property="Width" Duration="0:0:0.22" Easing="CubicEaseOut" />
+              <BrushTransition Property="Background" Duration="0:0:0.18" />
+              <BrushTransition Property="BorderBrush" Duration="0:0:0.18" />
+              <BoxShadowsTransition Property="BoxShadow" Duration="0:0:0.22" />
+            </Transitions>
+          </Border.Transitions>
+          <Grid ColumnDefinitions="Auto,*,Auto">
+            <TextBlock Classes="materialSymbol compact"
+                       Text="search"
+                       Foreground="#B8B4CC"
+                       VerticalAlignment="Center"
+                       Margin="0,0,8,0" />
+            <TextBox x:Name="SearchBox"
+                     Grid.Column="1"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     Padding="0"
+                     MinHeight="0"
+                     FontSize="13.5"
+                     VerticalAlignment="Center"
+                     VerticalContentAlignment="Center" />
+            <Button x:Name="SearchClear"
+                    Grid.Column="2"
+                    Classes="iconGhost"
+                    Width="28"
+                    Height="28"
+                    IsVisible="False"
+                    VerticalAlignment="Center">
+              <TextBlock Classes="materialSymbol compact" Text="close" />
+            </Button>
+          </Grid>
+        </Border>
       </Grid>
 
       <ScrollViewer Grid.Row="2" HorizontalScrollBarVisibility="Disabled">
