@@ -72,7 +72,10 @@ public sealed partial class GuestImageCache
     }
 
     // Removes the image and its stencil associations; the slot is freed after the current tick.
-    private void DeleteImage(ResourceSlotIdentifier imageIdentifier)
+    // A depth image holds the only copy of what the GPU wrote to its stencil plane, so that plane
+    // reaches guest memory first unless the guest unmapped it (publishStencil false): the next
+    // depth image over the plane loads it from there instead of stale bytes.
+    private void DeleteImage(ResourceSlotIdentifier imageIdentifier, bool publishStencil = true)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDelete);
         var image = _slots.TryGet(imageIdentifier);
@@ -96,10 +99,15 @@ public sealed partial class GuestImageCache
                 var associated = _slots[association];
                 if (associated.IsGpuModified)
                 {
+                    if (publishStencil && CanWriteBackStencilPlane(image))
+                    {
+                        WriteBackStencilPlane(image, associated.Description.Data);
+                    }
+
                     associated.ClearGpuModified();
                 }
 
-                DeleteImage(association);
+                DeleteImage(association, publishStencil);
             }
         }
 
@@ -564,7 +572,7 @@ public sealed partial class GuestImageCache
                 owner.ClearGpuModified();
             }
 
-            DeleteImage(imageIdentifier);
+            DeleteImage(imageIdentifier, publishStencil: false);
         }
     }
 }

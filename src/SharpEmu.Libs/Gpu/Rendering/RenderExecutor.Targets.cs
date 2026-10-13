@@ -325,7 +325,17 @@ public sealed partial class RenderExecutor
             var layout = _host.SamplesDepthAttachment(in depth)
                 ? loadState.AttachmentLayout(target.Format)
                 : DepthStencilState.WritableAttachmentLayout(target.Format);
-            _host.TransitionDepthAttachment(in depth, layout, loadState.AttachmentWriteAspects(target.Format));
+            var writeAspects = loadState.AttachmentWriteAspects(target.Format);
+            _host.TransitionDepthAttachment(in depth, layout, writeAspects);
+
+            // The stencil the draw writes belongs to the guest stencil plane the image holds. Marking
+            // the plane makes a plane switch or a replacement of the image write it back first, so the
+            // next depth image over that plane loads these values (Ghost of Yotei classifies its
+            // lighting tiles by stencil written in the G-buffer pass, read through a new image).
+            if ((writeAspects & ImageAspectFlags.StencilBit) != 0 && target.Samples == 1)
+            {
+                _host.MarkGpuWritten(depth.Image);
+            }
             var view = target.Request.View;
             rendering.Width = Math.Min(rendering.Width, target.Width);
             rendering.Height = Math.Min(rendering.Height, target.Height);

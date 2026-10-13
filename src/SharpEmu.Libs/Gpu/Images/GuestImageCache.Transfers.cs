@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Gpu.Vulkan;
@@ -231,11 +232,11 @@ public sealed unsafe partial class GuestImageCache
         image.UploadFromBuffer(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(copies), linear.Buffer, linear.Offset, linear.Size);
     }
 
-    private void UploadStencilPlane(CachedImage association, GpuBuffer source, ulong sourceOffset)
+    // The layout of a depth image's guest stencil plane at `plane`: one byte per texel.
+    private static ImageDescription StencilPlaneLayout(CachedImage depth, GuestSpan plane, string operation)
     {
-        var destination = _slots[association.DepthOwner];
-        var info = destination.Description;
-        info.Data = association.Description.Data;
+        var info = depth.Description;
+        info.Data = plane;
         info.GuestFormat = GuestPixelFormat.Bits8UInt;
         info.BytesPerBlock = 1;
         if (info.IsTiled)
@@ -243,12 +244,135 @@ public sealed unsafe partial class GuestImageCache
             info.Pitch = TileGeometry.DepthPitch(info.Extent.Width, 1);
         }
 
-        if (info.Samples != 1 || destination.Backing.Samples != 1 || info.Resources.Layers == 0 || info.Data.Size % info.Resources.Layers != 0)
+        if (info.Samples != 1 || depth.Backing.Samples != 1 || info.Resources.Layers == 0 || info.Data.Size % info.Resources.Layers != 0)
         {
             throw SubmissionScheduler.Fatal(
-                $"The stencil upload is invalid: address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X} layers={info.Resources.Layers} samples={info.Samples} backingSamples={destination.Backing.Samples}.");
+                $"The stencil {operation} is invalid: address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X} layers={info.Resources.Layers} samples={info.Samples} backingSamples={depth.Backing.Samples}.");
         }
 
+        return info;
+    }
+
+    // Whether the depth image's stencil aspect can be written back now: a single-sample native
+    // image while commands are recorded. A multisample plane has no guest layout here.
+    private bool CanWriteBackStencilPlane(CachedImage depth) =>
+        _scheduler.Active && !depth.DepthOwner.IsValid && depth.Description.IsDepth && depth.Description.HasStencil &&
+        depth.Backing.Exists && depth.Description.Samples == 1 && depth.Backing.Samples == 1;
+
+    // Writes the stencil aspect back to its guest plane once the current tick completes.
+    private void WriteBackStencilPlane(CachedImage depth, GuestSpan plane)
+    {
+        var info = StencilPlaneLayout(depth, plane, "write-back");
+        var download = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
+        if (!download.TryMap(plane.Size, out var offset, 4))
+        {
+            throw SubmissionScheduler.Fatal($"The reusable download ring cannot map the stencil plane: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+        }
+
+        download.Commit();
+        var fullSliceSize = info.Data.Size / info.Resources.Layers;
+        var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
+        if (info.IsTiled)
+        {
+            // Tiling fills only the plane's texels: the padding keeps its guest bytes.
+            if (!_backing.TryReadBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
+            {
+                throw SubmissionScheduler.Fatal($"The stencil plane cannot be read from guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+            }
+
+            download.Flush(offset, plane.Size);
+            var tiles = DepthTileTransfers(info, DepthBlock(info), fullSliceSize);
+            _tiler.TileImage(depth, copies, download.Handle, offset, plane.Size, plane.Size, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tiles));
+        }
+        else
+        {
+            for (var index = 0; index < copies.Length; index++)
+            {
+                copies[index].BufferOffset += offset;
+            }
+
+            depth.DownloadToBuffer(copies, download.Handle, offset, plane.Size);
+        }
+
+        var barrier = new BufferMemoryBarrier2
+        {
+            SType = StructureType.BufferMemoryBarrier2,
+            SrcAccessMask = AccessFlags2.MemoryWriteBit | AccessFlags2.TransferWriteBit | AccessFlags2.ShaderWriteBit,
+            DstAccessMask = AccessFlags2.HostReadBit,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Buffer = download.Handle,
+            Offset = offset,
+            Size = plane.Size,
+        };
+        _scheduler.EndRendering();
+        VulkanSynchronization.PipelineBarrier(_device.Vk, new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
+        var backing = _backing;
+        // Until the tick completes guest memory holds the plane this replaces; an upload of the
+        // range waits for it (AwaitPublishingDownloads).
+        var publishing = new PublishingDownload(plane.Address, plane.Size, _scheduler.CurrentTick);
+        lock (_publishingDownloads) _publishingDownloads.Add(publishing);
+        _scheduler.QueuePriorityCompletionAction(() =>
+        {
+            try
+            {
+                download.Invalidate(offset, plane.Size);
+                GpuWritebackEpoch.Advance();
+                if (!backing.TryWriteBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
+                {
+                    throw SubmissionScheduler.Fatal($"The stencil plane could not be written to guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+                }
+            }
+            finally
+            {
+                lock (_publishingDownloads) _publishingDownloads.Remove(publishing);
+            }
+        });
+    }
+
+    private sealed record PublishingDownload(ulong Address, ulong Size, ulong Tick);
+
+    // Readbacks whose guest bytes are written only when their tick completes. Until then guest
+    // memory holds the contents they supersede.
+    private readonly List<PublishingDownload> _publishingDownloads = new();
+
+    // Waits until every readback that will publish into the range has written guest memory, so
+    // an upload does not read the bytes it replaces. The cache lock is released while waiting.
+    private void AwaitPublishingDownloads(GuestSpan range)
+    {
+        ulong tick = 0;
+        lock (_publishingDownloads)
+        {
+            foreach (var download in _publishingDownloads)
+            {
+                if (download.Address < range.Address + range.Size && range.Address < download.Address + download.Size)
+                    tick = Math.Max(tick, download.Tick);
+            }
+        }
+
+        if (tick == 0)
+        {
+            return;
+        }
+
+        if (_scheduler.InsideTickCallback)
+        {
+            throw SubmissionScheduler.Fatal($"An image upload cannot wait for a pending readback from a completion callback: address=0x{range.Address:X16} size=0x{range.Size:X}.");
+        }
+
+        _lock.Exit();
+        try
+        {
+            _scheduler.Wait(tick);
+            _scheduler.WaitForPriorityOperations(tick);
+        }
+        finally { _lock.Enter(); }
+    }
+
+    private void UploadStencilPlane(CachedImage association, GpuBuffer source, ulong sourceOffset)
+    {
+        var destination = _slots[association.DepthOwner];
+        var info = StencilPlaneLayout(destination, association.Description.Data, "upload");
         var fullSliceSize = info.Data.Size / info.Resources.Layers;
         var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
         var linear = new TilerBufferSpan(source.Handle, sourceOffset, source.Size - sourceOffset);
@@ -356,6 +480,13 @@ public sealed unsafe partial class GuestImageCache
         var image = _slots[imageIdentifier];
         if (ImageDescription.IsEmptyRange(image.Description.Data))
         {
+            return;
+        }
+
+        AwaitPublishingDownloads(image.Description.Data);
+        if (!ReferenceEquals(_slots.TryGet(imageIdentifier), image))
+        {
+            // The image went away while the cache waited.
             return;
         }
 
