@@ -14,7 +14,6 @@ public partial class MainWindow
 
     private void InitializeTrophies()
     {
-        TrophiesButton.Click += (_, _) => OpenTrophyHub();
         TrophyTestGameBox.SelectionChanged += (_, _) => LoadTrophyTestCatalog();
         TrophyTestButton.Click += (_, _) => ShowTrophyTestNotification();
         TrophySound.Prepare();
@@ -23,26 +22,27 @@ public partial class MainWindow
             _settings.TrophySound = TrophySoundToggle.IsChecked == true;
             TrophySound.Enabled = _settings.TrophySound;
         };
-        // The game list can change while the launcher is open, so refresh it when the page is shown.
         OptionsEnvironmentNav.Click += (_, _) => RefreshTrophyTestGames();
     }
 
+    private IReadOnlyList<GameEntry> GamesWithTrophies() =>
+        _allGames.Where(g => !string.IsNullOrWhiteSpace(g.TitleId)).ToArray();
+
     private void OpenTrophyHub()
     {
-        var hub = new TrophyHubWindow(_allGames.Where(g => !string.IsNullOrWhiteSpace(g.TitleId)).ToArray());
-        hub.Show(this);
+        SetActivePage(2);
+        TrophyPageHost.ShowCollection(GamesWithTrophies());
     }
 
-    private async void OpenSelectedGameTrophies()
+    private void OpenSelectedGameTrophies()
     {
-        if (GameList.SelectedItem is not GameEntry game ||
-            string.IsNullOrWhiteSpace(game.TitleId) ||
-            Path.GetDirectoryName(game.Path) is not { } gameDirectory)
+        if (GameList.SelectedItem is not GameEntry game || string.IsNullOrWhiteSpace(game.TitleId))
         {
             return;
         }
 
-        await new TrophiesWindow(game.Name, gameDirectory, game.TitleId, game).ShowDialog(this);
+        SetActivePage(2);
+        TrophyPageHost.ShowGame(GamesWithTrophies(), game);
     }
 
     private async void ShowTrophyToast(TrophyUnlockNotice notice, string? ebootPath)
@@ -60,12 +60,9 @@ public partial class MainWindow
             gameName, EarnedWith(catalog, notice.TrophyId), catalog.Count));
     }
 
-    // The game's earned count with this trophy in it, whether or not the catalog has caught up.
     private static int EarnedWith(IReadOnlyList<TrophyEntry> catalog, int trophyId) =>
         catalog.Count(t => t.Unlocked || t.Id == trophyId);
 
-    // Options > Environment > Trophies: pick a game and one of its trophies and show the unlock
-    // notification for it, without having to earn anything.
     private void RefreshTrophyTestGames()
     {
         var selectedPath = (TrophyTestGameBox.SelectedItem as GameEntry)?.Path;

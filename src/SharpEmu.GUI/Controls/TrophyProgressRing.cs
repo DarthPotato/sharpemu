@@ -7,7 +7,6 @@ using Avalonia.Media;
 
 namespace SharpEmu.GUI.Controls;
 
-/// <summary>A completion ring: a faint track and a gradient arc from twelve o'clock.</summary>
 internal sealed class TrophyProgressRing : Control
 {
     public static readonly StyledProperty<double> ValueProperty =
@@ -21,7 +20,6 @@ internal sealed class TrophyProgressRing : Control
         AffectsRender<TrophyProgressRing>(ValueProperty, ThicknessProperty);
     }
 
-    /// <summary>Completion from 0 to 100.</summary>
     public double Value
     {
         get => GetValue(ValueProperty);

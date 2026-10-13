@@ -243,5 +243,11 @@
   "Options.Env.BinkPlayback.Desc": "Host afspiller Bink-videoer via FFmpeg-broen, men nogle spil kan opleve problemer.\nGuest bruger spilmotorens egen dekoder.\nSkip springer Bink-videoer over, hvilket kan gøre udviklingen nemmere.",
   "Options.Env.BinkPlayback.Host": "Host (FFmpeg)",
   "Options.Env.BinkPlayback.Guest": "Guest",
-  "Options.Env.BinkPlayback.Skip": "Spring over"
+  "Options.Env.BinkPlayback.Skip": "Spring over",
+  "Options.Env.Group.Trophies": "Trophies",
+  "Options.Env.TrophyTest.Label": "Test the trophy notification",
+  "Options.Env.TrophyTest.Desc": "Pick a game and a trophy, then show its unlock notification. Nothing is earned.",
+  "Options.Env.TrophyTest.Show": "Show notification",
+  "Options.Env.TrophySound.Label": "Trophy sound",
+  "Options.Env.TrophySound.Desc": "Play a short chime when a trophy is unlocked."
 }

@@ -3,8 +3,6 @@
 
 namespace SharpEmu.Libs.Np;
 
-/// <summary>One trophy of a title, as the launcher lists it.</summary>
-/// <param name="Grade">1 platinum, 2 gold, 3 silver, 4 bronze.</param>
 public sealed record TrophyEntry(
     int Id,
     int Grade,
@@ -15,13 +13,10 @@ public sealed record TrophyEntry(
     DateTime? UnlockedAtUtc,
     byte[]? IconPng);
 
-/// <summary>A trophy the running title just earned, parsed from the emulator's log.</summary>
 public sealed record TrophyUnlockNotice(string TitleId, int TrophyId, int Grade, string Name);
 
-/// <summary>Read-only view of a title's trophies for the launcher, which runs in another process.</summary>
 public static class TrophyCatalog
 {
-    /// <summary>Lists the title trophies with the progress saved for it; empty without a trophy package. Icons are the large part, so overviews pass false.</summary>
     public static IReadOnlyList<TrophyEntry> Load(string gameDirectory, string titleId, bool includeIcons = true)
     {
         try
@@ -53,7 +48,6 @@ public static class TrophyCatalog
         }
     }
 
-    /// <summary>Recognizes the log line the emulator prints when a trophy is earned.</summary>
     public static bool TryParseUnlockLine(string line, out TrophyUnlockNotice notice)
     {
         notice = null!;

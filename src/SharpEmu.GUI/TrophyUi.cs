@@ -14,7 +14,6 @@ using SharpEmu.GUI.Controls;
 
 namespace SharpEmu.GUI;
 
-/// <summary>Pieces and motion shared by the trophy windows and the unlock notification.</summary>
 internal static class TrophyUi
 {
     private static readonly IBrush ChipBrush = new SolidColorBrush(Color.FromArgb(24, 255, 255, 255));
@@ -52,7 +51,6 @@ internal static class TrophyUi
         VerticalAlignment = VerticalAlignment.Center,
     };
 
-    /// <summary>A rounded filter chip; <see cref="SetChipSelected"/> lights it.</summary>
     public static Border Chip(string text)
     {
         var chip = new Border
@@ -82,7 +80,6 @@ internal static class TrophyUi
         }
     }
 
-    /// <summary>A grade's medal with "earned / total" next to it.</summary>
     public static Border GradeChip(int grade, int earned, int total) => new()
     {
         CornerRadius = new CornerRadius(18),
@@ -98,21 +95,19 @@ internal static class TrophyUi
             Children =
             {
                 new TrophyMedal { Width = 26, Height = 26, Grade = grade, Opacity = earned == 0 ? 0.6 : 1 },
-                new TextBlock
-                {
-                    Inlines =
-                    {
-                        new Avalonia.Controls.Documents.Run(earned.ToString()) { FontWeight = FontWeight.Bold },
-                        new Avalonia.Controls.Documents.Run($" / {total}") { Foreground = new SolidColorBrush(Color.Parse("#8E89A6")) },
-                    },
-                    FontSize = 14,
-                    VerticalAlignment = VerticalAlignment.Center,
-                },
+                Count(earned, total, 14),
             },
         },
     };
 
-    /// <summary>A small glyph and label, such as the date a trophy was earned.</summary>
+    public static TextBlock Count(int earned, int total, double size)
+    {
+        var text = new TextBlock { FontSize = size, VerticalAlignment = VerticalAlignment.Center };
+        text.Inlines!.Add(new Avalonia.Controls.Documents.Run(earned.ToString()) { FontWeight = FontWeight.Bold });
+        text.Inlines.Add(new Avalonia.Controls.Documents.Run($" / {total}") { Foreground = new SolidColorBrush(Color.Parse("#8E89A6")) });
+        return text;
+    }
+
     public static Control StatusChip(string glyph, string text, Color color) => new StackPanel
     {
         Orientation = Orientation.Horizontal,
@@ -125,7 +120,6 @@ internal static class TrophyUi
         },
     };
 
-    /// <summary>A card that rises a little and brightens its edge under the pointer.</summary>
     public static void Lift(Border card)
     {
         var duration = TimeSpan.FromMilliseconds(170);
@@ -147,7 +141,6 @@ internal static class TrophyUi
         };
     }
 
-    /// <summary>Turns a card over around its horizontal axis: it opens up from a sliver.</summary>
     public static void FlipIn(Control card)
     {
         card.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
@@ -155,7 +148,6 @@ internal static class TrophyUi
         Dispatcher.UIThread.Post(() => card.RenderTransform = TransformOperations.Parse("scaleY(1)"), DispatcherPriority.Background);
     }
 
-    /// <summary>Fades the rows in one after another, each rising a little.</summary>
     public static void StaggerIn(IReadOnlyList<Control> rows)
     {
         for (var i = 0; i < rows.Count; i++)
@@ -178,7 +170,6 @@ internal static class TrophyUi
         var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(35) };
         timer.Tick += (_, _) =>
         {
-            // Rows past the first screenful appear together; nobody waits on them.
             var batch = next < 9 ? 1 : rows.Count;
             for (var i = 0; i < batch && next < rows.Count; i++)
             {
@@ -198,7 +189,6 @@ internal static class TrophyUi
         timer.Start();
     }
 
-    /// <summary>Eases a value from one number to another, for counters and progress.</summary>
     public static void Animate(double from, double to, TimeSpan duration, Action<double> apply)
     {
         apply(from);

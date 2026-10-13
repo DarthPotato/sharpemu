@@ -9,26 +9,13 @@ using System.Text.Json;
 
 namespace SharpEmu.Libs.Np;
 
-/// <summary>
-/// The title's trophy package (<c>sce_sys/trophy2/trophy00.ucp</c>), the stat rules that unlock
-/// its trophies (<c>sce_sys/uds/uds00.ucp</c>) and the emulated user's progress. A title never
-/// asks for an unlock: it posts universal-data-system events, and the console compares the stat
-/// each event feeds with the trophy's condition. This type does that comparison.
-/// </summary>
-/// <remarks>
-/// Package layouts and the stat-rule evaluation follow KytyPS5's NpTrophy2 implementation.
-/// </remarks>
 internal static class TrophyService
 {
-    // SceNpTrophy2Details is 1312 bytes: id/grade/group at +0/+4/+8, hidden at +12, has-reward at
-    // +13, progress target (type, value) at +16, then name[128], description[1024], reward[128].
-    // SceNpTrophy2Data is 32 bytes: id at +0, unlocked flag at +4, progress at +8, timestamp at +24.
     internal const int DetailsSize = 1312;
     internal const int DataSize = 32;
 
     private const string UnlockTrophyEvent = "_UnlockTrophy";
 
-    /// <summary>Prefix of the log line the launcher turns into a notification: titleId|id|grade|name.</summary>
     internal const string UnlockMarker = "[TROPHY][UNLOCK] ";
 
     private enum Comparison
@@ -55,7 +42,6 @@ internal static class TrophyService
         public byte[]? IconPng { get; init; }
         public bool Unlocked { get; set; }
 
-        /// <summary>SceRtcTick of the unlock: microseconds since 0001-01-01.</summary>
         public long UnlockedAt { get; set; }
 
         public bool IsPlatinum => Grade == 1;
@@ -90,7 +76,6 @@ internal static class TrophyService
         }
     }
 
-    /// <summary>A stat fed by one named event property: <c>$.input</c> of the event goes to the stat.</summary>
     private readonly record struct StatRule(ulong StatId, string Input, bool IsUInt32);
 
     private static readonly object Gate = new();
@@ -98,7 +83,6 @@ internal static class TrophyService
     private static Dictionary<string, List<StatRule>> _rules = [];
     private static string? _unlockPath;
 
-    /// <summary>Raised after a trophy is unlocked, on the thread that posted the event.</summary>
     internal static event Action<string, Trophy>? Unlocked;
 
     internal static Trophy[] Trophies
@@ -113,7 +97,6 @@ internal static class TrophyService
         }
     }
 
-    /// <summary>Forgets the loaded package so the next call reads the title's files again.</summary>
     internal static void ResetForTests()
     {
         lock (Gate)
@@ -124,7 +107,6 @@ internal static class TrophyService
         }
     }
 
-    /// <summary>Applies one posted event to the trophy stats and unlocks what it satisfies.</summary>
     internal static void OnUdsEvent(string eventName, UdsObjectNode root)
     {
         List<Trophy> unlockedNow = [];
@@ -136,8 +118,6 @@ internal static class TrophyService
                 return;
             }
 
-            // Titles that unlock by id (Hades) post this event; the package's own rules for it
-            // only copy the id into a per-trophy stat that the trophy then compares.
             if (eventName == UnlockTrophyEvent &&
                 root.Values.TryGetValue("_trophy_id", out var idValue) &&
                 idValue.Value is int unlockId)
@@ -181,7 +161,6 @@ internal static class TrophyService
                 }
             }
 
-            // The platinum comes with the last other trophy.
             var platinum = _trophies.FirstOrDefault(t => t.IsPlatinum && !t.Unlocked);
             if (platinum is not null && unlockedNow.Count > 0 &&
                 _trophies.Where(t => !t.IsPlatinum).All(t => t.Unlocked))
@@ -326,8 +305,6 @@ internal static class TrophyService
         }
     }
 
-    // A .ucp is an unencrypted container: a big-endian header, a table of 0x40-byte entries
-    // (name[0x20], offset, length), and JSON files for the contents.
     private static Dictionary<string, (int Offset, int Length)> ReadContainer(byte[] package)
     {
         var files = new Dictionary<string, (int Offset, int Length)>();
@@ -453,9 +430,6 @@ internal static class TrophyService
         return [.. result.Values];
     }
 
-    // Only direct unsigned "latest value" stats are evaluated: the event property named by the
-    // rule's input is the stat. Aggregated stats and filtered or nested extraction need event
-    // history the emulator does not keep.
     private static Dictionary<string, List<StatRule>> ReadRules(byte[] package)
     {
         var rules = new Dictionary<string, List<StatRule>>(StringComparer.Ordinal);

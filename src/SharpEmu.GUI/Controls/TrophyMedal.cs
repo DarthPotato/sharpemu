@@ -7,11 +7,6 @@ using Avalonia.Media;
 
 namespace SharpEmu.GUI.Controls;
 
-/// <summary>
-/// A struck metal medal in a trophy grade's finish: a bevelled rim, a domed face with the cup
-/// embossed on it and a specular highlight. <see cref="Spin"/> turns it around its vertical axis
-/// like a coin, showing the edge and then a star on the back.
-/// </summary>
 internal sealed class TrophyMedal : Control
 {
     public static readonly StyledProperty<int> GradeProperty =
@@ -23,10 +18,12 @@ internal sealed class TrophyMedal : Control
     public static readonly StyledProperty<double> SpinProperty =
         AvaloniaProperty.Register<TrophyMedal, double>(nameof(Spin));
 
+    public static readonly StyledProperty<IImage?> IconProperty =
+        AvaloniaProperty.Register<TrophyMedal, IImage?>(nameof(Icon));
+
     public static readonly StyledProperty<double> GlintProperty =
         AvaloniaProperty.Register<TrophyMedal, double>(nameof(Glint), -1);
 
-    // The cup and the star, in a 100 x 100 box.
     private static readonly Geometry Cup = Geometry.Parse(
         "M31,24 H69 V40 C69,53 60,61 50,61 C40,61 31,53 31,40 Z " +
         "M31,28 H21 C21,40 26,46 33,47 L32,42 C28,41 26.5,37 26.5,33 H31 Z " +
@@ -38,7 +35,7 @@ internal sealed class TrophyMedal : Control
 
     static TrophyMedal()
     {
-        AffectsRender<TrophyMedal>(GradeProperty, LockedProperty, SpinProperty, GlintProperty);
+        AffectsRender<TrophyMedal>(GradeProperty, LockedProperty, SpinProperty, GlintProperty, IconProperty);
     }
 
     public int Grade
@@ -53,21 +50,24 @@ internal sealed class TrophyMedal : Control
         set => SetValue(LockedProperty, value);
     }
 
-    /// <summary>Rotation around the vertical axis, in radians; zero faces the viewer.</summary>
     public double Spin
     {
         get => GetValue(SpinProperty);
         set => SetValue(SpinProperty, value);
     }
 
-    /// <summary>Position of a light band crossing the face, 0 to 1; negative hides it.</summary>
+    public IImage? Icon
+    {
+        get => GetValue(IconProperty);
+        set => SetValue(IconProperty, value);
+    }
+
     public double Glint
     {
         get => GetValue(GlintProperty);
         set => SetValue(GlintProperty, value);
     }
 
-    /// <summary>Highlight, body and shadow tones of a grade's metal.</summary>
     public static (Color Light, Color Mid, Color Dark) Palette(int grade, bool locked = false) => locked
         ? (Color.Parse("#9AA1AE"), Color.Parse("#5D6370"), Color.Parse("#2C3039"))
         : grade switch
@@ -93,7 +93,6 @@ internal sealed class TrophyMedal : Control
         var squash = Math.Max(0.04, Math.Abs(facing));
         var front = facing >= 0;
 
-        // The coin's edge shows beside the face while it turns.
         var edgeShift = radius * 0.13 * Math.Sin(Spin);
         using (context.PushTransform(Squash(center, squash, edgeShift)))
         {
@@ -102,11 +101,9 @@ internal sealed class TrophyMedal : Control
 
         using (context.PushTransform(Squash(center, squash, 0)))
         {
-            // Rim: brushed metal lit from the top left.
             context.DrawEllipse(Linear(light, mid, dark, 0.15, 0.1, 0.9, 0.95), null, center, radius, radius);
             context.DrawEllipse(null, new Pen(new SolidColorBrush(Shade(dark, 0.8)), radius * 0.03), center, radius * 0.86, radius * 0.86);
 
-            // Face: domed, so the light pools off centre.
             var face = radius * 0.82;
             context.DrawEllipse(new RadialGradientBrush
             {
@@ -122,13 +119,26 @@ internal sealed class TrophyMedal : Control
                 },
             }, null, center, face, face);
 
-            // Emblem: pressed in, so a dark copy sits below and right of a lit one.
-            var emblem = front ? Cup : Star;
-            var scale = face * 1.32 / 100;
-            DrawEmblem(context, emblem, center, scale, new Vector(radius * 0.025, radius * 0.035), new SolidColorBrush(Shade(dark, 0.75)));
-            DrawEmblem(context, emblem, center, scale, default, Linear(light, light, mid, 0.3, 0.2, 0.7, 0.85));
+            if (front && Icon is { } icon)
+            {
+                var art = face * 0.9;
+                var rect = new Rect(center.X - art, center.Y - art, art * 2, art * 2);
+                using (context.PushGeometryClip(new EllipseGeometry(rect)))
+                {
+                    context.DrawImage(icon, new Rect(icon.Size), rect);
+                }
 
-            // Specular highlight and, when asked, a band of light sliding over the face.
+                context.DrawEllipse(null, new Pen(new SolidColorBrush(Shade(dark, 0.8)), radius * 0.035), center, art, art);
+                context.DrawEllipse(null, new Pen(new SolidColorBrush(Color.FromArgb(120, light.R, light.G, light.B)), radius * 0.02), center, art + radius * 0.03, art + radius * 0.03);
+            }
+            else
+            {
+                var emblem = front ? Cup : Star;
+                var scale = face * 1.32 / 100;
+                DrawEmblem(context, emblem, center, scale, new Vector(radius * 0.025, radius * 0.035), new SolidColorBrush(Shade(dark, 0.75)));
+                DrawEmblem(context, emblem, center, scale, default, Linear(light, light, mid, 0.3, 0.2, 0.7, 0.85));
+            }
+
             context.DrawEllipse(new RadialGradientBrush
             {
                 GradientStops =

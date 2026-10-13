@@ -136,6 +136,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
           <Button x:Name="LibraryTabButton"
                   Classes="segment active"
                   Content="{Binding [Page.Library], Source={x:Static local:Localization.Instance}}" />
+          <Button x:Name="TrophiesTabButton"
+                  Classes="segment"
+                  Content="{Binding [Page.Trophies], Source={x:Static local:Localization.Instance}}" />
           <Button x:Name="OptionsTabButton"
                   Classes="segment"
                   Content="{Binding [Page.Options], Source={x:Static local:Localization.Instance}}" />
@@ -176,13 +179,6 @@ SPDX-License-Identifier: GPL-2.0-or-later
               </Slider>
             </StackPanel>
           </Border>
-          <Button x:Name="TrophiesButton"
-                  Classes="iconGhost"
-                  VerticalAlignment="Center"
-                  ToolTip.Tip="{Binding [Trophies.Title], Source={x:Static local:Localization.Instance}}">
-            <TextBlock Classes="materialSymbol compact"
-                       Text="emoji_events" />
-          </Button>
           <Button x:Name="LibraryLayoutButton"
                   Classes="iconGhost"
                   VerticalAlignment="Center">
@@ -1143,6 +1139,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
           </Grid>
         </Border>
         </Grid>
+
+        <local:TrophyPage x:Name="TrophyPageHost" IsVisible="False" Margin="32,6,32,16" />
 
         <!-- Options page: stable local navigation keeps each settings group
              focused while preserving every setting from the current launcher -->

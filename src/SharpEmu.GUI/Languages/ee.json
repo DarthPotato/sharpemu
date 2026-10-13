@@ -110,6 +110,12 @@
   "Options.Env.BinkPlayback.Host": "Host (FFmpeg)",
   "Options.Env.BinkPlayback.Guest": "Guest",
   "Options.Env.BinkPlayback.Skip": "Jäta vahele",
+  "Options.Env.Group.Trophies": "Trophies",
+  "Options.Env.TrophyTest.Label": "Test the trophy notification",
+  "Options.Env.TrophyTest.Desc": "Pick a game and a trophy, then show its unlock notification. Nothing is earned.",
+  "Options.Env.TrophyTest.Show": "Show notification",
+  "Options.Env.TrophySound.Label": "Trophy sound",
+  "Options.Env.TrophySound.Desc": "Play a short chime when a trophy is unlocked.",
 
   "Options.CpuEngine.Label": "CPU-mootor",
   "Options.CpuEngine.Desc": "Käitusmootor, mida kasutatakse mängukoodi käivitamiseks.",

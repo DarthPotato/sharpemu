@@ -12,7 +12,6 @@ using System.Runtime.InteropServices;
 
 namespace SharpEmu.GUI;
 
-/// <summary>What a trophy notification shows. Earned counts the new trophy.</summary>
 internal sealed record TrophyToastContent(
     string Name,
     string Description,
@@ -22,20 +21,8 @@ internal sealed record TrophyToastContent(
     int Earned = 0,
     int Total = 0);
 
-/// <summary>
-/// A topmost, click-through window announcing an earned trophy over the running game. It never
-/// takes focus or input, so the game keeps both. Toasts queue instead of stacking.
-/// </summary>
-/// <remarks>
-/// The card swings in from the right in 3D. Its medal spins like a tossed coin while the sound
-/// rises, and lands on the sound's impact: a ring leaves it, glints burst out round it, a glint crosses
-/// it and the game's progress bar moves up. The card is tinted in the grade's metal, with light
-/// drifting across it; rarer grades get more glints, and the platinum adds rays, an iridescent
-/// edge and a second burst. With Windows animations turned off the toast only fades.
-/// </remarks>
 internal sealed class TrophyToast : Window
 {
-    // Room around the card for the glints, which go out well before the edges.
     private const double WindowWidth = 840;
     private const double WindowHeight = 340;
     private const double CardWidth = 600;
@@ -43,8 +30,12 @@ internal sealed class TrophyToast : Window
     private const double CardMargin = 28;
     private const double MedalSize = 104;
     private const double MedalColumn = 140;
-    private const double EnterSeconds = 0.6;
-    private const double ExitSeconds = 0.5;
+    private const double PillSize = 56;
+    private const double CardRadius = 28;
+    private const double PopSeconds = 0.3;
+    private const double ExpandAt = 0.3;
+    private const double TextAt = 0.75;
+    private const double ExitSeconds = 0.75;
     private const double SpinStart = 0.15;
     private const double Impact = SpinStart + TrophySound.ImpactDelaySeconds;
 
@@ -72,9 +63,11 @@ internal sealed class TrophyToast : Window
     private readonly List<Sparkle> _sparkles = [];
     private readonly Canvas _overlay = new() { IsHitTestVisible = false };
     private readonly Grid _cardHost = new();
-    private readonly Rotate3DTransform _cardTilt = new() { Depth = 900 };
+    private readonly Border _cardBorder = new();
+    private readonly Border _edgeBorder = new();
     private readonly TranslateTransform _cardShift = new();
     private readonly ScaleTransform _cardScale = new();
+    private readonly TranslateTransform _medalShift = new();
     private readonly Border _glow = new();
     private readonly TrophyMedal _medal = new() { Width = MedalSize, Height = MedalSize };
     private readonly ScaleTransform _medalScale = new();
@@ -127,7 +120,6 @@ internal sealed class TrophyToast : Window
     {
         _content = content;
         (_light, _mid, _dark) = TrophyMedal.Palette(content.Grade);
-        // About four seconds on screen in all; the platinum stays a moment longer.
         _leaveAt = content.Grade == 1 ? 4.0 : 3.5;
 
         Width = WindowWidth;
@@ -154,7 +146,6 @@ internal sealed class TrophyToast : Window
         root.Children.Add(BuildCard());
         root.Children.Add(_overlay);
 
-        // The ring that leaves the medal as it lands.
         _ring.Width = MedalSize;
         _ring.Height = MedalSize;
         _ring.CornerRadius = new CornerRadius(MedalSize / 2);
@@ -180,12 +171,10 @@ internal sealed class TrophyToast : Window
             _ => (Color.Parse("#5A2E17"), Color.Parse("#26172E")),
         };
 
-        // Light in the grade's color, drifting slowly behind everything on the card.
         var aurora = new Canvas { IsHitTestVisible = false };
         aurora.Children.Add(Blob(_mid, 150, 360, -60, -170, _auroraA));
         aurora.Children.Add(Blob(Color.Parse("#8C6CFF"), 110, 320, 330, -60, _auroraB));
 
-        // Glass: the top of the card catches a little more light.
         var glass = new Border
         {
             IsHitTestVisible = false,
@@ -201,13 +190,19 @@ internal sealed class TrophyToast : Window
             },
         };
 
-        var content = new Grid { ColumnDefinitions = new ColumnDefinitions($"{MedalColumn},*") };
+        var content = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions($"{MedalColumn},*"),
+            Width = CardWidth,
+            Height = CardHeight,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top,
+        };
         content.Children.Add(BuildMedalArea());
         var text = BuildText();
         Grid.SetColumn(text, 1);
         content.Children.Add(text);
 
-        // One diagonal sweep of light after the medal lands.
         _shine.Width = 140;
         _shine.Height = CardHeight * 2.2;
         _shine.HorizontalAlignment = HorizontalAlignment.Left;
@@ -233,24 +228,21 @@ internal sealed class TrophyToast : Window
         layers.Children.Add(content);
         layers.Children.Add(_shine);
 
-        var card = new Border
+        var card = _cardBorder;
+        card.CornerRadius = new CornerRadius(CardRadius);
+        card.ClipToBounds = true;
+        card.Background = new LinearGradientBrush
         {
-            CornerRadius = new CornerRadius(24),
-            ClipToBounds = true,
-            Background = new LinearGradientBrush
+            StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+            EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
+            GradientStops =
             {
-                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
-                EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
-                GradientStops =
-                {
-                    new GradientStop(Color.FromArgb(245, deep.R, deep.G, deep.B), 0),
-                    new GradientStop(Color.FromArgb(245, deeper.R, deeper.G, deeper.B), 1),
-                },
+                new GradientStop(Color.FromArgb(245, deep.R, deep.G, deep.B), 0),
+                new GradientStop(Color.FromArgb(245, deeper.R, deeper.G, deeper.B), 1),
             },
-            Child = layers,
         };
+        card.Child = layers;
 
-        // A bright edge: metal along the top left fading round the card; the platinum's turns.
         var edgeBrush = new LinearGradientBrush
         {
             StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
@@ -272,16 +264,13 @@ internal sealed class TrophyToast : Window
             edgeBrush.GradientStops.Add(new GradientStop(Color.FromArgb(30, 255, 255, 255), 1));
         }
 
-        var edge = new Border
-        {
-            CornerRadius = new CornerRadius(24),
-            BorderBrush = edgeBrush,
-            BorderThickness = new Thickness(1.5),
-            IsHitTestVisible = false,
-        };
+        var edge = _edgeBorder;
+        edge.CornerRadius = new CornerRadius(CardRadius);
+        edge.BorderBrush = edgeBrush;
+        edge.BorderThickness = new Thickness(1.5);
+        edge.IsHitTestVisible = false;
 
-        // Shadow below the card, and a halo in the grade's color that breathes.
-        _glow.CornerRadius = new CornerRadius(24);
+        _glow.CornerRadius = new CornerRadius(CardRadius);
         _glow.Background = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0));
         _glow.BoxShadow = new BoxShadows(
             new BoxShadow { OffsetY = 16, Blur = 36, Color = Color.FromArgb(150, 0, 0, 0) },
@@ -292,8 +281,8 @@ internal sealed class TrophyToast : Window
         _cardHost.HorizontalAlignment = HorizontalAlignment.Right;
         _cardHost.VerticalAlignment = VerticalAlignment.Top;
         _cardHost.Margin = new Thickness(0, CardMargin, CardMargin, 0);
-        _cardHost.RenderTransformOrigin = new RelativePoint(1, 0.5, RelativeUnit.Relative);
-        _cardHost.RenderTransform = new TransformGroup { Children = { _cardScale, _cardTilt, _cardShift } };
+        _cardHost.RenderTransformOrigin = new RelativePoint(1, 0, RelativeUnit.Relative);
+        _cardHost.RenderTransform = new TransformGroup { Children = { _cardScale, _cardShift } };
         _cardHost.Children.Add(_glow);
         _cardHost.Children.Add(card);
         _cardHost.Children.Add(edge);
@@ -304,7 +293,6 @@ internal sealed class TrophyToast : Window
     {
         var area = new Grid { Width = MedalColumn, Height = CardHeight };
 
-        // A soft light behind the medal that flares when it lands.
         _burst.Width = MedalSize * 1.7;
         _burst.Height = MedalSize * 1.7;
         _burst.CornerRadius = new CornerRadius(MedalSize);
@@ -322,7 +310,6 @@ internal sealed class TrophyToast : Window
         _burst.Opacity = 0.35;
         area.Children.Add(_burst);
 
-        // Gold and platinum shine behind the medal with turning rays.
         if (_content.Grade <= 2 && !_reducedMotion)
         {
             BuildRays();
@@ -330,10 +317,11 @@ internal sealed class TrophyToast : Window
         }
 
         _medal.Grade = _content.Grade;
+        _medal.Icon = TrophyUi.LoadIcon(_content.IconPng);
         _medal.HorizontalAlignment = HorizontalAlignment.Center;
         _medal.VerticalAlignment = VerticalAlignment.Center;
         _medal.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
-        _medal.RenderTransform = _medalScale;
+        _medal.RenderTransform = new TransformGroup { Children = { _medalScale, _medalShift } };
         area.Children.Add(_medal);
         return area;
     }
@@ -404,24 +392,14 @@ internal sealed class TrophyToast : Window
         {
             var shift = new TranslateTransform();
             stack.Children[i].RenderTransform = shift;
-            _lines.Add((stack.Children[i], shift, 0.32 + i * 0.08));
+            _lines.Add((stack.Children[i], shift, TextAt + i * 0.09));
         }
 
         return stack;
     }
 
-    // The trophy's icon, the game's name and a completion bar that moves up when the medal lands.
     private Control BuildProgress()
     {
-        var icon = new Border
-        {
-            Width = 26,
-            Height = 26,
-            CornerRadius = new CornerRadius(7),
-            ClipToBounds = true,
-            Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
-            Child = new Image { Source = TrophyUi.LoadIcon(_content.IconPng), Stretch = Stretch.UniformToFill },
-        };
         var game = new TextBlock
         {
             Text = _content.GameName ?? string.Empty,
@@ -452,12 +430,7 @@ internal sealed class TrophyToast : Window
             GradientStops = { new GradientStop(_mid, 0), new GradientStop(_light, 1) },
         };
 
-        var right = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Center, Children = { labels, _progress } };
-        var row = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*"), ColumnSpacing = 10, Margin = new Thickness(0, 6, 0, 0) };
-        row.Children.Add(icon);
-        Grid.SetColumn(right, 1);
-        row.Children.Add(right);
-        return row;
+        return new StackPanel { Spacing = 4, Margin = new Thickness(0, 8, 0, 0), Children = { labels, _progress } };
     }
 
     private double PercentOf(int earned) => _content.Total == 0 ? 0 : Math.Clamp(earned, 0, _content.Total) * 100.0 / _content.Total;
@@ -564,33 +537,37 @@ internal sealed class TrophyToast : Window
             return;
         }
 
-        // The card swings in from the right around its right edge, and back out the same way.
-        var enter = Math.Clamp(t / EnterSeconds, 0, 1);
-        if (leaving)
-        {
-            var ease = EaseInCubic(leave);
-            _cardShift.X = ease * 140;
-            _cardTilt.AngleY = -ease * 40;
-            Opacity = 1 - ease;
-        }
-        else
-        {
-            _cardShift.X = (1 - EaseOutBack(enter)) * 170;
-            _cardTilt.AngleY = (1 - EaseOutCubic(enter)) * 55;
-            Opacity = Math.Min(1, enter * 2);
-        }
+        Opacity = 1;
+        var pop = EaseOutCubic(Math.Clamp(t / PopSeconds, 0, 1));
+        var textOut = EaseInOutCubic(Math.Clamp(leave / 0.33, 0, 1));
+        var fold = EaseInOutCubic(Math.Clamp((leave - 0.2) / 0.55, 0, 1));
+        var melt = EaseInOutCubic(Math.Clamp((leave - 0.65) / 0.35, 0, 1));
+        var openW = leaving ? 1 - fold : Math.Max(0, Spring(t - ExpandAt, 11, 0.74));
+        var openH = leaving ? 1 - fold : Math.Max(0, Spring(t - ExpandAt - 0.04, 10, 0.8));
+        var width = PillSize + (CardWidth - PillSize) * openW;
+        var height = PillSize + (CardHeight - PillSize) * openH;
+        _cardHost.Width = width;
+        _cardHost.Height = height;
+        var radius = new CornerRadius(Math.Min(CardRadius, Math.Min(width, height) / 2));
+        _cardBorder.CornerRadius = radius;
+        _edgeBorder.CornerRadius = radius;
+        _glow.CornerRadius = radius;
+        _cardHost.Opacity = Math.Min(1, t / 0.2) * (1 - melt);
+        _cardShift.Y = -10 * melt;
+        SetBlur(_cardHost, (1 - pop) * 12 + melt * 10);
 
-        // The medal spins like a tossed coin, slowing down to land face on at the impact.
         var spin = Math.Clamp((t - SpinStart) / (Impact - SpinStart), 0, 1);
         _medal.Spin = (1 - EaseOutQuart(spin)) * Math.PI * 6;
-        var grow = 0.45 + 0.55 * EaseOutCubic(Math.Min(1, spin * 2.2));
+        _medalShift.X = (PillSize / 2 - MedalColumn / 2) * (1 - openW);
+        _medalShift.Y = (PillSize / 2 - CardHeight / 2) * (1 - openH);
+        var grow = (PillSize * 0.86 / MedalSize) + (1 - PillSize * 0.86 / MedalSize) * openW;
         var sinceImpact = t - Impact;
         var thump = sinceImpact >= 0 ? Math.Exp(-sinceImpact * 9) * Math.Cos(sinceImpact * 28) * 0.14 : 0;
         _medalScale.ScaleX = _medalScale.ScaleY = grow + thump;
         _medal.Glint = sinceImpact is >= 0.05 and <= 0.75 ? (sinceImpact - 0.05) / 0.7 : -1;
 
-        // Landing: the card gives a little, the light behind the medal flares, the ring goes out.
-        _cardScale.ScaleX = _cardScale.ScaleY = sinceImpact >= 0 ? 1 + Math.Exp(-sinceImpact * 10) * Math.Sin(sinceImpact * 30) * 0.012 : 1;
+        var landing = sinceImpact >= 0 && !leaving ? 1 + Math.Exp(-sinceImpact * 10) * Math.Sin(sinceImpact * 30) * 0.012 : 1;
+        _cardScale.ScaleX = _cardScale.ScaleY = (0.7 + 0.3 * pop) * (1 - 0.25 * melt) * landing;
         _burst.Opacity = sinceImpact >= 0
             ? 0.4 + 0.6 * Math.Exp(-sinceImpact * 3.5) + 0.08 * Math.Sin(t * 3)
             : 0.25 + 0.25 * spin;
@@ -611,21 +588,19 @@ internal sealed class TrophyToast : Window
         if (ring is >= 0 and <= 1)
         {
             _ringScale.ScaleX = _ringScale.ScaleY = 1 + EaseOutCubic(ring) * (_content.Grade == 1 ? 1.9 : 1.2);
-            Canvas.SetLeft(_ring, MedalCenter.X - MedalSize / 2 + _cardShift.X);
         }
 
-        _rays.Opacity = sinceImpact >= 0 ? Math.Min(1, sinceImpact * 3) * (leaving ? 1 - leave : 1) : 0;
+        _rays.Opacity = sinceImpact >= 0 ? Math.Min(1, sinceImpact * 3) * (1 - textOut) : 0;
         _raysSpin.Angle = t * 18;
 
-        // The text follows, line by line, sliding in from the right.
         foreach (var (line, shift, delay) in _lines)
         {
-            var progress = Math.Clamp((t - delay) / 0.4, 0, 1);
-            shift.X = (1 - EaseOutCubic(progress)) * 34;
-            line.Opacity = progress;
+            var progress = EaseOutCubic(Math.Clamp((t - delay) / 0.45, 0, 1));
+            shift.Y = (1 - progress) * 8 - textOut * 4;
+            line.Opacity = progress * (1 - textOut);
+            SetBlur(line, (1 - progress) * 6 + textOut * 5);
         }
 
-        // The game's completion moves up to count the new trophy.
         if (_content.Total > 0)
         {
             var fill = Math.Clamp((sinceImpact - 0.15) / 0.8, 0, 1);
@@ -651,7 +626,6 @@ internal sealed class TrophyToast : Window
         StepSparkles(dt);
     }
 
-    // Four-pointed glints that burst from the medal all round, twinkle and go out near the card.
     private void SpawnSparkles(int count, double reach)
     {
         Color[] colors = _content.Grade == 1
@@ -685,7 +659,7 @@ internal sealed class TrophyToast : Window
                 Visual = visual,
                 Rotation = rotation,
                 Scale = scale,
-                X = origin.X + _cardShift.X,
+                X = origin.X,
                 Y = origin.Y,
                 Vx = Math.Cos(angle) * speed,
                 Vy = Math.Sin(angle) * speed,
@@ -711,7 +685,6 @@ internal sealed class TrophyToast : Window
                 continue;
             }
 
-            // They shoot out, slow almost to a stop and drift up a touch while they fade.
             p.Vx *= 1 - 5.5 * dt;
             p.Vy = p.Vy * (1 - 5.5 * dt) - 30 * dt;
             p.X += p.Vx * dt;
@@ -727,11 +700,37 @@ internal sealed class TrophyToast : Window
         }
     }
 
-    private static double EaseOutBack(double t)
+    private static double Spring(double t, double omega, double zeta)
     {
-        const double c1 = 1.4;
-        const double c3 = c1 + 1;
-        return 1 + c3 * Math.Pow(t - 1, 3) + c1 * Math.Pow(t - 1, 2);
+        if (t <= 0)
+        {
+            return 0;
+        }
+
+        var damped = omega * Math.Sqrt(1 - zeta * zeta);
+        return 1 - Math.Exp(-zeta * omega * t) * (Math.Cos(damped * t) + zeta * omega / damped * Math.Sin(damped * t));
+    }
+
+    private static void SetBlur(Control control, double radius)
+    {
+        if (radius < 0.4)
+        {
+            if (control.Effect is not null)
+            {
+                control.Effect = null;
+            }
+
+            return;
+        }
+
+        if (control.Effect is BlurEffect blur)
+        {
+            blur.Radius = radius;
+        }
+        else
+        {
+            control.Effect = new BlurEffect { Radius = radius };
+        }
     }
 
     private static double EaseOutCubic(double t) => 1 - Math.Pow(1 - t, 3);
@@ -742,7 +741,6 @@ internal sealed class TrophyToast : Window
 
     private static double EaseInOutCubic(double t) => t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2;
 
-    // Top right of the primary screen, where games rarely put their own HUD.
     private void Place()
     {
         var screen = Screens.Primary;
@@ -756,7 +754,6 @@ internal sealed class TrophyToast : Window
         Position = new PixelPoint(area.Right - (int)(Width * scale), area.Y);
     }
 
-    // The whole window, transparent margins included, lets mouse input through to the game.
     private void MakeClickThrough()
     {
         if (!OperatingSystem.IsWindows() || TryGetPlatformHandle() is not { } handle)
@@ -781,7 +778,6 @@ internal sealed class TrophyToast : Window
     [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW")]
     private static extern bool SystemParametersInfo(uint action, uint param, ref int value, uint winIni);
 
-    // True when Windows animations are turned off (Settings > Accessibility > Visual effects).
     private static bool ReducedMotion()
     {
         if (!OperatingSystem.IsWindows())

@@ -5,19 +5,8 @@ using System.Runtime.InteropServices;
 
 namespace SharpEmu.GUI;
 
-/// <summary>
-/// The sound of an unlocked trophy, synthesized here so no third-party audio ships with the launcher.
-/// A filtered whoosh rises while the medal spins; when it lands a soft thump and an E major chord
-/// struck like mallets ring out, with sparkles above them, all in a small stereo room.
-/// Rarer grades get a fuller chord, more sparkles and a longer tail.
-/// </summary>
-/// <remarks>
-/// It plays through its own waveOut device rather than PlaySound, which the title music already
-/// holds; a trophy must not stop the music. Like the title music, this is Windows-only.
-/// </remarks>
 internal static class TrophySound
 {
-    /// <summary>Seconds from <see cref="Play"/> to the impact; the notification lands its medal then.</summary>
     public const double ImpactDelaySeconds = 1.0;
 
     private const int SampleRate = 48000;
@@ -26,7 +15,6 @@ internal static class TrophySound
 
     public static bool Enabled { get; set; } = true;
 
-    /// <summary>Renders the four sounds in the background so the first trophy plays without delay.</summary>
     public static void Prepare()
     {
         if (OperatingSystem.IsWindows())
@@ -65,7 +53,6 @@ internal static class TrophySound
         }
     }
 
-    // 16-bit stereo PCM.
     internal static byte[] Render(int grade)
     {
         var tail = grade switch { 1 => 3.2, 2 => 2.6, _ => 2.2 };
@@ -78,7 +65,6 @@ internal static class TrophySound
         AddWhoosh(left, right, impact, random, grade == 1 ? 0.22 : 0.16);
         AddThump(left, right, impact, grade == 1 ? 0.9 : grade == 2 ? 0.6 : 0.45);
 
-        // E major, voiced upward; each grade adds voices on top.
         double[] chord = grade switch
         {
             1 => [164.81, 246.94, 329.63, 493.88, 659.25, 830.61, 987.77, 1318.51],
@@ -88,7 +74,6 @@ internal static class TrophySound
         };
         for (var i = 0; i < chord.Length; i++)
         {
-            // A quick strum from the bottom; low voices ring longest, high ones are quieter.
             var start = impact + (int)(i * 0.016 * SampleRate);
             var gain = 0.34 * Math.Pow(0.86, i);
             var decay = 1.6 - i * 0.12;
@@ -107,7 +92,6 @@ internal static class TrophySound
 
         if (grade == 1)
         {
-            // The platinum climbs once more after the chord.
             double[] climb = [1318.51, 1661.22, 1975.53, 2637.02];
             for (var i = 0; i < climb.Length; i++)
             {
@@ -119,7 +103,6 @@ internal static class TrophySound
         return ToPcm(left, right);
     }
 
-    // Noise through a low-pass that opens as it swells, panned left to right, cut just before the impact.
     private static void AddWhoosh(double[] left, double[] right, int impact, Random random, double gain)
     {
         var start = (int)(impact * 0.08);
@@ -138,7 +121,6 @@ internal static class TrophySound
         }
     }
 
-    // A short sine that drops in pitch: felt more than heard.
     private static void AddThump(double[] left, double[] right, int start, double gain)
     {
         var phase = 0.0;
@@ -152,7 +134,6 @@ internal static class TrophySound
         }
     }
 
-    // A struck bar: fundamental and soft overtones, two slightly detuned copies spread in stereo.
     private static void AddMallet(double[] left, double[] right, int start, double frequency, double gain, double decay, double pan)
     {
         ReadOnlySpan<(double Ratio, double Amplitude, double Damping)> partials = [(1.0, 1.0, 1.0), (2.0, 0.28, 2.2), (3.0, 0.08, 3.5), (4.0, 0.03, 5.0)];
@@ -180,7 +161,6 @@ internal static class TrophySound
         }
     }
 
-    // A small room: four damped combs and two all-passes per side, the right side slightly longer.
     private static void Reverb(double[] left, double[] right, double wet)
     {
         int[] combs = [1557, 1617, 1491, 1422];
@@ -237,7 +217,6 @@ internal static class TrophySound
             peak = Math.Max(peak, Math.Max(Math.Abs(left[i]), Math.Abs(right[i])));
         }
 
-        // About -5 dBFS at the loudest point, with a soft knee instead of a hard clip.
         var scale = 0.62 / peak;
         var pcm = new byte[left.Length * 4];
         for (var i = 0; i < left.Length; i++)
@@ -287,7 +266,6 @@ internal static class TrophySound
 
             if (waveOutWrite(device, header, size) == 0)
             {
-                // Wait for the device to finish the buffer, with a margin in case it never reports.
                 var deadline = Environment.TickCount64 + pcm.Length * 1000L / (SampleRate * 4) + 2000;
                 while ((Marshal.PtrToStructure<WaveHeader>(header).Flags & WaveHeaderDone) == 0 &&
                        Environment.TickCount64 < deadline)

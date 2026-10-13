@@ -462,7 +462,6 @@ internal static class NpUniversalDataSystemState
             postedRoot = clone;
         }
 
-        // Outside the gate: unlocking writes the trophy file and raises notifications.
         TrophyService.OnUdsEvent(postedName, postedRoot);
         return true;
     }

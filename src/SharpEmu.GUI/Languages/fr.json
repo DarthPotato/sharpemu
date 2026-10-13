@@ -19,6 +19,7 @@
 
   "Page.Library": "Bibliothèque",
   "Page.Options": "Options",
+  "Page.Trophies": "Trophées",
   "Page.GameCount.One": "1 jeu",
   "Page.GameCount.Other": "{0} jeux",
 
@@ -277,5 +278,10 @@
   "Trophies.Completed": "complété",
   "Trophies.EarnedTotal": "obtenus",
   "Trophies.HubSummary": "{0} trophées obtenus sur {1}, dans {2} jeux",
-  "Trophies.RevealHint": "Cliquez pour révéler"
+  "Trophies.RevealHint": "Cliquez pour révéler",
+  "Trophies.Latest": "Dernier : {0} · {1}",
+  "Trophies.NoneYet": "Aucun trophée obtenu",
+  "Trophies.Sort.Recent": "Récents",
+  "Trophies.Sort.Progress": "Progression",
+  "Trophies.Sort.Name": "A–Z"
 }

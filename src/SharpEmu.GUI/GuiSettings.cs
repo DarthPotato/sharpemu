@@ -42,7 +42,6 @@ public sealed class GuiSettings
 
     public double TitleMusicVolume { get; set; } = 1.0;
 
-    /// <summary>Play a chime with the trophy unlock notification.</summary>
     public bool TrophySound { get; set; } = true;
 
     public string LibraryLayout { get; set; } = "Carousel";

@@ -15,11 +15,7 @@ using SharpEmu.Libs.Np;
 
 namespace SharpEmu.GUI;
 
-/// <summary>
-/// One game's trophies over its blurred key art: completion ring, grade totals, filters, and a card
-/// per trophy. A hidden trophy stays hidden, icon included, until its card is clicked.
-/// </summary>
-public partial class TrophiesWindow : Window
+public partial class TrophyGameView : UserControl
 {
     private enum Filter
     {
@@ -28,8 +24,8 @@ public partial class TrophiesWindow : Window
         Locked,
     }
 
-    private readonly string _gameDirectory;
-    private readonly string _titleId;
+    private string _gameDirectory = string.Empty;
+    private string _titleId = string.Empty;
     private readonly DispatcherTimer _refreshTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly Dictionary<int, Bitmap?> _icons = [];
     private readonly HashSet<int> _revealed = [];
@@ -41,35 +37,42 @@ public partial class TrophiesWindow : Window
     private double _shownPercent;
     private bool _opened;
 
-    public TrophiesWindow()
-        : this(string.Empty, string.Empty, string.Empty)
-    {
-    }
+    public event Action? BackRequested;
 
-    public TrophiesWindow(string gameName, string gameDirectory, string titleId, GameEntry? game = null)
+    public TrophyGameView()
     {
         InitializeComponent();
-        _gameDirectory = gameDirectory;
-        _titleId = titleId;
-        GameNameText.Text = gameName;
-        CoverImage.Source = game?.Cover;
-        BuildFilters();
-        LoadBackdrop(game);
-        // The game may earn a trophy while this window is open.
-        _refreshTimer.Tick += (_, _) => Reload(force: false);
-        Opened += (_, _) =>
+        BackButton.Click += (_, _) => BackRequested?.Invoke();
+        _refreshTimer.Tick += (_, _) =>
         {
-            Reload(force: true);
-            _refreshTimer.Start();
-        };
-        Closed += (_, _) => _refreshTimer.Stop();
-        KeyDown += (_, e) =>
-        {
-            if (e.Key == Key.Escape)
+            if (IsEffectivelyVisible)
             {
-                Close();
+                Reload(force: false);
             }
         };
+        _refreshTimer.Start();
+    }
+
+    public void Show(GameEntry game, string gameDirectory)
+    {
+        _gameDirectory = gameDirectory;
+        _titleId = game.TitleId ?? string.Empty;
+        GameNameText.Text = game.Name;
+        CoverImage.Source = game.Cover;
+        CoverFrame.IsVisible = game.Cover is not null;
+        Backdrop.Source = null;
+        _icons.Clear();
+        _revealed.Clear();
+        _earnedBefore = [];
+        _trophies = [];
+        _lastSignature = string.Empty;
+        _filter = Filter.All;
+        _shownPercent = 0;
+        _opened = false;
+        BuildFilters();
+        TrophyList.Children.Clear();
+        LoadBackdrop(game);
+        Reload(force: true);
     }
 
     private async void LoadBackdrop(GameEntry? game)
@@ -101,6 +104,8 @@ public partial class TrophiesWindow : Window
 
     private void BuildFilters()
     {
+        FilterBar.Children.Clear();
+        _filterChips.Clear();
         foreach (var (filter, key) in new[] { (Filter.All, "Trophies.Filter.All"), (Filter.Earned, "Trophies.Filter.Earned"), (Filter.Locked, "Trophies.Filter.Locked") })
         {
             var chip = TrophyUi.Chip(Localization.Instance.Get(key));
@@ -130,6 +135,11 @@ public partial class TrophiesWindow : Window
         var gameDirectory = _gameDirectory;
         var titleId = _titleId;
         var trophies = await Task.Run(() => TrophyCatalog.Load(gameDirectory, titleId));
+        if (gameDirectory != _gameDirectory)
+        {
+            return;
+        }
+
         var signature = string.Join(',', trophies.Where(t => t.Unlocked).Select(t => t.Id)) + "/" + trophies.Count;
         if (!force && signature == _lastSignature)
         {
@@ -137,7 +147,6 @@ public partial class TrophiesWindow : Window
         }
 
         _lastSignature = signature;
-        // Trophies earned while the window is open get a moment in the light.
         var earnedNow = trophies.Where(t => t.Unlocked).Select(t => t.Id).ToHashSet();
         var fresh = force ? new HashSet<int>() : earnedNow.Except(_earnedBefore).ToHashSet();
         _earnedBefore = earnedNow;
@@ -151,11 +160,15 @@ public partial class TrophiesWindow : Window
         RenderList(stagger: !_opened, fresh);
         _opened = true;
 
-        // The package icons are large; decode the ones not seen yet off the UI thread.
         var missing = trophies.Where(t => !_icons.ContainsKey(t.Id)).ToArray();
         if (missing.Length > 0)
         {
             var decoded = await Task.Run(() => missing.Select(t => (t.Id, Icon: TrophyUi.LoadIcon(t.IconPng))).ToArray());
+            if (gameDirectory != _gameDirectory)
+            {
+                return;
+            }
+
             foreach (var (id, icon) in decoded)
             {
                 _icons[id] = icon;
@@ -169,7 +182,6 @@ public partial class TrophiesWindow : Window
     {
         var earned = _trophies.Count(t => t.Unlocked);
         var percent = _trophies.Count == 0 ? 0 : earned * 100.0 / _trophies.Count;
-        // The completion counts up to its value instead of appearing at it.
         TrophyUi.Animate(_shownPercent, percent, TimeSpan.FromMilliseconds(_opened ? 600 : 1200), value =>
         {
             PercentText.Text = $"{Math.Round(value)}%";
@@ -234,10 +246,29 @@ public partial class TrophiesWindow : Window
         var row = new Border
         {
             CornerRadius = new CornerRadius(18),
-            Padding = new Thickness(14),
+            Padding = new Thickness(0, 14, 14, 14),
             BorderThickness = new Thickness(1),
-            Child = BuildRowContent(trophy, hidden),
+            ClipToBounds = true,
         };
+        var stripe = new Border
+        {
+            Width = 5,
+            Margin = new Thickness(0, -14, 0, -14),
+            Background = new LinearGradientBrush
+            {
+                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+                EndPoint = new RelativePoint(0, 1, RelativeUnit.Relative),
+                GradientStops = { new GradientStop(light, 0), new GradientStop(mid, 1) },
+            },
+            Opacity = trophy.Unlocked ? 1 : 0.28,
+        };
+        var content = BuildRowContent(trophy, hidden);
+        content.Margin = new Thickness(14, 0, 0, 0);
+        var rowGrid = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
+        rowGrid.Children.Add(stripe);
+        Grid.SetColumn(content, 1);
+        rowGrid.Children.Add(content);
+        row.Child = rowGrid;
         if (trophy.Unlocked)
         {
             row.Background = new LinearGradientBrush
@@ -261,7 +292,6 @@ public partial class TrophiesWindow : Window
         TrophyUi.Lift(row);
         if (canReveal)
         {
-            // Like the console: a hidden trophy stays a mystery until you choose to look.
             row.Cursor = new Cursor(StandardCursorType.Hand);
             ToolTip.SetTip(row, Localization.Instance.Get("Trophies.RevealHint"));
             row.PointerPressed += (_, _) =>
@@ -271,7 +301,6 @@ public partial class TrophiesWindow : Window
                     _revealed.Add(trophy.Id);
                 }
 
-                // Only this card changes: it turns over to its other face.
                 var index = TrophyList.Children.IndexOf(row);
                 if (index >= 0)
                 {
@@ -285,7 +314,7 @@ public partial class TrophiesWindow : Window
         return row;
     }
 
-    private Control BuildRowContent(TrophyEntry trophy, bool hidden)
+    private Grid BuildRowContent(TrophyEntry trophy, bool hidden)
     {
         _icons.TryGetValue(trophy.Id, out var bitmap);
         var image = new Image { Source = bitmap, Stretch = Stretch.UniformToFill };
@@ -307,9 +336,13 @@ public partial class TrophiesWindow : Window
             Background = new SolidColorBrush(Color.FromArgb(36, 255, 255, 255)),
             Child = image,
         });
+        if (trophy.Unlocked)
+        {
+            var (_, glow, _) = TrophyMedal.Palette(trophy.Grade);
+            iconFrame.Effect = new DropShadowEffect { BlurRadius = 18, OffsetX = 0, OffsetY = 0, Color = glow, Opacity = 0.55 };
+        }
         if (hidden || !trophy.Unlocked)
         {
-            // A badge on the corner: a question mark while hidden, a padlock while locked.
             iconFrame.Children.Add(new Border
             {
                 Width = 26,
@@ -373,7 +406,6 @@ public partial class TrophiesWindow : Window
         return grid;
     }
 
-    // A trophy earned while the list is open glows in its grade color, then settles.
     private static void Celebrate(Border row, int grade)
     {
         var (light, mid, _) = TrophyMedal.Palette(grade);

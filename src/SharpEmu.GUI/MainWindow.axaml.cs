@@ -333,6 +333,7 @@ public partial class MainWindow : Window
         CloseConsoleButton.Click += (_, _) => ConsoleToggle.IsChecked = false;
         LibraryTabButton.Click += (_, _) => SetActivePage(0);
         OptionsTabButton.Click += (_, _) => SetActivePage(1);
+        TrophiesTabButton.Click += (_, _) => OpenTrophyHub();
         LibraryLayoutButton.Click += (_, _) => ToggleLibraryLayout();
         TitleMusicMuteButton.Click += (_, _) => TitleMusicToggle.IsChecked = !_settings.PlayTitleMusic;
         TitleMusicVolumeSlider.ValueChanged += (_, _) =>
@@ -515,6 +516,8 @@ public partial class MainWindow : Window
         _activePageIndex = index;
         SetActiveClass(LibraryTabButton, index == 0);
         SetActiveClass(OptionsTabButton, index == 1);
+        SetActiveClass(TrophiesTabButton, index == 2);
+        TrophyPageHost.IsVisible = index == 2;
         LibraryPage.IsVisible = index == 0;
         LibraryToolbar.IsVisible = index == 0;
         OptionsPageSurface.IsVisible = index == 1;
@@ -888,14 +891,16 @@ public partial class MainWindow : Window
         }
 
         var shoulderPressed = pad.Buttons & ~_previousPadButtons;
+        var shownOrder = new[] { 0, 2, 1 };
+        var shown = Array.IndexOf(shownOrder, _activePageIndex);
         if ((shoulderPressed & HostGamepadButtons.L1) != 0)
         {
-            SetActivePage(0);
+            SetActivePage(shownOrder[Math.Max(0, shown - 1)]);
         }
 
         if ((shoulderPressed & HostGamepadButtons.R1) != 0)
         {
-            SetActivePage(1);
+            SetActivePage(shownOrder[Math.Min(shownOrder.Length - 1, shown + 1)]);
         }
 
         if (_activePageIndex != 0 || _isGameSettingsOpen)

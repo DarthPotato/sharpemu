@@ -116,8 +116,6 @@ public static class NpTrophy2Exports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // The count is how many trophies the package really holds from offset on, capped by
-        // limit. Reporting limit itself makes a title walk past its own arrays.
         var trophies = TrophyService.Trophies;
         var start = (int)Math.Min(offset, (uint)trophies.Length);
         var count = (int)Math.Min(limit, (uint)(trophies.Length - start));
