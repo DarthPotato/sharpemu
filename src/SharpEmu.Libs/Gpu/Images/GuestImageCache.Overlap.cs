@@ -250,8 +250,19 @@ public sealed partial class GuestImageCache
 
         var newest = ResourceSlotIdentifier.Invalid;
         var newestContents = image.ContentSequence;
+        var newestStencil = ResourceSlotIdentifier.Invalid;
+        var newestStencilContents = newestContents;
         foreach (var aliasIdentifier in FindImagesInRange(image.Description.Data.Address, image.Description.Data.Size, pageOverlap: false))
         {
+            // A depth image's stencil plane of exactly this span, which the GPU wrote after this
+            // image last changed, is newer than the image (the guest memory under both is stale).
+            if (aliasIdentifier != imageIdentifier && _slots.TryGet(aliasIdentifier) is { DepthOwner.IsValid: true, IsGpuModified: true } plane &&
+                plane.Description.Data == image.Description.Data && plane.ContentSequence > newestStencilContents)
+            {
+                newestStencil = aliasIdentifier;
+                newestStencilContents = plane.ContentSequence;
+            }
+
             if (aliasIdentifier == imageIdentifier || _slots.TryGet(aliasIdentifier) is not { } alias || !alias.Registered ||
                 alias.DepthOwner.IsValid || !alias.SafeToDownload || alias.ContentSequence <= newestContents ||
                 !IsSameLayoutAlias(image.Description, alias.Description))
@@ -261,6 +272,22 @@ public sealed partial class GuestImageCache
 
             newest = aliasIdentifier;
             newestContents = alias.ContentSequence;
+        }
+
+        if (newestStencil.IsValid && newestStencilContents > newestContents)
+        {
+            // Only an 8-bit single-level image can show the plane; its values come from the owner.
+            var owner = _slots[_slots[newestStencil].DepthOwner];
+            if (image.Backing.Exists && image.Backing.Format == Format.R8Uint && CanWriteBackStencilPlane(owner) &&
+                image.Backing.MipLevels == 1 && image.Backing.Layers == owner.Backing.Layers &&
+                image.Backing.Extent.Width <= owner.Backing.Extent.Width && image.Backing.Extent.Height <= owner.Backing.Extent.Height)
+            {
+                owner.CopyStencilStorage(image, _bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: false);
+                // The copy is newer than guest memory, which a refresh must not paint over it.
+                TakeGpuOwnership(image);
+                image.ContentSequence = newestStencilContents;
+                return;
+            }
         }
 
         if (!newest.IsValid)
@@ -804,8 +831,42 @@ public sealed partial class GuestImageCache
 
         var record = _slots[association];
 
+        // An image a shader wrote through a color view before this depth target took the plane
+        // (Ghost of Yotei builds the stencil its lighting reads that way) is the association now,
+        // and holds the plane's newest values: they move into the depth image's stencil aspect.
+        var takeContents = record.Backing.Exists && !record.DepthOwner.IsValid && record.IsGpuModified &&
+                           TakeStandaloneStencilPlane(depth, association);
         TouchImage(record);
         record.AssociateDepth(depthImageIdentifier);
+        if (takeContents)
+        {
+            // The depth image now holds values newer than guest memory.
+            TakeGpuOwnership(record);
+        }
+
         return association;
+    }
+
+    // Copies a GPU-written single-level 8-bit image of the stencil plane into the depth image's
+    // stencil aspect; true when the depth image holds its values.
+    private bool TakeStandaloneStencilPlane(CachedImage depth, ResourceSlotIdentifier standaloneIdentifier)
+    {
+        var standalone = _slots[standaloneIdentifier];
+        if (standalone.Binding.IsBound || standalone.Binding.IsTarget)
+        {
+            standalone.Binding.NeedsRebind = true;
+        }
+
+        if (standalone.Backing.Format == Format.R8Uint && CanWriteBackStencilPlane(depth) &&
+            standalone.Backing.MipLevels == 1 && standalone.Backing.Layers == depth.Backing.Layers &&
+            standalone.Backing.Extent.Width <= depth.Backing.Extent.Width && standalone.Backing.Extent.Height <= depth.Backing.Extent.Height)
+        {
+            depth.CopyStencilStorage(standalone, _bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
+            return true;
+        }
+
+        // Nothing can carry the values over; the association reads guest memory as before.
+        Console.Error.WriteLine($"[GPU][WARN] A GPU-written image of a stencil plane cannot reach its depth image: address=0x{standalone.Description.Data.Address:X16} format={(int)standalone.Backing.Format}.");
+        return false;
     }
 }

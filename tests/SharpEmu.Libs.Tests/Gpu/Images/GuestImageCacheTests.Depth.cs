@@ -865,4 +865,60 @@ public sealed unsafe partial class GuestImageCacheTests
             harness.ReadImageBytes(harness.Image(largeId), ImageAspectFlags.StencilBit)[..8]);
         harness.Shutdown();
     }
-}
+
+    // A shader writes the stencil plane through an 8-bit color image before a depth target takes
+    // the plane (Ghost of Yotei builds the stencil its lighting reads that way). The values the
+    // GPU holds move into the depth image's stencil aspect; guest memory is stale.
+    [Fact]
+    public void GpuWrittenR8ImageAtTheStencilPlane_FeedsTheDepthImage()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var stencilFormat = SupportedStencilFormat(_vulkan, SampleCountFlags.Count1Bit);
+        if (stencilFormat == Format.Undefined) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var depthAddress = address + 0xc000;
+        var plane = address + 0xd000;
+        harness.Write(plane, [0x31, 0x32, 0x33, 0x34]);
+        var color = LinearRequest(plane, 4, Format.R8Uint, GuestPixelFormat.Bits8UInt, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 1, 1);
+        var colorId = harness.Acquire(ref color);
+        harness.MarkGpuWritten(colorId);
+        Assert.True(harness.Image(colorId).IsGpuModified);
+        harness.Write(plane, [0, 0, 0, 0]);
+
+        var depth = LinearRequest(depthAddress, 8, stencilFormat, GuestPixelFormat.Bits16UNorm, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 2, 1);
+        depth = AsDepthTarget(depth, stencilFormat);
+        depth.Description.Stencil = new GuestSpan(plane, 4);
+        depth.View = depth.View with { Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+        var depthId = harness.Acquire(ref depth);
+        Assert.Equal(new byte[] { 0x31, 0x32, 0x33, 0x34 }, harness.ReadImageBytes(harness.Image(depthId), ImageAspectFlags.StencilBit)[..4]);
+        harness.Shutdown();
+    }
+
+    // The depth image wrote the stencil plane; a shader then reads the plane as an 8-bit image.
+    [Fact]
+    public void R8ImageAtTheStencilPlane_SeesTheDepthImageStencil()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var stencilFormat = SupportedStencilFormat(_vulkan, SampleCountFlags.Count1Bit);
+        if (stencilFormat == Format.Undefined) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var depthAddress = address + 0xc000;
+        var plane = address + 0xd000;
+        harness.Write(plane, [0x11, 0x11, 0x11, 0x11]);
+        var depth = LinearRequest(depthAddress, 8, stencilFormat, GuestPixelFormat.Bits16UNorm, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 2, 1);
+        depth = AsDepthTarget(depth, stencilFormat);
+        depth.Description.Stencil = new GuestSpan(plane, 4);
+        depth.View = depth.View with { Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+        harness.Acquire(ref depth);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(plane, 4, 0x07070707)));
+
+        var color = LinearRequest(plane, 4, Format.R8Uint, GuestPixelFormat.Bits8UInt, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 1, 1);
+        var colorId = harness.Acquire(ref color);
+        harness.Finish();
+        var image = harness.Image(colorId);
+        var seen = image.DepthOwner.IsValid ? harness.ReadImageBytes(harness.Image(image.DepthOwner), ImageAspectFlags.StencilBit)[..4] : harness.ReadImageBytes(image)[..4];
+        Assert.Equal(new byte[] { 0x07, 0x07, 0x07, 0x07 }, seen);
+        harness.Shutdown();
+    }}
