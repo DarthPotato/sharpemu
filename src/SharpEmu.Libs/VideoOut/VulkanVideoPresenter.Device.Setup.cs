@@ -831,6 +831,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string ImageViewMinLodExtensionName = "VK_EXT_image_view_min_lod";
         private const string FillRectangleExtensionName = "VK_NV_fill_rectangle";
         private bool _supportsImageViewMinLod;
+        private bool _supportsSamplerFilterMinmax;
         private bool _supportsNativeTwoSampleMixed;
         private bool _supportsVariableSampleLocations;
 
@@ -1225,6 +1226,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var coverageReductionExtension = (byte*)SilkMarshal.StringToPtr("VK_NV_coverage_reduction_mode");
             var sampleLocationsExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sample_locations");
             var postDepthCoverageExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_post_depth_coverage");
+            var samplerFilterMinmaxExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sampler_filter_minmax");
             try
             {
                 var extensions = stackalloc byte*[24];
@@ -1276,6 +1278,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_supportsImageViewMinLod)
                 {
                     extensions[extensionCount++] = imageViewMinLodExtension;
+                }
+
+                // The extension form is used because the promoted Vulkan12Features struct cannot
+                // be chained next to the individual 1.2 feature structs this chain already uses.
+                // It has no feature bit of its own, so enabling it is what permits min/max reduction.
+                _supportsSamplerFilterMinmax = IsDeviceExtensionAvailable("VK_EXT_sampler_filter_minmax");
+                if (_supportsSamplerFilterMinmax)
+                {
+                    extensions[extensionCount++] = samplerFilterMinmaxExtension;
                 }
 
                 if (_supportsFillRectangle)
@@ -1461,6 +1472,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
+                SilkMarshal.Free((nint)samplerFilterMinmaxExtension);
                 SilkMarshal.Free((nint)nativeMixedExtension);
                 SilkMarshal.Free((nint)coverageReductionExtension);
                 SilkMarshal.Free((nint)sampleLocationsExtension);
@@ -1483,7 +1495,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
-            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled) { ImageViewMinLodSupported = _supportsImageViewMinLod, CustomTwoSampleLocationsSupported = _supportsNativeTwoSampleMixed };
+            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled) { ImageViewMinLodSupported = _supportsImageViewMinLod, SamplerFilterMinmaxSupported = _supportsSamplerFilterMinmax, CustomTwoSampleLocationsSupported = _supportsNativeTwoSampleMixed };
             _deviceInfo.NameObject = SetDebugName;
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
