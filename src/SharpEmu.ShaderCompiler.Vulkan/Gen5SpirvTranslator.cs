@@ -940,6 +940,11 @@ public static partial class Gen5SpirvTranslator
                     {
                         if (perVertexOwner is { } perVertex)
                         {
+                            if (attribute == perVertex && _promotedPerVertexAttributes.Contains(attribute))
+                            {
+                                _perVertexSourcedAttributes.Add(attribute, IsFlatSlot(attribute));
+                            }
+
                             if (attribute != perVertex)
                             {
                                 shared.Add(attribute, perVertex);
@@ -2858,7 +2863,8 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            if (_perVertexAttributes.Contains(interpolation.Attribute))
+            if (_perVertexAttributes.Contains(interpolation.Attribute) &&
+                !_promotedPerVertexAttributes.Contains(interpolation.Attribute))
             {
                 return TryEmitInterpolationParameter(instruction, interpolation, input, destination, out error);
             }

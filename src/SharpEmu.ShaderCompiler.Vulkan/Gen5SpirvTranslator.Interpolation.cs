@@ -13,6 +13,9 @@ public static partial class Gen5SpirvTranslator
         private readonly HashSet<uint> _flatParameterAttributes = [];
         // Slots that share a per-vertex input with a V_INTERP_MOV slot; true for a flat slot.
         private readonly Dictionary<uint, bool> _perVertexSourcedAttributes = [];
+        // Per-vertex owners that no V_INTERP_MOV reads: their group mixes flat and smooth slots.
+        // The input is per-vertex, but the owner itself is rebuilt like its aliases.
+        private readonly HashSet<uint> _promotedPerVertexAttributes = [];
         private uint _perspectiveBarycentric;
         private readonly Dictionary<int, uint> _barycentricInputs = [];
         private uint _interpolationSampleId;
@@ -60,6 +63,38 @@ public static partial class Gen5SpirvTranslator
                     instruction.Control is Gen5InterpolationControl interpolation)
                 {
                     _perVertexAttributes.Add(interpolation.Attribute);
+                }
+            }
+
+            if (_request.SupportsPerVertexPixelInputs && (_pixelInputAddress & _pixelInputEnable & (1u << 3)) == 0)
+            {
+                // A flat slot and a smooth slot reading one VS parameter cannot be two host inputs:
+                // the second would move to a location no vertex program writes and read zero. One
+                // per-vertex input serves both (vertex 0 for the flat slot, the barycentrics for the
+                // smooth one), as when a V_INTERP_MOV slot is among them.
+                var slotsByLocation = _request.Program.Instructions
+                    .Select(instruction => instruction.Control)
+                    .OfType<Gen5InterpolationControl>()
+                    .Select(control => control.Attribute)
+                    .Distinct()
+                    .Order()
+                    .GroupBy(attribute =>
+                        (attribute < (uint)_pixelInputCntl.Length ? _pixelInputCntl[attribute] : attribute) & 0x1Fu);
+                foreach (var group in slotsByLocation)
+                {
+                    if (group.Any(_perVertexAttributes.Contains))
+                    {
+                        continue;
+                    }
+
+                    var flatSlots = group.Count(attribute =>
+                        attribute < (uint)_pixelInputCntl.Length && (_pixelInputCntl[attribute] & 0x400u) != 0);
+                    if (flatSlots != 0 && flatSlots != group.Count())
+                    {
+                        var owner = group.First();
+                        _perVertexAttributes.Add(owner);
+                        _promotedPerVertexAttributes.Add(owner);
+                    }
                 }
             }
 

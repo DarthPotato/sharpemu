@@ -319,6 +319,41 @@ public sealed class Gen5InterpolationParameterTests
         ValidateWhenAvailable(shader.Spirv);
     }
 
+    [Fact]
+    public void FlatAndSmoothSlotsReadingOneParameter_ShareOnePerVertexInput()
+    {
+        // Slot 1 is flat, slot 2 is smooth, both map to VS parameter 1 and neither is a
+        // V_INTERP_MOV. Two host inputs would put the second on a location the vertex program
+        // never writes (it reads zero); one per-vertex input serves both.
+        Gen5ShaderInstruction Interpolate(uint pc, uint attribute, uint destination) =>
+            new(pc, Gen5ShaderEncoding.Vintrp, "VInterpP2F32",
+                [0], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(destination)], new Gen5InterpolationControl(attribute, 0));
+        var program = ResourceTestProgram.Program(Interpolate(0, 1, 4), Interpolate(4, 2, 5), ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelInputAddress = 2,
+            PixelInputEnable = 2,
+            PixelInputCntl = [0, 0x401, 0x1],
+            SupportsPerVertexPixelInputs = true,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var input = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr).Operands[0];
+        var location = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[0] == input && instruction.Operands[1] == (uint)SpirvDecoration.Location);
+        Assert.Equal(1u, location.Operands[2]);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.Flat && instruction.Operands[0] != input &&
+            instructions.Any(other => other.Opcode == SpirvOp.Decorate && other.Operands[0] == instruction.Operands[0] &&
+                other.Operands[1] == (uint)SpirvDecoration.Location));
+        // The flat slot reads vertex 0 (1 load); the smooth slot weights all three vertices (3 loads).
+        Assert.Equal(4, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
+            instruction.Operands[2] == input));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData(0u)]
