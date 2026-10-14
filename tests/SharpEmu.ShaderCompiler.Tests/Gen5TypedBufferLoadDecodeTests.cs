@@ -96,6 +96,18 @@ public sealed class Gen5TypedBufferLoadDecodeTests
     }
 
     [Fact]
+    public void UntypedD16HiX_DecodesOpcode0x26AsOneRegisterLoadKeepingTheLowHalf()
+    {
+        var instruction = Decode([0xE0002000u | (0x26u << 18), 0x80011A14u, 0xBF810000u]).Instructions[0];
+        Assert.Equal("BufferLoadFormatD16HiX", instruction.Opcode);
+        var control = Assert.IsType<Gen5BufferMemoryControl>(instruction.Control);
+        Assert.Equal(1u, control.DwordCount);
+        Assert.False(control.PackedD16);
+        var destination = Assert.Single(instruction.Destinations);
+        Assert.Equal(26u, destination.Value);
+    }
+
+    [Fact]
     public void OddBufferOffset_DoesNotChangeOpcode()
     {
         var instruction = Decode([0xE00C2001u, 0x80011A14u, 0xBF810000u]).Instructions[0];

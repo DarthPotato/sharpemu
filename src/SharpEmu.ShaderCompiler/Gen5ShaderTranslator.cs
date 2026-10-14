@@ -1593,6 +1593,7 @@ public static partial class Gen5ShaderTranslator
             0x23 => "BufferLoadSbyteD16Hi",
             0x24 => "BufferLoadShortD16",
             0x25 => "BufferLoadShortD16Hi",
+            0x26 => "BufferLoadFormatD16HiX",
             0x27 => "BufferStoreFormatD16HiX",
             0x30 => "BufferAtomicSwap",
             0x31 => "BufferAtomicCmpswap",
@@ -2764,7 +2765,8 @@ public static partial class Gen5ShaderTranslator
                     "BufferLoadSbyteD16" or
                     "BufferLoadSbyteD16Hi" or
                     "BufferLoadShortD16" or
-                    "BufferLoadShortD16Hi" => 1u,
+                    "BufferLoadShortD16Hi" or
+                    "BufferLoadFormatD16HiX" => 1u,
                     "BufferLoadDword" => 1u,
                     "BufferLoadDwordx2" => 2u,
                     "BufferLoadDwordx3" => 3u,
