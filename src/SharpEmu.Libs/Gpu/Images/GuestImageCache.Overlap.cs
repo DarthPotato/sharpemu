@@ -650,8 +650,43 @@ public sealed partial class GuestImageCache
         }
 
         var record = _slots[association];
+
+        // An image a shader wrote through a color view before this depth target took the plane
+        // (Ghost of Yotei builds the stencil its lighting reads that way) is the association now,
+        // and holds the plane's newest values: they move into the depth image's stencil aspect.
+        var takeContents = record.Backing.Exists && !record.DepthOwner.IsValid && record.IsGpuModified &&
+                           TakeStandaloneStencilPlane(depth, association);
         TouchImage(record);
         record.AssociateDepth(depthImageIdentifier);
+        if (takeContents)
+        {
+            // The depth image now holds values newer than guest memory.
+            TakeGpuOwnership(record);
+        }
+
         return association;
+    }
+
+    // Copies a GPU-written single-level 8-bit image of the stencil plane into the depth image's
+    // stencil aspect; true when the depth image holds its values.
+    private bool TakeStandaloneStencilPlane(CachedImage depth, ResourceSlotIdentifier standaloneIdentifier)
+    {
+        var standalone = _slots[standaloneIdentifier];
+        if (standalone.Binding.IsBound || standalone.Binding.IsTarget)
+        {
+            standalone.Binding.NeedsRebind = true;
+        }
+
+        if (standalone.Backing.Format == Format.R8Uint && CanWriteBackStencilPlane(depth) &&
+            standalone.Backing.MipLevels == 1 && standalone.Backing.Layers == depth.Backing.Layers &&
+            standalone.Backing.Extent.Width <= depth.Backing.Extent.Width && standalone.Backing.Extent.Height <= depth.Backing.Extent.Height)
+        {
+            depth.CopyStencilStorage(standalone, _bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
+            return true;
+        }
+
+        // Nothing can carry the values over; the association reads guest memory as before.
+        Console.Error.WriteLine($"[GPU][WARN] A GPU-written image of a stencil plane cannot reach its depth image: address=0x{standalone.Description.Data.Address:X16} format={(int)standalone.Backing.Format}.");
+        return false;
     }
 }
