@@ -19,6 +19,8 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
 
     // VK_EXT_image_view_min_lod is enabled, so a view can clamp to a texture descriptor's MIN_LOD.
     public bool ImageViewMinLodSupported { get; init; }
+    // VK_EXT_sampler_filter_minmax is enabled, so a sampler can reduce with min or max.
+    public bool SamplerFilterMinmaxSupported { get; init; }
 
     public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device)
     {
