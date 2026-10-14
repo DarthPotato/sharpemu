@@ -558,8 +558,8 @@ public static partial class Gen5SpirvTranslator
         {
             if (!_structuredDry && _maxDispatcherSteps > 0)
             {
-                var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
-                Store(_iterationGuard, steps);
+                var steps = IAdd(Load(_uintType, IterationGuard()), UInt(1));
+                Store(IterationGuard(), steps);
                 var withinLimit = _module.AddInstruction(SpirvOp.ULessThan, _boolType, steps, UInt((uint)_maxDispatcherSteps));
                 var exhausted = AllocateLabel();
                 var goOn = AllocateLabel();

@@ -30,7 +30,12 @@ public static partial class Gen5SpirvTranslator
         // mask is loaded per use so the value never has to dominate a later block.
         private uint LoadImageScaleFactor(in SpirvImageResource resource, uint factorDword)
         {
-            var index = resource.ResourceIndex;
+            if (resource.ResourceIndex < 0)
+            {
+                return Float(1f);
+            }
+
+            var index = (uint)resource.ResourceIndex;
             var maskDword = index < 32 ? ScaledImageMaskLowDword : ScaledImageMaskHighDword;
             var bit = UInt(1u << (int)(index & 31));
             var mask = LoadShaderDataDword(UInt(_request.Bindings.RenderScaleDword + maskDword));

@@ -23,7 +23,13 @@ public static partial class Gen5SpirvTranslator
         }
 
         private uint CooperativeCounterPointer(uint index) => _module.AddInstruction(
-            SpirvOp.AccessChain, _wave64ExchangeElementPointer, _cooperativeProgramCounters, index);
+            SpirvOp.AccessChain, ((EmulatedWave64Lowering)_waveLowering).ExchangeElementPointer, _cooperativeProgramCounters, index);
+
+        private void EmitWave64Barrier()
+        {
+            var workgroup = UInt(2);
+            _module.AddStatement(SpirvOp.ControlBarrier, workgroup, workgroup, UInt(0x108));
+        }
 
         private uint SelectCooperativeBlock(IReadOnlyList<ShaderBlock> blocks)
         {

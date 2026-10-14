@@ -20,6 +20,7 @@ public enum DescriptorBindingKind : uint
     ShaderData,
     RuntimeDescriptorTable,
     RuntimeDescriptorMisses,
+    MipStatistics,
     Count,
 }
 
@@ -392,7 +393,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     public uint ObjectIdDword => RenderScaleDword + (UsesRenderScale ? RenderScaleDwordCount : 0u);
 
-    public uint ShaderDataDwordCount => ObjectIdDword + (UsesObjectId ? 1u : 0u);
+    public uint MipStatisticsCount { get; init; }
+
+    public uint MipStatisticsDword => ObjectIdDword + (UsesObjectId ? 1u : 0u);
+
+    public uint ShaderDataDwordCount => MipStatisticsDword + MipStatisticsCount;
 
     public static uint ImageSlotTableDwordCount(ShaderResourceInfo info)
     {
@@ -422,7 +427,20 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public static uint NativeBindingIndex(ShaderStage stage, DescriptorBindingKind kind) =>
         (uint)kind + (stage == ShaderStage.Pixel ? (uint)DescriptorBindingKind.Count : 0);
 
-    public DescriptorBinding? Find(DescriptorBindingKind kind) => Descriptors.FirstOrDefault(binding => binding.Kind == kind);
+    // Called for every bound stage of every draw: an indexed loop allocates no closure or enumerator.
+    public DescriptorBinding? Find(DescriptorBindingKind kind)
+    {
+        var descriptors = Descriptors;
+        for (var index = 0; index < descriptors.Count; index++)
+        {
+            if (descriptors[index].Kind == kind)
+            {
+                return descriptors[index];
+            }
+        }
+
+        return null;
+    }
 
     // The user-data registers live at program entry: those some path reads before it
     // writes them, found by liveness over the control-flow graph, in ascending order.
@@ -635,10 +653,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
         var memoryOffsetCount = (uint)info.Buffers.Count;
         usesRuntimeBufferStrides &= memoryOffsetCount != 0;
+        var mipStatisticsCount = info.Images.Any(static image => image.MipStatistics) ? (uint)info.Images.Count : 0u;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 +
             (usesRuntimeBufferStrides ? (memoryOffsetCount + 1) / 2 : 0u) + (usesDispatchThreadLimits ? 3u : 0u) +
             (usesTessellationData ? Gen5TessellationData.DwordCount : 0u) + (usesRenderScale ? RenderScaleDwordCount : 0u) +
-            (usesObjectId ? 1u : 0u);
+            (usesObjectId ? 1u : 0u) + mipStatisticsCount;
         // The fixed-function control bridge shares the domain stage's runtime
         // buffer. Keep that ABI independent of per-stage push-data packing.
         var pushStart = usesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataStartDword, shaderDataDwords);
@@ -722,6 +741,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             descriptors.Add(new DescriptorBinding(DescriptorBindingKind.ShaderData, []));
         }
 
+        if (mipStatisticsCount != 0)
+        {
+            descriptors.Add(new DescriptorBinding(DescriptorBindingKind.MipStatistics, []));
+        }
+
         return new BindingLayout
         {
             PushDataStartDword = pushStart,
@@ -738,6 +762,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             UsesBindlessImages = usesBindlessImages,
             UsesRenderScale = usesRenderScale,
             UsesObjectId = usesObjectId,
+            MipStatisticsCount = mipStatisticsCount,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -756,6 +781,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         UsesBindlessImages == other.UsesBindlessImages &&
         UsesRenderScale == other.UsesRenderScale &&
         UsesObjectId == other.UsesObjectId &&
+        MipStatisticsCount == other.MipStatisticsCount &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));

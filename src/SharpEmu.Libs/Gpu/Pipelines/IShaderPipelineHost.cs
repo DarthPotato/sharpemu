@@ -39,6 +39,13 @@ internal interface IShaderPipelineHost
 
     bool ComputeWave64Supported { get; }
 
+    // True when a 64-invocation wave64 compute workgroup runs as one 64-lane host subgroup.
+    bool ComputeWave64SubgroupNative => false;
+
+    bool ComputeRunsOn32LaneSubgroups(ComputeInputInfo input) => false;
+
+    bool MipStatisticsSubgroupReduction => false;
+
     bool GraphicsSubgroupOperationsEnabled { get; }
 
     // The device supports shaderSharedInt64Atomics, so LDS 64-bit atomics can be
@@ -73,6 +80,9 @@ internal interface IShaderPipelineHost
 
     RenderHostLimits Limits { get; }
 
+    // The device can blend with a second fragment output (dualSrcBlend).
+    bool SupportsDualSourceBlend => false;
+
     // The sample counts a pipeline without attachments can rasterize at.
     SampleCountFlags NoAttachmentSampleCounts { get; }
 
@@ -83,9 +93,6 @@ internal interface IShaderPipelineHost
 
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
-
-    // The device can blend with a second fragment output (dualSrcBlend).
-    bool SupportsDualSourceBlend => false;
 
     bool TryReadCleanGuestWords(ulong address, Span<uint> words)
     {

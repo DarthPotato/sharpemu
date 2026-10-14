@@ -110,6 +110,9 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public HashSet<ulong> RegisteredDcc { get; } = new();
 
+    // Metadata the host knows and fills itself although its surface is not registered yet.
+    public HashSet<ulong> HostFillableDcc { get; } = new();
+
     public HashSet<ulong> ClearableImages { get; } = new();
 
     public Func<ulong, ulong, ulong>? ClampOverride { get; set; }
@@ -455,7 +458,7 @@ internal sealed class RecordingRenderHost : IRenderHost
     public bool TryFillDccMetadata(ulong address, ulong size, uint fillValue)
     {
         Calls.Add($"fill_dcc {address:X} {size:X} {fillValue:X8}");
-        return RegisteredDcc.Contains(address);
+        return RegisteredDcc.Contains(address) || HostFillableDcc.Contains(address);
     }
 
     public bool HostCopyAccepted { get; set; } = true;
@@ -467,6 +470,43 @@ internal sealed class RecordingRenderHost : IRenderHost
     }
 
     public Exception Fatal(string message) => new RenderExecutorFatalException(message);
+}
+
+// Takes nothing, but checks that the inputs a draw resolves its programs with are the ones its
+// register banks alone give: a prefetch computed ahead of the draw would use those.
+internal sealed class InputsCheckingPrefetch(IRenderHost host) : IProgramPrefetch
+{
+    public List<string> Mismatches { get; } = new();
+
+    public int Checks { get; private set; }
+
+    // A targetless draw whose pixel stage only stores to memory resolves its programs with the pixel
+    // stage active, which the registers alone do not say; a prefetch ahead of it resolves the draw
+    // without a pixel stage, and the draw then takes no prefetched result.
+    public bool AllowsStorageOnlyPixelStage { get; set; }
+
+    public bool TryTakeGraphics(RegisterBanks banks, in GraphicsProgramInputs inputs, out GraphicsPrograms programs)
+    {
+        Checks++;
+        var expected = RenderExecutor.ProgramInputsOf(banks, host.FormatSupport, host.Fatal);
+        if (AllowsStorageOnlyPixelStage && inputs.PixelActive && !expected.PixelActive)
+        {
+            expected.PixelActive = true;
+        }
+
+        if (!expected.Equals(inputs))
+        {
+            Mismatches.Add(
+                $"draw pixelActive={inputs.PixelActive}/{expected.PixelActive} depthBound={inputs.DepthBound}/{expected.DepthBound} " +
+                $"mapping=[{Describe(inputs.Mapping)}]/[{Describe(expected.Mapping)}]");
+        }
+
+        programs = null!;
+        return false;
+    }
+
+    private static string Describe(ReadOnlySpan<ColorComponentMap> mapping) =>
+        string.Join(",", mapping.ToArray().Select(map => map.Packed));
 }
 
 // Hands back the configured programs and records every pipeline request.

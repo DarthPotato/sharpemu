@@ -39,9 +39,10 @@ public sealed unsafe partial class CachedImage
         SubresourceRange = new ImageSubresourceRange(ViewFormatRules.FullAspects(Backing.Format), baseLevel, levelCount, baseLayer, layerCount),
     };
 
-    // Barriers for the requested state; a repeated write always gets a barrier.
-    private static readonly List<ImageMemoryBarrier2> NoBarriers = new(0);
+    // What a state that needs no barrier returns, so the common case allocates nothing. Callers only read it.
+    private static readonly List<ImageMemoryBarrier2> NoBarriers = [];
 
+    // Barriers for the requested state; a repeated write always gets a barrier.
     public (List<ImageMemoryBarrier2> Barriers, PipelineStageFlags SourceStages) GetBarriers(ImageLayout layout, AccessFlags access, PipelineStageFlags stage, SubresourceRange? range)
     {
         // Most requests need no barrier; the list exists only once one does. Callers never add to it.

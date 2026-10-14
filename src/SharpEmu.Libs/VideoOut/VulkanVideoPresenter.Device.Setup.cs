@@ -617,10 +617,15 @@ internal static unsafe partial class VulkanVideoPresenter
             _supportsShaderSignedZeroInfNanPreserveFloat32 =
                 floatControls.ShaderSignedZeroInfNanPreserveFloat32;
             SetNativeSubgroupCapabilities(subgroup.SubgroupSize, subgroup.SupportedStages);
+            SetMipStatisticsCapabilities(true, subgroup.SupportedOperations, subgroup.SupportedStages);
             _canRequireComputeSubgroup32 =
                 subgroup.SubgroupSize != RdnaSubgroupSize &&
                 subgroupSizeControl.MinSubgroupSize <= RdnaSubgroupSize &&
                 subgroupSizeControl.MaxSubgroupSize >= RdnaSubgroupSize &&
+                (subgroupSizeControl.RequiredSubgroupSizeStages & ShaderStageFlags.ComputeBit) != 0;
+            _canRequireComputeSubgroup64 =
+                subgroupSizeControl.MinSubgroupSize <= Wave64SubgroupSize &&
+                subgroupSizeControl.MaxSubgroupSize >= Wave64SubgroupSize &&
                 (subgroupSizeControl.RequiredSubgroupSizeStages & ShaderStageFlags.ComputeBit) != 0;
             _maxComputeWorkgroupSubgroups = subgroupSizeControl.MaxComputeWorkgroupSubgroups;
 
@@ -922,6 +927,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 queueInfoCount = 2;
             }
             _vk.GetPhysicalDeviceFeatures(_physicalDevice, out var supportedFeatures);
+            if (!supportedFeatures.FragmentStoresAndAtomics)
+            {
+                ShaderCompiler.Resources.ResourceMaterializer.RecordMipStatistics = false;
+            }
+
             _supportsIndependentBlend = supportedFeatures.IndependentBlend;
             _supportsDualSourceBlend = supportedFeatures.DualSrcBlend;
             _supportsDepthBiasClamp = supportedFeatures.DepthBiasClamp;
@@ -986,6 +996,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     "[LOADER][WARN] GPU does not support vertexPipelineStoresAndAtomics/fragmentStoresAndAtomics " +
                     "translated shaders using storage buffers in vertex/fragment stages may fail.");
+            }
+
+            if (!supportedFeatures.DualSrcBlend)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU does not support dualSrcBlend " +
+                    "blends that read SRC1 factors fall back to a single source.");
             }
 
             if (!supportedFeatures.ShaderImageGatherExtended)
@@ -1127,6 +1144,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
             _canRequireComputeSubgroup32 &= vulkan13Features.SubgroupSizeControl;
+            _canRequireComputeSubgroup64 &= vulkan13Features.SubgroupSizeControl;
             SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
             var supportsExactFloat16 = VulkanFloat16Support.SupportsExactConversions(_vk, _physicalDevice);
             SetExactFloat16ConversionsCapability(supportsExactFloat16);
@@ -1420,7 +1438,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     SType = StructureType.PhysicalDeviceVulkan13Features,
                     DynamicRendering = true,
                     Synchronization2 = true,
-                    SubgroupSizeControl = _canRequireComputeSubgroup32,
+                    SubgroupSizeControl = _canRequireComputeSubgroup32 || _canRequireComputeSubgroup64,
                     PNext = renderingChain,
                 };
                 var features2 = new PhysicalDeviceFeatures2
