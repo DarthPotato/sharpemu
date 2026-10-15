@@ -782,7 +782,9 @@ public static partial class Gen5SpirvTranslator
 
         // The heap slot of a descriptor key. Every access calls one shared function: inlined, the
         // hash and probes of each lookup made a shader with many runtime descriptor accesses
-        // several times larger and its pipeline many times slower to compile.
+        // several times larger and its pipeline many times slower to compile. The function is
+        // not marked DontInline: on NVIDIA, a DontInline lookup gave Yōtei's grass pixel shader
+        // the slot of an earlier lookup, so its color ramp sampled the base texture (gray grass).
         private uint LookupRuntimeDescriptor(uint[] key, bool image)
         {
             var kind = image ? 0 : 1;
@@ -808,7 +810,7 @@ public static partial class Gen5SpirvTranslator
                 var image = kind == 0;
                 var keyWords = image ? 1 + (int)RuntimeDescriptorTable.ImageWordCount : (int)RuntimeDescriptorTable.SamplerWordCount;
                 var type = _module.TypeFunction(_uintType, [.. Enumerable.Repeat(_uintType, keyWords + 1)]);
-                _module.BeginFunction(_uintType, type, function, SpirvFunctionControl.DontInline);
+                _module.BeginFunction(_uintType, type, function, SpirvFunctionControl.None);
                 _module.AddName(function, image ? "lookupRuntimeImage" : "lookupRuntimeSampler");
                 var key = new uint[keyWords];
                 for (var word = 0; word < keyWords; word++)
