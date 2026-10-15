@@ -1186,14 +1186,16 @@ public sealed partial class ScalarValueGraph
                 return;
             }
 
-            var hasModifiers = (instruction.Control is Gen5Vop3Control { AbsoluteMask: not 0 } or Gen5Vop3Control { NegateMask: not 0 } or
-                Gen5Vop3Control { Clamp: true } or Gen5Vop3Control { OutputModifier: not 0 } or Gen5Vop3Control { OperandSelect: not 0 }) ||
-                (instruction.Control is Gen5SdwaControl sdwa &&
-                (sdwa.AbsoluteMask != 0 || sdwa.NegateMask != 0 || sdwa.OutputModifier != 0 || sdwa.Clamp ||
-                 sdwa.DestinationSelect == 7 || sdwa.Source0Select == 7 || sdwa.Source1Select == 7 || sdwa.DestinationUnused == 3)) ||
-                instruction.Control is Gen5DppControl or Gen5Dpp8Control or Gen5Vop3pControl;
-            var value = hasModifiers ? _graph.Undefined(ScalarValueType.U32) : VectorResult(instruction, state);
-            if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } carryDestination } && !hasModifiers &&
+            // Sub-dword addressing, lane shuffles and packed opsel genuinely move or select
+            // data in ways this uniform-value graph does not model; everything else about
+            // VOP3 (abs/neg source modifiers, clamp, the 2/4/0.5x output modifier) is a
+            // straightforward bit-level transform applied in VectorResult/ApplyOutputModifiers.
+            var hasUnsupportedModifiers = instruction.Control is Gen5Vop3Control { OperandSelect: not 0 } or
+                Gen5SdwaControl or Gen5DppControl or Gen5Dpp8Control or Gen5Vop3pControl;
+            var value = hasUnsupportedModifiers
+                ? _graph.Undefined(ScalarValueType.U32)
+                : ApplyOutputModifiers(VectorResult(instruction, state), instruction.Control as Gen5Vop3Control);
+            if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } carryDestination } && !hasUnsupportedModifiers &&
                 opcode is "VAddCoU32" or "VSubCoU32" or "VSubrevCoU32" or "VAddCoCiU32" or "VSubCoCiU32" or "VSubrevCoCiU32" or "VMadU64U32")
             {
                 var carry = value.IsUndefined ? _graph.Undefined(ScalarValueType.Bool) : state.CarryOut;
@@ -1227,9 +1229,40 @@ public sealed partial class ScalarValueGraph
         {
             var opcode = instruction.Opcode;
             var sources = instruction.Sources;
-            ScalarValue Source(int index) => index < sources.Count
-                ? ApplySdwaSource(instruction.Control as Gen5SdwaControl, index, ReadVectorOperand(sources[index], state))
-                : _graph.Undefined(ScalarValueType.U32);
+            var vop3 = instruction.Control as Gen5Vop3Control;
+
+            // abs/neg are float sign-bit transforms and OMOD is float-only; on an integer opcode the
+            // VOP3 clamp bit means saturation, which this graph does not model. Stay conservative.
+            if (vop3 is { } modifiers &&
+                (modifiers.AbsoluteMask != 0 || modifiers.NegateMask != 0 || modifiers.Clamp || modifiers.OutputModifier != 0) &&
+                !IsFloatModifierOpcode(opcode))
+            {
+                return _graph.Undefined(ScalarValueType.U32);
+            }
+
+            ScalarValue Source(int index)
+            {
+                var raw = index < sources.Count
+                    ? ApplySdwaSource(instruction.Control as Gen5SdwaControl, index, ReadVectorOperand(sources[index], state))
+                    : _graph.Undefined(ScalarValueType.U32);
+                if (vop3 is null || raw.IsUndefined)
+                {
+                    return raw;
+                }
+
+                // Hardware applies |src| before the sign flip.
+                if (((vop3.AbsoluteMask >> index) & 1) != 0)
+                {
+                    raw = Binary(ScalarOperation.And32, raw, _graph.Constant(0x7FFF_FFFFu));
+                }
+
+                if (((vop3.NegateMask >> index) & 1) != 0)
+                {
+                    raw = Binary(ScalarOperation.Xor32, raw, _graph.Constant(0x8000_0000u));
+                }
+
+                return raw;
+            }
             ScalarValue Shift(ScalarValue value, ScalarValue count, ScalarOperation operation) =>
                 Binary(operation, value, Binary(ScalarOperation.And32, count, _graph.Constant(31u)));
             ScalarValue Low24(ScalarValue value) =>
@@ -1427,9 +1460,51 @@ public sealed partial class ScalarValueGraph
                     return Binary(ScalarOperation.FMax, Source(0), Source(1));
                 case "VTruncF32":
                     return Unary(ScalarOperation.FTrunc, Source(0));
+                case "VMadF32":
+                case "VFmaF32":
+                case "VMadMkF32":
+                case "VMadAkF32":
+                case "VFmaMkF32":
+                case "VFmaAkF32":
+                    return Binary(ScalarOperation.FAdd, Binary(ScalarOperation.FMul, Source(0), Source(1)), Source(2));
+                case "VMacF32":
+                case "VFmacF32":
+                {
+                    // VOP2 form has no explicit third source: the destination is the
+                    // running accumulator, read before this instruction overwrites it.
+                    var accumulator = sources.Count > 2 ? Source(2) : state.ReadVector(instruction.Destinations[0].Value);
+                    return Binary(ScalarOperation.FAdd, Binary(ScalarOperation.FMul, Source(0), Source(1)), accumulator);
+                }
                 default:
                     return _graph.Undefined(ScalarValueType.U32);
             }
+        }
+
+        // The f32 opcodes VectorResult models, the only ones whose VOP3 abs/neg/clamp/omod bits are float modifiers.
+        private static bool IsFloatModifierOpcode(string opcode) => opcode is
+            "VAddF32" or "VSubF32" or "VSubrevF32" or "VMulF32" or "VMinF32" or "VMaxF32" or "VTruncF32" or
+            "VMadF32" or "VFmaF32" or "VMadMkF32" or "VMadAkF32" or "VFmaMkF32" or "VFmaAkF32" or "VMacF32" or "VFmacF32";
+
+        // The 2-bit OMOD field: 0 none, 1 x2, 2 x4, 3 x0.5.
+        private ScalarValue ApplyOutputModifiers(ScalarValue value, Gen5Vop3Control? vop3)
+        {
+            if (vop3 is null || value.IsUndefined)
+            {
+                return value;
+            }
+
+            if (vop3.Clamp)
+            {
+                value = Binary(ScalarOperation.FMax, Binary(ScalarOperation.FMin, value, _graph.Constant(0x3F80_0000u)), _graph.Constant(0u));
+            }
+
+            return vop3.OutputModifier switch
+            {
+                1 => Binary(ScalarOperation.FMul, value, _graph.Constant(0x4000_0000u)),
+                2 => Binary(ScalarOperation.FMul, value, _graph.Constant(0x4080_0000u)),
+                3 => Binary(ScalarOperation.FMul, value, _graph.Constant(0x3F00_0000u)),
+                _ => value,
+            };
         }
 
         private ScalarValue ApplySdwaSource(Gen5SdwaControl? control, int sourceIndex, ScalarValue value)
