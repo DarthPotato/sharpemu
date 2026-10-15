@@ -167,6 +167,7 @@ public static partial class Gen5SpirvTranslator
         private readonly Dictionary<uint, uint> _scalarRegisterVariables = new();
         private readonly Dictionary<uint, uint> _vectorRegisterVariables = new();
         private uint _vectorRegisters;
+        private uint _upperVectorRegisters;
         private bool _needsDynamicVectorArray;
         private readonly Dictionary<uint, uint> _packedHalfRegisterVariables = [];
         private uint _scc;
@@ -8097,6 +8098,13 @@ public static partial class Gen5SpirvTranslator
                 var arrayType = _module.TypeArray(_uintType, VectorRegisterCount);
                 _vectorRegisters = Variable(arrayType, _module.ConstantNull(arrayType));
                 _module.AddName(_vectorRegisters, "vgpr");
+                // The upper lane half of a paired host thread owns its own bank; sharing one
+                // array let the upper pass clobber the registers of the lower half.
+                if (_pairedLanes)
+                {
+                    _upperVectorRegisters = Variable(arrayType, _module.ConstantNull(arrayType));
+                    _module.AddName(_upperVectorRegisters, "vgprUpperHalf");
+                }
             }
 
             _scc = Flag(false);
@@ -8331,7 +8339,7 @@ public static partial class Gen5SpirvTranslator
         private uint VectorPointer(uint register)
         {
             if (_vectorRegisters != 0)
-                return _module.AddInstruction(SpirvOp.AccessChain, _functionUintPointer, _vectorRegisters, UInt(register));
+                return _module.AddInstruction(SpirvOp.AccessChain, _functionUintPointer, CurrentVectorRegisterArray(), UInt(register));
 
             if (register >= VectorRegisterCount)
             {
@@ -8348,7 +8356,10 @@ public static partial class Gen5SpirvTranslator
         // undefined, and a mask costs nothing next to the surrounding load.
         private uint DynamicVectorPointer(uint registerIndex) =>
             _module.AddInstruction(SpirvOp.AccessChain, _functionUintPointer,
-                _vectorRegisters, BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1)));
+                CurrentVectorRegisterArray(), BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1)));
+
+        private uint CurrentVectorRegisterArray() =>
+            _pairedLanes && _laneHalf == 1 ? _upperVectorRegisters : _vectorRegisters;
 
         private uint LoadVDynamic(uint registerIndex) =>
             Load(_uintType, DynamicVectorPointer(registerIndex));
