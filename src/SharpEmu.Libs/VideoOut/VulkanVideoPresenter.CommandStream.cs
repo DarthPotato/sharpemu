@@ -473,9 +473,30 @@ internal static unsafe partial class VulkanVideoPresenter
             _bufferCache.NoteMemoryVisibilityPoint();
         }
 
-        public void NoteMemoryVisibilityPoint() => _bufferCache.NoteMemoryVisibilityPoint();
+        // The buffer cache belongs to the render thread, and the notes mark points in the stream: queued,
+        // they land after the stores and draws before them. Run at once, an older queued draw would
+        // consume the visibility state before the store it should have seen is applied.
+        public void NoteMemoryVisibilityPoint()
+        {
+            if (OnCommandThread)
+            {
+                _commandThread!.Post(() => _bufferCache.NoteMemoryVisibilityPoint());
+                return;
+            }
 
-        public void NoteCommandProcessorWrite(ulong address, ulong size) => _bufferCache.NoteCommandProcessorWrite(address, size);
+            _bufferCache.NoteMemoryVisibilityPoint();
+        }
+
+        public void NoteCommandProcessorWrite(ulong address, ulong size)
+        {
+            if (OnCommandThread)
+            {
+                _commandThread!.Post(() => _bufferCache.NoteCommandProcessorWrite(address, size));
+                return;
+            }
+
+            _bufferCache.NoteCommandProcessorWrite(address, size);
+        }
 
         public void Flush()
         {
