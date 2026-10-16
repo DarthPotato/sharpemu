@@ -74,9 +74,11 @@ public static partial class Gen5SpirvTranslator
                     // cross-subgroup bridge stays within that limit.
                     _exchange = context._lds;
                     _exchangeElementPointer = context._ldsElementPointer;
-                    _exchangeOffset = context._ldsDwordMask + 1 < LdsDwordCount
-                        ? context._ldsDwordMask + 1
-                        : LdsDwordCount - ExchangeTotalDwords;
+                    _exchangeOffset = context._ldsIsWorkgroup
+                        ? context._ldsZeroDword + 1
+                        : context._ldsDwordMask + 1 < LdsDwordCount
+                            ? context._ldsDwordMask + 1
+                            : LdsDwordCount - ExchangeTotalDwords;
                     return;
                 }
 

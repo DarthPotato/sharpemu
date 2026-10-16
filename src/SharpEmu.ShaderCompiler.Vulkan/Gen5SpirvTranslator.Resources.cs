@@ -1083,7 +1083,7 @@ public static partial class Gen5SpirvTranslator
                 {
                     var pointer = LdsPointer(offset, index * sizeof(uint));
                     if (store)
-                        Store(pointer, LoadV(control.SourceVectorRegister + index));
+                        StoreLds(pointer, LoadV(control.SourceVectorRegister + index));
                     else
                         StoreV(control.DestinationVectorRegister + index, Load(_uintType, pointer));
                 }

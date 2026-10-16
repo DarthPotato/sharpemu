@@ -183,6 +183,14 @@ public static partial class Gen5SpirvTranslator
         private uint _ldsElementPointer;
         private uint _lds64ElementPointer;
         private uint _ldsDwordMask;
+        // In-bounds condition of each workgroup LDS pointer that may point at the zero dword,
+        // so a store or atomic through it can be dropped when the guest address is out of range.
+        private readonly Dictionary<uint, uint> _ldsPointerInBounds = [];
+        private bool _ldsIsWorkgroup;
+        // Compute LDS layout (DeclareLds): guest dwords below _ldsGuestDwordLimit, then the
+        // translator's dword kept at zero, then the wave64 exchange when the shader uses one.
+        private uint _ldsGuestDwordLimit;
+        private uint _ldsZeroDword;
         private uint _scratch;
         private uint _scratchElementPointer;
         private uint _scratchDwordCount;
@@ -748,7 +756,20 @@ public static partial class Gen5SpirvTranslator
                 ? ComputeLdsGuestDwordCount()
                 : PrivateLdsDwordCount;
             _ldsDwordMask = dwordCount - 1;
+            _ldsIsWorkgroup = storageClass == SpirvStorageClass.Workgroup;
             var arrayDwordCount = _waveLowering.ReserveLdsDwords(dwordCount);
+            if (_ldsIsWorkgroup)
+            {
+                // The translator's dwords follow the guest's: one kept at zero, which guest
+                // accesses past the declared size resolve to (the hardware reads 0 there and
+                // drops writes), then the wave64 exchange. A shader declaring the full 32 KiB
+                // keeps the array at that size: the reserved dwords take its top, and guest
+                // addresses there count as out of range.
+                var reserved = 1 + _waveLowering.ReserveLdsDwords(0);
+                arrayDwordCount = Math.Min(dwordCount + reserved, LdsDwordCount);
+                _ldsZeroDword = arrayDwordCount - reserved;
+                _ldsGuestDwordLimit = Math.Min(dwordCount, _ldsZeroDword);
+            }
 
             var ldsArrayType = _module.TypeArray(_uintType, arrayDwordCount);
             var ldsPointer = _module.TypePointer(storageClass, ldsArrayType);
@@ -1227,6 +1248,14 @@ public static partial class Gen5SpirvTranslator
 
             Store(_programCounter, UInt(0));
             Store(_programActive, _module.ConstantBool(true));
+            if (_ldsIsWorkgroup)
+            {
+                // Every invocation zeroes the dword out-of-range LDS reads resolve to. Only zero
+                // is ever stored there, so each invocation sees zero without a barrier.
+                Store(
+                    _module.AddInstruction(SpirvOp.AccessChain, _ldsElementPointer, _lds, UInt(_ldsZeroDword)),
+                    UInt(0));
+            }
 
             if (_stage == Gen5SpirvStage.Vertex)
             {
@@ -2558,6 +2587,12 @@ public static partial class Gen5SpirvTranslator
                 UInt(offset + 3),
                 sizeBytes);
             var pointer = LdsPointer(baseAddress, offset);
+            if (_ldsPointerInBounds.TryGetValue(pointer, out var ldsInBounds))
+            {
+                // A counter past the allocation must not change the dword out-of-range reads see.
+                inBounds = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, inBounds, ldsInBounds);
+            }
+
             var destination = instruction.Destinations[0].Value;
             if (_pairedLanes)
             {
@@ -2669,23 +2704,50 @@ public static partial class Gen5SpirvTranslator
             var addressWithOffset = offsetBytes == 0
                 ? address
                 : IAdd(address, UInt(offsetBytes));
-            // Mask the dword index into the array bounds. LDS is a power-of-two
-            // dword count, so this is a no-op for in-range compute addresses but
-            // prevents out-of-bounds access when a graphics-stage scratch write
-            // uses an arbitrary computed byte address.
-            var index = BitwiseAnd(
-                ShiftRightLogical(addressWithOffset, UInt(2)),
-                UInt(_ldsDwordMask));
-            return _module.AddInstruction(
+            var dwordIndex = ShiftRightLogical(addressWithOffset, UInt(2));
+            if (!_ldsIsWorkgroup)
+            {
+                // Mask the dword index into the array bounds. The private LDS is a
+                // power-of-two dword count, so this prevents out-of-bounds access when a
+                // graphics-stage scratch write uses an arbitrary computed byte address.
+                return _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _ldsElementPointer,
+                    _lds,
+                    BitwiseAnd(dwordIndex, UInt(_ldsDwordMask)));
+            }
+
+            // Compute LDS follows the hardware: an address past the allocation reads 0 and
+            // drops writes. It must not wrap into the translator's dwords that follow the
+            // guest's (DeclareLds). Out-of-range accesses go to the dword that is always zero;
+            // StoreLds and the atomics skip writes through them.
+            var inBounds = _module.AddInstruction(
+                SpirvOp.ULessThan,
+                _boolType,
+                dwordIndex,
+                UInt(_ldsGuestDwordLimit));
+            var pointer = _module.AddInstruction(
                 SpirvOp.AccessChain,
                 _ldsElementPointer,
                 _lds,
-                index);
+                SelectU(inBounds, dwordIndex, UInt(_ldsZeroDword)));
+            _ldsPointerInBounds[pointer] = inBounds;
+            return pointer;
+        }
+
+        // The condition under which a write through an LDS pointer may happen: the lane is
+        // active and, for compute LDS, the guest address is inside the allocation.
+        private uint LdsWriteCondition(uint pointer)
+        {
+            var active = Load(_boolType, _exec);
+            return _ldsPointerInBounds.TryGetValue(pointer, out var inBounds)
+                ? _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, active, inBounds)
+                : active;
         }
 
         private void StoreLds(uint pointer, uint value)
         {
-            var active = Load(_boolType, _exec);
+            var active = LdsWriteCondition(pointer);
             // Inactive lanes must not read and write back another lane's shared value.
             EmitConditional(active, () => Store(pointer, value));
         }
@@ -2707,7 +2769,7 @@ public static partial class Gen5SpirvTranslator
                 var maskedPointer = LdsPointer(
                     GetRawSource(instruction, 0),
                     control.SingleOffsetBytes);
-                EmitExecConditional(() =>
+                EmitConditional(LdsWriteCondition(maskedPointer), () =>
                 {
                     var original = Load(_uintType, maskedPointer);
                     var updated = BitwiseOr(
@@ -2740,7 +2802,7 @@ public static partial class Gen5SpirvTranslator
 
                 var floatAddress = GetRawSource(instruction, 0);
                 var floatPointer = LdsPointer(floatAddress, control.SingleOffsetBytes);
-                EmitExecConditional(() =>
+                EmitConditional(LdsWriteCondition(floatPointer), () =>
                     EmitDataShareFloatAtomic(
                         floatPointer,
                         GetRawSource(instruction, 1),
@@ -2776,7 +2838,7 @@ public static partial class Gen5SpirvTranslator
 
             var address = GetRawSource(instruction, 0);
             var pointer = LdsPointer(address, control.SingleOffsetBytes);
-            EmitExecConditional(() =>
+            EmitConditional(LdsWriteCondition(pointer), () =>
             {
                 var original = EmitAtomic(
                     atomicOp,
