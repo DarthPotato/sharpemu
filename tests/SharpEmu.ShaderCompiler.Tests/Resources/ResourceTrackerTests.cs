@@ -146,6 +146,28 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
+    public void ReachabilityWalksStayLinearOnSharedSubgraphs()
+    {
+        // Every level uses the previous one twice: 2^60 paths, 61 nodes.
+        var value = ScalarValue.UserData(0);
+        for (var level = 0; level < 60; level++)
+        {
+            value = ScalarValue.MakeOperation(ScalarOperation.IAdd32, ScalarValueType.U32, value, value);
+        }
+
+        var hasRead = typeof(ResourceTracker).GetMethod(
+            "HasRuntimeRead", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static, [typeof(ScalarValue)])!;
+        var hasReadKind = typeof(ResourceTracker).GetMethod(
+            "HasRuntimeReadKind", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static, [typeof(ScalarValue), typeof(ScalarValueKind)])!;
+
+        var walk = System.Threading.Tasks.Task.Run(() => (
+            (bool)hasRead.Invoke(null, [value])!,
+            (bool)hasReadKind.Invoke(null, [value, ScalarValueKind.ScalarAddressWord])!));
+        Assert.True(walk.Wait(TimeSpan.FromSeconds(10)), "the reachability walk re-walked shared nodes");
+        Assert.Equal((false, false), walk.Result);
+    }
+
+    [Fact]
     public void SamplerWithDivergentBits_IsRejected()
     {
         var program = Program(

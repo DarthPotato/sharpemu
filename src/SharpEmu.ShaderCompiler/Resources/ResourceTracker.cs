@@ -694,43 +694,27 @@ public sealed partial class ResourceTracker
 
     private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind) => HasRuntimeReadKind(value, kind, []);
 
-    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind, HashSet<ScalarValue> visiting)
+    // Reachability: a node already explored cannot add a new answer, so the visited set is
+    // kept for the whole walk (removing it on return re-walks shared subgraphs exponentially).
+    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind, HashSet<ScalarValue> visited)
     {
-        if (!visiting.Add(value))
+        if (!visited.Add(value))
         {
             return false;
         }
 
-        try
-        {
-            return value.Kind == kind || value.Operands.Any(operand => HasRuntimeReadKind(operand, kind, visiting));
-        }
-        finally
-        {
-            visiting.Remove(value);
-        }
+        return value.Kind == kind || value.Operands.Any(operand => HasRuntimeReadKind(operand, kind, visited));
     }
 
-    private static bool HasRuntimeRead(ScalarValue value, HashSet<ScalarValue> visiting)
+    private static bool HasRuntimeRead(ScalarValue value, HashSet<ScalarValue> visited)
     {
-        if (!visiting.Add(value))
+        if (!visited.Add(value))
         {
             return false;
         }
 
-        try
-        {
-            if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord)
-            {
-                return true;
-            }
-
-            return value.Operands.Any(operand => HasRuntimeRead(operand, visiting));
-        }
-        finally
-        {
-            visiting.Remove(value);
-        }
+        return value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord ||
+            value.Operands.Any(operand => HasRuntimeRead(operand, visited));
     }
 
     // ---- dense tables ----
