@@ -114,7 +114,8 @@ internal sealed class ProgramPermutation
 // One decoded program with its resource plan and every permutation compiled from it.
 internal sealed class ProgramSourceEntry
 {
-    public required ShaderResourcePlan Plan { get; init; }
+    // Replaced once when an indirect image table proves too large to bind (see PreferRuntimeDescriptors).
+    public required ShaderResourcePlan Plan { get; set; }
     public required Gen5ShaderProgram Program { get; init; }
     public required bool HasBitwiseExclusiveOr { get; init; }
     public ConstantFill? ConstantFill { get; init; }
@@ -303,6 +304,18 @@ internal sealed class ShaderProgramCache
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
+            if (!materialized && materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded &&
+                PreferRuntimeDescriptors(source, options, entry))
+            {
+                // The table binds every image it can select, and this one selects more than a draw may bind. The
+                // shader reads its descriptors from its registers instead, so only the images it reaches are made.
+                materialized = _materializations is not null && captureIndirectImageFailure is null
+                    ? _materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
+                        out materializationFailure)
+                    : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
+                        captureIndirectImageFailure);
+            }
+
             if (!materialized)
             {
                 var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";
@@ -399,11 +412,9 @@ internal sealed class ShaderProgramCache
         ShaderResourcePlan plan;
         try
         {
-            plan = ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
-                fetch?.Loads.Select(load => load.Pc).ToHashSet(),
-                beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
-                // Graphics stages compile as wave32 (see the compile request); compute follows the dispatch.
-                waveSize: source.Stage == ShaderStage.Compute ? options.ComputeInfo?.WaveSize ?? 64u : 32u);
+            plan = ExtractPlan(source, options, program, fetch,
+                _host.RuntimeImageDescriptorsSupported ? RuntimeDescriptorMode.OnDemand : RuntimeDescriptorMode.Disabled,
+                dumpPlanning);
         }
         catch (ResourcePlanException exception)
         {
@@ -429,6 +440,49 @@ internal sealed class ShaderProgramCache
             EmbeddedFetch = fetch,
             VertexInputs = vertexInputs,
         };
+    }
+
+    private static ShaderResourcePlan ExtractPlan(ShaderSource source, StageCompileOptions options, Gen5ShaderProgram program,
+        EmbeddedVertexFetchPlan? fetch, RuntimeDescriptorMode runtimeDescriptors, bool dumpPlanning) =>
+        ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
+            fetch?.Loads.Select(load => load.Pc).ToHashSet(),
+            beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
+            // Graphics stages compile as wave32 (see the compile request); compute follows the dispatch.
+            waveSize: source.Stage == ShaderStage.Compute ? options.ComputeInfo?.WaveSize ?? 64u : 32u,
+            runtimeDescriptors: runtimeDescriptors);
+
+    // A material table or a bit-scan candidate set binds every image it can select, and its distinct images
+    // exceeded what a draw binds. Plans the program again so the accesses a host can serve at run time read
+    // their descriptors from the registers instead of binding candidates. Only a program that has such an
+    // access changes; the permutations compiled from the old plan belong to a layout no draw can use again.
+    private bool PreferRuntimeDescriptors(ShaderSource source, StageCompileOptions options, ProgramSourceEntry entry)
+    {
+        if (!_host.RuntimeImageDescriptorsSupported || entry.Plan.RuntimeDescriptors == RuntimeDescriptorMode.Preferred)
+        {
+            return false;
+        }
+
+        ShaderResourcePlan plan;
+        try
+        {
+            plan = ExtractPlan(source, options, entry.Program, entry.EmbeddedFetch, RuntimeDescriptorMode.Preferred, dumpPlanning: false);
+        }
+        catch (ResourcePlanException)
+        {
+            return false;
+        }
+
+        if (!plan.Info.UsesRuntimeDescriptors)
+        {
+            return false;
+        }
+
+        Console.Error.WriteLine(
+            $"[GPU][INFO] Shader reads its image descriptors at run time: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} " +
+            "(its descriptor table selects more images than a draw can bind).");
+        entry.Plan = plan;
+        entry.Permutations.Clear();
+        return true;
     }
 
     // One fixed-function input per fetched attribute; later loads of the same attribute alias the first.

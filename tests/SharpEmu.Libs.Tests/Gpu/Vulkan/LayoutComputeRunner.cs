@@ -33,7 +33,8 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         : ImageDescriptorBinding.ResourceClass(kind) == ImageResourceClass.Storage ? DescriptorType.StorageImage
         : DescriptorType.StorageBuffer;
 
-    public LayoutComputeRunner(ImageTestHarness harness, ShaderCompileRequest request, byte[] spirv)
+    // heapLayout, when the request reads runtime descriptors, is set 1 of the pipeline layout.
+    public LayoutComputeRunner(ImageTestHarness harness, ShaderCompileRequest request, byte[] spirv, DescriptorSetLayout heapLayout = default)
     {
         _harness = harness;
         _request = request;
@@ -59,13 +60,15 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         };
         Require(vk.CreateDescriptorSetLayout(device, &layoutInfo, null, out _setLayout), "vkCreateDescriptorSetLayout");
         var push = new PushConstantRange(ShaderStageFlags.ComputeBit, 0, PushData.ByteSize);
-        fixed (DescriptorSetLayout* layout = &_setLayout)
+        var setLayouts = stackalloc DescriptorSetLayout[2];
+        setLayouts[0] = _setLayout;
+        setLayouts[1] = heapLayout;
         {
             var pipelineLayoutInfo = new PipelineLayoutCreateInfo
             {
                 SType = StructureType.PipelineLayoutCreateInfo,
-                SetLayoutCount = 1,
-                PSetLayouts = layout,
+                SetLayoutCount = heapLayout.Handle != 0 ? 2u : 1u,
+                PSetLayouts = setLayouts,
                 PushConstantRangeCount = request.Bindings.UsesPushData ? 1u : 0u,
                 PPushConstantRanges = &push,
             };
@@ -182,7 +185,8 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         IReadOnlyDictionary<DescriptorBindingKind, DescriptorImageInfo[]>? boundImages = null,
         ulong shaderBase = 0,
         uint[]? dispatchThreadLimits = null,
-        uint[]? memoryOffsets = null)
+        uint[]? memoryOffsets = null,
+        DescriptorSet heapSet = default)
     {
         var vk = _harness.Vk;
         var device = _harness.Device.Device;
@@ -305,6 +309,10 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         VulkanSynchronization.PipelineBarrier(vk, command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, PipelineStageFlags.ComputeShaderBit, 0, 1, &barrier, 0, null, 0, null);
         vk.CmdBindPipeline(command, PipelineBindPoint.Compute, _pipeline);
         vk.CmdBindDescriptorSets(command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null);
+        if (heapSet.Handle != 0)
+        {
+            vk.CmdBindDescriptorSets(command, PipelineBindPoint.Compute, _pipelineLayout, RuntimeDescriptorTable.HeapDescriptorSet, 1, &heapSet, 0, null);
+        }
         if (layout.UsesPushData)
         {
             fixed (uint* pointer = pushData)
