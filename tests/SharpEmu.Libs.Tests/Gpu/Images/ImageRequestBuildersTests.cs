@@ -436,6 +436,16 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(ImageUsageFlags.DepthStencilAttachmentBit, request.View.Usage);
     }
 
+    // With both formats INVALID the DB has no surface: the depth state registers cannot ask for one.
+    [Fact]
+    public void DepthTarget_WithBothFormatsInvalidHasNoAttachmentWhateverTheDepthStateSays()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var words = RegisterWords.Depth(Base, 64, 64, GuestDepthFormat.Invalid, depthTest: true, depthWrite: true, depthClear: true);
+
+        Assert.Null(ImageRequestBuilders.DepthTarget(words, _vulkan.DeviceInfo));
+    }
+
     [Fact]
     public void DepthTarget_WithStencilSelectsACombinedFormat()
     {

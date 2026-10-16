@@ -91,6 +91,17 @@ public static partial class ImageRequestBuilders
         var hasStencil = depthWords.StencilFormat != GuestStencilFormat.Invalid;
         if (!copyMode)
         {
+            // With both formats INVALID the DB has no depth or stencil surface: depth and stencil
+            // tests and writes do not happen, whatever DB_DEPTH_CONTROL and the other fields say.
+            if (depthWords.DepthFormat == GuestDepthFormat.Invalid && !hasStencil)
+            {
+                if (Rendering.RenderTrace.Enabled)
+                {
+                    Rendering.RenderTrace.Write("DepthAttachmentRejected reason=invalid-formats");
+                }
+                return null;
+            }
+
             var depthActive = depthWords.DepthTestEnabled || depthWords.DepthWriteEnabled || depthWords.DepthBoundsEnabled || depthWords.DepthClearEnabled || depthWords.CopyDepthToColor;
             var stencilActive = hasStencil && (depthWords.StencilTestEnabled || depthWords.StencilClearEnabled || depthWords.CopyStencilToColor);
             if (!depthActive && !stencilActive)
