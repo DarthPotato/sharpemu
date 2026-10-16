@@ -134,7 +134,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 _commandStream.StopAccepting();
                 // The command stream thread ends after its slice; the rest drains here.
                 _commandThread?.Stop(() => RunCommandStreamSlices(long.MaxValue));
-                var outcome = _commandStream.DrainForShutdown(cancelBlockedOnNoProgress: true);
+                // The runtime may tear down guest memory while this drains; stop executing then.
+                var outcome = _commandStream.DrainForShutdown(
+                    cancelBlockedOnNoProgress: true,
+                    abandon: static () => GuestGpuMemoryHook.Current is null);
                 FlushBatchedGuestCommands();
                 Console.Error.WriteLine(
                     $"[LOADER][PERF] command_stream submissions={_commandStream.SubmissionsStarted} " +
