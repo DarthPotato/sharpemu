@@ -1556,7 +1556,8 @@ public static partial class Gen5ShaderTranslator
         out uint sizeDwords,
         out string error)
     {
-        var opcode = ((word >> 18) & 0x7F) | ((word & 1) << 7);
+        // GFX10 MUBUF has eight opcode bits at 18..25; bit zero belongs to OFFSET.
+        var opcode = (word >> 18) & 0xFF;
         name = opcode switch
         {
             0x00 => "BufferLoadFormatX",
