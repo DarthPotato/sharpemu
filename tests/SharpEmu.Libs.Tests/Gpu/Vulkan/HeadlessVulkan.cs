@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.Libs.Gpu.Buffers;
+using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Core.Native;
@@ -45,6 +46,29 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     public bool SupportsFragmentShaderBarycentric { get; private init; }
     public bool SupportsTessellationShader { get; private init; }
     public bool SupportsFillRectangle { get; private init; }
+
+    // The device was created with the descriptor indexing and null descriptor features the runtime
+    // descriptor heap needs (see RuntimeDescriptorHeap).
+    public bool SupportsRuntimeDescriptors { get; private init; }
+
+    public RuntimeDescriptorHeap.Limits RuntimeDescriptorLimits
+    {
+        get
+        {
+            var indexing = new PhysicalDeviceDescriptorIndexingProperties { SType = StructureType.PhysicalDeviceDescriptorIndexingProperties };
+            var properties2 = new PhysicalDeviceProperties2 { SType = StructureType.PhysicalDeviceProperties2, PNext = &indexing };
+            Vk.GetPhysicalDeviceProperties2(Physical, &properties2);
+            var limits = properties2.Properties.Limits;
+            return new RuntimeDescriptorHeap.Limits(
+                limits.MaxPerStageDescriptorSampledImages,
+                limits.MaxPerStageDescriptorSamplers,
+                indexing.MaxPerStageDescriptorUpdateAfterBindSampledImages,
+                indexing.MaxPerStageDescriptorUpdateAfterBindSamplers,
+                indexing.MaxDescriptorSetUpdateAfterBindSampledImages,
+                indexing.MaxDescriptorSetUpdateAfterBindSamplers,
+                indexing.MaxUpdateAfterBindDescriptorsInAllPools);
+        }
+    }
 
     private static readonly string[] RenderingExtensionNames =
     [
@@ -306,6 +330,24 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         }
         var barycentric = (bool)barycentricFeatures.FragmentShaderBarycentric;
 
+        const string robustness2Extension = "VK_EXT_robustness2";
+        var indexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures { SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures };
+        var robustness2Features = new PhysicalDeviceRobustness2FeaturesEXT
+        {
+            SType = StructureType.PhysicalDeviceRobustness2FeaturesExt,
+            PNext = &indexingFeatures,
+        };
+        var hasRobustness2 = HasDeviceExtensions(vk, physical, [robustness2Extension]);
+        var indexingQuery = new PhysicalDeviceFeatures2
+        {
+            SType = StructureType.PhysicalDeviceFeatures2,
+            PNext = hasRobustness2 ? &robustness2Features : &indexingFeatures,
+        };
+        vk.GetPhysicalDeviceFeatures2(physical, &indexingQuery);
+        var runtimeDescriptors = hasRobustness2 && robustness2Features.NullDescriptor && indexingFeatures.RuntimeDescriptorArray &&
+            indexingFeatures.ShaderSampledImageArrayNonUniformIndexing && indexingFeatures.DescriptorBindingSampledImageUpdateAfterBind &&
+            indexingFeatures.DescriptorBindingUpdateUnusedWhilePending && indexingFeatures.DescriptorBindingPartiallyBound;
+
         var vulkan13Features = new PhysicalDeviceVulkan13Features
         {
             SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -370,7 +412,29 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             barycentricFeatures.PNext = vulkan13Features.PNext;
             vulkan13Features.PNext = &barycentricFeatures;
         }
+        if (runtimeDescriptors)
+        {
+            indexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+            {
+                SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+                RuntimeDescriptorArray = true,
+                ShaderSampledImageArrayNonUniformIndexing = true,
+                DescriptorBindingSampledImageUpdateAfterBind = true,
+                DescriptorBindingUpdateUnusedWhilePending = true,
+                DescriptorBindingPartiallyBound = true,
+                PNext = timelineFeatures.PNext,
+            };
+            robustness2Features = new PhysicalDeviceRobustness2FeaturesEXT
+            {
+                SType = StructureType.PhysicalDeviceRobustness2FeaturesExt,
+                NullDescriptor = true,
+                PNext = &indexingFeatures,
+            };
+            timelineFeatures.PNext = &robustness2Features;
+        }
+
         var extensionNames = new List<string>();
+        if (runtimeDescriptors) extensionNames.Add(robustness2Extension);
         if (dynamicRendering) extensionNames.AddRange(RenderingExtensionNames);
         if (barycentric) extensionNames.Add(barycentricExtension);
         const string fillRectangleExtension = "VK_NV_fill_rectangle";
@@ -405,6 +469,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SupportsFragmentShaderBarycentric = barycentric,
             SupportsTessellationShader = enabledFeatures.TessellationShader,
             SupportsFillRectangle = fillRectangle,
+            SupportsRuntimeDescriptors = runtimeDescriptors,
         };
         if (validation)
         {

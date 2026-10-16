@@ -125,6 +125,11 @@ public sealed partial class GuestImageCache
             _surfaceMetadata.Remove(image.Description.Metadata.Range.Address);
         }
 
+        if (ViewsRetired is { } retired && image.Views.Count != 0)
+        {
+            retired([.. image.Views.Select(static cached => cached.View)]);
+        }
+
         RemoveFromIndex(imageIdentifier);
         if (_scheduler.Active)
         {

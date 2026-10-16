@@ -49,6 +49,8 @@ internal static unsafe partial class VulkanVideoPresenter
             public BufferView GlobalDataShare;
             public BufferView FlattenedTable;
             public BufferView ShaderData;
+            public BufferView RuntimeTable;
+            public BufferView RuntimeMisses;
         }
 
         private sealed class PreparedStageBindings(ShaderStageResources stage, ShaderProgramInfo program) : IPreparedBindings
@@ -67,7 +69,20 @@ internal static unsafe partial class VulkanVideoPresenter
 
             public uint[] ShaderData { get; set; } = [];
 
-            public TextureResource[] Textures => Descriptors.Images;
+            // The images a shader reads through the runtime descriptor heap, registered by the draws before it,
+            // with the table entry each belongs to. They are bound, transitioned and kept alive like the stage's
+            // own textures, but have no binding of their own: the shader reaches them by heap slot.
+            public List<TextureResource> RuntimeImages { get; } = [];
+
+            public List<RuntimeImageEntry<TextureResource>> RuntimeEntries { get; } = [];
+
+            private TextureResource[]? _textures;
+
+            // The stage's own textures, then the registered runtime ones once SealTextures has joined them.
+            public TextureResource[] Textures => _textures ?? Descriptors.Images;
+
+            public void SealTextures() =>
+                _textures = RuntimeImages.Count == 0 ? null : [.. Descriptors.Images, .. RuntimeImages];
         }
 
         private static ShaderStage StageOf(ShaderProgramInfo program) => program.Stage switch
@@ -153,7 +168,9 @@ internal static unsafe partial class VulkanVideoPresenter
         // Render-state discovery for one shader image; the view is acquired later with the draw.
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
-            ref var memo = ref ImageBindingMemoOf(program, index);
+            // A negative index has no slot in the program's memos (a registered runtime image): look it up afresh.
+            var unmemoized = default(ImageBindingMemo);
+            ref var memo = ref (index >= 0 ? ref ImageBindingMemoOf(program, index) : ref unmemoized);
             if (words.Length < 4)
             {
                 throw SubmissionScheduler.Fatal($"An image descriptor is too short: image={index} words={words.Length} hash=0x{program.Hash:X16}.");
@@ -411,6 +428,11 @@ internal static unsafe partial class VulkanVideoPresenter
             FindDeviceAddressBuffers(prepared);
             FindBuffers(prepared);
             ValidateDrawImageTypes(prepared);
+            if (layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
+            {
+                PrepareRuntimeDescriptors(prepared);
+            }
+
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {
                 RenderTrace.Write(
@@ -560,6 +582,12 @@ internal static unsafe partial class VulkanVideoPresenter
             BindBuffers(stage);
             ObtainDeviceAddressRanges(stage);
             BindImages(stage);
+            if (stage.Layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
+            {
+                BindRuntimeDescriptors(stage);
+            }
+
+            stage.SealTextures();
             _preparedTextures.Add(stage.Textures);
         }
 
@@ -931,6 +959,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.FragmentShaderBit;
             TextureResource[] textures = textureCount == 0 ? [] : new TextureResource[textureCount];
             var textureIndex = 0;
+            var runtimeHeapStages = false;
             fixed (DescriptorBufferInfo* bufferInfoPointer = bufferInfos)
             fixed (DescriptorImageInfo* imageInfoPointer = imageInfos)
             {
@@ -951,6 +980,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
 
                     RecordStageTextureTransitions(stage.Textures);
+                    if (stage.RuntimeImages.Count != 0 || stage.Layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
+                    {
+                        CommitRuntimeDescriptors(stage);
+                        runtimeHeapStages = true;
+                    }
+
                     foreach (var texture in stage.Textures)
                     {
                         if (texture.IsHostMovie && texture.NeedsUpload)
@@ -1022,11 +1057,15 @@ internal static unsafe partial class VulkanVideoPresenter
                                 case DescriptorBindingKind.FlattenedResourceTable:
                                 case DescriptorBindingKind.ShaderData:
                                 case DescriptorBindingKind.GlobalDataShare:
+                                case DescriptorBindingKind.RuntimeDescriptorTable:
+                                case DescriptorBindingKind.RuntimeDescriptorMisses:
                                 {
                                     var view = binding.Kind switch
                                     {
                                         DescriptorBindingKind.FlattenedResourceTable => descriptors.FlattenedTable,
                                         DescriptorBindingKind.ShaderData => descriptors.ShaderData,
+                                        DescriptorBindingKind.RuntimeDescriptorTable => descriptors.RuntimeTable,
+                                        DescriptorBindingKind.RuntimeDescriptorMisses => descriptors.RuntimeMisses,
                                         _ => descriptors.GlobalDataShare,
                                     };
                                     if (view.Buffer.Handle == 0)
@@ -1123,6 +1162,15 @@ internal static unsafe partial class VulkanVideoPresenter
                             ShaderCacheCounters.CountHeapSet();
                         }
                     }
+                }
+
+                if (runtimeHeapStages)
+                {
+                    // The persistent heap is set 1 of every layout that has a stage reading descriptors at run time.
+                    // It is bound on every commit: a pipeline with another layout in between does not keep it.
+                    var heapSet = (_runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal(
+                        "A stage reads its image descriptors at run time without a runtime descriptor heap.")).Set;
+                    _vk.CmdBindDescriptorSets(command, bindPoint, entry.Layout, RuntimeDescriptorTable.HeapDescriptorSet, 1, &heapSet, 0, null);
                 }
             }
 

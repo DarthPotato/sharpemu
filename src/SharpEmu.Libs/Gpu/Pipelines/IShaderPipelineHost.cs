@@ -34,6 +34,11 @@ internal interface IShaderPipelineHost
 {
     uint MaxPushDescriptors { get; }
 
+    // The host serves shaders that read their image and sampler descriptors at run time
+    // (RuntimeDescriptorTable): it keeps the persistent descriptor heap and fills the lookup table.
+    // Plans for a host without it keep the null fallback for a descriptor they cannot bind ahead of time.
+    bool RuntimeImageDescriptorsSupported => false;
+
     bool ComputeWave64Supported { get; }
 
     // True when a 64-invocation wave64 compute workgroup runs as one 64-lane host subgroup.

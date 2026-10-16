@@ -600,12 +600,25 @@ internal static unsafe partial class VulkanVideoPresenter
                 SType = StructureType.PhysicalDeviceSubgroupProperties,
                 PNext = &subgroupSizeControl,
             };
+            var descriptorIndexingProperties = new PhysicalDeviceDescriptorIndexingProperties
+            {
+                SType = StructureType.PhysicalDeviceDescriptorIndexingProperties,
+                PNext = &subgroup,
+            };
             var properties2 = new PhysicalDeviceProperties2
             {
                 SType = StructureType.PhysicalDeviceProperties2,
-                PNext = &subgroup,
+                PNext = &descriptorIndexingProperties,
             };
             _vk.GetPhysicalDeviceProperties2(_physicalDevice, &properties2);
+            _runtimeDescriptorLimits = new RuntimeDescriptorHeap.Limits(
+                properties.Limits.MaxPerStageDescriptorSampledImages,
+                properties.Limits.MaxPerStageDescriptorSamplers,
+                descriptorIndexingProperties.MaxPerStageDescriptorUpdateAfterBindSampledImages,
+                descriptorIndexingProperties.MaxPerStageDescriptorUpdateAfterBindSamplers,
+                descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindSampledImages,
+                descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindSamplers,
+                descriptorIndexingProperties.MaxUpdateAfterBindDescriptorsInAllPools);
             _supportsShaderSignedZeroInfNanPreserveFloat32 =
                 floatControls.ShaderSignedZeroInfNanPreserveFloat32;
             SetNativeSubgroupCapabilities(subgroup.SubgroupSize, subgroup.SupportedStages);
@@ -953,10 +966,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
                 PNext = &addressFeatures,
             };
+            var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+            {
+                SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+                PNext = &atomicInt64Features,
+            };
             var featuresQuery = new PhysicalDeviceFeatures2
             {
                 SType = StructureType.PhysicalDeviceFeatures2,
-                PNext = &atomicInt64Features,
+                PNext = &descriptorIndexingFeatures,
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
@@ -967,6 +985,24 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
+            // Shaders that read their image descriptors at run time index a persistent, partially bound,
+            // update-after-bind heap by a value that differs between invocations, and a missed lookup
+            // reads its null image. Without these the host plans such accesses as it always did (the
+            // null fallback); the plan is only made when the host reports support.
+            _supportsRuntimeDescriptors = descriptorIndexingFeatures.RuntimeDescriptorArray &&
+                descriptorIndexingFeatures.ShaderSampledImageArrayNonUniformIndexing &&
+                descriptorIndexingFeatures.DescriptorBindingSampledImageUpdateAfterBind &&
+                descriptorIndexingFeatures.DescriptorBindingUpdateUnusedWhilePending &&
+                descriptorIndexingFeatures.DescriptorBindingPartiallyBound &&
+                supportsNullDescriptor &&
+                RuntimeDescriptorHeap.Capacities(_runtimeDescriptorLimits).Images != 0;
+            if (!_supportsRuntimeDescriptors)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU lacks descriptor indexing (runtimeDescriptorArray, non-uniform sampled image indexing, " +
+                    "partially bound update-after-bind sampled images) or robustness2 nullDescriptor: image descriptors " +
+                    "a shader reads at run time fall back to the null texture.");
+            }
             _canRequireComputeSubgroup32 &= vulkan13Features.SubgroupSizeControl;
             _canRequireComputeSubgroup64 &= vulkan13Features.SubgroupSizeControl;
             SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
@@ -1117,6 +1153,21 @@ internal static unsafe partial class VulkanVideoPresenter
                     PNext = &timelineSemaphoreFeatures,
                 };
                 void* renderingChain = &addressFeatures;
+                if (_supportsRuntimeDescriptors)
+                {
+                    descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+                    {
+                        SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+                        RuntimeDescriptorArray = true,
+                        ShaderSampledImageArrayNonUniformIndexing = true,
+                        DescriptorBindingSampledImageUpdateAfterBind = true,
+                        DescriptorBindingUpdateUnusedWhilePending = true,
+                        DescriptorBindingPartiallyBound = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &descriptorIndexingFeatures;
+                }
+
                 if (supportsSharedInt64Atomics)
                 {
                     atomicInt64Features = new PhysicalDeviceShaderAtomicInt64Features
@@ -1242,6 +1293,10 @@ internal static unsafe partial class VulkanVideoPresenter
             CreateBufferCache();
             CreateImageCache();
             _descriptorHeap = new DescriptorHeap(_deviceInfo, _scheduler);
+            if (_supportsRuntimeDescriptors)
+            {
+                CreateRuntimeDescriptorHeap();
+            }
             CreateCommandStream();
             LoadDebugUtilsCommands();
             if (!_vk.TryGetDeviceExtension(_instance, _device, out _swapchainApi))

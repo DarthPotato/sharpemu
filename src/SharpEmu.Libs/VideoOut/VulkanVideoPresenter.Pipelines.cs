@@ -68,6 +68,23 @@ internal static unsafe partial class VulkanVideoPresenter
 
         uint IShaderPipelineHost.MaxPushDescriptors => _maxPushDescriptors;
 
+        bool IShaderPipelineHost.RuntimeImageDescriptorsSupported => _supportsRuntimeDescriptors;
+
+        private bool _supportsRuntimeDescriptors;
+        private RuntimeDescriptorHeap.Limits _runtimeDescriptorLimits;
+        private RuntimeDescriptorHeap? _runtimeDescriptorHeap;
+
+        private static bool UsesRuntimeHeap(ShaderProgramInfo program) =>
+            program.Bindings?.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null;
+
+        private void CreateRuntimeDescriptorHeap()
+        {
+            var heap = new RuntimeDescriptorHeap(_deviceInfo, _scheduler, _runtimeDescriptorLimits);
+            heap.SetDefaultSampler(_samplerStore.GetSampler(new SamplerDescriptorWords(stackalloc uint[4]), integerView: false));
+            _imageCache.ViewsRetired = heap.InvalidateViews;
+            _runtimeDescriptorHeap = heap;
+        }
+
         // Wave64 compute runs natively when the device's subgroup is that wide; smaller devices emulate it.
         bool IShaderPipelineHost.ComputeWave64SubgroupNative =>
             Volatile.Read(ref _nativeSubgroupSize) >= 64 && (_canRequireComputeSubgroup64 || Volatile.Read(ref _nativeSubgroupSize) == 64);
@@ -580,14 +597,24 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private PipelineLayout CreatePipelineLayout(DescriptorSetLayout setLayout, ShaderStageFlags pushStages)
+        private PipelineLayout CreatePipelineLayout(DescriptorSetLayout setLayout, ShaderStageFlags pushStages, bool runtimeHeap = false)
         {
             var pushConstants = new PushConstantRange { StageFlags = pushStages, Offset = 0, Size = PushConstantBytes };
+            // Set 0 holds the stage's own bindings; set 1, when a stage reads its image descriptors at run
+            // time, is the persistent heap those descriptors are looked up in.
+            var setLayouts = stackalloc DescriptorSetLayout[2];
+            setLayouts[0] = setLayout;
+            if (runtimeHeap)
+            {
+                setLayouts[1] = (_runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal(
+                    "A shader reads its image descriptors at run time, but this device cannot serve them.")).Layout;
+            }
+
             var create = new PipelineLayoutCreateInfo
             {
                 SType = StructureType.PipelineLayoutCreateInfo,
-                SetLayoutCount = 1,
-                PSetLayouts = &setLayout,
+                SetLayoutCount = runtimeHeap ? 2u : 1u,
+                PSetLayouts = setLayouts,
                 PushConstantRangeCount = 1,
                 PPushConstantRanges = &pushConstants,
             };
@@ -624,7 +651,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SetLayout = setLayout,
                 Demand = demand,
-                Layout = CreatePipelineLayout(setLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit),
+                Layout = CreatePipelineLayout(setLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
+                    UsesRuntimeHeap(description.VertexStage) || (description.PixelStage is { } runtimePixel && UsesRuntimeHeap(runtimePixel))),
                 UsesPushDescriptors = usesPushDescriptors,
                 Description = description,
                 ProfileVertexHash = description.VertexStage.Hash,
@@ -999,7 +1027,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit);
+            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, UsesRuntimeHeap(description.Stage));
             var computeModule = new ShaderModule(description.Program.Module);
             if (computeModule.Handle == 0)
             {
@@ -1219,7 +1247,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit);
+            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, UsesRuntimeHeap(description.Stage));
             var computeModule = new ShaderModule(description.Program.Module);
             if (computeModule.Handle == 0)
             {

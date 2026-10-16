@@ -57,6 +57,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     public ulong TotalUsedMemory => _totalUsedMemory;
 
+    // Called with the views of an image that leaves the cache, before the image is freed. A heap that
+    // holds descriptors of those views drops them; the views stay valid until the GPU work that used
+    // them completes.
+    public Action<IReadOnlyList<ImageView>>? ViewsRetired { get; set; }
+
     public int ImageCount => _slots.Count;
 
     // Finishes GPU work, removes every image from the index and its watches, then frees the images.
