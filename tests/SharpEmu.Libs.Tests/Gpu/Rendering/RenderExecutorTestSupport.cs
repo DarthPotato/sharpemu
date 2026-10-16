@@ -439,10 +439,20 @@ internal sealed class InputsCheckingPrefetch(IRenderHost host) : IProgramPrefetc
 
     public int Checks { get; private set; }
 
+    // A targetless draw whose pixel stage only stores to memory resolves its programs with the pixel
+    // stage active, which the registers alone do not say; a prefetch ahead of it resolves the draw
+    // without a pixel stage, and the draw then takes no prefetched result.
+    public bool AllowsStorageOnlyPixelStage { get; set; }
+
     public bool TryTakeGraphics(RegisterBanks banks, in GraphicsProgramInputs inputs, out GraphicsPrograms programs)
     {
         Checks++;
         var expected = RenderExecutor.ProgramInputsOf(banks, host.FormatSupport, host.Fatal);
+        if (AllowsStorageOnlyPixelStage && inputs.PixelActive && !expected.PixelActive)
+        {
+            expected.PixelActive = true;
+        }
+
         if (!expected.Equals(inputs))
         {
             Mismatches.Add(

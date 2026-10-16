@@ -69,6 +69,16 @@ public sealed partial class RenderExecutor
             return true;
         }
 
+        if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive &&
+            PixelStageWritesMemory(banks, ref state))
+        {
+            // A pixel shader can be a rasterized producer for a later visibility or culling
+            // pass. With no attachment and no export it has no framebuffer output, but its
+            // stores are observable and the hardware runs it for every covered pixel.
+            TraceDrawDisposition(banks, in draw, "pixel-stores-only");
+            return true;
+        }
+
         if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive)
         {
             TraceDrawDisposition(banks, in draw, "no-framebuffer");
@@ -98,6 +108,28 @@ public sealed partial class RenderExecutor
         ResolveShaderPrograms(banks, ref state);
         var stage = state.Programs.VertexInput.Stage;
         return stage.Program is { } program && (WritesStorageImage(program) || HasBufferWrites(stage));
+    }
+
+    // Whether the bound pixel stage stores to a buffer, a storage image or a device address. On
+    // true the pixel stage is active for the draw; on false the state is left as it was.
+    private bool PixelStageWritesMemory(RegisterBanks banks, ref DrawState state)
+    {
+        if (banks.Shader.Pixel.Address == 0)
+        {
+            return false;
+        }
+
+        state.PixelActive = true;
+        ResolveShaderPrograms(banks, ref state);
+        var stage = state.Programs.PixelInput.Stage;
+        if (state.Programs.Available && stage.Program is { } program &&
+            (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage)))
+        {
+            return true;
+        }
+
+        state.PixelActive = false;
+        return false;
     }
 
     // Color control mode 3 resolves slot 0 into slot 1 instead of drawing; true consumes the draw.
