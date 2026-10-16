@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
+using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Vulkan;
@@ -278,6 +279,8 @@ public sealed partial class RenderExecutor
 
         if (metadataAddress != 0 && _host.IsHtile(metadataAddress) && _host.MarkHtileRewritten(metadataAddress))
         {
+            SyncCostProbe.Add(SyncCostProbe.HtileMarked, 1);
+            SyncCostProbe.MaybeReport();
             if (RenderTrace.Enabled && RenderTrace.MetadataClear())
             {
                 RenderTrace.Write(

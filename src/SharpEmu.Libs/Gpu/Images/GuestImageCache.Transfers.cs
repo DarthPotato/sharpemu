@@ -284,6 +284,9 @@ public sealed unsafe partial class GuestImageCache
     // Writes the stencil aspect back to its guest plane once the current tick completes.
     private void WriteBackStencilPlane(CachedImage depth, GuestSpan plane)
     {
+        SyncCostProbe.Add(SyncCostProbe.StencilWb, 1);
+        SyncCostProbe.Add(SyncCostProbe.StencilWbBytes, (long)plane.Size);
+        SyncCostProbe.MaybeReport();
         var info = StencilPlaneLayout(depth, plane, "write-back");
         var download = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
         if (!download.TryMap(plane.Size, out var offset, 4))
@@ -383,12 +386,19 @@ public sealed unsafe partial class GuestImageCache
         }
 
         _lock.Exit();
+        var waitStart = SyncCostProbe.Begin();
         try
         {
             _scheduler.Wait(tick);
             _scheduler.WaitForPriorityOperations(tick);
         }
-        finally { _lock.Enter(); }
+        finally
+        {
+            SyncCostProbe.AddElapsed(SyncCostProbe.AwaitTicks, waitStart);
+            SyncCostProbe.Add(SyncCostProbe.AwaitWaits, 1);
+            SyncCostProbe.MaybeReport();
+            _lock.Enter();
+        }
     }
 
     private void UploadStencilPlane(CachedImage association, GpuBuffer source, ulong sourceOffset)

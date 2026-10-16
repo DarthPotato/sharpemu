@@ -359,6 +359,17 @@ public sealed partial class GuestImageCache
     // whose every tile says so is cleared; any other slice keeps the depth in memory.
     private void ResolveRewrittenHtile(ulong address)
     {
+        ResolveRewrittenHtileCore(address, out var start);
+        if (start != 0)
+        {
+            SyncCostProbe.AddElapsed(SyncCostProbe.HtileResolveTicks, start);
+            SyncCostProbe.MaybeReport();
+        }
+    }
+
+    private void ResolveRewrittenHtileCore(ulong address, out long start)
+    {
+        start = 0;
         ulong size;
         uint layers;
         using (var held = _lock.Hold())
@@ -369,6 +380,8 @@ public sealed partial class GuestImageCache
             }
 
             found.RewrittenByGpu = false;
+            start = SyncCostProbe.Begin();
+            SyncCostProbe.Add(SyncCostProbe.HtileResolves, 1);
             size = found.Size;
             layers = found.Layers;
         }
@@ -381,7 +394,10 @@ public sealed partial class GuestImageCache
         // Reading waits for the dispatch; it must not run under the region lock.
         if (_bufferCache.HasGpuDirtyBytes(address, size))
         {
+            var readStart = SyncCostProbe.Begin();
             _bufferCache.ReadMemory(address, size, isWrite: false);
+            SyncCostProbe.AddElapsed(SyncCostProbe.HtileReadTicks, readStart);
+            SyncCostProbe.Add(SyncCostProbe.HtileReads, 1);
         }
 
         var sliceSize = size / layers;
