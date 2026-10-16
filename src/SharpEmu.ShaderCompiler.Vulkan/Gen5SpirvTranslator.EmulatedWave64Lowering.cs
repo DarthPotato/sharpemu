@@ -127,7 +127,12 @@ public static partial class Gen5SpirvTranslator
 
             public void BeginBlock()
             {
-                _synchronizeSharedMemory = HalfMaskPlan() is null;
+                // One guest wave can span two host subgroups. Keep its shared-memory phases ordered.
+                // The half-mask plan's barriers only order its own mask exchanges, not the program's
+                // LDS traffic: with phase ordering off under the plan, UE's FFT bloom (wave64, 512
+                // threads, LDS butterflies) read half-written rows and blurred the whole post chain
+                // into a flat haze.
+                _synchronizeSharedMemory = true;
                 _sharedMemoryPhase = SharedMemoryPhase.None;
             }
 
