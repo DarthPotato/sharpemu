@@ -361,6 +361,7 @@ public sealed partial class ResourceTracker
         {
             var current = _bufferCandidateTables[existing];
             if (!_graph.Equivalent(current.SrtHandle, table.SrtHandle) ||
+                current.BaseOffset != table.BaseOffset ||
                 !_graph.Equivalent(current.OffsetExpression, table.OffsetExpression))
             {
                 continue;
