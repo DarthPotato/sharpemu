@@ -163,6 +163,17 @@ public sealed partial class DirectExecutionBackend
 			LastError = $"Import dispatch index out of range: {importIndex}";
 			return 18446744071562199042uL;
 		}
+		// Once the host is shutting down, a guest thread still running reaches no more HLE: the
+		// services behind the imports are being torn down, and a title that sees them fail (a null
+		// command buffer from the GPU library, say) crashes the process on its way out. This runs
+		// before the leaf fast paths, which would otherwise still call into those services.
+		// ActiveForcedGuestExit includes the global request on this backend, so testing its
+		// negation here would prevent every shutdown redirect.
+		if (_forcedGuestExit && TryEndGuestSliceForShutdown(argPackPtr))
+		{
+			cpuContext[CpuRegister.Rax] = 1uL;
+			return 1uL;
+		}
 		ImportStubEntry importStubEntry = _importEntries[importIndex];
 		using var registerPacketImport = SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.MeasureImport(importStubEntry.Nid);
 		if (_perfHleHistogram)
@@ -344,14 +355,6 @@ public sealed partial class DirectExecutionBackend
 			}
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] bootstrap_call#{num}: op=0x{value:X16} sym_ptr=0x{value2:X16} sym='{symbolText}' out_ptr=0x{num3:X16} ret=0x{num7:X16}");
-		}
-		// Once the host is shutting down, a guest thread still running reaches no more HLE: the
-		// services behind the imports are being torn down, and a title that sees them fail (a null
-		// command buffer from the GPU library, say) crashes the process on its way out.
-		if (_forcedGuestExit && !ActiveForcedGuestExit && TryEndGuestSliceForShutdown(argPackPtr))
-		{
-			cpuContext[CpuRegister.Rax] = 1uL;
-			return 1uL;
 		}
 		if (!isGuestWorker &&
 			!ActiveForcedGuestExit &&
