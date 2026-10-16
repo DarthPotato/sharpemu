@@ -119,6 +119,16 @@ public readonly record struct Gen5ColorComponentMapping
     }
 }
 
+// SPI_SHADER_COL_FORMAT selects the representation carried by a compressed EXP.
+public enum Gen5PixelExportFormat : byte
+{
+    Float16 = 4,
+    Unorm16 = 5,
+    Snorm16 = 6,
+    Uint16 = 7,
+    Sint16 = 8,
+}
+
 public readonly record struct Gen5PixelOutputBinding(
     uint GuestSlot,
     uint HostLocation,
@@ -152,6 +162,9 @@ public readonly record struct Gen5PixelOutputBinding(
     // The fragment output index: 1 is the second source of dual-source blending, which
     // shares its location with the first and is not a render target.
     public uint Index { get; init; }
+
+    // How a compressed export of this target packs its halves.
+    public Gen5PixelExportFormat ExportFormat { get; init; } = Gen5PixelExportFormat.Float16;
 
     // The slot receives the object ID plus the primitive ID instead of an export.
     public bool ObjectPrimitiveId { get; init; }

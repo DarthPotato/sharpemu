@@ -250,7 +250,8 @@ public static partial class Gen5SpirvTranslator
             uint Type,
             Gen5PixelOutputKind Kind,
             Gen5ColorComponentMapping ComponentMapping,
-            uint DualSourceAlphaVariable = 0);
+            uint DualSourceAlphaVariable = 0,
+            Gen5PixelExportFormat ExportFormat = Gen5PixelExportFormat.Float16);
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error)
         {
@@ -1081,7 +1082,8 @@ public static partial class Gen5SpirvTranslator
                         outputType,
                         binding.Kind,
                         binding.ComponentMapping,
-                        alphaVariable);
+                        alphaVariable,
+                        binding.ExportFormat);
                     _pixelOutputs.Add(binding.ExportTarget, output);
                     _interfaces.Add(variable);
                     if (binding.ObjectPrimitiveId)
@@ -7003,21 +7005,7 @@ public static partial class Gen5SpirvTranslator
 
                     if (export.Compressed)
                     {
-                        var value = LoadCompressedExportComponent(
-                            instruction,
-                            component);
-                        values[component] = output.Kind switch
-                        {
-                            Gen5PixelOutputKind.Uint => _module.AddInstruction(
-                                SpirvOp.ConvertFToU,
-                                _uintType,
-                                value),
-                            Gen5PixelOutputKind.Sint => _module.AddInstruction(
-                                SpirvOp.ConvertFToS,
-                                _intType,
-                                value),
-                            _ => value,
-                        };
+                        values[component] = LoadPixelCompressedExportComponent(instruction, component, output);
                         continue;
                     }
 
@@ -7871,6 +7859,55 @@ public static partial class Gen5SpirvTranslator
                        System.Globalization.CultureInfo.InvariantCulture,
                        out var address) &&
                    _request.Program.Address == address;
+        }
+
+        // A compressed pixel export carries two 16-bit values per register, low half first.
+        // SPI_SHADER_COL_FORMAT says whether they are half floats, normalized or integers; the
+        // result is converted to the target's kind.
+        private uint LoadPixelCompressedExportComponent(
+            Gen5ShaderInstruction instruction, int component, SpirvPixelOutput output)
+        {
+            if (output.ExportFormat is Gen5PixelExportFormat.Uint16 or Gen5PixelExportFormat.Sint16)
+            {
+                var signed = output.ExportFormat == Gen5PixelExportFormat.Sint16;
+                var packed = LoadV(instruction.Sources[component >> 1].Value);
+                var value = _module.AddInstruction(
+                    signed ? SpirvOp.BitFieldSExtract : SpirvOp.BitFieldUExtract,
+                    signed ? _intType : _uintType,
+                    signed ? Bitcast(_intType, packed) : packed,
+                    UInt((uint)(component & 1) * 16),
+                    UInt(16));
+                return output.Kind switch
+                {
+                    Gen5PixelOutputKind.Uint => signed ? Bitcast(_uintType, value) : value,
+                    Gen5PixelOutputKind.Sint => signed ? value : Bitcast(_intType, value),
+                    _ => _module.AddInstruction(
+                        signed ? SpirvOp.ConvertSToF : SpirvOp.ConvertUToF, _floatType, value),
+                };
+            }
+
+            uint decoded;
+            if (output.ExportFormat is Gen5PixelExportFormat.Unorm16 or Gen5PixelExportFormat.Snorm16)
+            {
+                // GLSL.std.450 UnpackUnorm2x16 = 61, UnpackSnorm2x16 = 60.
+                var unpacked = Ext(
+                    output.ExportFormat == Gen5PixelExportFormat.Unorm16 ? 61u : 60u,
+                    _vec2Type,
+                    LoadV(instruction.Sources[component >> 1].Value));
+                decoded = _module.AddInstruction(
+                    SpirvOp.CompositeExtract, _floatType, unpacked, (uint)(component & 1));
+            }
+            else
+            {
+                decoded = LoadCompressedExportComponent(instruction, component);
+            }
+
+            return output.Kind switch
+            {
+                Gen5PixelOutputKind.Uint => _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, decoded),
+                Gen5PixelOutputKind.Sint => _module.AddInstruction(SpirvOp.ConvertFToS, _intType, decoded),
+                _ => decoded,
+            };
         }
 
         private uint LoadCompressedExportComponent(
