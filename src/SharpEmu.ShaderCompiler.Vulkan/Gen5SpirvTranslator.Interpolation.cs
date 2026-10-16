@@ -219,10 +219,13 @@ public static partial class Gen5SpirvTranslator
             vgpr++;
         }
 
-        // The perspective barycentrics a smooth slot sharing a per-vertex input is rebuilt with.
+        // The barycentrics a smooth slot sharing a per-vertex input is rebuilt with: the enabled
+        // perspective ones, or the no-perspective ones when those are the only modes enabled.
         private void DeclarePerspectiveBarycentric()
         {
-            foreach (var bit in new[] { 0, 1, 2 })
+            var modes = _pixelInputEnable & _pixelInputAddress & 0x7Fu;
+            var linear = (modes & 0x70u) != 0 && (modes & 0x7u) == 0;
+            foreach (var bit in linear ? new[] { 4, 5, 6 } : new[] { 0, 1, 2 })
             {
                 if (_barycentricInputs.TryGetValue(bit, out var existing))
                 {
@@ -233,7 +236,8 @@ public static partial class Gen5SpirvTranslator
 
             _perspectiveBarycentric = _module.AddGlobalVariable(
                 _module.TypePointer(SpirvStorageClass.Input, _vec3Type), SpirvStorageClass.Input);
-            _module.AddDecoration(_perspectiveBarycentric, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.BaryCoordKhr);
+            _module.AddDecoration(_perspectiveBarycentric, SpirvDecoration.BuiltIn,
+                (uint)(linear ? SpirvBuiltIn.BaryCoordNoPerspKhr : SpirvBuiltIn.BaryCoordKhr));
             _interfaces.Add(_perspectiveBarycentric);
         }
 
@@ -252,7 +256,12 @@ public static partial class Gen5SpirvTranslator
             var value = LoadVertex(0);
             if (!flat)
             {
-                var barycentric = Load(_vec3Type, _perspectiveBarycentric);
+                // With one mode enabled the slot is rebuilt with that mode's own coordinates
+                // (sample, center or centroid), as the hardware's I/J registers hold.
+                var modes = _pixelInputEnable & _pixelInputAddress & 0x7Fu;
+                var bit = modes switch { 1u => 0, 2u => 1, 4u => 2, 16u => 4, 32u => 5, 64u => 6, _ => -1 };
+                var barycentric = bit >= 0 ? LoadBarycentricCoordinates(bit, _perspectiveBarycentric)
+                    : Load(_vec3Type, _perspectiveBarycentric);
                 value = _module.AddInstruction(SpirvOp.FMul, _floatType, value,
                     _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, barycentric, 0));
                 for (uint vertex = 1; vertex < 3; vertex++)

@@ -229,6 +229,42 @@ public sealed class Gen5InterpolationParameterTests
     }
 
     [Theory]
+    [InlineData(0x1u, false)]
+    [InlineData(0x2u, false)]
+    [InlineData(0x4u, false)]
+    [InlineData(0x10u, true)]
+    [InlineData(0x20u, true)]
+    [InlineData(0x40u, true)]
+    public void SmoothSlotSharingAPerVertexParameter_UsesTheEnabledBarycentricMode(uint mode, bool noPerspective)
+    {
+        var move = new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Vintrp, "VInterpMovF32",
+            [1], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(4)], new Gen5InterpolationControl(1, 0));
+        var smooth = new Gen5ShaderInstruction(4, Gen5ShaderEncoding.Vintrp, "VInterpP2F32",
+            [0], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(5)], new Gen5InterpolationControl(2, 0));
+        var program = ResourceTestProgram.Program(move, smooth, ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelInputAddress = mode,
+            PixelInputEnable = mode,
+            PixelInputCntl = [0, 0x1, 0x1],
+            PixelCustomInterpolationMask = 2,
+            SupportsPerVertexPixelInputs = true,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var builtIns = Instructions(shader.Spirv)
+            .Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
+                instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn)
+            .Select(instruction => instruction.Operands[2])
+            .ToArray();
+        // The perspective coordinates must not be invented for a shader that enables only
+        // no-perspective ones, and vice versa: the slot would be weighted by the wrong coordinates.
+        Assert.Equal(noPerspective, builtIns.Contains((uint)SpirvBuiltIn.BaryCoordNoPerspKhr));
+        Assert.Equal(!noPerspective, builtIns.Contains((uint)SpirvBuiltIn.BaryCoordKhr));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
     [InlineData(false, true, 0x3F800000u)]
     [InlineData(false, false, 0xBF800000u)]
     [InlineData(true, true, 1u)]
