@@ -332,7 +332,8 @@ public sealed class ScalarValueGraphTests
         Assert.Equal([0xA5A5A5A5u], table);
 
         var overflow = Extract(Read(16), userDataCount: 0);
-        Assert.False(RuntimeValueEvaluator.FlattenResourceTable(overflow, Inputs([], memory.Read), out _));
+        Assert.True(RuntimeValueEvaluator.FlattenResourceTable(overflow, Inputs([], memory.Read), out var zeroed));
+        Assert.Equal([0u], zeroed);
     }
 
     // A loop whose body runs under a divergent mask still reaches a fixpoint: the

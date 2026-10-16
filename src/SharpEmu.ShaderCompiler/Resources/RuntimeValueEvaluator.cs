@@ -282,8 +282,8 @@ public sealed class RuntimeValueEvaluator
             var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
             if (aligned > size || size - aligned < sizeof(uint))
             {
-                // An unbound (empty) V# reads as zero; overrunning a bound buffer stays a failure.
-                return (uint)records == 0 ? RawAddress.Zero : RawAddress.Failed;
+                // Scalar buffer loads outside the descriptor range return zero, per dword.
+                return RawAddress.Zero;
             }
 
             address = ((baseAddress & ~3ul) + byteOffset) & ~3ul;
