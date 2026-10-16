@@ -247,6 +247,32 @@ public sealed class AgcDrawIndex2Tests
         }
     }
 
+    [Theory]
+    [InlineData(0x40000000UL)]
+    [InlineData(0x60000000UL)]
+    [InlineData(0UL)]
+    public void DirectDrawsEmitTheirPacketForEveryModifier(ulong modifier)
+    {
+        var memory = new FakeCpuMemory(BaseAddress, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        var commandBufferAddress = BaseAddress + 0x80;
+        WriteUInt64(memory, commandBufferAddress + 0x10, CommandAddress);
+        WriteUInt64(memory, commandBufferAddress + 0x18, CommandAddress + 0x100);
+        context[CpuRegister.Rdi] = commandBufferAddress;
+        context[CpuRegister.Rsi] = 6;
+        context[CpuRegister.Rdx] = modifier;
+        AgcExports.DcbDrawIndexAuto(context);
+        Assert.NotEqual(0UL, context[CpuRegister.Rax]);
+
+        WriteUInt64(memory, commandBufferAddress + 0x10, CommandAddress + 0x80);
+        context[CpuRegister.Rdi] = commandBufferAddress;
+        context[CpuRegister.Rsi] = 6;
+        context[CpuRegister.Rdx] = BaseAddress + 0x300;
+        context[CpuRegister.Rcx] = modifier;
+        AgcExports.DcbDrawIndex(context);
+        Assert.NotEqual(0UL, context[CpuRegister.Rax]);
+    }
+
     private static void WriteUInt32(FakeCpuMemory memory, ulong address, uint value)
     {
         Span<byte> buffer = stackalloc byte[sizeof(uint)];
