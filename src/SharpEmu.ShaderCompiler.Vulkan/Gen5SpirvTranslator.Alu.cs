@@ -1983,11 +1983,13 @@ public static partial class Gen5SpirvTranslator
             bool highLane)
         {
             var operand = instruction.Sources[index];
-            if (operand.Kind is Gen5OperandKind.EncodedConstant or Gen5OperandKind.LiteralConstant)
+            if (operand.Kind is Gen5OperandKind.EncodedConstant)
             {
-                // An inline constant or literal is a single f32 value, not a
-                // packed register: both lanes take the exactly-converted f16 of
-                // the same constant, so there is no half to select.
+                // An inline constant is a single f32 value, not a packed register:
+                // both lanes take the exactly-converted f16 of the same constant,
+                // so there is no half to select. A 32-bit literal is not: it holds
+                // two f16 halves that op_sel / op_sel_hi select like a register's,
+                // so it takes the path below.
                 var constant = GetFloatSource(instruction, index);
                 var constantNegate = highLane ? control.NegHiMask : control.NegLoMask;
                 if (((constantNegate >> index) & 1) != 0)
