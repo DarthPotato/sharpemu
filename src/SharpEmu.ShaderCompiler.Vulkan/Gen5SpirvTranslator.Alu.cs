@@ -2701,12 +2701,12 @@ public static partial class Gen5SpirvTranslator
                     SpirvOp.ISub,
                     _uintType,
                     UInt(31),
-                    Ext(74, _uintType, high));
+                    Ext(75, _uintType, high));
                 var lowClz = _module.AddInstruction(
                     SpirvOp.ISub,
                     _uintType,
                     UInt(31),
-                    Ext(74, _uintType, low));
+                    Ext(75, _uintType, low));
                 var lowResult = IAdd(lowClz, UInt(32));
                 var leadingZeroResult = _module.AddInstruction(
                     SpirvOp.Select,
@@ -2859,7 +2859,9 @@ public static partial class Gen5SpirvTranslator
                 case "SFlbitI32B32":
                 {
                     // Count leading zero bits, 0xFFFFFFFF when the source is zero.
-                    var msb = Ext(74, _uintType, left);
+                    // The source is unsigned: FindUMsb (75), not FindSMsb, which would
+                    // locate the highest zero bit of a value with bit 31 set.
+                    var msb = Ext(75, _uintType, left);
                     var clz = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(31), msb);
                     result = _module.AddInstruction(
                         SpirvOp.Select, _uintType, IsNotZero(left), clz, UInt(0xFFFFFFFFu));
