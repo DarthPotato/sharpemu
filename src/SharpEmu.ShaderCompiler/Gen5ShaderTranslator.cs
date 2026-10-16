@@ -1590,6 +1590,8 @@ public static partial class Gen5ShaderTranslator
             0x23 => "BufferLoadSbyteD16Hi",
             0x24 => "BufferLoadShortD16",
             0x25 => "BufferLoadShortD16Hi",
+            0x26 => "BufferLoadFormatD16HiX",
+            0x27 => "BufferStoreFormatD16HiX",
             0x30 => "BufferAtomicSwap",
             0x31 => "BufferAtomicCmpswap",
             0x32 => "BufferAtomicAdd",
@@ -1620,6 +1622,14 @@ public static partial class Gen5ShaderTranslator
             0x4C => "BufferAtomicInc",
             0x50 => "BufferAtomicSwapX2",
             0x5A => "BufferAtomicOrX2",
+            0x80 => "BufferLoadFormatD16X",
+            0x81 => "BufferLoadFormatD16Xy",
+            0x82 => "BufferLoadFormatD16Xyz",
+            0x83 => "BufferLoadFormatD16Xyzw",
+            0x84 => "BufferStoreFormatD16X",
+            0x85 => "BufferStoreFormatD16Xy",
+            0x86 => "BufferStoreFormatD16Xyz",
+            0x87 => "BufferStoreFormatD16Xyzw",
             _ => $"MubufRaw{opcode:X2}",
         };
         sizeDwords = (extra >> 24) == 0xFF ? 3u : 2u;
@@ -1866,6 +1876,20 @@ public static partial class Gen5ShaderTranslator
 
         return FinishDecode(name, $"unknown-vintrp op=0x{opcode:X1}", out error);
     }
+
+    // Formatted D16 accesses (not the _HI_X single-component forms) pack two 16-bit
+    // components per register.
+    private static bool IsPackedD16FormatOpcode(string opcode) =>
+        opcode.Contains("FormatD16", StringComparison.Ordinal) &&
+        !opcode.Contains("Hi", StringComparison.Ordinal);
+
+    // Memory components of a packed D16 access; 0 leaves ComponentCount at the register count.
+    private static uint FormatD16ComponentCount(string opcode) =>
+        !IsPackedD16FormatOpcode(opcode) ? 0u
+            : opcode.EndsWith("Xyzw", StringComparison.Ordinal) ? 4u
+            : opcode.EndsWith("Xyz", StringComparison.Ordinal) ? 3u
+            : opcode.EndsWith("Xy", StringComparison.Ordinal) ? 2u
+            : 1u;
 
     // These write a 64-bit VGPR pair: the high half is a definition too.
     private static bool HasDoubleVectorResult(string opcode) => opcode is
@@ -2736,6 +2760,10 @@ public static partial class Gen5ShaderTranslator
                     "BufferStoreFormatXy" => 2u,
                     "BufferStoreFormatXyz" => 3u,
                     "BufferStoreFormatXyzw" => 4u,
+                    "BufferLoadFormatD16X" or "BufferLoadFormatD16Xy" or
+                    "BufferStoreFormatD16X" or "BufferStoreFormatD16Xy" => 1u,
+                    "BufferLoadFormatD16Xyz" or "BufferLoadFormatD16Xyzw" or
+                    "BufferStoreFormatD16Xyz" or "BufferStoreFormatD16Xyzw" => 2u,
                     "BufferLoadUbyte" or
                     "BufferLoadSbyte" or
                     "BufferLoadUshort" or
@@ -2749,7 +2777,9 @@ public static partial class Gen5ShaderTranslator
                     "BufferLoadSbyteD16" or
                     "BufferLoadSbyteD16Hi" or
                     "BufferLoadShortD16" or
-                    "BufferLoadShortD16Hi" => 1u,
+                    "BufferLoadShortD16Hi" or
+                    "BufferLoadFormatD16HiX" or
+                    "BufferStoreFormatD16HiX" => 1u,
                     "BufferLoadDword" => 1u,
                     "BufferLoadDwordx2" => 2u,
                     "BufferLoadDwordx3" => 3u,
@@ -2781,7 +2811,9 @@ public static partial class Gen5ShaderTranslator
                     ((word >> 13) & 1) != 0,
                     ((word >> 12) & 1) != 0,
                     ((word >> 14) & 1) != 0,
-                    ((extra >> 22) & 1) != 0);
+                    ((extra >> 22) & 1) != 0,
+                    PackedD16: IsPackedD16FormatOpcode(opcode),
+                    FormatComponentCount: FormatD16ComponentCount(opcode));
                 break;
             }
             case Gen5ShaderEncoding.Mtbuf:
@@ -2824,7 +2856,9 @@ public static partial class Gen5ShaderTranslator
                     ((word >> 14) & 1) != 0,
                     ((extra >> 22) & 1) != 0,
                     Typed: true,
-                    TypedFormat: (word >> 19) & 0x7F);
+                    TypedFormat: (word >> 19) & 0x7F,
+                    PackedD16: IsPackedD16FormatOpcode(opcode),
+                    FormatComponentCount: FormatD16ComponentCount(opcode));
                 break;
             }
             case Gen5ShaderEncoding.Mimg:

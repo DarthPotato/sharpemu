@@ -267,7 +267,14 @@ public sealed record Gen5BufferMemoryControl(
     bool Glc,
     bool Slc,
     bool Typed = false,
-    uint TypedFormat = 0) : Gen5InstructionControl;
+    uint TypedFormat = 0,
+    bool PackedD16 = false,
+    uint FormatComponentCount = 0) : Gen5InstructionControl
+{
+    // Memory components a formatted access transfers. Packed D16 pairs two of them per
+    // register, so it differs from DwordCount; every other access has one per register.
+    public uint ComponentCount => FormatComponentCount == 0 ? DwordCount : FormatComponentCount;
+}
 
 public sealed record Gen5ExportControl(
     uint Target,

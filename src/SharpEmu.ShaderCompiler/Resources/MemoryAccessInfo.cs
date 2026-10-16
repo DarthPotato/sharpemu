@@ -247,7 +247,7 @@ public sealed class MemoryAccessTable
             Offset = unchecked((uint)control.OffsetBytes),
             DataDwords = Math.Max(control.DwordCount, 1u),
             DataBits = bits,
-            ComponentCount = Math.Max(control.DwordCount, 1u),
+            ComponentCount = Math.Max(control.ComponentCount, 1u),
             DataFormat = dataFormat,
             NumberFormat = numberFormat,
             DataSigned = signed,
