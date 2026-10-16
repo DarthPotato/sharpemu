@@ -357,7 +357,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (!ResolveTopology(userConfig, autoDraw: true, out var topology))
+        if (!ResolveTopology(userConfig, autoDraw: true, out var topology, arguments.VertexCount))
         {
             TraceDrawDisposition(banks, in draw, "no-primitive-topology");
             _host.ResetBindings();
@@ -367,7 +367,10 @@ public sealed partial class RenderExecutor
         ResolveShaderPrograms(banks, ref state);
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;
-        var rectangleList = topology == PrimitiveTopology.PatchList;
+        // A legacy rectangle batch also draws as a patch list but keeps its draws: its pixel
+        // inputs may come from fixed-function interpolation of the three vertices.
+        var rectangleList = topology == PrimitiveTopology.PatchList &&
+            userConfig.PrimitiveType != (uint)GuestPrimitiveType.RectangleListLegacy;
         if (rectangleList && vertexInput.Buffers.Length == 0 && vertexInput.Stage.Program?.ParameterExportMask == 0 && pixelInput.InputCount != 0)
         {
             if (RenderTrace.Enabled)
@@ -572,7 +575,11 @@ public sealed partial class RenderExecutor
         return mode is ColorModeEliminateFastClear or ColorModeFmaskDecompress or ColorModeDccDecompress;
     }
 
-    public bool ResolveTopology(UserConfigRegisters userConfig, bool autoDraw, out PrimitiveTopology topology)
+    // Several legacy rectangles in one draw: three vertices each, as the hardware takes them.
+    // One rectangle keeps the four-vertex strip, which needs no rectangle pipeline.
+    private static bool IsLegacyRectangleBatch(uint vertexCount) => vertexCount > 3 && vertexCount % 3 == 0;
+
+    public bool ResolveTopology(UserConfigRegisters userConfig, bool autoDraw, out PrimitiveTopology topology, uint vertexCount = 3)
     {
         topology = PrimitiveTopology.PointList;
         switch ((GuestPrimitiveType)userConfig.PrimitiveType)
@@ -607,7 +614,9 @@ public sealed partial class RenderExecutor
                     throw _host.Fatal($"The primitive type is unknown for an indexed draw: primitiveType={userConfig.PrimitiveType}.");
                 }
 
-                topology = PrimitiveTopology.TriangleStrip;
+                // Several rectangles take the rectangle-list path, which fills each one from its
+                // three vertices instead of rasterizing a made-up fourth vertex.
+                topology = IsLegacyRectangleBatch(vertexCount) ? PrimitiveTopology.PatchList : PrimitiveTopology.TriangleStrip;
                 break;
             case GuestPrimitiveType.QuadListLegacy:
                 topology = PrimitiveTopology.TriangleFan;

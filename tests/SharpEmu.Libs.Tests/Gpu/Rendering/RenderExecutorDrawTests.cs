@@ -271,6 +271,9 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.False(_executor.ResolveTopology(new UserConfigRegisters { PrimitiveType = 0 }, autoDraw: false, out _));
         Assert.True(_executor.ResolveTopology(new UserConfigRegisters { PrimitiveType = 17 }, autoDraw: true, out var topology));
         Assert.Equal(PrimitiveTopology.TriangleStrip, topology);
+        // Several legacy rectangles take the rectangle-list path.
+        Assert.True(_executor.ResolveTopology(new UserConfigRegisters { PrimitiveType = 17 }, autoDraw: true, out topology, vertexCount: 63));
+        Assert.Equal(PrimitiveTopology.PatchList, topology);
         var fatal = Assert.Throws<RenderExecutorFatalException>(() => _executor.ResolveTopology(new UserConfigRegisters { PrimitiveType = 17 }, autoDraw: false, out _));
         Assert.Contains("primitiveType=17", fatal.Message);
         fatal = Assert.Throws<RenderExecutorFatalException>(() => _executor.ResolveTopology(new UserConfigRegisters { PrimitiveType = 9 }, autoDraw: true, out _));
@@ -540,13 +543,18 @@ public sealed class RenderExecutorDrawTests : IDisposable
     }
 
     [Fact]
-    public void LegacyRectangleList_DrawsFourVerticesAndRejectsOtherShapes()
+    public void LegacyRectangleList_DrawsFourVerticesOrABatchAndRejectsOtherShapes()
     {
         _executor.DrawAuto(1, Banks(primitiveType: 17), Auto(3, instances: 2));
         Assert.Contains("draw 4 2 0 0", _host.Calls);
+        Assert.Equal(PrimitiveTopology.TriangleStrip, _pipelines.PipelineRequests[0].Topology);
 
-        var fatal = Assert.Throws<RenderExecutorFatalException>(() => _executor.DrawAuto(1, Banks(primitiveType: 17), Auto(6)));
-        Assert.Contains("count=6 buffers=0", fatal.Message);
+        _executor.DrawAuto(1, Banks(primitiveType: 17), Auto(63));
+        Assert.Contains("draw 63 1 0 0", _host.Calls);
+        Assert.Equal(PrimitiveTopology.PatchList, _pipelines.PipelineRequests[1].Topology);
+
+        var fatal = Assert.Throws<RenderExecutorFatalException>(() => _executor.DrawAuto(1, Banks(primitiveType: 17), Auto(5)));
+        Assert.Contains("count=5 buffers=0", fatal.Message);
 
         fatal = Assert.Throws<RenderExecutorFatalException>(() => _executor.DrawIndexed(1, Banks(primitiveType: 17), Indexed(3)));
         Assert.Contains("primitiveType=17", fatal.Message);
@@ -581,6 +589,15 @@ public sealed class RenderExecutorDrawTests : IDisposable
         _executor.DrawAuto(1, Banks(primitiveType: 7), Auto(3));
         Assert.Contains("draw 3 1 0 0", _host.Calls);
         Assert.Equal(PrimitiveTopology.PatchList, _pipelines.PipelineRequests[0].Topology);
+    }
+
+    [Fact]
+    public void LegacyRectangleBatchWithoutParameterExports_IsNotSkippedLikeAnAgcRectangleList()
+    {
+        _pipelines.Graphics = Programs(vertexStage: Stage(Program(ShaderStageKind.Vertex, parameterExportMask: 0)), pixelInputs: 2);
+        _executor.DrawAuto(1, Banks(primitiveType: 17), Auto(6));
+
+        Assert.Contains("draw 6 1 0 0", _host.Calls);
     }
 
     [Fact]
