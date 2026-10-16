@@ -64,17 +64,25 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var eventType = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
         var eventAddress = ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 || eventType > 0x3F || eventAddress != 0)
+        var hasAddress = (eventType & ~1u) == 0x38;
+        if (commandBufferAddress == 0 || eventType > 0x3F || (eventAddress != 0 && !hasAddress))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryEmitCommandDwords(ctx, commandBufferAddress, out var commandAddress, Pm4(2, ItEventWrite, 0), eventType))
+        // Counter selection and counter dumps carry a payload in the address fields.
+        var packetDwords = hasAddress ? 4u : 2u;
+        Span<uint> packet = stackalloc uint[4];
+        packet[0] = Pm4(packetDwords, ItEventWrite, 0);
+        packet[1] = hasAddress ? eventType | 0x100u : eventType;
+        packet[2] = (uint)eventAddress & ~7u;
+        packet[3] = (uint)(eventAddress >> 32);
+        if (!TryEmitCommandDwords(ctx, commandBufferAddress, out var commandAddress, packet[..(int)packetDwords]))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        TraceAgc($"agc.dcb_event_write buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} type={eventType}");
+        TraceAgc($"agc.dcb_event_write buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} type={eventType} address=0x{eventAddress:X16}");
         return ReturnPointer(ctx, commandAddress);
     }
 
