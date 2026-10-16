@@ -51,6 +51,8 @@ internal static unsafe partial class VulkanVideoPresenter
             public ulong ProfileVertexHash;
             public ulong ProfilePixelHash;
             public ulong ProfileComputeHash;
+            // The pipeline and layouts belong to another entry of the same content, which destroys them.
+            public bool SharesNativeObjects;
 
             public bool RectangleList => Description is { StaticParameters.Topology: PrimitiveTopology.PatchList };
         }
@@ -990,6 +992,12 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
+            var contentKey = CreateComputeContentKey(description, bindings);
+            if (contentKey is { } existingKey && _computePipelinesByContent.TryGetValue(existingKey, out var existing))
+            {
+                return RegisterSharedComputePipeline(existing, description.Stage.Hash);
+            }
+
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
             var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit);
             var computeModule = new ShaderModule(description.Program.Module);
@@ -1048,8 +1056,60 @@ internal static unsafe partial class VulkanVideoPresenter
                 UsesPushDescriptors = usesPushDescriptors,
                 ProfileComputeHash = description.Stage.Hash,
             };
+            if (contentKey is { } key)
+            {
+                _computePipelinesByContent[key] = new SharedComputePipeline(pipeline, layout, setLayout, demand, usesPushDescriptors);
+            }
+
             return RegisterPipeline(entry);
         }
+
+        // Compute pipelines by what vkCreateComputePipelines consumes. Programs are specialized per
+        // draw, and a new program id often names a module and layout that already have a pipeline.
+        private sealed record SharedComputePipeline(
+            Pipeline Pipeline,
+            PipelineLayout Layout,
+            DescriptorSetLayout SetLayout,
+            DescriptorSetDemand Demand,
+            bool UsesPushDescriptors);
+
+        private readonly Dictionary<ComputePipelineContentKey, SharedComputePipeline> _computePipelinesByContent = new();
+        private readonly Dictionary<ComputePipelineContentKey, PendingComputePipeline> _pendingComputeByContent = new();
+
+        private ComputePipelineContentKey? CreateComputeContentKey(ComputePipelineDescription description, List<DescriptorSetLayoutBinding> bindings)
+        {
+            if (!_shaderModuleCacheIdentities.TryGetValue(description.Program.Module, out var identity))
+            {
+                return null;
+            }
+
+            var descriptorCount = 0u;
+            foreach (var binding in bindings)
+            {
+                descriptorCount += binding.DescriptorCount;
+            }
+
+            return ComputePipelineContentKey.Create(
+                identity,
+                bindings,
+                descriptorCount <= _maxPushDescriptors,
+                ShaderStageFlags.ComputeBit,
+                PushConstantBytes,
+                ComputeRequiredSubgroupSize(description.Input));
+        }
+
+        // The entry only references the shared native objects; the entry that created them destroys them.
+        private PipelineHandle RegisterSharedComputePipeline(SharedComputePipeline shared, ulong guestHash) =>
+            RegisterPipeline(new RenderPipelineEntry
+            {
+                Pipeline = shared.Pipeline,
+                Layout = shared.Layout,
+                SetLayout = shared.SetLayout,
+                Demand = shared.Demand,
+                UsesPushDescriptors = shared.UsesPushDescriptors,
+                ProfileComputeHash = guestHash,
+                SharesNativeObjects = true,
+            });
 
         // One compute pipeline whose vkCreateComputePipelines call runs on a worker
         // thread. Everything the command stream owns (descriptor and pipeline layout,
@@ -1066,6 +1126,9 @@ internal static unsafe partial class VulkanVideoPresenter
             public Task<Pipeline> Compile = Task.FromResult(default(Pipeline));
             public long StartTimestamp;
             public long CompileMilliseconds;
+            public ComputePipelineContentKey? ContentKey;
+            // Set once an entry owns the compiled pipeline; later programs that wait on the same compile share it.
+            public SharedComputePipeline? Finished;
         }
 
         private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
@@ -1100,15 +1163,29 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 _pendingComputePipelines.Remove(key);
+                if (pending.Finished is { } finished)
+                {
+                    handle = RegisterSharedComputePipeline(finished, description.Stage.Hash);
+                    return true;
+                }
+
                 var compiled = pending.Compile.GetAwaiter().GetResult();
                 ReportPipelineCreation(
                     Interlocked.Read(ref pending.CompileMilliseconds),
                     "compute-async",
-                    $"cs=0x{pending.Hash:X16} waited_ms={(long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds}",
+                    $"cs=0x{pending.Hash:X16} module={pending.ContentKey?.ModuleIdentity[..12]} waited_ms={(long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds}",
                     pending.SpirvBytes.ToString());
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, compiled.Handle, $"SharpEmu compute cs=0x{pending.Hash:X16}");
+                pending.Finished = new SharedComputePipeline(
+                    compiled, pending.Layout, pending.SetLayout, pending.Demand, pending.UsesPushDescriptors);
+                if (pending.ContentKey is { } finishedKey)
+                {
+                    _computePipelinesByContent[finishedKey] = pending.Finished;
+                    _pendingComputeByContent.Remove(finishedKey);
+                }
+
                 handle = RegisterPipeline(new RenderPipelineEntry
                 {
                     Pipeline = compiled,
@@ -1124,6 +1201,23 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
+            var contentKey = CreateComputeContentKey(description, bindings);
+            if (contentKey is { } existingKey)
+            {
+                if (_computePipelinesByContent.TryGetValue(existingKey, out var existing))
+                {
+                    handle = RegisterSharedComputePipeline(existing, description.Stage.Hash);
+                    return true;
+                }
+
+                if (_pendingComputeByContent.TryGetValue(existingKey, out var inFlight))
+                {
+                    // The same module and layout are compiling for another program.
+                    _pendingComputePipelines.Add(key, inFlight);
+                    return false;
+                }
+            }
+
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
             var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit);
             var computeModule = new ShaderModule(description.Program.Module);
@@ -1145,6 +1239,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Hash = description.Stage.Hash,
                 SpirvBytes = SpirvBytesOf(computeModule.Handle),
                 StartTimestamp = Stopwatch.GetTimestamp(),
+                ContentKey = contentKey,
             };
             started.Compile = Task.Factory.StartNew(
                 () =>
@@ -1173,6 +1268,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default);
             _pendingComputePipelines.Add(key, started);
+            if (contentKey is { } startedKey)
+            {
+                _pendingComputeByContent[startedKey] = started;
+            }
+
             return false;
         }
 
@@ -1224,8 +1324,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DrainPendingComputePipelines()
         {
-            foreach (var pending in _pendingComputePipelines.Values)
+            // Programs that wait on the same compile share one pending object.
+            foreach (var pending in _pendingComputePipelines.Values.Distinct())
             {
+                if (pending.Finished is not null)
+                {
+                    continue;
+                }
+
                 try
                 {
                     var pipeline = pending.Compile.GetAwaiter().GetResult();
@@ -1239,12 +1345,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 _vk.DestroyDescriptorSetLayout(_device, pending.SetLayout, null);
             }
             _pendingComputePipelines.Clear();
+            _pendingComputeByContent.Clear();
+            _computePipelinesByContent.Clear();
         }
 
         private void DestroyRenderPipelines()
         {
             foreach (var entry in _pipelineEntries.Values)
             {
+                if (entry.SharesNativeObjects)
+                {
+                    continue;
+                }
+
                 foreach (var pipeline in new[] { entry.Pipeline, entry.StripVariant, entry.ListVariant, entry.RectangleVariant })
                 {
                     if (pipeline.Handle != 0)
