@@ -1060,11 +1060,13 @@ public static class ResourceMaterializer
             var numericClass = GuestImageFormat.SampledNumericClass(format);
             if (storage)
             {
-                if ((!rawSintStorage && numericClass == ImageNumericClass.Sint) || numericClass == ImageNumericClass.Unsupported)
+                if (numericClass == ImageNumericClass.Unsupported)
                 {
                     return Fail($"storage image descriptor {index} uses unsupported format {format}");
                 }
 
+                // A write-only 32-bit sint image is stored as raw bits through its uint view;
+                // every other sint storage image keeps its signed class (and *_SINT view).
                 // Atomics use the uint view; float min/max compare-exchange its bits.
                 if (rawSintStorage || (baseImage.Atomic && numericClass == ImageNumericClass.Float))
                 {

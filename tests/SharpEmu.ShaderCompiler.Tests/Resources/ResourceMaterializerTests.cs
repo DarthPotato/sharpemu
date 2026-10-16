@@ -301,4 +301,34 @@ public sealed class ResourceMaterializerTests
         Assert.False(applied.SamplerByMemoryIndex.ContainsKey(floatIndex));
         Assert.Equal(2, snapshot.Samplers.Length);
     }
+
+    // Signed-integer storage images keep their signed class; only a write-only 32-bit sint
+    // image is compiled as raw uint bits.
+    [Theory]
+    [InlineData(6u, true, ImageNumericClass.Sint)]
+    [InlineData(12u, true, ImageNumericClass.Sint)]
+    [InlineData(12u, false, ImageNumericClass.Sint)]
+    [InlineData(Format32Sint, true, ImageNumericClass.Uint)]
+    [InlineData(Format32Sint, false, ImageNumericClass.Uint)]
+    public void SignedStorageImage_SpecializesWithItsNumericClass(uint format, bool alsoLoaded, ImageNumericClass expected)
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        uint pc = 0;
+        instructions.AddRange(ImageWords(ref pc, 16, 0x1000, format));
+        instructions.Add(Image(pc, "ImageStore", 16, dmask: 1)); pc += 8;
+        if (alsoLoaded)
+        {
+            instructions.Add(Image(pc, "ImageLoad", 16, dmask: 1)); pc += 8;
+        }
+
+        instructions.Add(EndProgram(pc));
+        var plan = Extract(Program([.. instructions]));
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+
+        Assert.True(ResourceMaterializer.Materialize(plan, Inputs([]), ref snapshot, ref specialization, out var failure), failure.ToString());
+        // A load of the same descriptor can add a separate sampled-class resource.
+        var image = Assert.Single(ResourceMaterializer.ApplyTo(plan, specialization).Info.Images, resource => resource.ResourceClass == ImageResourceClass.Storage);
+        Assert.Equal(expected, image.NumericClass);
+    }
 }

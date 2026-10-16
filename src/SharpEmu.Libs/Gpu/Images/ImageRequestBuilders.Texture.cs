@@ -289,8 +289,10 @@ public static partial class ImageRequestBuilders
         {
             pixelFormat = depthFormat.DepthAttachmentFormat;
         }
-        // Atomic storage images are declared as UINT in SPIR-V, including float atomics.
-        var storageViewFormat = storage && (shape.Atomic || format == GuestPixelFormat.Bits32SInt) ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
+        // Atomic storage images are declared as UINT in SPIR-V, including float atomics, and a
+        // raw 32-bit sint store is compiled as uint; other sint storage keeps its *_SINT view.
+        var rawSint32 = format == GuestPixelFormat.Bits32SInt && shape.NumericClass != TextureNumericClass.Sint;
+        var storageViewFormat = storage && (shape.Atomic || rawSint32) ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
         var viewFormat = storage && storageViewFormat != Format.Undefined ? storageViewFormat : pixelFormat;
         var blockBytes = GuestPixelFormats.BlockCompressedBytes(format);
         var description = ImageDescription.Create();
