@@ -36,6 +36,19 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         MaxMemoryAllocationCount = properties.Limits.MaxMemoryAllocationCount;
         MaxComputeWorkGroupCount = (properties.Limits.MaxComputeWorkGroupCount[0], properties.Limits.MaxComputeWorkGroupCount[1], properties.Limits.MaxComputeWorkGroupCount[2]);
         Slabs = new GpuMemorySlabs(this);
+        Images.GuestPixelFormats.UseNativeNarrowSrgb(
+            SupportsRenderTarget(Format.R8Srgb) && SupportsRenderTarget(Format.R8G8Srgb));
+    }
+
+    // Colour attachments that blend, sample with filtering and copy both ways: what a guest
+    // render target that is later sampled and uploaded or read back needs.
+    private bool SupportsRenderTarget(Format format)
+    {
+        const FormatFeatureFlags Required =
+            FormatFeatureFlags.ColorAttachmentBit | FormatFeatureFlags.ColorAttachmentBlendBit |
+            FormatFeatureFlags.SampledImageBit | FormatFeatureFlags.SampledImageFilterLinearBit |
+            FormatFeatureFlags.TransferSrcBit | FormatFeatureFlags.TransferDstBit;
+        return (GetFormatProperties(format).OptimalTilingFeatures & Required) == Required;
     }
 
     // Shared chunks the small buffers are carved from; freed at device teardown.

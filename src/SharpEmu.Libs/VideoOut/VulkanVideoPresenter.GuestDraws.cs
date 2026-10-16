@@ -118,7 +118,8 @@ internal static unsafe partial class VulkanVideoPresenter
             (29, 0, _) or (4, 0, _) => Format.R32Sfloat,
             (1, 1, _) => Format.R8SNorm,
             (1, 5, _) => Format.R8Sint,
-            // The image path stands a same-width UNORM format in for narrow sRGB targets.
+            // The image path uses the native format, or a same-width UNORM stand-in on a device
+            // without it (GuestPixelFormats.UseNativeNarrowSrgb); the output is a float either way.
             (1, 6 or 9, _) => Format.R8Srgb,
             (3, 1, _) => Format.R8G8SNorm,
             (3, 4, _) => Format.R8G8Uint,

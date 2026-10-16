@@ -473,7 +473,8 @@ public static class GuestPixelFormats
         (GuestPixelFormat.Bits32_32_32_32UInt, Format.R32G32B32A32Uint),
         (GuestPixelFormat.Bits32_32_32_32SInt, Format.R32G32B32A32Sint),
         (GuestPixelFormat.Bits32_32_32_32Float, Format.R32G32B32A32Sfloat),
-        // Narrow sRGB formats are optional in Vulkan; a same-width UNORM format stands in.
+        // Narrow sRGB formats are optional in Vulkan as colour attachments; a same-width UNORM
+        // format stands in unless the device offers the native one (UseNativeNarrowSrgb).
         (GuestPixelFormat.Bits8Srgb, Format.R8Unorm),
         (GuestPixelFormat.Bits8_8Srgb, Format.R8G8Unorm),
         (GuestPixelFormat.Bits8_8_8_8Srgb, Format.R8G8B8A8Srgb),
@@ -560,6 +561,15 @@ public static class GuestPixelFormats
             GuestPixelFormat.Bits11_11_10UInt => GuestPixelFormat.Bits32UInt,
             _ => format,
         };
+
+    // Switches the 8-bit and 8_8 sRGB formats between the native host format, which decodes and
+    // encodes the gamma on sampling, blending and writes, and the same-width UNORM stand-in that
+    // applies none. Called when a device is opened, before any image exists.
+    public static void UseNativeNarrowSrgb(bool native)
+    {
+        HostLookup[(int)GuestPixelFormat.Bits8Srgb] = native ? Format.R8Srgb : Format.R8Unorm;
+        HostLookup[(int)GuestPixelFormat.Bits8_8Srgb] = native ? Format.R8G8Srgb : Format.R8G8Unorm;
+    }
 
     public static Format HostFormat(GuestPixelFormat format) =>
         (uint)format < LookupSize ? HostLookup[(int)format] : Format.Undefined;

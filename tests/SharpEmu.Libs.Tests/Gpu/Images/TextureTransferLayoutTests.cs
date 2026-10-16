@@ -142,11 +142,9 @@ public sealed class TextureTransferLayoutTests
     [Theory]
     [InlineData(ChannelLayout.Bits8, ChannelType.SNorm, Format.R8SNorm)]
     [InlineData(ChannelLayout.Bits8, ChannelType.SInt, Format.R8Sint)]
-    [InlineData(ChannelLayout.Bits8, ChannelType.Srgb, Format.R8Unorm)]
     [InlineData(ChannelLayout.Bits8_8, ChannelType.SNorm, Format.R8G8SNorm)]
     [InlineData(ChannelLayout.Bits8_8, ChannelType.UInt, Format.R8G8Uint)]
     [InlineData(ChannelLayout.Bits8_8, ChannelType.SInt, Format.R8G8Sint)]
-    [InlineData(ChannelLayout.Bits8_8, ChannelType.Srgb, Format.R8G8Unorm)]
     [InlineData(ChannelLayout.Bits16_16, ChannelType.SNorm, Format.R16G16SNorm)]
     [InlineData(ChannelLayout.Bits8_8_8_8, ChannelType.SNorm, Format.R8G8B8A8SNorm)]
     [InlineData(ChannelLayout.Bits16_16_16_16, ChannelType.SNorm, Format.R16G16B16A16SNorm)]
@@ -158,6 +156,20 @@ public sealed class TextureTransferLayoutTests
 
         Assert.True(SharpEmu.Libs.VideoOut.VulkanVideoPresenter.TryDecodeRenderTargetFormat((uint)layout, (uint)type, 0, out var output));
         Assert.Equal(KindOf(host), output.OutputKind);
+    }
+
+    // The narrow sRGB targets use the native format when the device offers it and a same-width
+    // UNORM stand-in otherwise; either way the pixel output stays a float.
+    [Theory]
+    [InlineData(ChannelLayout.Bits8, ChannelType.Srgb, Format.R8Srgb, Format.R8Unorm)]
+    [InlineData(ChannelLayout.Bits8_8, ChannelType.Srgb, Format.R8G8Srgb, Format.R8G8Unorm)]
+    public void NarrowSrgbRenderTargets_UseTheNativeFormatOrItsUnormStandIn(ChannelLayout layout, ChannelType type, Format native, Format standIn)
+    {
+        var target = TextureTransferLayout.RenderTargetFormat(layout, type, ChannelOrder.Standard);
+        Assert.Contains(target.HostFormat, new[] { native, standIn });
+
+        Assert.True(SharpEmu.Libs.VideoOut.VulkanVideoPresenter.TryDecodeRenderTargetFormat((uint)layout, (uint)type, 0, out var output));
+        Assert.Equal(SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float, output.OutputKind);
     }
 
     // Every combination that both tables accept must agree on the numeric class of the attachment.
