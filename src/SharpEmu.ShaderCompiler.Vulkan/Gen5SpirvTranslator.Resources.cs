@@ -213,6 +213,12 @@ public static partial class Gen5SpirvTranslator
                     case DescriptorBindingKind.MipStatistics:
                         _mipStatistics = DeclareWordBlock("mipStatistics", number);
                         break;
+                    case DescriptorBindingKind.RuntimeDescriptorTable:
+                        _runtimeDescriptorTable = DeclareWordBlock("runtimeDescriptorTable", number);
+                        break;
+                    case DescriptorBindingKind.RuntimeDescriptorMisses:
+                        _runtimeDescriptorMisses = DeclareWordBlock("runtimeDescriptorMisses", number);
+                        break;
                     default:
                         DeclareImageClass(binding, number);
                         break;

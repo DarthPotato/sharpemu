@@ -215,9 +215,19 @@ public enum SpirvCapability : uint
     ShaderLayer = 5253,
     ShaderViewportIndex = 5254,
     ShaderViewportIndexLayerExt = 5254,
+    ShaderNonUniform = 5301,
     RuntimeDescriptorArray = 5302,
+    SampledImageArrayNonUniformIndexing = 5307,
     PhysicalStorageBufferAddresses = 5347,
     SignedZeroInfNanPreserve = 4466,
+}
+
+// The function-control mask of OpFunction. Only None exists on purpose: NVIDIA miscompiles repeated
+// calls of one DontInline function (every call returns the first call's result when the calls sit in a
+// uniform loop and the result indexes a descriptor array), so no function of ours may ask for it.
+public enum SpirvFunctionControl : uint
+{
+    None = 0,
 }
 
 public enum SpirvStorageClass : uint
@@ -265,6 +275,7 @@ public enum SpirvDecoration : uint
     Offset = 35,
     NoContraction = 42,
     NonWritable = 24,
+    NonUniform = 5300,
 }
 
 public enum SpirvBuiltIn : uint
@@ -796,6 +807,10 @@ public sealed class SpirvModuleBuilder
         Emit(_functions, SpirvOp.Function, returnType, id, 0, functionType);
         return id;
     }
+
+    // Defines a function whose id callers already used (a call can precede the definition).
+    public void BeginFunction(uint returnType, uint functionType, uint id, SpirvFunctionControl control = SpirvFunctionControl.None) =>
+        Emit(_functions, SpirvOp.Function, returnType, id, (uint)control, functionType);
 
     public uint AddFunctionParameter(uint type) =>
         EmitResult(_functions, SpirvOp.FunctionParameter, type);

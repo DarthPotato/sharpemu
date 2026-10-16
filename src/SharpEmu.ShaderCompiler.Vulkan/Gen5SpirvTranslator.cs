@@ -523,6 +523,7 @@ public static partial class Gen5SpirvTranslator
 
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
+                EmitRuntimeLookupFunctions();
 
                 var model = _stage switch
                 {
@@ -5575,6 +5576,11 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (_request.Memory.Find(instruction.Pc) is { RuntimeDescriptor: true } runtimeDescriptor)
+            {
+                return TryEmitRuntimeDescriptorImage(instruction, image, runtimeDescriptor, out error);
+            }
+
             SpirvImageResource resource;
             uint imageObject;
             uint dstSelect;

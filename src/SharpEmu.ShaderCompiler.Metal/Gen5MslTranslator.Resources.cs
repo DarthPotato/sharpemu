@@ -19,6 +19,12 @@ public static partial class Gen5MslTranslator
     public static bool TryCompileProgram(ShaderCompileRequest request, out Gen5MslShader shader, out string error)
     {
         shader = default!;
+        if (request.Resources.Info.UsesRuntimeDescriptors)
+        {
+            error = "The Metal backend has no runtime image descriptor heap.";
+            return false;
+        }
+
         try
         {
             BindingLayoutValidator.Validate(

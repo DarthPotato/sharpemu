@@ -31,7 +31,12 @@ namespace SharpEmu.ShaderCompiler.Resources;
 //   [0] image misses written, [1] sampler misses written (atomic counters, may exceed the capacity)
 //   from ImageMissOffset:   ImageMissCapacity records of (view class, image words 0..7)
 //   from SamplerMissOffset: SamplerMissCapacity records of sampler words 0..3
-// A miss beyond the capacity is counted but not stored; the descriptor misses again next draw.
+//   from ImageSeenOffset / SamplerSeenOffset: a bitmap of SeenBits bits per table
+// Every invocation of a draw that holds a missing descriptor would append the same record, filling the
+// buffer with duplicates before a second descriptor is seen. A shader therefore sets the bit its key
+// hashes to (atomic or) and records the miss only when it was the one that set the bit: each distinct
+// key is recorded once per buffer. Two keys sharing a bit are recorded in different ticks. A miss beyond
+// the record capacity is counted but not stored; the descriptor misses again in a later draw.
 public static class RuntimeDescriptorTable
 {
     public const uint ImageWordCount = 8;
@@ -58,7 +63,17 @@ public static class RuntimeDescriptorTable
     public const uint SamplerMissRecordDwords = SamplerWordCount;
     public const uint ImageMissOffset = 4;
     public const uint SamplerMissOffset = ImageMissOffset + ImageMissCapacity * ImageMissRecordDwords;
-    public const uint MissBufferDwords = SamplerMissOffset + SamplerMissCapacity * SamplerMissRecordDwords;
+    public const uint SeenBits = 2048;
+    public const uint SeenDwords = SeenBits / 32;
+    public const uint ImageSeenOffset = SamplerMissOffset + SamplerMissCapacity * SamplerMissRecordDwords;
+    public const uint SamplerSeenOffset = ImageSeenOffset + SeenDwords;
+    public const uint MissBufferDwords = SamplerSeenOffset + SeenDwords;
+
+    // The descriptor set that holds the heap, and its bindings: sampled images, then samplers. Slot 0
+    // of both is the null image and the default sampler.
+    public const uint HeapDescriptorSet = 1;
+    public const uint HeapSampledImageBinding = 0;
+    public const uint HeapSamplerBinding = 1;
 
     private const uint MaxSectionEntries = 1u << 20;
 
