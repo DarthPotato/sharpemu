@@ -2126,6 +2126,8 @@ public static partial class Gen5SpirvTranslator
                 "STtraceData" or
                 // Wave scheduling priority hint; no effect on results.
                 "SSetprio" or
+                // Wave sleep hint; it only delays the wave.
+                "SSleep" or
                 // NGG shaders bracket their exports with s_sendmsg
                 // (GS_ALLOC_REQ/DEALLOC) to reserve hardware export space;
                 // exports are translated directly, so the message is moot.
