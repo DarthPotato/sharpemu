@@ -559,7 +559,7 @@ public sealed partial class ResourceTracker
         return $"{value.Kind}#{value.Id}";
     }
 
-    // An image descriptor read from a scalar buffer must be one contiguous record.
+    // An image descriptor read from a scalar buffer must be made of contiguous four-dword runs.
     private bool IsContiguousScalarBufferRecord(DescriptorSource source)
     {
         if (!source.Dwords.Any(dword => dword.Kind == ScalarValueKind.ScalarBufferWord))
@@ -567,15 +567,17 @@ public sealed partial class ResourceTracker
             return true;
         }
 
-        var first = ScalarReadMemory(source.Dwords[0], out _);
+        // Each dword is evaluated on its own, so a record may be assembled from several
+        // four-dword loads of the same buffer (an 8-dword T# built by two s_buffer_load_x4).
         for (var dword = 0; dword < source.Dwords.Length; dword++)
         {
             var read = source.Dwords[dword];
+            var first = ScalarReadMemory(source.Dwords[dword & ~3], out _);
             var memory = ScalarReadMemory(read, out _);
             if (first is null || memory is null ||
-                memory.Offset != first.Offset + (uint)dword * sizeof(uint) ||
-                !_graph.Equivalent(read.Operands[0], source.Dwords[0].Operands[0]) ||
-                !_graph.Equivalent(read.Operands[1], source.Dwords[0].Operands[1]))
+                memory.Offset != first.Offset + (uint)(dword & 3) * sizeof(uint) ||
+                !_graph.Equivalent(read.Operands[0], source.Dwords[dword & ~3].Operands[0]) ||
+                !_graph.Equivalent(read.Operands[1], source.Dwords[dword & ~3].Operands[1]))
             {
                 return false;
             }

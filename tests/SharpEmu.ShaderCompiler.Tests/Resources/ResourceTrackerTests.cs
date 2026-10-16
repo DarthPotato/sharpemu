@@ -129,6 +129,23 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
+    public void ImageRecordBuiltFromTwoFourDwordScalarBufferLoads_IsPlanned()
+    {
+        var program = Program(
+            ScalarBufferLoad(0, 0, destination: 8, count: 4, dynamicOffsetRegister: 4),
+            ScalarBufferLoad(8, 0, destination: 12, count: 4, immediateOffset: 32, dynamicOffsetRegister: 4),
+            Image(0x10, "ImageLoad", 8, dimension: 1),
+            EndProgram(0x18));
+
+        var plan = Extract(program);
+
+        var image = Assert.Single(plan.Info.Images);
+        // The record is read from the buffer, not replaced by a null descriptor.
+        var source = plan.DescriptorSources[(int)image.Source];
+        Assert.All(source.Dwords, dword => Assert.False(dword.IsConstant));
+    }
+
+    [Fact]
     public void SamplerWithDivergentBits_IsRejected()
     {
         var program = Program(
