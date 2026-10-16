@@ -2045,7 +2045,7 @@ public static class KernelPthreadCompatExports
                     }
                 }
 
-                _ = Monitor.Wait(state.SyncRoot, waitDuration);
+                _ = Monitor.Wait(state.SyncRoot, KernelHostWait.RoundUpMilliseconds(waitDuration));
                 if (waiter.CompletionState == 0 &&
                     timed &&
                     GetRemainingTimeout(deadline) <= TimeSpan.Zero)
