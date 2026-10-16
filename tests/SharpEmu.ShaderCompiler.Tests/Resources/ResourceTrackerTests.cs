@@ -614,6 +614,27 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
+    public void LoadWhoseAddressALoopAdvances_IsNotAnInvariantPhi()
+    {
+        // s[8:9] is reloaded through itself every iteration: its phi merges the first load
+        // with a load whose address is the phi, so it is not one value.
+        var program = Program(
+            ScalarLoad(0, 2, 8, count: 2),
+            ScalarLoad(8, 8, 8, count: 2),
+            MoveScalar(16, 10, 256), MoveScalar(20, 11, 0),
+            Branch(24, "SCbranchScc1", -6),
+            BufferLoad(28, 8, dwords: 3),
+            EndProgram(36));
+        var graph = ScalarValueGraph.Build(program, 0, 8);
+
+        var phis = graph.Values.Where(value => value.Kind == ScalarValueKind.Phi).ToList();
+        Assert.NotEmpty(phis);
+        Assert.Contains(phis, phi => graph.ResolveInvariantPhi(phi) is null);
+        var plan = Extract(program, userDataCount: 8);
+        Assert.Empty(plan.Info.Buffers);
+    }
+
+    [Fact]
     public void DescriptorChosenByControlFlow_KeepsTypedAccessRejected()
     {
         var error = Assert.ThrowsAny<ResourcePlanException>(() => Extract(PhiSelectedDescriptor("TBufferLoadFormatXyz")));
