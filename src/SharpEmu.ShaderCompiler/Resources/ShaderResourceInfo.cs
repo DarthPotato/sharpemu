@@ -35,6 +35,10 @@ public static class DescriptorConstants
     public const uint IdentityImageSwizzle = 0xFAC;
     public const uint InvalidFormat = 0;
     public const uint NoIndex = uint.MaxValue;
+
+    // GFX10 S# dword 3 bits 12-29 are reserved. The adjusted sample forms carry their
+    // adjustment there; the sampler itself ignores them.
+    public const uint SamplerDword3ReservedMask = 0x3FFF_F000u;
 }
 
 // One buffer resource of a program and how the program uses it.
@@ -184,6 +188,10 @@ public sealed class ShaderResourceInfo
     public bool HasBitwiseExclusiveOr { get; set; }
     public bool UsesDeviceAddresses { get; set; }
 
+    // Some image access reads its T# and S# from the shader registers at run time and resolves
+    // them through the host's runtime descriptor table (RuntimeDescriptorTable).
+    public bool UsesRuntimeDescriptors { get; set; }
+
     public ShaderResourceInfo Clone() => new()
     {
         Buffers = Buffers.Select(buffer => buffer.Clone()).ToList(),
@@ -198,6 +206,7 @@ public sealed class ShaderResourceInfo
         InstanceOffsetScalarRegister = InstanceOffsetScalarRegister,
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
+        UsesRuntimeDescriptors = UsesRuntimeDescriptors,
     };
 }
 

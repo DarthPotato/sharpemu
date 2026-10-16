@@ -19,6 +19,11 @@ public enum DescriptorBindingKind : uint
     FlattenedResourceTable,
     ShaderData,
     MipStatistics,
+
+    // The runtime descriptor table the host fills and the buffer a shader records its misses in
+    // (RuntimeDescriptorTable). The heap they index is a second descriptor set, not a binding here.
+    RuntimeDescriptorTable,
+    RuntimeDescriptorMisses,
     Count,
 }
 
@@ -659,6 +664,12 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         if (usesGlobalDataShare)
         {
             descriptors.Add(new DescriptorBinding(DescriptorBindingKind.GlobalDataShare, []));
+        }
+
+        if (info.UsesRuntimeDescriptors)
+        {
+            descriptors.Add(new DescriptorBinding(DescriptorBindingKind.RuntimeDescriptorTable, []));
+            descriptors.Add(new DescriptorBinding(DescriptorBindingKind.RuntimeDescriptorMisses, []));
         }
 
         if (info.UsesDeviceAddresses)

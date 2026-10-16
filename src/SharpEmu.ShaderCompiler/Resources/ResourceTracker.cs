@@ -6,14 +6,31 @@ using System.Linq;
 
 namespace SharpEmu.ShaderCompiler.Resources;
 
+// Whether an image access that cannot be bound ahead of time may read its descriptors at run time
+// (RuntimeDescriptorTable). The host that compiles the plan must be able to serve the table.
+public enum RuntimeDescriptorMode : byte
+{
+    // Never: a descriptor without a plan-time source keeps the historical null fallback or plan error.
+    Disabled,
+
+    // An access with no plan-time source reads its descriptors at run time. A descriptor table that
+    // the planner can bind statically still is.
+    OnDemand,
+
+    // As OnDemand, and an access the run-time table can read also skips the indirect-table plans
+    // (material tables, bit-scan candidate sets), which bind every record the table holds. Used
+    // when materializing such a table exceeded the image capacity.
+    Preferred,
+}
+
 // Interns descriptor sources, builds the dense buffer, image, sampler and pair tables
 // and patches each access with its index. A failure names hash, stage and pc.
 public sealed partial class ResourceTracker
 {
     private const uint SamplerBorderClampMask = (1u << 2) | (1u << 5) | (1u << 8);
-    private const uint SamplerDword3ReservedMask = 0x3FFF_F000u;
 
     private readonly ShaderResourcePlan _plan;
+    private readonly RuntimeDescriptorMode _runtimeDescriptors;
     private readonly ScalarValueGraph _graph;
     private readonly ShaderResourceInfo _info = new();
     private readonly List<DescriptorSource> _sources = [];
@@ -42,9 +59,10 @@ public sealed partial class ResourceTracker
         IReadOnlySet<ScalarValue> IndirectReads,
         IReadOnlyList<BufferCandidateTablePlan> BufferCandidateTables);
 
-    private ResourceTracker(ShaderResourcePlan plan)
+    private ResourceTracker(ShaderResourcePlan plan, RuntimeDescriptorMode runtimeDescriptors)
     {
         _plan = plan;
+        _runtimeDescriptors = runtimeDescriptors;
         _graph = plan.Graph;
         var roots = new List<ScalarValue>();
         foreach (var access in plan.Accesses)
@@ -86,7 +104,8 @@ public sealed partial class ResourceTracker
         }
     }
 
-    public static Result Track(ShaderResourcePlan plan) => new ResourceTracker(plan).Run();
+    public static Result Track(ShaderResourcePlan plan, RuntimeDescriptorMode runtimeDescriptors = RuntimeDescriptorMode.Disabled) =>
+        new ResourceTracker(plan, runtimeDescriptors).Run();
 
     private Result Run()
     {
@@ -276,8 +295,8 @@ public sealed partial class ResourceTracker
 
             var left = value.Operands[0];
             var right = value.Operands[1];
-            var leftReserved = (PossibleBits(left) & ~SamplerDword3ReservedMask) == 0;
-            var rightReserved = (PossibleBits(right) & ~SamplerDword3ReservedMask) == 0;
+            var leftReserved = (PossibleBits(left) & ~DescriptorConstants.SamplerDword3ReservedMask) == 0;
+            var rightReserved = (PossibleBits(right) & ~DescriptorConstants.SamplerDword3ReservedMask) == 0;
             if (leftReserved && rightReserved)
             {
                 return _graph.Constant(0u);
@@ -479,7 +498,8 @@ public sealed partial class ResourceTracker
         bool sampler = false,
         bool sampleAdjust = false,
         string? memoryOpcode = null,
-        MemoryAccess memoryAccess = MemoryAccess.Read)
+        MemoryAccess memoryAccess = MemoryAccess.Read,
+        bool allowNullFallback = true)
     {
         if (handle is null || handle.Kind != expected)
         {
@@ -509,7 +529,9 @@ public sealed partial class ResourceTracker
             // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
             // descriptor). Buffer/sampler-adjacent handles or any other validation failure
             // still hard-fail, since those aren't safe to silently zero.
-            var dynamicImageFallback = expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
+            // An access the run-time descriptor table can serve does not take this fallback: it fails
+            // here and the caller reads the descriptors from the shader registers instead.
+            var dynamicImageFallback = allowNullFallback && expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
                 (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
                  (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
             if (dynamicImageFallback)
@@ -1107,32 +1129,58 @@ public sealed partial class ResourceTracker
         }
 
         uint imageSource;
-        var indirect = _indirectImages.FirstOrDefault(plan => ReferenceEquals(plan.Handle, access.Handle));
-        if (indirect is not null)
+        uint samplerSource = 0;
+        // The hardware reads both descriptors from memory into registers when the access runs.
+        // An access the run-time descriptor table can serve does the same when no plan-time source
+        // exists, instead of reading the null descriptor.
+        var runtimeReadable = _runtimeDescriptors != RuntimeDescriptorMode.Disabled && CanReadDescriptorsAtRuntime(memory, access);
+        try
         {
-            imageSource = indirect.Source;
+            var indirect = _indirectImages.FirstOrDefault(plan => ReferenceEquals(plan.Handle, access.Handle));
+            if (indirect is not null)
+            {
+                imageSource = indirect.Source;
+            }
+            else
+            {
+                imageSource = GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc, allowNullFallback: !runtimeReadable);
+            }
+
+            if (memory.NeedsSampler)
+            {
+                if (access.SamplerHandle is null)
+                {
+                    throw Failure(memory.Pc, "sampled image operation has no sampler handle");
+                }
+
+                var sampleAdjust = (memory.ImageSampleFlags & ImageSampleFlags.Adjust) != 0;
+                samplerSource = GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust,
+                    allowNullFallback: !runtimeReadable);
+            }
         }
-        else
+        catch (ResourcePlanException) when (runtimeReadable)
         {
-            imageSource = GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc);
+            // No plan-time source: the shader reads both descriptors from its registers.
+            UseRuntimeDescriptors(memory);
+            return;
         }
 
         var image = AddImage(imageSource, memory, memory.Pc);
         if (image == DescriptorConstants.NoIndex)
         {
+            // Past the image binding budget the access reads its descriptors from its registers.
+            if (runtimeReadable)
+            {
+                UseRuntimeDescriptors(memory);
+                return;
+            }
+
             throw Failure(memory.Pc, "image resource limit exceeded");
         }
 
         uint sampler = 0;
         if (memory.NeedsSampler)
         {
-            if (access.SamplerHandle is null)
-            {
-                throw Failure(memory.Pc, "sampled image operation has no sampler handle");
-            }
-
-            var sampleAdjust = (memory.ImageSampleFlags & ImageSampleFlags.Adjust) != 0;
-            var samplerSource = GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust);
             sampler = AddSampler(samplerSource, memory.Pc);
             if (sampler == DescriptorConstants.NoIndex)
             {
@@ -1143,6 +1191,43 @@ public sealed partial class ResourceTracker
         }
 
         AddMemoryPatch(index, image, sampler, memory.NeedsSampler, memory.Pc);
+    }
+
+    // A sampled access or an image load that the host can create from descriptor words alone.
+    // An adjusted sample keys its sampler without the reserved bits its adjustment uses. These
+    // stay on their planned path: depth compares (the view and sampler must agree on the compare
+    // state, which the host derives from the planned pair), cube views (the face selection is a
+    // property of the planned view), storage writes and atomics (they need storage images and
+    // write tracking), queries (they read the descriptor, not a view).
+    private bool CanReadDescriptorsAtRuntime(MemoryAccessInfo memory, MemoryAccessBinding access) =>
+        memory.ImageClass == ImageResourceClass.Sampled &&
+        ((memory.NeedsSampler && access.SamplerHandle is not null &&
+            (memory.ImageSampleFlags & ImageSampleFlags.Compare) == 0) ||
+            (!memory.NeedsSampler && memory.Opcode is "ImageLoad" or "ImageLoadMip")) &&
+        RuntimeDescriptorTable.SupportsRuntimeView(memory.ImageDimension) &&
+        _graph.Program.Instructions.FirstOrDefault(instruction => instruction.Pc == memory.Pc)?.Control is Gen5ImageControl { Dimension: not CubeDimension };
+
+    private const uint CubeDimension = 3;
+
+    // Whether some access through this handle would read its descriptors at run time.
+    private bool ReadsDescriptorsAtRuntime(ScalarValue handle)
+    {
+        for (var index = 0; index < _plan.Memory.Count; index++)
+        {
+            if (_plan.Memory[index] is { Kind: MemoryResourceKind.Image } memory && _plan.Accesses[index] is { } access &&
+                ReferenceEquals(access.Handle, handle) && CanReadDescriptorsAtRuntime(memory, access))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void UseRuntimeDescriptors(MemoryAccessInfo memory)
+    {
+        memory.RuntimeDescriptor = true;
+        _info.UsesRuntimeDescriptors = true;
     }
 
     private void LinkImageAliases()
@@ -1219,6 +1304,13 @@ public sealed partial class ResourceTracker
             var memory = _plan.Memory[index];
             if (memory.Kind != MemoryResourceKind.Image || _plan.Accesses[index]?.Handle is not { } handle ||
                 _indirectImages.Any(plan => ReferenceEquals(plan.Handle, handle)))
+            {
+                continue;
+            }
+
+            // A table plan binds every image the table can select and suppresses the loads that fed
+            // the descriptor, which the run-time lookup needs in its registers.
+            if (_runtimeDescriptors == RuntimeDescriptorMode.Preferred && ReadsDescriptorsAtRuntime(handle))
             {
                 continue;
             }
