@@ -23,7 +23,6 @@ internal static unsafe partial class VulkanVideoPresenter
     private sealed partial class Presenter
     {
         private const ulong NullStorageBufferBytes = 16;
-        private const uint MaxMemoryOffsetAdjustment = 256;
         private const uint TransientDataAlignment = 256;
         private const int MaxImageOccurrences = 64;
 
@@ -613,20 +612,18 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, resource.Written, isTexelBuffer: resource.Formatted, bufferIdentifier);
-            var alignedOffset = offset - offset % alignment;
-            var adjustment = offset - alignedOffset;
-            if (adjustment % sizeof(uint) != 0 || adjustment >= MaxMemoryOffsetAdjustment || size > maxRange - adjustment)
+            if (!StorageBufferViewPlanner.TryPlan(offset, size, alignment, maxRange, buffer.Size, resource.DwordAddressed, out var view, out var planError))
             {
-                throw SubmissionScheduler.Fatal($"A storage buffer offset adjustment is unsupported: buffer={slot} adjustment={adjustment} hash=0x{program.Hash:X16}.");
+                throw SubmissionScheduler.Fatal($"{planError} buffer={slot} hash=0x{program.Hash:X16}.");
             }
 
-            memoryOffset = (uint)adjustment;
+            memoryOffset = view.MemoryOffset;
             if (resource.Formatted && resource.Written)
             {
                 _imageCache.InvalidateMemoryFromGpu(address, size);
             }
 
-            return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
+            return new BufferView(buffer.Handle, view.AlignedOffset, view.Range);
         }
 
         private BufferView UploadDwords(uint[] data, string label, ShaderProgramInfo program)

@@ -53,6 +53,13 @@ public sealed class BufferResource
     public bool Formatted { get; set; }
     public bool Scalar { get; set; }
 
+    // Some access reads or writes whole dwords through the bound words (dword loads and stores,
+    // atomics, scalar buffer loads). The host must then bind the buffer at a dword-aligned
+    // base: those paths address a word by the byte address shifted right by two. Buffers
+    // reached only through byte, short or formatted accesses assemble elements from bytes and
+    // accept any base.
+    public bool DwordAddressed { get; set; }
+
     public BufferResource Clone() => (BufferResource)MemberwiseClone();
 }
 

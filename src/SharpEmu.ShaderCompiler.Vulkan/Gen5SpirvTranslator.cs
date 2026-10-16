@@ -4474,17 +4474,38 @@ public static partial class Gen5SpirvTranslator
             {
                 if (Gfx10UnifiedFormat.HasWholeDwordComponents(dataFormat))
                 {
-                    // Dword components are dword aligned and keep their register bits.
-                    var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+                    if (_request.Resources.Info.Buffers[bindingIndex].DwordAddressed)
+                    {
+                        // The host binds a dword-addressed buffer at a dword-aligned base, so
+                        // the components keep their register bits and need no read-modify-write.
+                        var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+                        for (uint component = 0; component < componentCount; component++)
+                        {
+                            Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, component, out var byteOffset, out _, out _);
+                            StoreBufferWord(
+                                bindingIndex,
+                                byteOffset == 0 ? dwordAddress : IAdd(dwordAddress, UInt(byteOffset / 4)),
+                                LoadV(control.VectorData + component));
+                        }
+
+                        return;
+                    }
+
+                    // Any other buffer may be bound mid-dword, so the element goes through the
+                    // byte-granular store with full masks.
+                    var wholeElement = new (uint Value, uint Mask)[(elementBytes + 3) / 4];
+                    for (var index = 0; index < wholeElement.Length; index++)
+                    {
+                        wholeElement[index] = (UInt(0), 0);
+                    }
+
                     for (uint component = 0; component < componentCount; component++)
                     {
                         Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, component, out var byteOffset, out _, out _);
-                        StoreBufferWord(
-                            bindingIndex,
-                            byteOffset == 0 ? dwordAddress : IAdd(dwordAddress, UInt(byteOffset / 4)),
-                            LoadV(control.VectorData + component));
+                        wholeElement[(int)(byteOffset / 4)] = (LoadV(control.VectorData + component), uint.MaxValue);
                     }
 
+                    StoreBufferElementBits(bindingIndex, byteAddress, wholeElement);
                     return;
                 }
 

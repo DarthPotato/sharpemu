@@ -181,7 +181,8 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         uint[]? flattenedTable = null,
         IReadOnlyDictionary<DescriptorBindingKind, DescriptorImageInfo[]>? boundImages = null,
         ulong shaderBase = 0,
-        uint[]? dispatchThreadLimits = null)
+        uint[]? dispatchThreadLimits = null,
+        uint[]? memoryOffsets = null)
     {
         var vk = _harness.Vk;
         var device = _harness.Device.Device;
@@ -197,6 +198,12 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         {
             shaderData[layout.ShaderBaseDword] = (uint)shaderBase;
             shaderData[layout.ShaderBaseDword + 1] = (uint)(shaderBase >> 32);
+        }
+
+        // The byte offset of each buffer's real base inside its aligned view, one byte per buffer.
+        for (var index = 0; memoryOffsets is not null && index < memoryOffsets.Length; index++)
+        {
+            shaderData[layout.MemoryOffsetDword + (uint)index / 4] |= (memoryOffsets[index] & 0xFF) << ((index % 4) * 8);
         }
 
         if (layout.UsesDispatchThreadLimits)

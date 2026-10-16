@@ -722,7 +722,18 @@ public sealed partial class ResourceTracker
         resource.Atomic |= atomic;
         resource.Formatted |= memory.Formatted;
         resource.Scalar |= memory.Kind == MemoryResourceKind.ScalarBuffer;
+        resource.DwordAddressed |= IsDwordAddressed(memory);
     }
+
+    // Raw dword accesses, atomics, scalar loads and typed stores of whole-dword formats index
+    // the bound words directly. Byte, short, other typed and formatted accesses go through the
+    // byte address, and so do untyped formatted stores, whose format is known only at
+    // specialization: the emitter gives them the byte-granular store.
+    internal static bool IsDwordAddressed(MemoryAccessInfo memory) =>
+        memory.Access == MemoryAccess.Atomic ||
+        memory.Kind == MemoryResourceKind.ScalarBuffer ||
+        (!memory.Formatted && !memory.Typed && memory.DataBits >= 32) ||
+        (memory.Typed && memory.Access == MemoryAccess.Write && Gfx10UnifiedFormat.HasWholeDwordComponents(memory.DataFormat));
 
     private uint AddImage(uint source, MemoryAccessInfo memory, uint pc)
     {
