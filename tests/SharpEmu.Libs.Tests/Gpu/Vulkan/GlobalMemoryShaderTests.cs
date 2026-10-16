@@ -202,6 +202,108 @@ public sealed class GlobalMemoryShaderTests(HeadlessVulkanFixture fixture, ITest
 
     private const uint Format8Sint = 6;
 
+    // A run-time format reads a component through two aligned dwords: 32- and 16-bit
+    // components at unaligned offsets, straddling dwords and the end of the buffer.
+    [Theory]
+    [InlineData(20u, 4, 1u, 8u)]
+    [InlineData(20u, 4, 2u, 8u)]
+    [InlineData(20u, 4, 3u, 8u)]
+    [InlineData(20u, 4, 4u, 8u)]
+    [InlineData(20u, 4, 1u, 5u)]
+    [InlineData(20u, 4, 5u, 8u)]
+    [InlineData(20u, 4, 17u, 19u)]
+    [InlineData(20u, 4, 16u, 19u)]
+    [InlineData(11u, 2, 3u, 8u)]
+    [InlineData(11u, 2, 7u, 8u)]
+    [InlineData(11u, 2, 7u, 9u)]
+    [InlineData(11u, 2, 1u, 8u)]
+    public void DeviceDescriptorFormattedLoads_StraddleDwordsAndTheBufferEnd(
+        uint format, int componentBytes, uint offset, uint size)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        var initial = CreateInput();
+        for (var index = 0; index < 24; index++) initial[index] = (byte)(index * 0x13 + 0x21);
+        WriteWord(initial, DescriptorOffset, (uint)(BufferAddress & uint.MaxValue));
+        WriteWord(initial, DescriptorOffset + 4, (uint)(BufferAddress >> 32));
+        WriteWord(initial, DescriptorOffset + 8, size);
+        WriteWord(initial, DescriptorOffset + 12, (format << 12) | IdentitySwizzle);
+        var expected = (byte[])initial.Clone();
+        initial.AsSpan(0, 16).CopyTo(expected.AsSpan(MemoryOffset, 16));
+        var value = 0u;
+        if (offset + (uint)componentBytes <= size)
+        {
+            for (var index = componentBytes - 1; index >= 0; index--) value = (value << 8) | initial[(int)offset + index];
+        }
+
+        WriteWord(expected, MemoryOffset, value);
+
+        var words = new List<uint>
+        {
+            0xE0380000, 0x80000400,
+            0x7E000000u | (20u << 17) | (2u << 9) | 256u,
+            0xF4000000u | (10u << 18) | (16u << 6), (20u << 25) | DescriptorOffset,
+            0xBF8CC07F,
+            // An odd offset cannot ride the immediate field (its low bit extends the opcode), so
+            // it goes through the scalar offset operand: inline constants 129..192 are 1..64.
+            0xE0000000, ((0x80u + offset) << 24) | 0x040400,
+            0xE0780000 | MemoryOffset, 0x80000400,
+            0xBF810000,
+        };
+        var shader = CompileProgram(DecodeProgram(words), BaseScalars());
+        Assert.Equal(expected, RunOnce(vulkan, shader, initial));
+    }
+
+    // Every formatted load of a run-time format decodes its layout from one shared table and
+    // joins two dwords, so a program of many loads stays small.
+    [Fact]
+    public void DeviceDescriptorFormattedLoads_StayCompactPerLoad()
+    {
+        int Words(int loads)
+        {
+            var words = new List<uint>
+            {
+                0xE0380000, 0x80000400,
+                0x7E000000u | (20u << 17) | (2u << 9) | 256u,
+                0xF4000000u | (10u << 18) | (16u << 6), (20u << 25) | DescriptorOffset,
+                0xBF8CC07F,
+            };
+            for (var index = 0; index < loads; index++)
+            {
+                // buffer_load_format_xyzw v[4:7], v0, s[16:19], 0 offen: offset = index * 16
+                words.Add(0xE0000000 | (3u << 18) | (uint)(index * 16));
+                words.Add(0x80040400);
+            }
+
+            words.Add(0xE0780000 | MemoryOffset);
+            words.Add(0x80000400);
+            words.Add(0xBF810000);
+            var plan = ShaderResourcePlan.Extract(DecodeProgram(words), ShaderStage.Compute, 1, 0, 20);
+            var scalars = BaseScalars();
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            Assert.True(ResourceMaterializer.Materialize(plan, ResourceTestProgram.Inputs(scalars[..20]),
+                ref snapshot, ref specialization, out var failure), failure.ToString());
+            var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+            var layout = BindingLayout.Allocate(resources.Info,
+                BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 20), false,
+                ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false);
+            var request = new ShaderCompileRequest(plan, resources, layout) { TraceDeviceAddressFaults = true };
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+            return shader.Spirv.Length / sizeof(uint);
+        }
+
+        var one = Words(1);
+        var many = Words(9);
+        var perLoad = (many - one) / 8;
+        output.WriteLine($"SPIR-V words: 1 load={one}, 9 loads={many}, per load={perLoad}");
+        Assert.True(perLoad < PerLoadWordBudget, $"{perLoad} words per formatted load");
+    }
+
+    // Measured 2183 after the change, 10242 before (fault tracing on, nine loads minus one over eight).
+    private const int PerLoadWordBudget = 3000;
+
     [Theory]
     [InlineData(1u, 188u, true)]
     [InlineData(2u, 184u, true)]

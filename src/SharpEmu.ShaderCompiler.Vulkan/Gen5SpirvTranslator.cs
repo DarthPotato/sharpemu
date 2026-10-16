@@ -175,6 +175,7 @@ public static partial class Gen5SpirvTranslator
         private readonly Dictionary<(uint Register, uint Lane), uint> _laneSpillSlots = new();
         private uint _globalBuffers;
         private uint _gfx10BufferFormatTable;
+        private uint _gfx10ComponentLayoutTable;
         private uint _storageBlockPointer;
         private uint _storageUintPointer;
         private uint _lds;
@@ -3745,16 +3746,69 @@ public static partial class Gen5SpirvTranslator
 
             var canonical = new uint[4];
             var componentBounds = new uint[4];
-            for (var component = 0; component < canonical.Length; component++)
+            if (_module.TryGetConstantValue(dataFormat, out _))
             {
-                canonical[component] = LoadGfx10DeviceBufferFormatComponent(
+                for (var component = 0; component < canonical.Length; component++)
+                {
+                    canonical[component] = LoadGfx10DeviceBufferFormatComponent(
+                        baseAddress,
+                        size,
+                        byteAddress,
+                        dataFormat,
+                        numberFormat,
+                        UInt((uint)component),
+                        out componentBounds[component]);
+                }
+            }
+            else
+            {
+                // The layout is only known at run time. One loop body decodes, loads and
+                // converts a component, so the module carries it once instead of four times.
+                EnsureGfx10FormatLoopScratch();
+                var preheader = _module.AllocateId();
+                var header = _module.AllocateId();
+                var body = _module.AllocateId();
+                var continueLabel = _module.AllocateId();
+                var mergeLabel = _module.AllocateId();
+                var next = _module.AllocateId();
+                _module.AddStatement(SpirvOp.Branch, preheader);
+                _module.AddLabel(preheader);
+                _module.AddStatement(SpirvOp.Branch, header);
+                _module.AddLabel(header);
+                var counter = _module.AddInstruction(
+                    SpirvOp.Phi, _uintType, UInt(0), preheader, next, continueLabel);
+                var more = _module.AddInstruction(SpirvOp.ULessThan, _boolType, counter, UInt(4));
+                _module.AddStatement(SpirvOp.LoopMerge, mergeLabel, continueLabel, 0);
+                _module.AddStatement(SpirvOp.BranchConditional, more, body, mergeLabel);
+                _module.AddLabel(body);
+                var value = LoadGfx10DeviceBufferFormatComponent(
                     baseAddress,
                     size,
                     byteAddress,
                     dataFormat,
                     numberFormat,
-                    component,
-                    out componentBounds[component]);
+                    counter,
+                    out var inBoundsComponent);
+                Store(Gfx10FormatLoopSlot(_gfx10FormatValueScratch, counter), value);
+                Store(
+                    Gfx10FormatLoopSlot(_gfx10FormatBoundsScratch, counter),
+                    _module.AddInstruction(SpirvOp.Select, _uintType, inBoundsComponent, UInt(1), UInt(0)));
+                _module.AddStatement(SpirvOp.Branch, continueLabel);
+                _module.AddLabel(continueLabel);
+                _module.AddStatement(SpirvOp.IAdd, _uintType, next, counter, UInt(1));
+                _module.AddStatement(SpirvOp.Branch, header);
+                _module.AddLabel(mergeLabel);
+                for (uint component = 0; component < 4; component++)
+                {
+                    canonical[component] = Load(
+                        _uintType,
+                        Gfx10FormatLoopSlot(_gfx10FormatValueScratch, UInt(component)));
+                    componentBounds[component] = _module.AddInstruction(
+                        SpirvOp.INotEqual,
+                        _boolType,
+                        Load(_uintType, Gfx10FormatLoopSlot(_gfx10FormatBoundsScratch, UInt(component))),
+                        UInt(0));
+                }
             }
 
             var selectors = new uint[componentCount];
@@ -3801,26 +3855,10 @@ public static partial class Gen5SpirvTranslator
             uint elementAddress,
             uint dataFormat,
             uint numberFormat,
-            int component,
+            uint component,
             out uint componentInBounds)
         {
-            var byteOffset = UInt(0);
-            var bitOffset = UInt(0);
-            var bitCount = UInt(0);
-
-            void SetLayout(uint format, uint bytes, uint bits, uint count)
-            {
-                var matches = _module.AddInstruction(SpirvOp.IEqual, _boolType, dataFormat, UInt(format));
-                byteOffset = _module.AddInstruction(SpirvOp.Select, _uintType, matches, UInt(bytes), byteOffset);
-                bitOffset = _module.AddInstruction(SpirvOp.Select, _uintType, matches, UInt(bits), bitOffset);
-                bitCount = _module.AddInstruction(SpirvOp.Select, _uintType, matches, UInt(count), bitCount);
-            }
-
-            foreach (var layout in Gfx10UnifiedFormat.ComponentLayouts)
-            {
-                if (layout.Component == (uint)component)
-                    SetLayout(layout.DataFormat, layout.ByteOffset, layout.BitOffset, layout.BitCount);
-            }
+            var (byteOffset, bitOffset, bitCount) = LoadGfx10ComponentLayout(dataFormat, component);
 
             var componentAddress = IAdd(elementAddress, byteOffset);
             var componentBytes = ShiftRightLogical(IAdd(IAdd(bitOffset, bitCount), UInt(7)), UInt(3));
@@ -3833,15 +3871,23 @@ public static partial class Gen5SpirvTranslator
                 _boolType,
                 LogicalNot(hasComponent),
                 inRange);
-            var packed = UInt(0);
-            for (uint index = 0; index < sizeof(uint); index++)
-            {
-                var address = index == 0 ? componentAddress : IAdd(componentAddress, UInt(index));
-                var word = LoadDeviceBufferElementWord(baseAddress, size, address, accessAllowed);
-                var shift = ShiftLeftLogical(BitwiseAnd(address, UInt(3)), UInt(3));
-                var value = BitwiseAnd(ShiftRightLogical(word, shift), UInt(0xFF));
-                packed = BitwiseOr(packed, ShiftLeftLogical(value, UInt(index * 8)));
-            }
+            // A component spans at most four bytes, so it lies in two aligned dwords; the
+            // second is read only when the component crosses into it. Both keep the
+            // element-level bounds semantic of LoadDeviceBufferElementWord.
+            var byteInDword = BitwiseAnd(componentAddress, UInt(3));
+            var shift = ShiftLeftLogical(byteInDword, UInt(3));
+            var low = LoadDeviceBufferElementWord(baseAddress, size, componentAddress, accessAllowed);
+            var crossesDword = _module.AddInstruction(
+                SpirvOp.UGreaterThan,
+                _boolType,
+                IAdd(byteInDword, componentBytes),
+                UInt(4));
+            var high = LoadDeviceBufferElementWord(
+                baseAddress,
+                size,
+                IAdd(BitwiseAnd(componentAddress, UInt(~3u)), UInt(4)),
+                LogicalAnd(accessAllowed, crossesDword));
+            var packed = FunnelShiftRight(low, high, shift);
 
             var raw = _module.AddInstruction(SpirvOp.BitFieldUExtract, _uintType, packed, bitOffset, bitCount);
             var converted = ConvertGfx10BufferComponent(raw, bitCount, numberFormat, dataFormat);
@@ -3851,8 +3897,55 @@ public static partial class Gen5SpirvTranslator
                 _uintType,
                 valid,
                 converted,
-                component == 3 ? Gfx10FormatOne(numberFormat) : UInt(0));
+                AbsentGfx10Component(component, numberFormat));
         }
+
+        // What a component the format lacks reads as: one in W, zero elsewhere.
+        private uint AbsentGfx10Component(uint component, uint numberFormat)
+        {
+            if (_module.TryGetConstantValue(component, out var known))
+            {
+                return known == 3 ? Gfx10FormatOne(numberFormat) : UInt(0);
+            }
+
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, component, UInt(3)),
+                Gfx10FormatOne(numberFormat),
+                UInt(0));
+        }
+
+        private uint _gfx10FormatValueScratch;
+        private uint _gfx10FormatBoundsScratch;
+
+        private void EnsureGfx10FormatLoopScratch()
+        {
+            if (_gfx10FormatValueScratch != 0)
+            {
+                return;
+            }
+
+            var arrayType = _module.TypeArray(_uintType, 4);
+            var pointerType = _module.TypePointer(SpirvStorageClass.Private, arrayType);
+            uint NewScratch(string name)
+            {
+                var zero = UInt(0);
+                var variable = _module.AddGlobalVariable(
+                    pointerType,
+                    SpirvStorageClass.Private,
+                    _module.ConstantComposite(arrayType, [zero, zero, zero, zero]));
+                _module.AddName(variable, name);
+                _interfaces.Add(variable);
+                return variable;
+            }
+
+            _gfx10FormatValueScratch = NewScratch("gfx10FormatValues");
+            _gfx10FormatBoundsScratch = NewScratch("gfx10FormatBounds");
+        }
+
+        private uint Gfx10FormatLoopSlot(uint scratch, uint index) =>
+            _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, scratch, index);
 
         private void EmitBufferFormatLoad(
             int bindingIndex,
@@ -4260,6 +4353,71 @@ public static partial class Gen5SpirvTranslator
                     UInt(0xFF)));
         }
 
+        // Number of legacy data formats the component layout table covers; any larger
+        // data format has no layout and reads as an absent component.
+        private const uint Gfx10LayoutFormatCount = 16;
+
+        // The byte offset, bit offset and bit count of one component of a data format. A
+        // translation-time constant format folds on the host; otherwise one module-level
+        // table (index = format * 4 + component, entry = byte | bit << 8 | count << 16)
+        // replaces a compare and three selects per layout entry at every load site.
+        private (uint ByteOffset, uint BitOffset, uint BitCount) LoadGfx10ComponentLayout(
+            uint dataFormat,
+            uint component)
+        {
+            if (_module.TryGetConstantValue(dataFormat, out var knownFormat) &&
+                _module.TryGetConstantValue(component, out var knownComponent))
+            {
+                Gfx10UnifiedFormat.TryGetComponentLayout(
+                    knownFormat,
+                    knownComponent,
+                    out var knownByte,
+                    out var knownBit,
+                    out var knownCount);
+                return (UInt(knownByte), UInt(knownBit), UInt(knownCount));
+            }
+
+            if (_gfx10ComponentLayoutTable == 0)
+            {
+                var entries = new uint[Gfx10LayoutFormatCount * 4];
+                Array.Fill(entries, UInt(0));
+                foreach (var layout in Gfx10UnifiedFormat.ComponentLayouts)
+                {
+                    entries[layout.DataFormat * 4 + layout.Component] = UInt(
+                        layout.ByteOffset | (layout.BitOffset << 8) | (layout.BitCount << 16));
+                }
+
+                var tableType = _module.TypeArray(_uintType, (uint)entries.Length);
+                var tablePointer = _module.TypePointer(SpirvStorageClass.Private, tableType);
+                _gfx10ComponentLayoutTable = _module.AddGlobalVariable(
+                    tablePointer,
+                    SpirvStorageClass.Private,
+                    _module.ConstantComposite(tableType, entries));
+                _module.AddName(_gfx10ComponentLayoutTable, "gfx10ComponentLayouts");
+                _interfaces.Add(_gfx10ComponentLayoutTable);
+            }
+
+            // Formats past the table have no layout; row 15 is empty.
+            var row = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, dataFormat, UInt(Gfx10LayoutFormatCount)),
+                dataFormat,
+                UInt(Gfx10LayoutFormatCount - 1));
+            var index = IAdd(ShiftLeftLogical(row, UInt(2)), component);
+            var entry = Load(
+                _uintType,
+                _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _privateUintPointer,
+                    _gfx10ComponentLayoutTable,
+                    index));
+            return (
+                BitwiseAnd(entry, UInt(0xFF)),
+                BitwiseAnd(ShiftRightLogical(entry, UInt(8)), UInt(0xFF)),
+                BitwiseAnd(ShiftRightLogical(entry, UInt(16)), UInt(0xFF)));
+        }
+
         private uint LoadGfx10BufferFormatComponent(
             int bindingIndex,
             uint elementAddress,
@@ -4268,45 +4426,7 @@ public static partial class Gen5SpirvTranslator
             int component,
             out uint componentInBounds)
         {
-            var byteOffset = UInt(0);
-            var bitOffset = UInt(0);
-            var bitCount = UInt(0);
-
-            void SetLayout(uint format, uint bytes, uint bits, uint count)
-            {
-                var matches = _module.AddInstruction(
-                    SpirvOp.IEqual,
-                    _boolType,
-                    dataFormat,
-                    UInt(format));
-                byteOffset = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    matches,
-                    UInt(bytes),
-                    byteOffset);
-                bitOffset = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    matches,
-                    UInt(bits),
-                    bitOffset);
-                bitCount = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    matches,
-                    UInt(count),
-                    bitCount);
-            }
-
-            // The layout is selected at run time from the descriptor's data format.
-            foreach (var layout in Gfx10UnifiedFormat.ComponentLayouts)
-            {
-                if (layout.Component == (uint)component)
-                {
-                    SetLayout(layout.DataFormat, layout.ByteOffset, layout.BitOffset, layout.BitCount);
-                }
-            }
+            var (byteOffset, bitOffset, bitCount) = LoadGfx10ComponentLayout(dataFormat, UInt((uint)component));
 
             var packed = LoadUnalignedBufferWord(
                 bindingIndex,
@@ -4573,23 +4693,27 @@ public static partial class Gen5SpirvTranslator
                 whenTrue,
                 whenFalse);
 
+        // Four bytes from any byte address: the two aligned dwords they span, joined by a
+        // funnel shift. A dword outside the binding reads as zero.
         private uint LoadUnalignedBufferWord(int bindingIndex, uint byteAddress)
         {
-            var result = UInt(0);
-            for (uint index = 0; index < 4; index++)
-            {
-                var address = index == 0
-                    ? byteAddress
-                    : IAdd(byteAddress, UInt(index));
-                var dwordAddress = ShiftRightLogical(address, UInt(2));
-                var bitOffset = ShiftLeftLogical(BitwiseAnd(address, UInt(3)), UInt(3));
-                var value = BitwiseAnd(
-                    ShiftRightLogical(LoadBufferWord(bindingIndex, dwordAddress), bitOffset),
-                    UInt(0xFF));
-                result = BitwiseOr(result, ShiftLeftLogical(value, UInt(index * 8)));
-            }
+            var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+            var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+            var low = LoadBufferWord(bindingIndex, dwordAddress);
+            var high = LoadBufferWord(bindingIndex, IAdd(dwordAddress, UInt(1)));
+            return FunnelShiftRight(low, high, shift);
+        }
 
-            return result;
+        // (high:low) >> shift for shift in 0..24, as the low 32 bits.
+        private uint FunnelShiftRight(uint low, uint high, uint shift)
+        {
+            var aligned = _module.AddInstruction(SpirvOp.IEqual, _boolType, shift, UInt(0));
+            var highPart = ShiftLeftLogical(
+                high,
+                BitwiseAnd(_module.AddInstruction(SpirvOp.ISub, _uintType, UInt(32), shift), UInt(31)));
+            return BitwiseOr(
+                ShiftRightLogical(low, shift),
+                _module.AddInstruction(SpirvOp.Select, _uintType, aligned, UInt(0), highPart));
         }
 
         private uint LoadSubdwordBufferValue(
