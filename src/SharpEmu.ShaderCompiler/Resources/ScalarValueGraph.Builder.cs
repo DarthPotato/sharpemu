@@ -1718,7 +1718,8 @@ public sealed partial class ScalarValueGraph
             state.WriteVector(destination.Value, _graph.Undefined(ScalarValueType.U32));
             if (!lane.IsConstant)
             {
-                state.ClearLanes(destination.Value);
+                // Writelane ignores EXEC, so an unknown lane index may hit any lane.
+                state.ClearLanes(destination.Value, masked: false);
                 return;
             }
 
@@ -2040,10 +2041,15 @@ public sealed partial class ScalarValueGraph
                 return;
             }
 
-            Vectors[register] = value.IsUndefined ? value : _graph.Select(Exec, value, Vectors[register]);
+            Vectors[register] = Exec.IsConstant && !Exec.ConstantBool
+                ? Vectors[register]
+                : value.IsUndefined ? value : _graph.Select(Exec, value, Vectors[register]);
         }
 
-        public void ClearLanes(uint register)
+        // Forgets the known lane values of a register. An ordinary write reaches only the lanes
+        // EXEC enables, so a lane that a constant EXEC disables keeps its value; `masked: false`
+        // is for writes that ignore EXEC and may touch any lane.
+        public void ClearLanes(uint register, bool masked = true)
         {
             if (Lanes.Count == 0)
             {
@@ -2052,6 +2058,20 @@ public sealed partial class ScalarValueGraph
 
             foreach (var key in Lanes.Keys.Where(key => key.Register == register).ToArray())
             {
+                if (masked)
+                {
+                    // A phi's operands still change while the builder converges, so resolve
+                    // it afresh rather than through the graph's post-build cache.
+                    var maskValue = Scalars[key.Lane < 32 ? ExecLow : ExecHigh];
+                    var mask = maskValue.Kind == ScalarValueKind.Phi
+                        ? ScalarValueEquivalence.ResolveInvariantPhi(_graph.Memory, maskValue) ?? maskValue
+                        : maskValue;
+                    if (mask is { IsConstant: true } && (mask.ConstantU32 & (1u << (int)(key.Lane & 31))) == 0)
+                    {
+                        continue;
+                    }
+                }
+
                 Lanes.Remove(key);
             }
         }
