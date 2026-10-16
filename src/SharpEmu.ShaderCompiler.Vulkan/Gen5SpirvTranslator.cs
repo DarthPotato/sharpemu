@@ -176,6 +176,7 @@ public static partial class Gen5SpirvTranslator
         private uint _globalBuffers;
         private uint _gfx10BufferFormatTable;
         private uint _gfx10ComponentLayoutTable;
+        private uint _gfx10AccessByteTable;
         private uint _storageBlockPointer;
         private uint _storageUintPointer;
         private uint _lds;
@@ -3549,6 +3550,13 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Opcode is "BufferStoreFormatX" or "BufferStoreFormatXy" or
+                "BufferStoreFormatXyz" or "BufferStoreFormatXyzw")
+            {
+                EmitDeviceBufferFormatStore(baseAddress, size, byteAddress, descriptorWord3, control);
+                return true;
+            }
+
             if (instruction.Opcode.Contains("Format", StringComparison.Ordinal))
             {
                 error = $"device buffer descriptor operation {instruction.Opcode} is not supported";
@@ -3898,6 +3906,373 @@ public static partial class Gen5SpirvTranslator
                 valid,
                 converted,
                 AbsentGfx10Component(component, numberFormat));
+        }
+
+        // A formatted store through a device-address V#: each transferred component is
+        // converted with the descriptor's number format and merged into its own bits, so
+        // neighbouring bytes (and lanes writing them) are untouched. The element is stored
+        // whole or not at all: it must fit the buffer, as for a bound buffer's store.
+        private void EmitDeviceBufferFormatStore(
+            uint baseAddress,
+            uint size,
+            uint byteAddress,
+            uint descriptorWord3,
+            Gen5BufferMemoryControl control)
+        {
+            var unifiedFormat = BitwiseAnd(
+                ShiftRightLogical(descriptorWord3, UInt(12)),
+                UInt(0x7F));
+            var (dataFormat, numberFormat) = DecodeGfx10BufferFormat(unifiedFormat);
+            var componentCount = control.DwordCount;
+            var constantFormat = _module.TryGetConstantValue(dataFormat, out var knownDataFormat) &
+                _module.TryGetConstantValue(numberFormat, out var knownNumberFormat);
+            var elementBytes = constantFormat
+                ? UInt(Gfx10UnifiedFormat.GetAccessByteSize(knownDataFormat, componentCount))
+                : LoadGfx10AccessByteSize(dataFormat, componentCount);
+
+            // An unbound descriptor or a format without a layout transfers no bytes.
+            var allowed = LogicalAnd(
+                _module.AddInstruction(SpirvOp.INotEqual, _boolType, elementBytes, UInt(0)),
+                IsDeviceBufferElementInRange(
+                    size,
+                    byteAddress,
+                    _module.AddInstruction(SpirvOp.ISub, _uintType, elementBytes, UInt(1))));
+            var elementStart = And64(
+                IAdd64(baseAddress, Widen(byteAddress)),
+                ULong(DeviceAddressMask));
+            var values = new uint[componentCount];
+            for (uint index = 0; index < componentCount; index++)
+            {
+                values[index] = LoadV(control.VectorData + index);
+            }
+
+            EmitExecConditional(() => EmitConditional(allowed, () =>
+            {
+                if (constantFormat)
+                {
+                    for (uint component = 0; component < componentCount; component++)
+                    {
+                        if (!Gfx10UnifiedFormat.TryGetComponentLayout(
+                                knownDataFormat, component, out _, out _, out var knownBitCount) ||
+                            knownBitCount == 0)
+                        {
+                            continue;
+                        }
+
+                        StoreDeviceFormatComponent(
+                            elementStart,
+                            dataFormat,
+                            numberFormat,
+                            UInt(component),
+                            values[component],
+                            knownDataFormat,
+                            knownNumberFormat);
+                    }
+
+                    return;
+                }
+
+                // The layout is only known at run time. One loop body encodes and merges a
+                // component, so the module carries the encoder once instead of per component.
+                var preheader = _module.AllocateId();
+                var header = _module.AllocateId();
+                var body = _module.AllocateId();
+                var continueLabel = _module.AllocateId();
+                var mergeLabel = _module.AllocateId();
+                var next = _module.AllocateId();
+                _module.AddStatement(SpirvOp.Branch, preheader);
+                _module.AddLabel(preheader);
+                _module.AddStatement(SpirvOp.Branch, header);
+                _module.AddLabel(header);
+                var counter = _module.AddInstruction(
+                    SpirvOp.Phi, _uintType, UInt(0), preheader, next, continueLabel);
+                var more = _module.AddInstruction(
+                    SpirvOp.ULessThan, _boolType, counter, UInt(componentCount));
+                _module.AddStatement(SpirvOp.LoopMerge, mergeLabel, continueLabel, 0);
+                _module.AddStatement(SpirvOp.BranchConditional, more, body, mergeLabel);
+                _module.AddLabel(body);
+                var value = values[0];
+                for (uint index = 1; index < componentCount; index++)
+                {
+                    value = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.IEqual, _boolType, counter, UInt(index)),
+                        values[index],
+                        value);
+                }
+
+                StoreDeviceFormatComponent(
+                    elementStart, dataFormat, numberFormat, counter, value, null, null);
+                _module.AddStatement(SpirvOp.Branch, continueLabel);
+                _module.AddLabel(continueLabel);
+                _module.AddStatement(SpirvOp.IAdd, _uintType, next, counter, UInt(1));
+                _module.AddStatement(SpirvOp.Branch, header);
+                _module.AddLabel(mergeLabel);
+            }));
+        }
+
+        // Merges one converted component into the bits it occupies. A component that lacks
+        // bits in this format has an empty mask and writes nothing. It may straddle two
+        // dwords when the element is not dword aligned.
+        private void StoreDeviceFormatComponent(
+            uint elementStart,
+            uint dataFormat,
+            uint numberFormat,
+            uint component,
+            uint value,
+            uint? knownDataFormat,
+            uint? knownNumberFormat)
+        {
+            var (byteOffset, bitOffset, bitCount) = LoadGfx10ComponentLayout(dataFormat, component);
+            var mask = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, bitCount, UInt(32)),
+                UInt(uint.MaxValue),
+                _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _uintType,
+                    ShiftLeftLogical(UInt(1), bitCount),
+                    UInt(1)));
+            uint encoded;
+            if (knownDataFormat is { } staticDataFormat &&
+                knownNumberFormat is { } staticNumberFormat &&
+                _module.TryGetConstantValue(bitCount, out var staticBitCount))
+            {
+                encoded = EncodeGfx10BufferComponent(
+                    value, staticBitCount, staticNumberFormat, staticDataFormat);
+            }
+            else
+            {
+                encoded = EncodeGfx10BufferComponentDynamic(
+                    value, bitCount, numberFormat, dataFormat, mask);
+            }
+
+            encoded = BitwiseAnd(encoded, mask);
+            var address = IAdd64(elementStart, Widen(byteOffset));
+            var position = IAdd(
+                ShiftLeftLogical(Narrow(And64(address, ULong(3))), UInt(3)),
+                bitOffset);
+            var shift = BitwiseAnd(position, UInt(31));
+            var aligned = IAdd64(
+                And64(address, ULong(~3ul)),
+                Widen(ShiftLeftLogical(ShiftRightLogical(position, UInt(5)), UInt(2))));
+            var carries = _module.AddInstruction(SpirvOp.INotEqual, _boolType, shift, UInt(0));
+            var carryShift = BitwiseAnd(
+                _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(32), shift),
+                UInt(31));
+            var allowed = _module.ConstantBool(true);
+            StoreDeviceMaskedWord(
+                aligned,
+                ShiftLeftLogical(encoded, shift),
+                ShiftLeftLogical(mask, shift),
+                allowed);
+            StoreDeviceMaskedWord(
+                IAdd64(aligned, ULong(4)),
+                _module.AddInstruction(
+                    SpirvOp.Select, _uintType, carries, ShiftRightLogical(encoded, carryShift), UInt(0)),
+                _module.AddInstruction(
+                    SpirvOp.Select, _uintType, carries, ShiftRightLogical(mask, carryShift), UInt(0)),
+                allowed);
+        }
+
+        // Bytes an access of `componentCount` components touches: one module-level table
+        // (index = format * 4 + count - 1) built from the host layout, so the element's
+        // bounds can be checked before any component is written.
+        private uint LoadGfx10AccessByteSize(uint dataFormat, uint componentCount)
+        {
+            if (_gfx10AccessByteTable == 0)
+            {
+                var entries = new uint[Gfx10LayoutFormatCount * 4];
+                for (uint format = 0; format < Gfx10LayoutFormatCount; format++)
+                {
+                    for (uint count = 1; count <= 4; count++)
+                    {
+                        entries[format * 4 + count - 1] = UInt(
+                            Gfx10UnifiedFormat.GetAccessByteSize(format, count));
+                    }
+                }
+
+                var tableType = _module.TypeArray(_uintType, (uint)entries.Length);
+                var tablePointer = _module.TypePointer(SpirvStorageClass.Private, tableType);
+                _gfx10AccessByteTable = _module.AddGlobalVariable(
+                    tablePointer,
+                    SpirvStorageClass.Private,
+                    _module.ConstantComposite(tableType, entries));
+                _module.AddName(_gfx10AccessByteTable, "gfx10AccessBytes");
+                _interfaces.Add(_gfx10AccessByteTable);
+            }
+
+            // Formats past the table have no layout; row 15 is empty.
+            var row = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, dataFormat, UInt(Gfx10LayoutFormatCount)),
+                dataFormat,
+                UInt(Gfx10LayoutFormatCount - 1));
+            var index = IAdd(ShiftLeftLogical(row, UInt(2)), UInt(componentCount - 1));
+            return Load(
+                _uintType,
+                _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _privateUintPointer,
+                    _gfx10AccessByteTable,
+                    index));
+        }
+
+        // Encodes one register for a run-time component width and number format, with the
+        // same conversions and rounding as the translation-time EncodeGfx10BufferComponent.
+        private uint EncodeGfx10BufferComponentDynamic(
+            uint value,
+            uint bitCount,
+            uint numberFormat,
+            uint dataFormat,
+            uint mask)
+        {
+            var signedMaximum = ShiftRightLogical(mask, UInt(1));
+            var signedMinimum = _module.AddInstruction(SpirvOp.Not, _uintType, signedMaximum);
+            var floatMask = _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, mask);
+            var floatSignedMaximum = _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, signedMaximum);
+            var floatSignedMinimum = _module.AddInstruction(
+                SpirvOp.ConvertSToF, _floatType, Bitcast(_intType, signedMinimum));
+            var input = Bitcast(_floatType, value);
+            input = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, input),
+                Float(0f),
+                input);
+
+            uint Rounded(uint minimum, uint maximum, uint scale, bool signed)
+            {
+                var scaled = Ext(43, _floatType, input, minimum, maximum);
+                if (scale != 0)
+                {
+                    scaled = _module.AddInstruction(SpirvOp.FMul, _floatType, scaled, scale);
+                }
+
+                scaled = Ext(2, _floatType, scaled);
+                return signed
+                    ? Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertFToS, _intType, scaled))
+                    : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, scaled);
+            }
+
+            var unorm = Rounded(Float(0f), Float(1f), floatMask, signed: false);
+            var snorm = BitwiseAnd(Rounded(Float(-1f), Float(1f), floatSignedMaximum, signed: true), mask);
+            var uscaled = Rounded(Float(0f), floatMask, 0, signed: false);
+            var sscaled = BitwiseAnd(
+                Rounded(floatSignedMinimum, floatSignedMaximum, 0, signed: true),
+                mask);
+            var unsigned = Ext(38, _uintType, value, mask);
+            var signedInteger = BitwiseAnd(
+                Bitcast(
+                    _uintType,
+                    Ext(
+                        45,
+                        _intType,
+                        Bitcast(_intType, value),
+                        Bitcast(_intType, signedMinimum),
+                        Bitcast(_intType, signedMaximum))),
+                mask);
+
+            // Half conversion keeps NaN, so it reads the register rather than the filtered input.
+            var half = BitwiseAnd(
+                Ext(
+                    58,
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _vec2Type,
+                        Bitcast(_floatType, value),
+                        Float(0f))),
+                UInt(0xFFFF));
+            var floating = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, bitCount, UInt(16)),
+                half,
+                BitwiseAnd(value, mask));
+            floating = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, dataFormat, UInt(6)),
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, dataFormat, UInt(7))),
+                EncodeUnsignedMiniFloatDynamic(value, bitCount, mask),
+                floating);
+
+            var result = BitwiseAnd(value, mask);
+            result = SelectUInt(numberFormat, 0, unorm, result);
+            result = SelectUInt(numberFormat, 1, snorm, result);
+            result = SelectUInt(numberFormat, 2, uscaled, result);
+            result = SelectUInt(numberFormat, 3, sscaled, result);
+            result = SelectUInt(numberFormat, 4, unsigned, result);
+            result = SelectUInt(numberFormat, 5, signedInteger, result);
+            result = SelectUInt(numberFormat, 7, floating, result);
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, bitCount, UInt(32)),
+                value,
+                result);
+        }
+
+        // EncodeUnsignedMiniFloat for a 10 or 11 bit width known only at run time.
+        private uint EncodeUnsignedMiniFloatDynamic(uint value, uint bitCount, uint mask)
+        {
+            var mantissaBits = _module.AddInstruction(SpirvOp.ISub, _uintType, bitCount, UInt(5));
+            var shift = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(23), mantissaBits);
+            var mantissaMask = _module.AddInstruction(
+                SpirvOp.ISub, _uintType, ShiftLeftLogical(UInt(1), mantissaBits), UInt(1));
+            var input = Bitcast(_floatType, value);
+            var isNan = _module.AddInstruction(SpirvOp.IsNan, _boolType, input);
+            var positive = _module.AddInstruction(SpirvOp.FOrdGreaterThan, _boolType, input, Float(0f));
+            var exponent = BitwiseAnd(ShiftRightLogical(value, UInt(23)), UInt(0xFF));
+
+            var denormal = _module.AddInstruction(
+                SpirvOp.ConvertFToU,
+                _uintType,
+                Ext(
+                    2,
+                    _floatType,
+                    _module.AddInstruction(
+                        SpirvOp.FMul,
+                        _floatType,
+                        input,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertUToF,
+                            _floatType,
+                            ShiftLeftLogical(UInt(1), IAdd(mantissaBits, UInt(14)))))));
+
+            var roundBias = IAdd(
+                _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _uintType,
+                    ShiftLeftLogical(UInt(1), _module.AddInstruction(SpirvOp.ISub, _uintType, shift, UInt(1))),
+                    UInt(1)),
+                BitwiseAnd(ShiftRightLogical(value, shift), UInt(1)));
+            var rounded = IAdd(value, roundBias);
+            var roundedExponent = BitwiseAnd(ShiftRightLogical(rounded, UInt(23)), UInt(0xFF));
+            var normal = BitwiseOr(
+                ShiftLeftLogical(
+                    _module.AddInstruction(SpirvOp.ISub, _uintType, roundedExponent, UInt(112)),
+                    mantissaBits),
+                BitwiseAnd(ShiftRightLogical(rounded, shift), mantissaMask));
+            var overflow = _module.AddInstruction(
+                SpirvOp.UGreaterThanEqual, _boolType, roundedExponent, UInt(143));
+            var result = _module.AddInstruction(
+                SpirvOp.Select, _uintType, overflow, ShiftLeftLogical(UInt(31), mantissaBits), normal);
+            result = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, exponent, UInt(113)),
+                denormal,
+                result);
+            result = _module.AddInstruction(SpirvOp.Select, _uintType, positive, result, UInt(0));
+            return _module.AddInstruction(SpirvOp.Select, _uintType, isNan, mask, result);
         }
 
         // What a component the format lacks reads as: one in W, zero elsewhere.

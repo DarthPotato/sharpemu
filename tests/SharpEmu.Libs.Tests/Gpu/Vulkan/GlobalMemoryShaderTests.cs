@@ -449,6 +449,263 @@ public sealed class GlobalMemoryShaderTests(HeadlessVulkanFixture fixture, ITest
         output.WriteLine($"Verified {threadCount} adjacent byte stores, typed={typed} on {vulkan.DeviceName}; validation={vulkan.ValidationEnabled}.");
     }
 
+    private static void WriteDeviceDescriptor(byte[] bytes, uint size, uint word3)
+    {
+        WriteWord(bytes, DescriptorOffset, (uint)(BufferAddress & uint.MaxValue));
+        WriteWord(bytes, DescriptorOffset + 4, (uint)(BufferAddress >> 32));
+        WriteWord(bytes, DescriptorOffset + 8, size);
+        WriteWord(bytes, DescriptorOffset + 12, word3);
+    }
+
+    // The V# comes from memory through a lane-derived offset the plan cannot resolve, so the
+    // store goes through the device address. v4..v7 hold the first four words of the buffer
+    // (or 0xFF in v4 for the adjacent-byte case) and are dumped at RegisterOutputOffset.
+    private static ShaderFixture CompileDeviceStoreShader(
+        uint opcode, uint offset, uint threadCount = 1, bool vectorOffset = false, bool byteData = false)
+    {
+        var words = new List<uint>
+        {
+            0xE0380000, 0x80000400,
+            0x7E000000u | (20u << 17) | (2u << 9) | 256u,
+            0xF4000000u | (10u << 18) | (16u << 6), (20u << 25) | DescriptorOffset,
+            0xBF8CC07F,
+        };
+        if (byteData)
+        {
+            words.Add(0x7E00_02FF | (SourceRegister << 17));
+            words.Add(0xFF);
+        }
+
+        var accessPc = checked((uint)words.Count * 4);
+        // An odd offset cannot ride the immediate field, so its low bit goes through the scalar operand.
+        words.Add(0xE000_0000u | (opcode << 18) | (vectorOffset ? 1u << 12 : 0u) | (offset & ~1u));
+        words.Add(((0x80u + (offset & 1u)) << 24) | ((16u / 4) << 16) | (SourceRegister << 8));
+        words.Add(0xE078_0000 | RegisterOutputOffset);
+        words.Add(0x8000_0400);
+        words.Add(0xBF81_0000);
+
+        var program = DecodeProgram(words);
+        var access = Assert.Single(program.Instructions, instruction => instruction.Pc == accessPc);
+        var control = Assert.IsType<Gen5BufferMemoryControl>(access.Control);
+        Assert.False(control.Typed);
+        Assert.Equal(opcode - 3, control.DwordCount);
+        Assert.Equal(16u, control.ScalarResource);
+        return CompileProgram(program, BaseScalars(), threadCount);
+    }
+
+    private static byte[] DeviceStoreInput(uint[] sources, uint size, uint descriptorWord3)
+    {
+        var initial = CreateInput();
+        for (var index = 0; index < sources.Length; index++)
+            WriteWord(initial, index * 4, sources[index]);
+        WriteDeviceDescriptor(initial, size, descriptorWord3);
+        return initial;
+    }
+
+    // The bound-buffer store cases, with the V# read through a device address: same bytes
+    // written, neighbours untouched, an element past the end or an unbound V# writes nothing.
+    [Theory]
+    [MemberData(nameof(DescriptorStoreCases))]
+    public void DeviceDescriptorFormattedStores_EncodeComponentsLikeBoundBuffers(
+        uint format, uint descriptorWord3, uint opcode, uint offset, uint[] sources, byte[]? expectedBytes)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        var initial = DeviceStoreInput(sources, BufferBytes, descriptorWord3);
+        var expected = (byte[])initial.Clone();
+        initial.AsSpan(0, 16).CopyTo(expected.AsSpan(RegisterOutputOffset, 16));
+        expectedBytes?.CopyTo(expected.AsSpan((int)offset));
+
+        var shader = CompileDeviceStoreShader(opcode, offset);
+        Assert.Equal(expected, RunOnce(vulkan, shader, initial));
+        output.WriteLine($"Verified device store format={format}, descriptor=0x{descriptorWord3:X}, opcode={opcode}, offset={offset} on {vulkan.DeviceName}.");
+    }
+
+    public static IEnumerable<object[]> UnalignedDeviceStoreCases()
+    {
+        // format, opcode, byte offset, sources, the bytes expected there
+        yield return [Format8x4Unorm, 7u, 65u, Floats(1f, Half, 0f, -1f), Bytes(0xFF, 0x80, 0x00, 0x00)];
+        yield return [Format8x4Unorm, 7u, 66u, Floats(1f, Half, 1f, 1f), Bytes(0xFF, 0x80, 0xFF, 0xFF)];
+        yield return [Format8x4Unorm, 5u, 67u, Floats(1f, 1f, 0f, 0f), Bytes(0xFF, 0xFF)];
+        yield return [Format16Float, 4u, 65u, Floats(1f, 0, 0, 0), Bytes(0x00, 0x3C)];
+        yield return [Format16Float, 4u, 67u, Floats(-2f, 0, 0, 0), Bytes(0x00, 0xC0)];
+        // 16_16 UNORM (23): both halves straddle a dword at an odd address.
+        yield return [23u, 5u, 67u, Floats(1f, 0f, 0, 0), Bytes(0xFF, 0xFF, 0x00, 0x00)];
+        // 16_16 SINT (28) clamps to the signed range.
+        yield return [28u, 5u, 66u, Words(unchecked((uint)-5), 40000, 0, 0), Bytes(0xFB, 0xFF, 0xFF, 0x7F)];
+        yield return [Format32x4Float, 7u, 66u, Words(0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00),
+            Bytes(0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xCC, 0xBB, 0xAA, 0x99, 0x00, 0xFF, 0xEE, 0xDD)];
+        yield return [Format32Float, 4u, 71u, Words(0xA1B2C3D4, 0, 0, 0), Bytes(0xD4, 0xC3, 0xB2, 0xA1)];
+        // 32_32 FLOAT-like pair (data format 11) keeps only the transferred X when opcode is X.
+        yield return [64u, 4u, 65u, Words(0x01020304, 0x0A0B0C0D, 0, 0), Bytes(0x04, 0x03, 0x02, 0x01)];
+        yield return [64u, 5u, 65u, Words(0x01020304, 0x0A0B0C0D, 0, 0),
+            Bytes(0x04, 0x03, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A)];
+        // 2_10_10_10 UNORM, the same packed element shifted across a dword boundary.
+        yield return [50u, 7u, 66u, Floats(1f, Half, 0f, 1f), Bytes(0xFF, 0x03, 0x08, 0xC0)];
+        // 11_11_10 FLOAT (43) and 10_11_11 FLOAT (36) at an odd address.
+        yield return [43u, 7u, 65u, Floats(1f, 2f, Half, 0), Bytes(0xE0, 0x01, 0x10, 0x70)];
+        yield return [36u, 7u, 65u, Floats(1f, 2f, Half, 0), Bytes(0xC0, 0x03, 0x20, 0x70)];
+    }
+
+    // An unaligned element merges into two dwords; every byte around it keeps its value.
+    [Theory]
+    [MemberData(nameof(UnalignedDeviceStoreCases))]
+    public void DeviceDescriptorFormattedStores_MergeUnalignedElementsWithoutTouchingNeighbours(
+        uint format, uint opcode, uint offset, uint[] sources, byte[] expectedBytes)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        var initial = DeviceStoreInput(sources, BufferBytes, (format << 12) | IdentitySwizzle);
+        var expected = (byte[])initial.Clone();
+        initial.AsSpan(0, 16).CopyTo(expected.AsSpan(RegisterOutputOffset, 16));
+        expectedBytes.CopyTo(expected.AsSpan((int)offset));
+
+        var shader = CompileDeviceStoreShader(opcode, offset);
+        Assert.Equal(expected, RunOnce(vulkan, shader, initial));
+    }
+
+    // The element must fit the V# size as a whole: a store that would end one byte past
+    // it writes nothing, and one ending on the last byte writes everything.
+    [Theory]
+    [InlineData(7u, 64u, 80u, true)]
+    [InlineData(7u, 64u, 79u, false)]
+    [InlineData(7u, 66u, 82u, true)]
+    [InlineData(7u, 66u, 81u, false)]
+    [InlineData(6u, 64u, 76u, true)]
+    [InlineData(6u, 64u, 75u, false)]
+    public void DeviceDescriptorFormattedStores_AreDroppedWhenTheElementPassesTheDescriptorSize(
+        uint opcode, uint offset, uint size, bool written)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        var sources = Words(0x11111111, 0x22222222, 0x33333333, 0x44444444);
+        var initial = DeviceStoreInput(sources, size, (Format32x4Float << 12) | IdentitySwizzle);
+        var expected = (byte[])initial.Clone();
+        initial.AsSpan(0, 16).CopyTo(expected.AsSpan(RegisterOutputOffset, 16));
+        if (written) initial.AsSpan(0, (int)(opcode - 3) * 4).CopyTo(expected.AsSpan((int)offset));
+        var shader = CompileDeviceStoreShader(opcode, offset);
+        Assert.Equal(expected, RunOnce(vulkan, shader, initial));
+    }
+
+    // Four invocations store one byte each into the same dword through a device V#; the
+    // merge is atomic, so every byte survives.
+    [Fact]
+    public void DeviceDescriptorFormattedStores_FromSeparateInvocationsKeepEveryByte()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        const uint format8Uint = 5;
+        var initial = DeviceStoreInput([], BufferBytes, (format8Uint << 12) | IdentitySwizzle);
+        var expected = (byte[])initial.Clone();
+        initial.AsSpan(0, 16).CopyTo(expected.AsSpan(RegisterOutputOffset, 16));
+        WriteWord(expected, RegisterOutputOffset, 0xFF);
+        WriteWord(expected, MemoryOffset, 0xFFFF_FFFF);
+
+        // buffer_store_format_x v4, v0, s[16:19], 0 offen offset:MemoryOffset
+        var shader = CompileDeviceStoreShader(4, MemoryOffset, threadCount: 4, vectorOffset: true, byteData: true);
+        Assert.Equal(expected, RunOnce(vulkan, shader, initial, 4));
+    }
+
+    private static IEnumerable<uint> SweepFormats()
+    {
+        for (uint format = 1; format <= 0x7F; format++)
+        {
+            if (Gfx10UnifiedFormat.TryDecode(format, out var dataFormat, out _) &&
+                Gfx10UnifiedFormat.ComponentCount(dataFormat) != 0)
+                yield return format;
+        }
+    }
+
+    // Every decodable format with floats, special floats and integers: the device store writes
+    // the bytes the bound store writes, at an aligned and an unaligned element address.
+    [Fact]
+    public void DeviceDescriptorFormattedStores_MatchBoundStoresForEveryFormat()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        var sourceSets = new[]
+        {
+            Floats(0.3f, -0.7f, 1.9f, 200.25f),
+            [0x7FC00000u, 0xFF800000u, 0x00000003u, 0x80000001u],
+            Words(0xFFFFFFF0u, 77u, 0x12345678u, 3u),
+        };
+        var mismatches = new List<string>();
+        foreach (var format in SweepFormats())
+        {
+            var descriptor = (format << 12) | IdentitySwizzle;
+            foreach (var opcode in new[] { 5u, 7u })
+            {
+                for (var set = 0; set < sourceSets.Length; set++)
+                {
+                    // A bound store of whole-dword components rounds the element down to a dword;
+                    // the device store, like the device load, honours the exact byte address.
+                    Gfx10UnifiedFormat.TryDecode(format, out var dataFormat, out _);
+                    var offset = set == 1 && !Gfx10UnifiedFormat.HasWholeDwordComponents(dataFormat)
+                        ? 67u
+                        : (uint)MemoryOffset;
+                    var initial = DeviceStoreInput(sourceSets[set], BufferBytes, descriptor);
+                    var bound = RunOnce(vulkan, CompileTypedShader(format, descriptor, offset, opcode, SourceRegister, typed: false), initial);
+                    var device = RunOnce(vulkan, CompileDeviceStoreShader(opcode, offset), initial);
+                    if (!bound.AsSpan(0, RegisterOutputOffset).SequenceEqual(device.AsSpan(0, RegisterOutputOffset)))
+                        mismatches.Add($"format={format} opcode={opcode} set={set} bound={Convert.ToHexString(bound.AsSpan(MemoryOffset, 24))} device={Convert.ToHexString(device.AsSpan(MemoryOffset, 24))}");
+                }
+            }
+        }
+
+        Assert.True(mismatches.Count == 0, string.Join(Environment.NewLine, mismatches));
+    }
+
+    // A formatted store of a run-time format shares one component loop, so a program of many
+    // stores stays small.
+    [Fact]
+    public void DeviceDescriptorFormattedStores_StayCompactPerStore()
+    {
+        int Words(int stores)
+        {
+            var words = new List<uint>
+            {
+                0xE0380000, 0x80000400,
+                0x7E000000u | (20u << 17) | (2u << 9) | 256u,
+                0xF4000000u | (10u << 18) | (16u << 6), (20u << 25) | DescriptorOffset,
+                0xBF8CC07F,
+            };
+            for (var index = 0; index < stores; index++)
+            {
+                // buffer_store_format_xyzw v[4:7], v0, s[16:19], 0 offset: index * 16
+                words.Add(0xE0000000 | (7u << 18) | (uint)(64 + index * 16));
+                words.Add(0x80040400);
+            }
+
+            words.Add(0xBF810000);
+            var plan = ShaderResourcePlan.Extract(DecodeProgram(words), ShaderStage.Compute, 1, 0, 20);
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            Assert.True(ResourceMaterializer.Materialize(plan, ResourceTestProgram.Inputs(BaseScalars()[..20]),
+                ref snapshot, ref specialization, out var failure), failure.ToString());
+            var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+            var layout = BindingLayout.Allocate(resources.Info,
+                BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 20), false,
+                ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false);
+            var request = new ShaderCompileRequest(plan, resources, layout) { TraceDeviceAddressFaults = true };
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+            return shader.Spirv.Length / sizeof(uint);
+        }
+
+        var one = Words(1);
+        var many = Words(9);
+        var perStore = (many - one) / 8;
+        output.WriteLine($"SPIR-V words: 1 store={one}, 9 stores={many}, per store={perStore}");
+        Assert.True(perStore < PerStoreWordBudget, $"{perStore} words per formatted store");
+    }
+
+    // Measured 1947 (fault tracing on, nine stores minus one over eight).
+    private const int PerStoreWordBudget = 3000;
+
     private static uint[] Floats(float x, float y, float z, float w) =>
         [BitConverter.SingleToUInt32Bits(x), BitConverter.SingleToUInt32Bits(y), BitConverter.SingleToUInt32Bits(z), BitConverter.SingleToUInt32Bits(w)];
 
