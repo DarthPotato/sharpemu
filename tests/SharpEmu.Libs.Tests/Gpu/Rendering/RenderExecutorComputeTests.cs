@@ -106,6 +106,25 @@ public sealed class RenderExecutorComputeTests : IDisposable
         AssertNotDispatched();
         Assert.DoesNotContain("end_rendering", _host.Calls);
         Assert.DoesNotContain("reset_bindings", _host.Calls);
+        // No shader is looked up, materialized or compiled for work that never runs.
+        Assert.Empty(_pipelines.Calls);
+    }
+
+    [Fact]
+    public void ZeroSizedThreadDimensionDispatch_IsSkippedBeforeTheProgramLookup()
+    {
+        _executor.Dispatch(1, Banks(), 0, 4, 1, 0x41 | (1u << 5), indirectArgumentsAddress: RecordingRenderHost.MemoryBase + 0x400);
+
+        AssertNotDispatched();
+        Assert.Empty(_pipelines.Calls);
+    }
+
+    [Fact]
+    public void IndirectDispatchResolvedOnTheGpu_IsNotSkippedByItsZeroPlaceholderCounts()
+    {
+        _executor.Dispatch(1, Banks(), 0, 0, 0, 0x41, indirectArgumentsAddress: RecordingRenderHost.MemoryBase + 0x400);
+
+        Assert.NotEmpty(_pipelines.Calls);
     }
 
     [Fact]
