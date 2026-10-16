@@ -426,7 +426,15 @@ public sealed partial class ScalarValueGraph
             {
                 case Gen5ShaderEncoding.Sop1:
                 case Gen5ShaderEncoding.Sop2:
+                    ApplyScalarAlu(instruction, state);
+                    return;
                 case Gen5ShaderEncoding.Sopk:
+                    if (instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
+                    {
+                        ApplyScalarCompareK(instruction, state);
+                        return;
+                    }
+
                     ApplyScalarAlu(instruction, state);
                     return;
                 case Gen5ShaderEncoding.Sopc:
@@ -1088,6 +1096,27 @@ public sealed partial class ScalarValueGraph
             }
 
             state.Scc = Compare(opcode["SCmp".Length..], left, right);
+        }
+
+        private void ApplyScalarCompareK(Gen5ShaderInstruction instruction, RegisterState state)
+        {
+            if (instruction.Destinations.Count != 1 ||
+                instruction.Destinations[0] is not { Kind: Gen5OperandKind.ScalarRegister, Value: < ScalarRegisterCount } source ||
+                instruction.Words.Count == 0)
+            {
+                state.Scc = _graph.Undefined(ScalarValueType.Bool);
+                return;
+            }
+
+            // The signed compares sign-extend SIMM16, the unsigned ones zero-extend it.
+            var simm16 = instruction.Words[0] & 0xFFFF;
+            var immediate = instruction.Opcode.EndsWith("I32", StringComparison.Ordinal)
+                ? unchecked((uint)(int)(short)simm16)
+                : simm16;
+
+            // SOPK compares encode the SGPR they test in the SDST field. They only
+            // update SCC and leave that register as it was.
+            state.Scc = Compare(instruction.Opcode["SCmp".Length..], state.Scalars[source.Value], _graph.Constant(immediate));
         }
 
         private ScalarValue Compare(string suffix, ScalarValue left, ScalarValue right) => suffix switch
