@@ -384,7 +384,11 @@ public sealed partial class RenderExecutor
     {
         var program = input.Stage.Program ?? throw _host.Fatal("The compute stage has no program.");
         var resources = input.Stage.Resources;
-        if (program.ConstantStoreValue is not { } value ||
+        // The recognized four-instruction kernel stores at group * 64 + thread through a V# read
+        // from its own user data; any other program that merely stores a constant is no fill.
+        if (program.ConstantStoreValue is not { } value || program.ImmediateConstantFill is not { } fill ||
+            program.UserDataBase != 0 || fill.GroupScalarRegister != (uint)input.WorkgroupRegister ||
+            fill.DestinationScalarResource + 4 > resources.UserData.Length ||
             program.Buffers.Length != 1 || resources.Buffers.Length != 1 || resources.Buffers[0].Length != 4 ||
             program.Images.Length != 0 || program.SamplerCount != 0 || program.UsesDeviceAddresses)
         {
@@ -393,6 +397,11 @@ public sealed partial class RenderExecutor
 
         var info = program.Buffers[0];
         var descriptor = BufferDescriptorWords.From(resources.Buffers[0]);
+        if (!resources.UserData.AsSpan((int)fill.DestinationScalarResource, 4).SequenceEqual(resources.Buffers[0]))
+        {
+            return null;
+        }
+
         var threads = (ulong)groupsX * input.ThreadsX;
         if (!info.Formatted || !info.Written || info.Read || info.Atomic || info.Scalar || info.MaxByteExtent != sizeof(uint) ||
             descriptor.Stride != sizeof(uint) || descriptor.Format != BufferDescriptorWords.Format32UInt || descriptor.SwizzleEnabled ||
@@ -415,7 +424,10 @@ public sealed partial class RenderExecutor
     {
         var program = input.Stage.Program ?? throw _host.Fatal("The compute stage has no program.");
         var resources = input.Stage.Resources;
-        if (program.Buffers.Length != 2 || resources.Buffers.Length != 2 || program.Images.Length != 0 || program.SamplerCount != 0 ||
+        if (program.ConstantFill is not { } fill || program.UserDataBase != 0 ||
+            fill.GroupScalarRegister != (uint)input.WorkgroupRegister ||
+            fill.DestinationScalarResource + 4 > resources.UserData.Length || fill.SourceScalarResource + 4 > resources.UserData.Length ||
+            program.Buffers.Length != 2 || resources.Buffers.Length != 2 || program.Images.Length != 0 || program.SamplerCount != 0 ||
             program.UsesDeviceAddresses || resources.Images.Length != 0 || resources.Samplers.Length != 0 ||
             resources.Buffers[0].Length != 4 || resources.Buffers[1].Length != 4)
         {
@@ -443,6 +455,12 @@ public sealed partial class RenderExecutor
 
         var descriptor = BufferDescriptorWords.From(resources.Buffers[target]);
         var valueDescriptor = BufferDescriptorWords.From(resources.Buffers[source]);
+        if (!resources.UserData.AsSpan((int)fill.DestinationScalarResource, 4).SequenceEqual(resources.Buffers[target]) ||
+            !resources.UserData.AsSpan((int)fill.SourceScalarResource, 4).SequenceEqual(resources.Buffers[source]))
+        {
+            return null;
+        }
+
         var threads = (ulong)groupsX * input.ThreadsX;
         if (descriptor.Stride != sizeof(uint) || descriptor.Format != BufferDescriptorWords.Format32UInt || descriptor.SwizzleEnabled ||
             descriptor.IndexStride != 0 || descriptor.AddThreadId || descriptor.RecordCount == 0 ||
