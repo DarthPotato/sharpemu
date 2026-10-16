@@ -2733,11 +2733,23 @@ public static partial class Gen5SpirvTranslator
             var left = GetRawSource(instruction, 0);
             if (instruction.Opcode == "SBitreplicateB64B32")
             {
-                // S_BITREPLICATE_B64_B32 broadcasts the source dword into both
-                // halves of its 64-bit SGPR destination and does not update SCC.
-                StoreS(destination, left);
-                StoreS(destination + 1, left);
+                // S_BITREPLICATE_B64_B32 doubles every source bit: bit i lands in bits
+                // 2i and 2i+1 of the 64-bit destination, so the low dword comes from
+                // source bits 0-15 and the high dword from bits 16-31. SCC is unchanged.
+                StoreS(destination, ReplicateBits(BitwiseAnd(left, UInt(0xFFFF))));
+                StoreS(destination + 1, ReplicateBits(ShiftRightLogical(left, UInt(16))));
                 return true;
+            }
+
+            // Spreads the low 16 bits of `value` to the even bit positions and copies each
+            // into the odd position above it: abcd -> aabbccdd.
+            uint ReplicateBits(uint value)
+            {
+                value = BitwiseAnd(BitwiseOr(value, ShiftLeftLogical(value, UInt(8))), UInt(0x00FF_00FF));
+                value = BitwiseAnd(BitwiseOr(value, ShiftLeftLogical(value, UInt(4))), UInt(0x0F0F_0F0F));
+                value = BitwiseAnd(BitwiseOr(value, ShiftLeftLogical(value, UInt(2))), UInt(0x3333_3333));
+                value = BitwiseAnd(BitwiseOr(value, ShiftLeftLogical(value, UInt(1))), UInt(0x5555_5555));
+                return BitwiseOr(value, ShiftLeftLogical(value, UInt(1)));
             }
 
             if (instruction.Opcode.EndsWith("SaveexecB32", StringComparison.Ordinal))

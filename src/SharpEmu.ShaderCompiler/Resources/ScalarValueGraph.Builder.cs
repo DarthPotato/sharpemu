@@ -465,6 +465,19 @@ public sealed partial class ScalarValueGraph
             }
         }
 
+        // Spreads the low 16 bits of `value` to the even bit positions and copies each
+        // one into the odd position above it: abcd -> aabbccdd.
+        private ScalarValue ReplicateBits(ScalarValue value)
+        {
+            foreach (var (shift, mask) in new[] { (8u, 0x00FF_00FFu), (4u, 0x0F0F_0F0Fu), (2u, 0x3333_3333u), (1u, 0x5555_5555u) })
+            {
+                var widened = Binary(ScalarOperation.Or32, value, Binary(ScalarOperation.ShiftLeft32, value, _graph.Constant(shift)));
+                value = Binary(ScalarOperation.And32, widened, _graph.Constant(mask));
+            }
+
+            return Binary(ScalarOperation.Or32, value, Binary(ScalarOperation.ShiftLeft32, value, _graph.Constant(1u)));
+        }
+
         // ---- scalar ALU ----
 
         private void ApplyScalarAlu(Gen5ShaderInstruction instruction, RegisterState state)
@@ -484,9 +497,13 @@ public sealed partial class ScalarValueGraph
                     return;
                 case "SBitreplicateB64B32":
                 {
-                    var replicated = Read(instruction.Sources[0], state);
-                    state.WriteScalar(destinationRegister, replicated);
-                    state.WriteScalar(destinationRegister + 1, replicated);
+                    // Every source bit i fills destination bits 2i and 2i+1, so the low
+                    // dword comes from source bits 0-15 and the high one from bits 16-31.
+                    var source = Read(instruction.Sources[0], state);
+                    state.WriteScalar(destinationRegister,
+                        ReplicateBits(Binary(ScalarOperation.And32, source, _graph.Constant(0xFFFFu))));
+                    state.WriteScalar(destinationRegister + 1,
+                        ReplicateBits(Binary(ScalarOperation.ShiftRightLogical32, source, _graph.Constant(16u))));
                     return;
                 }
                 case "SMovkI32":
