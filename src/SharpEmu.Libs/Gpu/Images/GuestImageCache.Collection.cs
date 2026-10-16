@@ -47,16 +47,17 @@ public sealed partial class GuestImageCache
         _recencyQueue.ForEachItemAtOrBeforeTick(tick - age, imageIdentifier =>
         {
             candidates.Add(imageIdentifier);
-            return candidates.Count == deletions;
+            // A protected prefix must not hide older reclaimable images behind it: the walk takes
+            // every candidate and the budget below counts retirements, not candidates visited.
+            return false;
         });
         foreach (var imageIdentifier in candidates)
         {
-            if (deletions == 0)
+            if (deletions <= 0)
             {
                 break;
             }
 
-            deletions--;
             var owner = _slots.TryGet(imageIdentifier);
             if (owner == null || !owner.Registered || owner.DepthOwner.IsValid)
             {
@@ -84,7 +85,7 @@ public sealed partial class GuestImageCache
                 owner.ClearGpuModified();
             }
 
-            DeleteImage(imageIdentifier);
+            deletions -= DeleteImage(imageIdentifier);
             if (_totalUsedMemory < _criticalMemoryBytes && aggressive)
             {
                 deletions >>= 2;

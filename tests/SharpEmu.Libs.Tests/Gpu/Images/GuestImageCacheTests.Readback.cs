@@ -93,6 +93,45 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // Images collection keeps (here: GPU-written ones that are not under pressure) must not use up
+    // the budget of one pass: an older reclaimable image behind more of them than the pass retires
+    // would never be collected.
+    [Fact]
+    public void GarbageCollector_ProtectedImagesDoNotHideReclaimableOnes()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x400000, ReadWrite);
+        const int protectedCount = 12;
+        var images = new ResourceSlotIdentifier[protectedCount + 1];
+        for (var index = 0; index < images.Length; index++)
+        {
+            var request = Color32(address + 0x330000 + (ulong)index * 0x2000);
+            images[index] = harness.Acquire(ref request);
+        }
+
+        for (var index = 0; index < protectedCount; index++)
+        {
+            harness.MarkGpuWritten(images[index]);
+        }
+
+        // The protected images are the oldest; the clean one is the newest candidate.
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, ulong.MaxValue, ulong.MaxValue, 17);
+            harness.Images.ResetRecency(images, 17);
+            harness.Images.RunGarbageCollector(endsFrame: false);
+        });
+
+        Assert.False(harness.Images.Contains(images[protectedCount]));
+        for (var index = 0; index < protectedCount; index++)
+        {
+            Assert.True(harness.Images.Contains(images[index]));
+        }
+
+        harness.Shutdown();
+    }
+
     // A title submits many command buffers per frame; collection after each of them must not age
     // the textures it samples once a frame, or they are deleted and uploaded again every frame.
     [Fact]

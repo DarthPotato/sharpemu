@@ -75,15 +75,18 @@ public sealed partial class GuestImageCache
     // A depth image holds the only copy of what the GPU wrote to its stencil plane, so that plane
     // reaches guest memory first unless the guest unmapped it (publishStencil false): the next
     // depth image over the plane loads it from there instead of stale bytes.
-    private void DeleteImage(ResourceSlotIdentifier imageIdentifier, bool publishStencil = true)
+    // The number of images retired: the image and the stencil planes associated with it, or zero
+    // when it was not registered.
+    private int DeleteImage(ResourceSlotIdentifier imageIdentifier, bool publishStencil = true)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDelete);
         var image = _slots.TryGet(imageIdentifier);
         if (image == null || !image.Registered)
         {
-            return;
+            return 0;
         }
 
+        var retiredImages = 1;
         if (!image.DepthOwner.IsValid)
         {
             var associations = new List<ResourceSlotIdentifier>();
@@ -107,7 +110,7 @@ public sealed partial class GuestImageCache
                     associated.ClearGpuModified();
                 }
 
-                DeleteImage(association, publishStencil);
+                retiredImages += DeleteImage(association, publishStencil);
             }
         }
 
@@ -131,6 +134,8 @@ public sealed partial class GuestImageCache
         {
             _slots.Erase(imageIdentifier);
         }
+
+        return retiredImages;
     }
 
     private void ReleaseImage(ResourceSlotIdentifier imageIdentifier)
