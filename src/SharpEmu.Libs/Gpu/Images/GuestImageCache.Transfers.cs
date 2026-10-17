@@ -823,8 +823,53 @@ public sealed unsafe partial class GuestImageCache
             return;
         }
 
+        if (!destination.IsDeviceLocal)
+        {
+            // Tiling scatters small writes. Into host memory each crossed the bus on its own:
+            // 180 ms for a 4K 8-byte target on a GTX 1660 Super, against 0.45 ms into device
+            // memory and 5 ms for a 66 MB copy. Stage the range in device memory, tile there
+            // and copy it back; the range keeps the guest bytes the tiling does not cover.
+            var staging = _tiler.GetScratchBuffer(destinationSize);
+            CopyBufferRange(destination.Handle, destinationOffset, staging.Buffer, staging.Offset, destinationSize);
+            _tiler.TileImage(image, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(color.Regions), staging.Buffer, staging.Offset, destinationSize, color.LinearSize, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(color.Tiles), swap);
+            CopyBufferRange(staging.Buffer, staging.Offset, destination.Handle, destinationOffset, destinationSize);
+            return;
+        }
+
         _tiler.TileImage(image, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(color.Regions), destination.Handle, destinationOffset, destinationSize, color.LinearSize, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(color.Tiles), swap);
     }
+
+    // Copies a buffer range with the barriers around it: every earlier write, including the
+    // host's, reaches the copy, and the copy reaches every later read, including the host's.
+    private void CopyBufferRange(Silk.NET.Vulkan.Buffer source, ulong sourceOffset, Silk.NET.Vulkan.Buffer destination, ulong destinationOffset, ulong size)
+    {
+        _scheduler.EndRendering();
+        var command = new CommandBuffer(_scheduler.Current.Handle);
+        var before = stackalloc BufferMemoryBarrier2[2];
+        before[0] = RangeBarrier(source, sourceOffset, size, AccessFlags2.MemoryWriteBit | AccessFlags2.HostWriteBit, AccessFlags2.TransferReadBit);
+        before[1] = RangeBarrier(destination, destinationOffset, size, AccessFlags2.MemoryWriteBit | AccessFlags2.MemoryReadBit, AccessFlags2.TransferWriteBit);
+        VulkanSynchronization.PipelineBarrier(_device.Vk, command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit,
+            PipelineStageFlags.TransferBit, 0, 0, null, 2, before, 0, null);
+        var copy = new BufferCopy(sourceOffset, destinationOffset, size);
+        _device.Vk.CmdCopyBuffer(command, source, destination, 1, &copy);
+        VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.BufferCopy);
+        var after = RangeBarrier(destination, destinationOffset, size, AccessFlags2.TransferWriteBit,
+            AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.HostReadBit);
+        VulkanSynchronization.PipelineBarrier(_device.Vk, command, PipelineStageFlags.TransferBit,
+            PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, 0, 0, null, 1, &after, 0, null);
+    }
+
+    private static BufferMemoryBarrier2 RangeBarrier(Silk.NET.Vulkan.Buffer buffer, ulong offset, ulong size, AccessFlags2 source, AccessFlags2 destination) => new()
+    {
+        SType = StructureType.BufferMemoryBarrier2,
+        SrcAccessMask = source,
+        DstAccessMask = destination,
+        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+        Buffer = buffer,
+        Offset = offset,
+        Size = size,
+    };
 
     // Copies image data into the buffer without transferring GPU ownership to the buffer.
     public bool TrySynchronizeBufferFromImage(GpuBuffer buffer, ulong address, ulong size)
