@@ -527,8 +527,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 var scaledCount = Math.Min(info.Images.Count, 64);
                 for (var index = 0; index < scaledCount; index++)
                 {
-                    var identifier = descriptors.Images[index].ImageIdentifier;
-                    if (identifier.IsValid && _imageCache.GetImage(identifier).IsScaled)
+                    // Resolving a later binding can evict an image resolved earlier; the stale
+                    // binding is resolved again before recording. The scale is a function of
+                    // the description, so the request gives the answer the new image will have.
+                    var binding = descriptors.Images[index];
+                    var identifier = binding.ImageIdentifier;
+                    var scaled = !identifier.IsValid ? false
+                        : _imageCache.TryGetImage(identifier, out var bound) ? bound.IsScaled
+                        : RenderScalePolicy.ScaleFor(binding.Request.Description) != 1.0f;
+                    if (scaled)
                     {
                         scaledImages |= 1UL << index;
                     }
