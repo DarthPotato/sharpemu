@@ -756,6 +756,31 @@ public sealed unsafe partial class CachedImage
             return;
         }
 
+        // Two images at the same render scale copy directly, but the caller's rectangle is in
+        // guest pixels: map it onto the backings. Other mips go through the guest-sized twins.
+        if (IsScaled && source.IsScaled)
+        {
+            if (mip != 0)
+            {
+                CopyRegionAtGuestResolution(source, sourceX, sourceY, mip, width, height);
+                return;
+            }
+
+            var scale = RenderScale;
+            var left = (uint)Math.Floor(sourceX * (double)scale);
+            var top = (uint)Math.Floor(sourceY * (double)scale);
+            var right = Math.Min(RenderScalePolicy.ScaleLength(sourceX + width, scale), source.Backing.Extent.Width);
+            var bottom = Math.Min(RenderScalePolicy.ScaleLength(sourceY + height, scale), source.Backing.Extent.Height);
+            width = Math.Min(right > left ? right - left : 0, Backing.Extent.Width);
+            height = Math.Min(bottom > top ? bottom - top : 0, Backing.Extent.Height);
+            sourceX = left;
+            sourceY = top;
+            if (width == 0 || height == 0)
+            {
+                return;
+            }
+        }
+
         if (mip >= Backing.MipLevels || sourceX + width > source.Backing.Extent.Width || sourceY + height > source.Backing.Extent.Height)
         {
             throw SubmissionScheduler.Fatal(

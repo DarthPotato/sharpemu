@@ -103,6 +103,17 @@ public sealed unsafe partial class CachedImage
         Transition(ReadyLayout, ReadyAccess, null, command);
     }
 
+    // Runs a guest-pixel region copy between two scaled images through their guest-sized
+    // twins, for the cases a backing-space rectangle cannot express (a mip below the first).
+    private void CopyRegionAtGuestResolution(CachedImage source, uint sourceX, uint sourceY, uint mip, uint width, uint height)
+    {
+        var guestSource = source.AtGuestResolution();
+        var twin = GuestSizedTwin();
+        twin.BlitFrom(this);
+        twin.CopyRegionFrom(guestSource, sourceX, sourceY, mip, width, height);
+        BlitFrom(twin);
+    }
+
     // True when a copy between the two images would cross host resolutions. Host-owned
     // helpers are built to match the image they mirror, so only guest-placed pairs qualify.
     private bool CrossesRenderScale(CachedImage other) =>
