@@ -835,11 +835,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         catch (CachedImage.ImageOutOfMemoryException)
         {
             // The budget is an estimate: the device can still run out. Free everything that can
-            // go, wait for retired images to be destroyed, and try once more.
+            // go, wait for retired images to be destroyed, and try once more, in system memory
+            // if device memory is still full.
             ReclaimAfterFailedAllocation();
             try
             {
-                image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory, allowScaling);
+                image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory, allowScaling,
+                    allowSystemMemory: CachedImage.SystemMemoryFallback);
             }
             catch (CachedImage.ImageOutOfMemoryException again)
             {

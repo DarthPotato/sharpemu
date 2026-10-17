@@ -95,10 +95,23 @@ public sealed unsafe partial class CachedImage : IDisposable
     public ulong LastAccessTick;
     public int RecencyEntryIndex;
 
+    // SHARPEMU_IMAGE_SYSTEM_MEMORY_FALLBACK=0 stops the emulator when device memory is full
+    // instead of placing the image in system memory.
+    internal static readonly bool SystemMemoryFallback = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_SYSTEM_MEMORY_FALLBACK"), "0", StringComparison.Ordinal);
+
+    private readonly bool _allowSystemMemory;
+    private static int _systemMemoryFallbackLogged;
+    private static long _systemMemoryImages;
+
+    // Images placed in system memory because device memory was full, since start.
+    public static long SystemMemoryImages => Interlocked.Read(ref _systemMemoryImages);
+
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
         ImageBackingPool? pool = null, OptimalImageMemoryPool? memoryPool = null, Func<string>? memoryDiagnostics = null,
-        bool allowScaling = true)
+        bool allowScaling = true, bool allowSystemMemory = false)
     {
+        _allowSystemMemory = allowSystemMemory;
         _device = device;
         _scheduler = scheduler;
         _guestBacking = guestBacking;
@@ -211,6 +224,36 @@ public sealed unsafe partial class CachedImage : IDisposable
             if (allocated == Result.Success)
             {
                 break;
+            }
+        }
+
+        // Device memory is exhausted even after the cache reclaimed what it could. A memory
+        // type outside device-local memory (system memory the GPU reaches over PCIe) is slow,
+        // but keeps the title running where the image would otherwise stop the emulator.
+        if (allocated is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory && _allowSystemMemory)
+        {
+            for (uint index = 0; index < device.MemoryTypeCount; index++)
+            {
+                if ((requirements.MemoryTypeBits & (1u << (int)index)) == 0 ||
+                    (device.GetMemoryTypeFlags(index) & MemoryPropertyFlags.DeviceLocalBit) != 0)
+                {
+                    continue;
+                }
+
+                allocateInfo.MemoryTypeIndex = index;
+                allocated = device.AllocateMemory(allocateInfo, out Backing.Memory);
+                if (allocated == Result.Success)
+                {
+                    if (Interlocked.Exchange(ref _systemMemoryFallbackLogged, 1) == 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[GPU][WARN] Device memory is full: images now spill to system memory type {index} " +
+                            $"(first: {create.Extent.Width}x{create.Extent.Height}x{create.ArrayLayers} {create.Format}, {requirements.Size} bytes). Expect slower frames.");
+                    }
+
+                    Interlocked.Increment(ref _systemMemoryImages);
+                    break;
+                }
             }
         }
 

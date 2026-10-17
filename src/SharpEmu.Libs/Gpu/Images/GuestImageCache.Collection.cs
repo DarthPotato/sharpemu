@@ -27,9 +27,21 @@ public sealed partial class GuestImageCache
             else if (image.Description.IsTiled) modifiedTiledBytes += image.AccountedSize;
             else modifiedLinearBytes += image.AccountedSize;
         });
+        // The largest images show what fills the device; age is in scheduler submissions.
+        var largest = new List<CachedImage>();
+        _slots.ForEach((_, image) =>
+        {
+            if (image.Registered) largest.Add(image);
+        });
+        var now = _scheduler.CurrentTick;
+        var top = string.Join(" ", largest.OrderByDescending(static image => image.AccountedSize).Take(12).Select(image =>
+            $"[0x{image.Description.Data.Address:X} {image.Description.Extent.Width}x{image.Description.Extent.Height}x{image.Backing.Layers} " +
+            $"{image.Backing.Format} mb={image.AccountedSize >> 20} scale={image.RenderScale:0.##} gpu={(image.IsGpuModified ? 1 : 0)} " +
+            $"age={(now >= image.LastAccessTick ? now - image.LastAccessTick : 0)} safe={(image.SafeToDownload ? 1 : 0)}]"));
         return $"registered_images={registered} clean_image_bytes={cleanBytes} gpu_modified_linear_bytes={modifiedLinearBytes} " +
             $"gpu_modified_tiled_bytes={modifiedTiledBytes} retired_image_bytes={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
-            $"retained_backing_bytes={_backingPool?.PooledBytes ?? 0} collection_bytes={CollectionMemoryBytes} critical_bytes={_criticalMemoryBytes}";
+            $"retained_backing_bytes={_backingPool?.PooledBytes ?? 0} collection_bytes={CollectionMemoryBytes} critical_bytes={_criticalMemoryBytes} " +
+            $"system_memory_images={CachedImage.SystemMemoryImages} largest={top}";
     }
 
     // Allocation-time pressure is deliberately separate from the periodic sweep:

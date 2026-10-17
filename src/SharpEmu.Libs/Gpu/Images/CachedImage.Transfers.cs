@@ -600,7 +600,7 @@ public sealed unsafe partial class CachedImage
         description.Resources = new SubresourceCount(1, Backing.Layers);
         description.Pitch = width;
         description.BytesPerBlock = 1;
-        return new CachedImage(_device, _scheduler, _guestBacking, description, memoryPool: _memoryPool);
+        return new CachedImage(_device, _scheduler, _guestBacking, description, memoryPool: _memoryPool, allowSystemMemory: SystemMemoryFallback);
     }
 
     public void CopyStencilStorage(CachedImage storage, GpuBuffer buffer, bool writeBack)

@@ -29,7 +29,7 @@ public sealed unsafe partial class CachedImage
         description.Stencil = default;
         description.Metadata = default;
         description.HtileClearMask = uint.MaxValue;
-        _guestSizedTwin = new CachedImage(_device, _scheduler, _guestBacking, description);
+        _guestSizedTwin = new CachedImage(_device, _scheduler, _guestBacking, description, allowSystemMemory: SystemMemoryFallback);
         return _guestSizedTwin;
     }
 

@@ -778,7 +778,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 // the image cache from treating it as guest memory that needs upload.
                 description.Pitch = 0;
                 description.TileMode = GuestTileMode.Linear;
-                snapshot = new CachedImage(_deviceInfo, _scheduler, _guestBacking, description);
+                snapshot = new CachedImage(_deviceInfo, _scheduler, _guestBacking, description, allowSystemMemory: CachedImage.SystemMemoryFallback);
             }
             var range = new SubresourceRange(0, source.Backing.MipLevels, 0, source.Backing.Layers);
             if ((aspect & (ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit)) != 0)
