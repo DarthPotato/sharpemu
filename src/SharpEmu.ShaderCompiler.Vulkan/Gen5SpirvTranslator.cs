@@ -9109,6 +9109,15 @@ public static partial class Gen5SpirvTranslator
         // so the lane's bit is tested on one dword instead of a composed 64-bit mask.
         private uint IsLaneSetInMaskRegisters(uint lowRegister)
         {
+            // A paired host invocation knows at translation time which half of the wave it is
+            // emitting, so its lane bit sits in a known register at the subgroup lane: one 32-bit
+            // test instead of composing the 64-bit mask, on every EXEC and VCC write.
+            if (_pairedLanes && _subgroupInvocationIdInput != 0)
+            {
+                var word = Load(_uintType, ScalarPointer(lowRegister + (uint)_laneHalf));
+                return IsNotZero(BitwiseAnd(ShiftRightLogical(word, PairedSubgroupLane()), UInt(1)));
+            }
+
             var low = Load(_uintType, ScalarPointer(lowRegister));
             if (_waveLaneCount != 32)
             {
