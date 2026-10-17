@@ -96,9 +96,18 @@ public sealed class Gen5MoveRelativeSpirvTests
     // Unknown indices require the full bank; bounded indices are tested separately.
     private static void AssertResolvesUnknownRelativeRegisters(byte[] spirv, string opcode)
     {
-        Assert.True(HasDynamicVectorRegisterAccess(spirv), $"{opcode} must preserve every register its runtime index can name");
+        // Either the file is an array indexed at run time (SHARPEMU_VGPR_DYNAMIC_ARRAY=1), or
+        // the computed register number selects among all 256 per-register variables.
+        Assert.True(
+            HasDynamicVectorRegisterAccess(spirv) || CountInstructions(spirv, SelectOpcode) >= 255,
+            $"{opcode} must preserve every register its runtime index can name");
         SharpEmu.ShaderCompiler.Tests.Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(spirv);
     }
+
+    private const uint SelectOpcode = 169;
+
+    private static int CountInstructions(byte[] spirv, uint opcode) =>
+        EnumerateInstructions(spirv).Count(instruction => instruction.Item1 == opcode);
 
     // True when some access chain takes a computed index, i.e. registers are indexed at run time.
     private static bool HasDynamicVectorRegisterAccess(byte[] spirv)

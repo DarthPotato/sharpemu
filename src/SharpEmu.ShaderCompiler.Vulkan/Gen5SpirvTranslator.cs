@@ -169,6 +169,8 @@ public static partial class Gen5SpirvTranslator
         private uint _vectorRegisters;
         private uint _upperVectorRegisters;
         private bool _needsDynamicVectorArray;
+        private static readonly bool DynamicVectorArrayEnabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_VGPR_DYNAMIC_ARRAY"), "1", StringComparison.Ordinal);
         private readonly Dictionary<uint, uint> _packedHalfRegisterVariables = [];
         private uint _scc;
         private uint _vcc;
@@ -611,7 +613,9 @@ public static partial class Gen5SpirvTranslator
                 _module.TypePointer(SpirvStorageClass.Private, _vec2Type);
 
             _moveRelativeOffsets = Ir.Gen5MoveRelativeOffsets.Analyze(_request.Program);
-            _needsDynamicVectorArray = _request.Program.Instructions.Any(instruction =>
+            // SHARPEMU_VGPR_DYNAMIC_ARRAY=1 keeps the whole VGPR file in an array for programs
+            // with an unbounded V_MOVREL, instead of selecting among registers at that site.
+            _needsDynamicVectorArray = DynamicVectorArrayEnabled && _request.Program.Instructions.Any(instruction =>
                 instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal) &&
                 !_moveRelativeOffsets.ContainsKey(instruction.Pc));
             // Register files belong to the function executing the program (see
@@ -8474,11 +8478,44 @@ public static partial class Gen5SpirvTranslator
         private uint CurrentVectorRegisterArray() =>
             _pairedLanes && _laneHalf == 1 ? _upperVectorRegisters : _vectorRegisters;
 
-        private uint LoadVDynamic(uint registerIndex) =>
-            Load(_uintType, DynamicVectorPointer(registerIndex));
+        // Without the array file a computed register number selects among the per-register
+        // variables of the whole (masked) file: a few hundred selects at the V_MOVREL site
+        // instead of turning every register access of the program into an array access, which
+        // drivers keep in memory rather than registers. Never-written registers read zero, as
+        // the zero-initialized array did.
+        private uint LoadVDynamic(uint registerIndex)
+        {
+            if (_vectorRegisters != 0)
+                return Load(_uintType, DynamicVectorPointer(registerIndex));
+
+            var masked = BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1));
+            var value = LoadV(0);
+            for (uint register = 1; register < VectorRegisterCount; register++)
+            {
+                value = _module.AddInstruction(SpirvOp.Select, _uintType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, masked, UInt(register)), LoadV(register), value);
+            }
+
+            return value;
+        }
 
         private void StoreVDynamic(uint registerIndex, uint value)
         {
+            if (_vectorRegisters == 0)
+            {
+                var masked = BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1));
+                var active = _execKnownFull ? _module.ConstantBool(true) : Load(_boolType, _exec);
+                for (uint register = 0; register < VectorRegisterCount; register++)
+                {
+                    var selected = LogicalAnd(active,
+                        _module.AddInstruction(SpirvOp.IEqual, _boolType, masked, UInt(register)));
+                    StoreV(register, _module.AddInstruction(SpirvOp.Select, _uintType, selected, value, LoadV(register)),
+                        guardWithExec: false);
+                }
+
+                return;
+            }
+
             var pointer = DynamicVectorPointer(registerIndex);
             if (!_execKnownFull)
                 value = _module.AddInstruction(SpirvOp.Select, _uintType,
