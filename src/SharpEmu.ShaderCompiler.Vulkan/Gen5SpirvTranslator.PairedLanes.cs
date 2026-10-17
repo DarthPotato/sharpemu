@@ -54,10 +54,10 @@ public static partial class Gen5SpirvTranslator
                 return;
             }
 
+            // flag() lists a Private flag in the entry-point interface itself; a Function-scope
+            // one must not be listed (SPIR-V 1.4+ interfaces hold global variables only).
             _upperVcc = flag(false);
             _upperExec = flag(true);
-            _interfaces.Add(_upperVcc);
-            _interfaces.Add(_upperExec);
             _module.AddName(_upperVcc, "vccUpperHalf");
             _module.AddName(_upperExec, "execUpperHalf");
         }
