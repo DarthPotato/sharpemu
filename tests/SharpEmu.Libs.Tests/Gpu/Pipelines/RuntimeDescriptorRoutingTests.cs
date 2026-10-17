@@ -41,11 +41,13 @@ public sealed class RuntimeDescriptorRoutingTests : IDisposable
 
     // The resource table the shader reads at fixed offsets (+32: the material V#, +48: the heap V#), the material
     // records, and the heap of T#s they select by key.
-    private void WriteScene(uint materialCount)
+    private void WriteScene(uint materialCount, uint declaredCount = 0)
     {
+        // The V#s may declare more records than the guest has mapped, as a game's pools do.
+        var declared = declaredCount == 0 ? materialCount : declaredCount;
         _guest.WriteWords(Srt + 32,
-            Low(Materials), High(Materials) | (MaterialBytes << 16), materialCount, 0x00FFF000,
-            Low(Heap), High(Heap), materialCount * 32, 0x00FFF000);
+            Low(Materials), High(Materials) | (MaterialBytes << 16), declared, 0x00FFF000,
+            Low(Heap), High(Heap), declared * 32, 0x00FFF000);
         var records = new uint[materialCount * (MaterialBytes / 4)];
         for (uint material = 0; material < materialCount; material++)
         {
@@ -121,5 +123,35 @@ public sealed class RuntimeDescriptorRoutingTests : IDisposable
         WriteScene(materialCount: 3);
         Assert.True(TryCompile(out _, out rejection), rejection);
         Assert.Single(_guest.Compiler.Requests);
+    }
+
+    // The V#s declare far more records than the guest ever fills, as a game's pool does: the table cannot be enumerated.
+    [Fact]
+    public void ATableWhoseDeclaredRecordsCannotAllBeEnumeratedIsReadAtRunTimeWhenTheHostCanServeIt()
+    {
+        const uint declared = 200_000;
+        _guest.Host.RuntimeImageDescriptorsSupported = true;
+        WriteScene(materialCount: 200, declaredCount: declared);
+
+        Assert.True(TryCompile(out _, out var rejection), rejection);
+
+        var request = Assert.Single(_guest.Compiler.Requests);
+        Assert.True(request.Resources.Info.UsesRuntimeDescriptors);
+    }
+
+    [Fact]
+    public void ATableThatCannotBeEnumeratedIsRejectedWithItsReasonWithoutARuntimeHost()
+    {
+        const uint declared = 200_000;
+        const string kind = "ImageCapacityExceeded";
+        const string detail = "selector probes exceed";
+        _guest.Host.RuntimeImageDescriptorsSupported = false;
+        WriteScene(materialCount: 200, declaredCount: declared);
+
+        Assert.False(TryCompile(out _, out var rejection));
+
+        Assert.Contains(kind, rejection);
+        Assert.Contains("detail=", rejection);
+        Assert.Contains(detail, rejection);
     }
 }

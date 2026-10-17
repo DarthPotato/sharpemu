@@ -642,6 +642,8 @@ public static class ResourceMaterializer
         }
         if (provenOffsets is null && probeCount > MaxIndirectImageProbes)
         {
+            // A table this large cannot be enumerated into bindings; a host that reads descriptors at run time serves it.
+            failure = ResourceMaterializationFailure.ImageCapacityExceeded;
             return Detail($"indirect image {Hex(image.FirstUsePc)}: {probeCount} unbounded selector probes exceed {MaxIndirectImageProbes} " +
                 $"(material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
         }
@@ -654,6 +656,7 @@ public static class ResourceMaterializer
         {
             if (!ReadScalarBufferWord(material.Dwords, (uint)offset, indirect.MaterialImmediate, inputs, out var key))
             {
+                failure = ResourceMaterializationFailure.UnreadableImageCandidates;
                 return Detail($"indirect image {Hex(image.FirstUsePc)} material key at offset {Hex(offset)}: " +
                     DescribeScalarBufferRead(material.Dwords, (uint)offset, indirect.MaterialImmediate, inputs));
             }
@@ -675,6 +678,7 @@ public static class ResourceMaterializer
             {
                 if (!ReadScalarBufferWord(heap.Dwords, heapOffset, dword * sizeof(uint), inputs, out candidate[dword]))
                 {
+                    failure = ResourceMaterializationFailure.UnreadableImageCandidates;
                     return Detail($"indirect image {Hex(image.FirstUsePc)} heap descriptor for key 0x{key:X8} dword {dword}: " +
                         DescribeScalarBufferRead(heap.Dwords, heapOffset, dword * sizeof(uint), inputs));
                 }
@@ -731,8 +735,11 @@ public static class ResourceMaterializer
                 var relative = entry + dword * sizeof(uint);
                 if (relative > AddressMask || baseAddress > AddressMask - relative ||
                     !inputs.ReadCleanMemory(baseAddress + relative, out candidate[dword]))
+                {
+                    failure = ResourceMaterializationFailure.UnreadableImageCandidates;
                     return Detail($"dense indirect image {Hex(image.FirstUsePc)} key {key} dword {dword}: cannot read {sizeof(uint)} bytes at guest address " +
                         $"{Hex(baseAddress + relative)} (heap base={Hex(baseAddress)} offset={Hex(relative)})");
+                }
             }
 
             if (!UsableImageCandidate(candidate, r128))
@@ -766,7 +773,10 @@ public static class ResourceMaterializer
 
         var baseAddress = (((ulong)heap.Dwords[1] << 32) | heap.Dwords[0]) & AddressMask;
         if (!TryReadCleanWord(baseAddress, wave.MaskOffset, inputs, out var activeMask))
+        {
+            failure = ResourceMaterializationFailure.UnreadableImageCandidates;
             return ReadFailed($"wave-indexed image {Hex(image.FirstUsePc)} active mask", baseAddress, wave.MaskOffset, inputs);
+        }
 
         var keys = new SortedSet<uint>();
         for (uint bit = 0; bit < 32; bit++)
@@ -775,7 +785,10 @@ public static class ResourceMaterializer
                 continue;
             var indexOffset = (ulong)wave.IndexTableOffset + (ulong)bit * wave.IndexStride;
             if (!TryReadCleanWord(baseAddress, indexOffset, inputs, out var key))
+            {
+                failure = ResourceMaterializationFailure.UnreadableImageCandidates;
                 return ReadFailed($"wave-indexed image {Hex(image.FirstUsePc)} lane {bit} index", baseAddress, indexOffset, inputs);
+            }
             // VCmpxLeI32 0, key suppresses signed-negative indices before ReadFirstLane.
             if ((key & 0x8000_0000u) == 0)
                 keys.Add(key);
@@ -790,8 +803,11 @@ public static class ResourceMaterializer
             for (uint dword = 0; dword < candidate.Length; dword++)
             {
                 if (!TryReadCleanWord(baseAddress, descriptorOffset + dword * sizeof(uint), inputs, out candidate[dword]))
+                {
+                    failure = ResourceMaterializationFailure.UnreadableImageCandidates;
                     return ReadFailed($"wave-indexed image {Hex(image.FirstUsePc)} key {key} descriptor dword {dword}",
                         baseAddress, descriptorOffset + dword * sizeof(uint), inputs);
+                }
             }
 
             if (!UsableImageCandidate(candidate, r128))

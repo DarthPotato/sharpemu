@@ -304,7 +304,8 @@ internal sealed class ShaderProgramCache
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
-            if (!materialized && materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded &&
+            if (!materialized && materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded or
+                ResourceMaterializationFailure.UnreadableImageCandidates &&
                 PreferRuntimeDescriptors(source, options, entry))
             {
                 // The table binds every image it can select, and this one selects more than a draw may bind. The
@@ -322,7 +323,8 @@ internal sealed class ShaderProgramCache
                 // Set on this thread by the materialization that just failed; the cache only delegates to it.
                 if (ResourceMaterializer.LastFailureDetail is { } detail)
                     message = message[..^1] + $" detail={detail}.";
-                if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
+                if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded or
+                    ResourceMaterializationFailure.UnreadableImageCandidates)
                     throw new ShaderProgramRejectedException(message);
                 throw SubmissionScheduler.Fatal(message);
             }
