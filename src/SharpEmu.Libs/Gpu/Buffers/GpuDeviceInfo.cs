@@ -130,6 +130,19 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         }
     }
 
+    // The driver's current device-local budget and usage (all processes' share of it for this
+    // one), for diagnostics; zero without VK_EXT_memory_budget.
+    public (ulong Budget, ulong Usage) QueryDeviceLocalUsage()
+    {
+        if (!HasMemoryBudget)
+        {
+            return (0, 0);
+        }
+
+        var (budget, usage, _) = QueryDeviceLocalMemory();
+        return (budget, usage);
+    }
+
     private (ulong Budget, ulong Usage, ulong Available) QueryDeviceLocalMemory()
     {
         var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT

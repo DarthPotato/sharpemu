@@ -248,7 +248,8 @@ public sealed unsafe partial class CachedImage : IDisposable
                     {
                         Console.Error.WriteLine(
                             $"[GPU][WARN] Device memory is full: images now spill to system memory type {index} " +
-                            $"(first: {create.Extent.Width}x{create.Extent.Height}x{create.ArrayLayers} {create.Format}, {requirements.Size} bytes). Expect slower frames.");
+                            $"(first: {create.Extent.Width}x{create.Extent.Height}x{create.ArrayLayers} {create.Format}, {requirements.Size} bytes). Expect slower frames. " +
+                            (_memoryDiagnostics?.Invoke() ?? string.Empty));
                     }
 
                     Interlocked.Increment(ref _systemMemoryImages);

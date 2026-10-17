@@ -34,6 +34,7 @@ public sealed partial class GuestImageCache
             if (image.Registered) largest.Add(image);
         });
         var now = _scheduler.CurrentTick;
+        var (deviceBudget, deviceUsage) = _device.QueryDeviceLocalUsage();
         var top = string.Join(" ", largest.OrderByDescending(static image => image.AccountedSize).Take(12).Select(image =>
             $"[0x{image.Description.Data.Address:X} {image.Description.Extent.Width}x{image.Description.Extent.Height}x{image.Backing.Layers} " +
             $"{image.Backing.Format} mb={image.AccountedSize >> 20} scale={image.RenderScale:0.##} gpu={(image.IsGpuModified ? 1 : 0)} " +
@@ -41,7 +42,8 @@ public sealed partial class GuestImageCache
         return $"registered_images={registered} clean_image_bytes={cleanBytes} gpu_modified_linear_bytes={modifiedLinearBytes} " +
             $"gpu_modified_tiled_bytes={modifiedTiledBytes} retired_image_bytes={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
             $"retained_backing_bytes={_backingPool?.PooledBytes ?? 0} collection_bytes={CollectionMemoryBytes} critical_bytes={_criticalMemoryBytes} " +
-            $"system_memory_images={CachedImage.SystemMemoryImages} largest={top}";
+            $"system_memory_images={CachedImage.SystemMemoryImages} device_budget={deviceBudget} device_usage={deviceUsage} " +
+            $"buffer_cache_bytes={_bufferCache.TotalUsedMemory} image_pool_bytes={_imageMemoryPool.AllocatedBytes} largest={top}";
     }
 
     // Allocation-time pressure is deliberately separate from the periodic sweep:
