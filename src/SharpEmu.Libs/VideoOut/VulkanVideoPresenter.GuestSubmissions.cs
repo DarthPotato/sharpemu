@@ -96,6 +96,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             _ = bundle;
             EndRendering();
+            RecordRuntimeMissCopies();
             if (!_batchOpen)
             {
                 return;

@@ -3,7 +3,6 @@
 
 namespace SharpEmu.Libs.VideoOut;
 
-using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Images;
@@ -35,17 +34,32 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             // The entries and the pending misses of the shader.
             public readonly RuntimeDescriptorRegistry<TextureResource> Registry = new();
-            public GpuBuffer? Table;
-
-            // The miss buffer of the tick being recorded, and the ones read and ready for reuse.
-            public GpuBuffer? CurrentMisses;
-            public ulong CurrentMissesTick = ulong.MaxValue;
-            public readonly ConcurrentBag<GpuBuffer> FreeMissBuffers = [];
+            public RuntimeDescriptorBuffers? Buffers;
         }
 
         // Feedback belongs to the shader that generated it, not to the process: a new scene must not
         // acquire the textures of every older shader.
         private readonly Dictionary<(ShaderStageKind Stage, ulong Hash), RuntimeDescriptorSet> _runtimeDescriptorSets = new();
+
+        // The buffers whose miss buffer the tick being recorded has bound; copied out just before it is submitted.
+        private readonly List<RuntimeDescriptorBuffers> _runtimeMissBuffersThisTick = [];
+
+        private void RecordRuntimeMissCopies()
+        {
+            // A presenter built without its constructor (the tests do) has no list.
+            var pending = _runtimeMissBuffersThisTick;
+            if (pending is not { Count: > 0 })
+            {
+                return;
+            }
+
+            foreach (var buffers in pending)
+            {
+                buffers.RecordMissCopies();
+            }
+
+            pending.Clear();
+        }
 
         private RuntimeDescriptorSet RuntimeDescriptorsFor(ShaderProgramInfo program)
         {
@@ -222,80 +236,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
-            var table = RuntimeDescriptorTableBuffer(descriptors);
+            var buffers = descriptors.Buffers ??= new RuntimeDescriptorBuffers(_deviceInfo, _scheduler, _runtimeMissBuffersThisTick);
+            var table = buffers.Table(descriptors.Registry);
             prepared.Descriptors.RuntimeTable = new BufferView(table.Handle, 0, table.Size);
             // The tick the draw records in is fixed by now, so the buffer is read when that tick completes.
-            var misses = RuntimeDescriptorMissBuffer(descriptors);
+            var misses = buffers.Misses(descriptors.Registry);
             prepared.Descriptors.RuntimeMisses = new BufferView(misses.Handle, 0, misses.Size);
-        }
-
-        // The table buffer of the current entries. A change builds a new buffer: draws already recorded keep
-        // reading the one they were bound with until their tick completes.
-        private GpuBuffer RuntimeDescriptorTableBuffer(RuntimeDescriptorSet descriptors)
-        {
-            var current = descriptors.Table;
-            if (current is not null && !descriptors.Registry.TableDirty)
-            {
-                return current;
-            }
-
-            var words = descriptors.Registry.BuildTable();
-            var buffer = new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Upload, 0, BufferUsageFlags.StorageBufferBit, (ulong)words.Length * sizeof(uint));
-            buffer.Write(0, MemoryMarshal.AsBytes(words.AsSpan()));
-            if (current is not null)
-            {
-                _scheduler.QueueCompletionAction(current.Dispose);
-            }
-
-            descriptors.Table = buffer;
-            return buffer;
-        }
-
-        // One miss buffer per tick and shader: every draw of the tick records into it, and it is read, cleared
-        // and kept for a later tick once the tick completes.
-        private GpuBuffer RuntimeDescriptorMissBuffer(RuntimeDescriptorSet descriptors)
-        {
-            var tick = _scheduler.CurrentTick;
-            if (descriptors.CurrentMisses is { } current && descriptors.CurrentMissesTick == tick)
-            {
-                return current;
-            }
-
-            if (!descriptors.FreeMissBuffers.TryTake(out var buffer))
-            {
-                buffer = new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Download, 0, BufferUsageFlags.StorageBufferBit,
-                    RuntimeDescriptorTable.MissBufferDwords * sizeof(uint));
-                ClearRuntimeMissBuffer(buffer);
-            }
-
-            descriptors.CurrentMisses = buffer;
-            descriptors.CurrentMissesTick = tick;
-            _scheduler.QueueCompletionAction(() =>
-            {
-                buffer.Invalidate(0, buffer.Size);
-                descriptors.Registry.ReadMisses(MemoryMarshal.Cast<byte, uint>(buffer.Mapped));
-                ClearRuntimeMissBuffer(buffer);
-                descriptors.FreeMissBuffers.Add(buffer);
-            });
-            return buffer;
-        }
-
-        private static void ClearRuntimeMissBuffer(GpuBuffer buffer)
-        {
-            buffer.Mapped.Clear();
-            buffer.Flush(0, buffer.Size);
         }
 
         private void DestroyRuntimeDescriptors()
         {
             foreach (var descriptors in _runtimeDescriptorSets.Values)
             {
-                descriptors.Table?.Dispose();
-                descriptors.CurrentMisses = null;
-                foreach (var buffer in descriptors.FreeMissBuffers)
-                {
-                    buffer.Dispose();
-                }
+                descriptors.Buffers?.Dispose();
             }
 
             _runtimeDescriptorSets.Clear();

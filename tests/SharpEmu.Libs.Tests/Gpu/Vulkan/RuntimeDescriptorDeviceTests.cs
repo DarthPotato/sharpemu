@@ -269,6 +269,85 @@ public sealed class RuntimeDescriptorDeviceTests(HeadlessVulkanFixture fixture, 
         output.WriteLine($"Verified runtime image sampling after {scenario.RoundsRun} ticks on {vulkan.DeviceName}; validation={vulkan.ValidationEnabled}.");
     }
 
+    // The host registers descriptors, grows the table and frees heap slots between the draws of one command buffer
+    // that is still recording. None of that may invalidate the buffer: the heap is update-after-bind, and a
+    // superseded table or a read miss buffer is only destroyed once the submission that bound it has completed.
+    [Fact]
+    public void RegisteringAndGrowingTheTableWhileRecording_KeepsTheCommandBufferValid()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, runtimeDescriptors: true))
+        {
+            return;
+        }
+
+        const int Count = 3;
+        using var scenario = new Scenario(vulkan, LoopProgram("ImageSampleLz", EntryBytes, (uint)Count, withSampler: true), EntryBytes * (uint)Count);
+        var tableData = new byte[EntryBytes * (uint)Count];
+        for (var index = 0; index < Count; index++)
+        {
+            var word = (uint)(ImageBase >> 8) + (uint)index * 0x10;
+            WriteEntry(tableData, index, EntryBytes, ImageWords((ulong)word << 8, Format32Float));
+            scenario.AddImage(word, Format.R32Sfloat, GuestPixelFormat.Bits32Float, Floats(0.25f * (index + 1)));
+        }
+
+        scenario.TableBytes = scenario.Runner.CreateBuffer(tableData);
+        var sampler = scenario.Runner.CreateSampler(Filter.Nearest);
+        List<RuntimeDescriptorBuffers> recording = [];
+        var buffers = new RuntimeDescriptorBuffers(scenario.Harness.Device, scenario.Harness.Scheduler, recording);
+        scenario.Harness.Run(() =>
+        {
+            var command = new CommandBuffer(scenario.Harness.Scheduler.Current.Handle);
+            foreach (var image in scenario.Images)
+            {
+                image.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+            }
+
+            // One tick, several dispatches: each registers one more descriptor, so the table is rebuilt (the
+            // previous one superseded) and a heap slot is written while the earlier dispatches are recorded.
+            for (var step = 0; step <= Count; step++)
+            {
+                if (step > 0)
+                {
+                    var (key, entry) = (step - 1, new RuntimeImageEntry<object>(ImageKeyOf(scenario, step - 1)));
+                    scenario.Registry.Images.Add(RuntimeDescriptorKey.From(entry.Key), entry);
+                    var (image, view) = scenario.ImagesByAddressWord[entry.Key[1]];
+                    entry.Slot = scenario.Heap.GetOrCreateImageSlot(image.GetOrCreateView(view), ImageLayout.ShaderReadOnlyOptimal);
+                    scenario.Registry.TableDirty = true;
+                }
+
+                var table = buffers.Table(scenario.Registry);
+                var misses = buffers.Misses(scenario.Registry);
+                scenario.Runner.Dispatch(scenario.Registers, new Dictionary<DescriptorBindingKind, GpuBuffer[]>
+                {
+                    [DescriptorBindingKind.RuntimeDescriptorTable] = [table],
+                    [DescriptorBindingKind.RuntimeDescriptorMisses] = [misses],
+                    [DescriptorBindingKind.Buffers] = scenario.Snapshot.Buffers.Select(descriptor => descriptor[0] == (uint)TableAddress ? scenario.TableBytes! : scenario.Result).ToArray(),
+                }, 1, flattenedTable: scenario.Snapshot.FlattenedResourceTable, heapSet: scenario.Heap.Set);
+            }
+
+            // The tick is about to be submitted: the miss buffer the dispatches wrote is copied out and cleared.
+            foreach (var pending in recording)
+            {
+                pending.RecordMissCopies();
+            }
+
+            recording.Clear();
+        });
+
+        scenario.Harness.AssertNoValidationMessages();
+        Assert.Equal(BitConverter.SingleToUInt32Bits(0.25f), scenario.ResultWord(0));
+        Assert.Equal(BitConverter.SingleToUInt32Bits(0.75f), scenario.ResultWord(2));
+        scenario.Harness.Finish();
+        // The first dispatch ran with an empty table: its misses came back through the device-local buffer.
+        Assert.True(scenario.Registry.PendingMisses > 0);
+        buffers.Dispose();
+        scenario.Harness.AssertNoValidationMessages();
+    }
+
+    private static uint[] ImageKeyOf(Scenario scenario, int index) =>
+        [RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D), (uint)(ImageBase >> 8) + (uint)index * 0x10, Format32Float << 20, 0, 0xFAC | (ImageType2D << 28), 0, 0, 0, 0];
+
     [Fact]
     public void ImageLoadLoop_FetchesThroughTheViewOfEachNumericClass()
     {
