@@ -542,6 +542,7 @@ public static partial class Gen5SpirvTranslator
                     ? (uint)_vertexOutputs.Count
                     : (uint)_pixelInputs.Count;
                 shader = new Gen5SpirvShader(_module.Build(), attributeCount);
+                SizeProfileReport(shader.Spirv.Length / sizeof(uint));
                 return true;
             }
             catch (Exception exception)
@@ -1698,7 +1699,9 @@ public static partial class Gen5SpirvTranslator
                             }
 
                             _execKnownFull = true;
+                            var runMark = SizeProfileMark();
                             var ok = TryEmitInstruction(run, out var runError);
+                            SizeProfileRecord(run.Opcode, runMark);
                             _execKnownFull = false;
                             if (!ok)
                             {
@@ -1726,9 +1729,11 @@ public static partial class Gen5SpirvTranslator
 
                 _execKnownFull = IsExecKnownFull(instruction.Pc);
                 _unobservedWrites = ObservationPlan()?.UnobservedWrites(instruction.Pc) ?? default;
+                var mark = SizeProfileMark();
                 var emitted = _pairedLanes && IsPairedLaneInstruction(instruction)
                     ? TryEmitPairedLaneInstruction(instruction, out error)
                     : TryEmitInstruction(instruction, out error);
+                SizeProfileRecord(instruction.Opcode, mark);
                 _execKnownFull = false;
                 _unobservedWrites = default;
                 if (!emitted)

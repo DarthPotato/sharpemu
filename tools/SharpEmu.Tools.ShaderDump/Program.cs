@@ -126,6 +126,9 @@ if (args.Length == 4 && args[0] == "--replay-compute")
         ThreadCountX = state.GetProperty("ThreadCountX").GetUInt32(),
         ThreadCountY = state.GetProperty("ThreadCountY").GetUInt32(),
         ThreadCountZ = state.GetProperty("ThreadCountZ").GetUInt32(),
+        // The capture does not record the host; SHARPEMU_REPLAY_HOST32=1 replays for a
+        // 32-lane-subgroup device (NVIDIA), which lowers wave64 to half or paired waves.
+        HostComputeSubgroup32 = wave == 64 && Environment.GetEnvironmentVariable("SHARPEMU_REPLAY_HOST32") == "1",
     };
     if (!Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out error))
         throw new InvalidOperationException(error);

@@ -860,6 +860,7 @@ public sealed class SpirvModuleBuilder
     {
         var result = id ?? AllocateId();
         Emit(_functions, SpirvOp.Label, result);
+        LabelCount++;
         if (_functionVariableOffset < 0) _functionVariableOffset = _functions.Count;
         return result;
     }
@@ -889,6 +890,10 @@ public sealed class SpirvModuleBuilder
 
         return id;
     }
+
+    internal int FunctionWordCount => _functions.Count;
+
+    internal int LabelCount { get; private set; }
 
     public uint AddInstruction(SpirvOp opcode, uint resultType, params uint[] operands) =>
         TryFold(opcode, resultType, operands, out var folded)
