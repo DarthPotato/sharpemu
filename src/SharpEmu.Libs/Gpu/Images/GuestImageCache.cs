@@ -330,6 +330,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             {
                 inserted.MarkBufferModified();
             }
+
+            SyncResizedSibling(result);
         }
 
         var image = _slots[result];
