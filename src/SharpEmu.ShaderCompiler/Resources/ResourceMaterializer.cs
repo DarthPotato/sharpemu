@@ -12,7 +12,11 @@ namespace SharpEmu.ShaderCompiler.Resources;
 public static class ResourceMaterializer
 {
     private const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
-    private const ulong MaxIndirectImageProbes = 65536;
+    // An unbounded selector enumerates every reachable dword offset of its material table.
+    // A probe is one word read, plus one heap descriptor read per distinct key, so a few
+    // hundred thousand stay cheap: Ghost of Yotei has a 2502-record table of 116-byte
+    // records, 72559 probes.
+    private const ulong MaxIndirectImageProbes = 1 << 18;
 
     // Why the last Materialize call on this thread returned false, for the host's fatal.
     [ThreadStatic]

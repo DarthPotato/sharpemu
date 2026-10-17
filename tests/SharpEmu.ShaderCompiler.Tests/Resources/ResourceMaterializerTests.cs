@@ -152,7 +152,7 @@ public sealed class ResourceMaterializerTests
     }
 
     // A 116-byte-stride material table with a selector offset of 4: the exhaustive probe step is
-    // 4 bytes, so a table of 2260+ records exceeds the probe cap. Keys 1 and 2 sit at record
+    // 4 bytes, so a table of 9040+ records exceeds the probe cap. Keys 1 and 2 sit at record
     // aligned offsets (4 + 116 * 3 and 4 + 116 * 2000); key 3 is at a misaligned offset
     // (4 + 116 * 10 + 8) reachable through wrapped selector arithmetic.
     private const uint AlignedStride = 116;
@@ -167,9 +167,10 @@ public sealed class ResourceMaterializerTests
         Assert.Equal(AlignedStride, selector.SelectorStride);
         Assert.Equal(4u, selector.SelectorOffset);
 
-        const ulong heapBase = 0x60000;
+        // The heap follows the table, which can be larger than the memory before 0x60000.
+        var heapBase = Math.Max(0x60000UL, (0x1000UL + records * AlignedStride + 0x1FFFUL) & ~0xFFFUL);
         uint[] userData = [0x1000, AlignedStride << 16, records, 0, (uint)heapBase, 16 << 16, 16, 0, 7];
-        var memory = new TestWordMemory { Base = 0x1000, Words = new uint[0x60000 / 4], RequireAlignment = true };
+        var memory = new TestWordMemory { Base = 0x1000, Words = new uint[(heapBase + 0x1000 - 0x1000) / 4], RequireAlignment = true };
         var heap = new uint[4][];
         for (var key = 0; key < heap.Length; key++)
         {
@@ -204,7 +205,8 @@ public sealed class ResourceMaterializerTests
         Assert.Equal(MisalignedKeyThreeOffset, wrappedOffset);
         Assert.NotEqual(0u, (wrappedOffset - 4u) % AlignedStride);
 
-        var (plan, smallerInputs, heap) = RecordAlignedTable(2259);
+        // 29 dword probes per 116-byte record plus one: 9039 records fit the 262144 cap.
+        var (plan, smallerInputs, heap) = RecordAlignedTable(9039);
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
         Assert.True(ResourceMaterializer.Materialize(plan, smallerInputs, ref snapshot, ref specialization));
@@ -212,20 +214,20 @@ public sealed class ResourceMaterializerTests
         var previousSnapshot = snapshot;
         var previousSpecialization = specialization;
 
-        var (_, expandedInputs, _) = RecordAlignedTable(2260);
+        var (_, expandedInputs, _) = RecordAlignedTable(9040);
         Assert.False(ResourceMaterializer.Materialize(plan, expandedInputs, ref snapshot, ref specialization,
             out var failureKind));
         Assert.Equal(ResourceMaterializationFailure.Other, failureKind);
-        Assert.Contains("unbounded selector probes exceed 65536", ResourceMaterializer.LastFailureDetail);
+        Assert.Contains("unbounded selector probes exceed 262144", ResourceMaterializer.LastFailureDetail);
         Assert.Same(previousSnapshot, snapshot);
         Assert.Same(previousSpecialization, specialization);
     }
 
-    // 2259 records keep the exhaustive probe count under the cap (65512 offsets, step 4): the
-    // misaligned key must be found. 2260 records exceed it (65541) and require a selector proof.
+    // 9039 records keep the exhaustive probe count under the cap (262132 offsets, step 4): the
+    // misaligned key must be found. 9040 records exceed it (262161) and require a selector proof.
     [Theory]
-    [InlineData(2259u, true)]
-    [InlineData(2260u, false)]
+    [InlineData(9039u, true)]
+    [InlineData(9040u, false)]
     public void UnboundedSelectorProbesRequireExhaustiveOffsetsOrFail(uint records, bool exhaustive)
     {
         var (plan, inputs, heap) = RecordAlignedTable(records);
@@ -247,8 +249,8 @@ public sealed class ResourceMaterializerTests
     }
 
     [Theory]
-    [InlineData(2259u, false)]
-    [InlineData(2260u, true)]
+    [InlineData(9039u, false)]
+    [InlineData(9040u, true)]
     public void UnboundedSelectorFailureReportsOnlyExhaustivelyProbedOffsets(uint records, bool exceedsCap)
     {
         var (plan, inputs, _) = RecordAlignedTable(records, incompatibleKeyTwo: true);
@@ -290,14 +292,14 @@ public sealed class ResourceMaterializerTests
 
     // The shader clamps the selector to [0, 5], so only record offsets 4 + 116 * k for k <= 5 are
     // reachable: key 1 (k = 3) is found; key 2 (k = 2000) and the misaligned poison key are not,
-    // even though a 2260-record table exceeds the exhaustive cap.
+    // even though a 9040-record table exceeds the exhaustive cap.
     [Theory]
     [InlineData("VMinU32", 5u)]
     [InlineData("VMed3U32", 5u)]
     [InlineData("VAndB32", 7u)]
     public void ClampedSelectorProbesOnlyTheClampedRecords(string opcode, uint value)
     {
-        var (plan, inputs, heap) = RecordAlignedTable(2260, clamp: (opcode, value));
+        var (plan, inputs, heap) = RecordAlignedTable(9040, clamp: (opcode, value));
         var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
         Assert.Equal(value, selector.SelectorBound);
         var snapshot = new ResourceSnapshot();
@@ -323,7 +325,7 @@ public sealed class ResourceMaterializerTests
     [Fact]
     public void ClampedSelectorReportsTheClampBoundedMode()
     {
-        var (plan, inputs, _) = RecordAlignedTable(2260, incompatibleKeyTwo: true, clamp: ("VMinU32", 2000u));
+        var (plan, inputs, _) = RecordAlignedTable(9040, incompatibleKeyTwo: true, clamp: ("VMinU32", 2000u));
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
         var captures = new List<IndirectImageFailure>();
