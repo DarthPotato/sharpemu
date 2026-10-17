@@ -635,6 +635,17 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
+    // An array type of its own, never shared with TypeArray's cache. A layout decoration (ArrayStride, for an array in a
+    // block or push-constant struct) is only valid on types used with explicit-layout storage classes, so the array a block
+    // decorates must not be the one a Private or Function variable of the same element and length uses.
+    public uint TypeLayoutArray(uint elementType, uint count)
+    {
+        var length = Constant(TypeInt(32, false), count);
+        var id = AllocateId();
+        Emit(_typesConstantsGlobals, SpirvOp.TypeArray, id, elementType, length);
+        return id;
+    }
+
     public uint TypeRuntimeArray(uint elementType)
     {
         if (_runtimeArrayTypes.TryGetValue(elementType, out var existing))

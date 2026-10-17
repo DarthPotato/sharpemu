@@ -227,7 +227,7 @@ public static partial class Gen5SpirvTranslator
 
             if (layout.UsesPushData)
             {
-                var arrayType = _module.TypeArray(_uintType, PushData.DwordCount);
+                var arrayType = _module.TypeLayoutArray(_uintType, PushData.DwordCount);
                 _module.AddDecoration(arrayType, SpirvDecoration.ArrayStride, sizeof(uint));
                 var block = _module.TypeStruct(arrayType);
                 _module.AddDecoration(block, SpirvDecoration.Block);
