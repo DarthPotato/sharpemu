@@ -3207,6 +3207,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             fixed (BufferCopy* pointer = regions)
             {
                 vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)regions.Length, pointer);
+                VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.BufferCopy);
             }
 
             var after = before;

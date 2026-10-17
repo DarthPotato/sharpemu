@@ -1154,11 +1154,13 @@ public sealed unsafe partial class GuestImageCache
         if (aspect == ImageAspectFlags.ColorBit)
         {
             _device.Vk.CmdClearColorImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &colorClear, 1, &range);
+            VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.Clear);
         }
         else
         {
             var clear = new ClearDepthStencilValue(depthClear, stencilClear);
             _device.Vk.CmdClearDepthStencilImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &range);
+            VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.Clear);
         }
 
         TakeGpuOwnership(image);
