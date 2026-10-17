@@ -187,4 +187,56 @@ public sealed partial class GuestImageCacheTests
 
         harness.Shutdown();
     }
+
+    [Fact]
+    public void RetiredImagesStayCountedUntilTheirWorkCompletes()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        ResourceSlotIdentifier image = default;
+        harness.Worker.Run(() => image = harness.Images.InsertImageForTest(SmallImage(address)));
+        var accounted = harness.Image(image).AccountedSize;
+        Assert.NotEqual(0UL, accounted);
+        Assert.Equal(accounted, harness.Images.TotalUsedMemory);
+
+        harness.Worker.Run(() => harness.Images.DeleteImageForTest(image));
+        // Unregistered, but the device memory is held until the GPU is done with the tick.
+        Assert.False(harness.Images.Contains(image));
+        Assert.Equal(accounted, harness.Images.TotalUsedMemory);
+        Assert.False(harness.Images.RetirementOverBudget);
+
+        harness.Finish();
+        Assert.Equal(0UL, harness.Images.TotalUsedMemory);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void AllocationNearTheBudgetRetiresOldImagesFirst()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const uint Width = 1024;
+        const ulong Size = (ulong)Width * Width * 4;
+        var address = harness.MapBacked(6 * Size, ReadWrite);
+        var old = new List<ResourceSlotIdentifier>();
+        harness.Worker.Run(() =>
+        {
+            for (var index = 0u; index < 4; index++)
+            {
+                old.Add(harness.Images.InsertImageForTest(SmallImage(address + index * Size, Width)));
+            }
+        });
+
+        var current = harness.Images.CollectionMemoryBytes;
+        // Every image so far is from an earlier frame; the budget has room for one more megabyte.
+        harness.Images.SetCollectionThresholds(1, current - 1, current + (1UL << 20), 10);
+        ResourceSlotIdentifier created = default;
+        harness.Worker.Run(() => created = harness.Images.InsertImageForTest(SmallImage(address + 4 * Size, Width)));
+
+        Assert.True(old.Count(identifier => !harness.Images.Contains(identifier)) >= 1);
+        Assert.True(harness.Images.Contains(created));
+        harness.Finish();
+        harness.Shutdown();
+    }
 }

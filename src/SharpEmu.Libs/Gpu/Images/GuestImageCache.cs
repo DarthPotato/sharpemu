@@ -17,6 +17,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 {
     private const ulong TicksBeforeRemoval = 32;
     private const ulong MiB = 1024 * 1024;
+    private const ulong GiB = 1024 * MiB;
+    private const ulong MinimumMemorySafetyMargin = 512 * MiB;
+    private const ulong NoBudgetImageCacheLimit = 4 * GiB;
 
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
@@ -36,9 +39,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly SortedDictionary<ulong, SurfaceMetadata> _surfaceMetadata = new();
     private ulong _totalUsedMemory;
     private ulong _collectionStartBytes;
-    private ulong _memoryPressureBytes = 1536 * MiB;
-    private ulong _criticalMemoryBytes = 3072 * MiB;
+    private ulong _memoryPressureBytes;
+    private ulong _criticalMemoryBytes;
+    private long _retiredImageMemoryBytes;
     private ulong _collectionTick;
+    private bool _allocationCollectionBlocked;
     private uint _queryEpoch;
     private bool _readbackLinearImages;
     private bool _disposed;
@@ -51,13 +56,79 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _bufferCache = bufferCache;
         _backing = backing;
         _readbackLinearImages = readbackLinearImages;
+        ConfigureCollectionBudget();
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
         _backingPool = ImageBackingPool.Enabled ? new ImageBackingPool(device) : null;
         _imageMemoryPool = new OptimalImageMemoryPool(device);
     }
 
-    public ulong TotalUsedMemory => _totalUsedMemory;
+    private static int _budgetLogged;
+
+    // Set once, from the device-local memory the driver reports when the device starts:
+    // recomputed later, the budget would count the cache's own images as used memory and
+    // shrink as the cache fills.
+    private void ConfigureCollectionBudget()
+    {
+        var available = Math.Max(_device.DeviceLocalAvailableBytes, 1UL);
+        var imageBudget = ComputeImageCacheBudget(available, _device.HasMemoryBudget);
+        if (ImageCacheBudgetCap is { } cap)
+        {
+            imageBudget = Math.Min(imageBudget, cap);
+        }
+
+        _collectionStartBytes = Math.Max(imageBudget / 2, MiB);
+        _memoryPressureBytes = Math.Max(imageBudget * 3 / 5, MiB);
+        _criticalMemoryBytes = Math.Max(imageBudget * 7 / 10, MiB);
+        if (Interlocked.Exchange(ref _budgetLogged, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Image cache budget source={(_device.HasMemoryBudget ? "VK_EXT_memory_budget" : "device-local heap size")} " +
+                $"heap={_device.DeviceLocalHeapBytes} budget={_device.DeviceLocalBudgetBytes} " +
+                $"usage={_device.DeviceLocalUsageBytes} available={_device.DeviceLocalAvailableBytes} " +
+                $"image_budget={imageBudget} thresholds={_collectionStartBytes}/{_memoryPressureBytes}/{_criticalMemoryBytes}");
+        }
+    }
+
+    // SHARPEMU_IMAGE_CACHE_BUDGET_MB caps the image cache below its derived budget, which
+    // otherwise keeps most free device memory for cached images. A lower cap leaves room for
+    // other users, such as a frame-capture tool's copies of every resource.
+    private static readonly ulong? ImageCacheBudgetCap =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_CACHE_BUDGET_MB"), out var megabytes) && megabytes > 0
+            ? megabytes * MiB
+            : null;
+
+    // The image cache may use what is free minus a margin (a quarter, at least 512 MiB) for
+    // everything else the process allocates. Without VK_EXT_memory_budget the heap size says
+    // nothing about memory the driver or other processes already hold, so the budget stays at
+    // the conservative fixed cap.
+    internal static ulong ComputeImageCacheBudget(ulong available, bool hasMemoryBudget)
+    {
+        available = Math.Max(available, 1UL);
+        var safetyMargin = Math.Max(available / 4, MinimumMemorySafetyMargin);
+        var imageBudget = available > safetyMargin
+            ? available - safetyMargin
+            : Math.Max(available / 2, MiB);
+        return hasMemoryBudget ? imageBudget : Math.Min(imageBudget, NoBudgetImageCacheLimit);
+    }
+
+    // The registered images' device memory plus the images retired but not yet destroyed.
+    public ulong TotalUsedMemory => _totalUsedMemory + (ulong)Interlocked.Read(ref _retiredImageMemoryBytes);
+
+    // Memory under the cache's control that a collection can bring down: registered images,
+    // retired images that await GPU completion, free space inside the image blocks and the
+    // retained backings of destroyed images.
+    internal ulong CollectionMemoryBytes => TotalUsedMemory +
+        _imageMemoryPool.UnusedBytes + (_backingPool?.PooledBytes ?? 0);
+
+    // The cache is past its pressure threshold: collection should run without waiting for a frame.
+    public bool MemoryUnderPressure => CollectionMemoryBytes >= _memoryPressureBytes;
+
+    // Retired images hold device memory until the work that used them completes; too many of
+    // them need that work finished, not another sweep.
+    public bool RetirementOverBudget =>
+        Interlocked.Read(ref _retiredImageMemoryBytes) > 256L * (long)MiB ||
+        (Interlocked.Read(ref _retiredImageMemoryBytes) > 0 && CollectionMemoryBytes >= _criticalMemoryBytes);
 
     // Called with the views of an image that leaves the cache, before the image is freed. A heap that
     // holds descriptors of those views drops them; the views stay valid until the GPU work that used
@@ -624,6 +695,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ResourceSlotIdentifier InsertImage(in ImageDescription description)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
+        CollectForAllocation((description.Data.Size + 1023) & ~1023UL);
         CachedImage image;
         try
         {

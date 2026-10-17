@@ -130,10 +130,17 @@ public sealed partial class GuestImageCache
             retired([.. image.Views.Select(static cached => cached.View)]);
         }
 
+        var retiredBytes = checked((long)image.AccountedSize);
         RemoveFromIndex(imageIdentifier);
         if (_scheduler.Active)
         {
-            _scheduler.QueueCompletionAction(() => _slots.Erase(imageIdentifier));
+            // The image keeps its device memory until the work that may use it completes.
+            Interlocked.Add(ref _retiredImageMemoryBytes, retiredBytes);
+            _scheduler.QueueCompletionAction(() =>
+            {
+                _slots.Erase(imageIdentifier);
+                Interlocked.Add(ref _retiredImageMemoryBytes, -retiredBytes);
+            });
         }
         else
         {

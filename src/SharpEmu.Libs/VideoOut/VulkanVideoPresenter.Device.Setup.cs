@@ -741,6 +741,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string FragmentShaderBarycentricExtensionName = "VK_KHR_fragment_shader_barycentric";
         private const string Maintenance5ExtensionName = "VK_KHR_maintenance5";
         private const string ImageViewMinLodExtensionName = "VK_EXT_image_view_min_lod";
+        private const string MemoryBudgetExtensionName = "VK_EXT_memory_budget";
+        private bool _memoryBudgetEnabled;
         private const string FillRectangleExtensionName = "VK_NV_fill_rectangle";
         private bool _supportsImageViewMinLod;
         private bool _supportsSamplerFilterMinmax;
@@ -1051,6 +1053,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var viewportIndexLayerExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_shader_viewport_index_layer");
             var maintenance5Extension = (byte*)SilkMarshal.StringToPtr(Maintenance5ExtensionName);
             var imageViewMinLodExtension = (byte*)SilkMarshal.StringToPtr(ImageViewMinLodExtensionName);
+            var memoryBudgetExtension = (byte*)SilkMarshal.StringToPtr(MemoryBudgetExtensionName);
+            _memoryBudgetEnabled = IsDeviceExtensionAvailable(MemoryBudgetExtensionName);
             var fillRectangleExtension = (byte*)SilkMarshal.StringToPtr(FillRectangleExtensionName);
             var samplerFilterMinmaxExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sampler_filter_minmax");
             try
@@ -1095,6 +1099,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_supportsImageViewMinLod)
                 {
                     extensions[extensionCount++] = imageViewMinLodExtension;
+                }
+
+                if (_memoryBudgetEnabled)
+                {
+                    extensions[extensionCount++] = memoryBudgetExtension;
                 }
 
                 // The extension form is used because the promoted Vulkan12Features struct cannot
@@ -1270,6 +1279,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)maintenance8Extension);
                 SilkMarshal.Free((nint)maintenance5Extension);
                 SilkMarshal.Free((nint)imageViewMinLodExtension);
+                SilkMarshal.Free((nint)memoryBudgetExtension);
                 SilkMarshal.Free((nint)fillRectangleExtension);
                 SilkMarshal.Free((nint)robustness2Extension);
                 SilkMarshal.Free((nint)portabilitySubsetExtension);
@@ -1282,7 +1292,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
-            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device) { ImageViewMinLodSupported = _supportsImageViewMinLod, SamplerFilterMinmaxSupported = _supportsSamplerFilterMinmax };
+            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled) { ImageViewMinLodSupported = _supportsImageViewMinLod, SamplerFilterMinmaxSupported = _supportsSamplerFilterMinmax };
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
                 _vk.GetDeviceQueue(_device, readbackQueueFamily, 0, out _readbackQueue);

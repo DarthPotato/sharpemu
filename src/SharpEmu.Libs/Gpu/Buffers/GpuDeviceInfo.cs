@@ -29,12 +29,21 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     // VK_EXT_sampler_filter_minmax is enabled, so a sampler can reduce with min or max.
     public bool SamplerFilterMinmaxSupported { get; init; }
 
-    public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device)
+    // `memoryBudgetEnabled`: VK_EXT_memory_budget is enabled on the device, so the driver reports
+    // how much device-local memory this process can still use.
+    public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device, bool memoryBudgetEnabled = false)
     {
         Vk = vk;
         PhysicalDevice = physicalDevice;
         Device = device;
         vk.GetPhysicalDeviceMemoryProperties(physicalDevice, out _memoryProperties);
+        var deviceLocalHeaps = DeviceLocalHeaps();
+        DeviceLocalHeapBytes = SumHeapBytes(deviceLocalHeaps);
+        var queried = memoryBudgetEnabled ? QueryDeviceLocalMemory(deviceLocalHeaps) : default;
+        HasMemoryBudget = queried.Budget != 0;
+        DeviceLocalBudgetBytes = HasMemoryBudget ? queried.Budget : DeviceLocalHeapBytes;
+        DeviceLocalUsageBytes = HasMemoryBudget ? queried.Usage : 0;
+        DeviceLocalAvailableBytes = HasMemoryBudget ? queried.Available : DeviceLocalHeapBytes;
         vk.GetPhysicalDeviceProperties(physicalDevice, out var properties);
         MinUniformBufferOffsetAlignment = Math.Max(properties.Limits.MinUniformBufferOffsetAlignment, 1);
         MinStorageBufferOffsetAlignment = Math.Max(properties.Limits.MinStorageBufferOffsetAlignment, 1);
@@ -71,6 +80,19 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
 
     public Device Device { get; }
 
+    // The device-local heaps' total size, and what the driver reports of this process's share
+    // of them at device creation (VK_EXT_memory_budget). Without the extension the budget is
+    // the heap size, which says nothing about memory other processes already hold.
+    public ulong DeviceLocalHeapBytes { get; }
+
+    public ulong DeviceLocalBudgetBytes { get; }
+
+    public ulong DeviceLocalUsageBytes { get; }
+
+    public ulong DeviceLocalAvailableBytes { get; }
+
+    public bool HasMemoryBudget { get; }
+
     public ulong MinUniformBufferOffsetAlignment { get; }
 
     public ulong MinStorageBufferOffsetAlignment { get; }
@@ -84,6 +106,71 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     public (uint X, uint Y, uint Z) MaxComputeWorkGroupCount { get; }
 
     public uint MemoryTypeCount => _memoryProperties.MemoryTypeCount;
+
+    private bool[] DeviceLocalHeaps()
+    {
+        var heaps = new bool[_memoryProperties.MemoryHeapCount];
+        fixed (PhysicalDeviceMemoryProperties* properties = &_memoryProperties)
+        {
+            var memoryTypes = &properties->MemoryTypes.Element0;
+            for (var index = 0u; index < properties->MemoryTypeCount; index++)
+            {
+                if ((memoryTypes[index].PropertyFlags & MemoryPropertyFlags.DeviceLocalBit) != 0)
+                {
+                    heaps[(int)memoryTypes[index].HeapIndex] = true;
+                }
+            }
+        }
+
+        return heaps;
+    }
+
+    private ulong SumHeapBytes(bool[] heaps)
+    {
+        ulong total = 0;
+        fixed (PhysicalDeviceMemoryProperties* properties = &_memoryProperties)
+        {
+            var memoryHeaps = &properties->MemoryHeaps.Element0;
+            for (var index = 0; index < heaps.Length; index++)
+            {
+                if (heaps[index])
+                {
+                    total += memoryHeaps[index].Size;
+                }
+            }
+        }
+
+        return total;
+    }
+
+    private (ulong Budget, ulong Usage, ulong Available) QueryDeviceLocalMemory(bool[] heaps)
+    {
+        var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT
+        {
+            SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt,
+        };
+        var properties = new PhysicalDeviceMemoryProperties2
+        {
+            SType = StructureType.PhysicalDeviceMemoryProperties2,
+            PNext = &budget,
+        };
+        Vk.GetPhysicalDeviceMemoryProperties2(PhysicalDevice, &properties);
+        ulong totalBudget = 0, totalUsage = 0, totalAvailable = 0;
+        for (var index = 0; index < heaps.Length; index++)
+        {
+            if (heaps[index])
+            {
+                totalBudget += budget.HeapBudget[index];
+                totalUsage += budget.HeapUsage[index];
+                totalAvailable += CalculateAvailableBytes(budget.HeapBudget[index], budget.HeapUsage[index]);
+            }
+        }
+
+        return (totalBudget, totalUsage, totalAvailable);
+    }
+
+    internal static ulong CalculateAvailableBytes(ulong budget, ulong usage) =>
+        budget > usage ? budget - usage : 0;
 
     public int LiveAllocations => Volatile.Read(ref _liveAllocations);
 

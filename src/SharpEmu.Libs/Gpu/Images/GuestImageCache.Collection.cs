@@ -18,16 +18,98 @@ public sealed partial class GuestImageCache
     {
         using var held = _lock.Hold();
         var tick = endsFrame ? _collectionTick++ : _collectionTick;
-        if (_totalUsedMemory < _collectionStartBytes)
+        _allocationCollectionBlocked = false;
+        if (MemoryUnderPressure)
+        {
+            // Idle pool memory is kept for reuse until the cache is short of memory.
+            ReleaseUnusedMemoryCore();
+        }
+
+        if (CollectionMemoryBytes < _collectionStartBytes)
         {
             return;
         }
 
         Collect(tick, allowAggressive: false);
-        if (_totalUsedMemory >= _criticalMemoryBytes)
+        if (CollectionMemoryBytes >= _criticalMemoryBytes)
         {
             Collect(tick, allowAggressive: true);
         }
+    }
+
+    public void ReleaseUnusedMemory()
+    {
+        using var held = _lock.Hold();
+        ReleaseUnusedMemoryCore();
+    }
+
+    // Allocation-time pressure is separate from the periodic sweep: a burst of draws can create
+    // thousands of images before the next frame boundary. Destruction still goes through
+    // DeleteImage's completion action, so no image is freed while the current tick can use it.
+    private void CollectForAllocation(ulong requiredBytes)
+    {
+        FinishRetiredImagesForAllocation(requiredBytes);
+        // A burst can contain only newly touched images. Once the recency walk finds nothing
+        // evictable, repeating it for every allocation in the same tick is wasted work; the next
+        // collection makes older images eligible.
+        if (_allocationCollectionBlocked)
+        {
+            return;
+        }
+
+        var current = CollectionMemoryBytes;
+        if (requiredBytes > _criticalMemoryBytes || current <= _criticalMemoryBytes - requiredBytes)
+        {
+            return;
+        }
+
+        var target = _criticalMemoryBytes - requiredBytes;
+        var blocked = false;
+        // Retired images still occupy memory until completion; do not retire the whole old
+        // working set merely because that completion is pending.
+        while (CollectionMemoryBytes - (ulong)Interlocked.Read(ref _retiredImageMemoryBytes) > target)
+        {
+            var before = _totalUsedMemory;
+            Collect(_collectionTick, allowAggressive: true);
+            if (_totalUsedMemory == before)
+            {
+                blocked = true;
+                break;
+            }
+        }
+
+        _allocationCollectionBlocked = blocked;
+        FinishRetiredImagesForAllocation(requiredBytes);
+    }
+
+    private void FinishRetiredImagesForAllocation(ulong requiredBytes)
+    {
+        if (Interlocked.Read(ref _retiredImageMemoryBytes) == 0 || !_scheduler.Active || _scheduler.InsideTickCallback)
+        {
+            return;
+        }
+
+        if (!RetirementOverBudget && requiredBytes <= _criticalMemoryBytes &&
+            CollectionMemoryBytes <= _criticalMemoryBytes - requiredBytes)
+        {
+            return;
+        }
+
+        // Completion destroys the retired images and can call back into the cache: never wait
+        // while holding its lock. Images this preparation touched stay registered; only the
+        // previously retired ones are destroyed.
+        _lock.Exit();
+        try
+        {
+            _scheduler.Finish();
+        }
+        finally
+        {
+            _lock.Enter();
+        }
+
+        ReleaseUnusedMemoryCore();
+        _allocationCollectionBlocked = false;
     }
 
     // An allocation failed despite the cache's own accounting: the device is full. Retire every
@@ -79,18 +161,18 @@ public sealed partial class GuestImageCache
 
     private void Collect(ulong tick, bool allowAggressive, bool reclaim = false)
     {
-        var pressured = reclaim || _totalUsedMemory >= _memoryPressureBytes;
-        var aggressive = reclaim || (allowAggressive && _totalUsedMemory >= _criticalMemoryBytes);
-        // A reclaim keeps only the images the current frame touched: older ones are not needed
-        // by the work being recorded, and whatever that work already references is destroyed
-        // after its tick completes.
-        var age = reclaim ? 1UL : aggressive ? 160UL : pressured ? 80UL : 16UL;
-        if (tick < age && (reclaim || (!pressured && !aggressive)))
+        var pressured = reclaim || CollectionMemoryBytes >= _memoryPressureBytes;
+        var aggressive = reclaim || (allowAggressive && CollectionMemoryBytes >= _criticalMemoryBytes);
+        // Under pressure only the images the current frame touched are kept: the work being
+        // recorded needs those, and whatever it already references is destroyed after its
+        // tick completes. Waiting more frames as memory fills would stop reclamation in a
+        // slow title.
+        var age = pressured ? 1UL : 16UL;
+        if (tick < age)
         {
             return;
         }
 
-        age = Math.Min(age, tick);
         var deletions = aggressive ? 40 : pressured ? 20 : 10;
         var candidates = new List<ResourceSlotIdentifier>(deletions);
         // Deleting a depth image also deletes its stencil association, so the recency walk ends first.
@@ -147,13 +229,13 @@ public sealed partial class GuestImageCache
                 continue;
             }
 
-            if (_totalUsedMemory < _criticalMemoryBytes && aggressive)
+            if (CollectionMemoryBytes < _criticalMemoryBytes && aggressive)
             {
                 deletions >>= 2;
                 aggressive = false;
             }
 
-            if (_totalUsedMemory < _memoryPressureBytes && pressured)
+            if (CollectionMemoryBytes < _memoryPressureBytes && pressured)
             {
                 deletions >>= 1;
                 pressured = false;

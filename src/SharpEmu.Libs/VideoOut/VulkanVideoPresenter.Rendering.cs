@@ -197,8 +197,32 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        private ulong _pressureCollectionTick = ulong.MaxValue;
+
         public void RunPendingOperations()
         {
+            // Start of a draw or dispatch: nothing is bound yet, so the tick can end here.
+            if (_imageCache is { } images && _preparation is null && _scheduler.Active && !_scheduler.InsideTickCallback)
+            {
+                // A slow frame can materialize many draws' textures before the next flip, so memory
+                // pressure is relieved here, once per submitted tick, while no new draw bindings
+                // can be invalidated.
+                if (images.MemoryUnderPressure && _pressureCollectionTick != _scheduler.CurrentTick)
+                {
+                    _pressureCollectionTick = _scheduler.CurrentTick;
+                    images.RunGarbageCollector(endsFrame: false);
+                }
+
+                if (images.RetirementOverBudget)
+                {
+                    _scheduler.Finish();
+                    if (images.MemoryUnderPressure)
+                    {
+                        images.ReleaseUnusedMemory();
+                    }
+                }
+            }
+
             RunPendingCommands();
             if (_batchOpen && _preparation is null && _bufferCache?.HotWritePending == true)
             {

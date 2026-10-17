@@ -513,7 +513,10 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public bool IsWatched => WatchBegin != 0 && WatchEnd != 0;
 
-    public ulong AccountedSize => Backing.Exists ? (Description.Data.Size + 1023) & ~1023UL : 0;
+    // The device allocation, not the guest byte range: a tiled image reserves more than its
+    // guest payload (tiling, mip alignment, driver requirements), and the allocation is what
+    // the memory pool actually holds and releases.
+    public ulong AccountedSize => Backing.Exists ? Backing.AllocationSize : 0;
 
     // Hashes the first and last partial tracker page of the guest data through the backing alias.
     public ulong HashGuestEdges()
