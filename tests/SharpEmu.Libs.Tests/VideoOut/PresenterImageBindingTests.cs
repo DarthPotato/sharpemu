@@ -252,6 +252,27 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         harness.Shutdown();
     }
 
+    [Theory]
+    [InlineData((byte)0x00, true, 0f, 0f, 0f, 0f)]
+    [InlineData((byte)0x40, true, 0f, 0f, 0f, 1f)]
+    [InlineData((byte)0x80, true, 1f, 1f, 1f, 0f)]
+    [InlineData((byte)0xc0, true, 1f, 1f, 1f, 1f)]
+    [InlineData((byte)0x40, false, 0f, 0f, 0f, 0f)]
+    [InlineData((byte)0x20, true, 0f, 0f, 0f, 0f)]
+    public void SampledDccClear_FixedCodesCarryTheirOwnColour(byte code, bool fixedSupported, float r, float g, float b, float a)
+    {
+        // A surface fast-cleared and only sampled has no CB clear word: the register code (0x20)
+        // never decodes there, every fixed code decodes to its own colour.
+        var decode = PresenterUnderTest.PresenterType.GetMethod("TryDecodeDccClear", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var arguments = new object?[] { code, false, fixedSupported, default(ClearColorValue), default(ClearColorValue) };
+        var decoded = (bool)decode.Invoke(null, arguments)!;
+        var value = (ClearColorValue)arguments[4]!;
+        var expected = code != 0x20 && (code == 0x00 || fixedSupported);
+        Assert.Equal(expected, decoded);
+        if (expected)
+            Assert.Equal((r, g, b, a), (value.Float32_0, value.Float32_1, value.Float32_2, value.Float32_3));
+    }
+
     private static byte[] CreateStencilIncrementShader(uint imageBinding)
     {
         var module = new SpirvModuleBuilder();
