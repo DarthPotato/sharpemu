@@ -151,12 +151,13 @@ public sealed partial class GuestImageCache
         ReleaseUnusedMemoryCore();
     }
 
-    // Idle memory the pools keep for reuse: retired backings and empty blocks. Registered
-    // images are untouched.
+    // Idle memory the pools keep for reuse: retired backings, empty image blocks and buffer slab
+    // chunks without a live buffer. Registered images and live buffers are untouched.
     private void ReleaseUnusedMemoryCore()
     {
         _backingPool?.ReleaseRetained();
         _imageMemoryPool.ReleaseRetained();
+        _device.Slabs.ReleaseUnused();
     }
 
     private void Collect(ulong tick, bool allowAggressive, bool reclaim = false)
