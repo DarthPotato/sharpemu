@@ -239,4 +239,67 @@ public sealed partial class GuestImageCacheTests
         harness.Finish();
         harness.Shutdown();
     }
+
+    [Fact]
+    public void FreePoolSpaceAndRetiredImagesAreNotPressure()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const uint Width = 1024;
+        const ulong Size = (ulong)Width * Width * 4;
+        var address = harness.MapBacked(4 * Size, ReadWrite);
+        var images = new List<ResourceSlotIdentifier>();
+        harness.Worker.Run(() =>
+        {
+            for (var index = 0u; index < 4; index++)
+            {
+                images.Add(harness.Images.InsertImageForTest(SmallImage(address + index * Size, Width)));
+            }
+        });
+
+        // The pool holds a 256 MiB block for 16 MiB of images; the images used last frame fit the
+        // 100 MiB threshold and must all survive the collection.
+        Assert.True(harness.Images.TotalUsedMemory < (50UL << 20));
+        harness.Images.SetCollectionThresholds(1, 100UL << 20, 100UL << 20, 40);
+        harness.Worker.Run(() =>
+        {
+            harness.Images.ResetRecency(Array.Empty<ResourceSlotIdentifier>(), 39);
+            harness.Images.RunGarbageCollector();
+        });
+        Assert.All(images, identifier => Assert.True(harness.Images.Contains(identifier)));
+        harness.Finish();
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void PressureEvictsTheOldestImagesOnlyDownToTheThreshold()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const uint Width = 1024;
+        const ulong Size = (ulong)Width * Width * 4;
+        var address = harness.MapBacked(4 * Size, ReadWrite);
+        var images = new List<ResourceSlotIdentifier>();
+        harness.Worker.Run(() =>
+        {
+            for (var index = 0u; index < 4; index++)
+            {
+                images.Add(harness.Images.InsertImageForTest(SmallImage(address + index * Size, Width)));
+            }
+        });
+
+        var used = harness.Images.CollectionMemoryBytes;
+        var each = used / 4;
+        // One image over the threshold.
+        harness.Images.SetCollectionThresholds(1, used - each / 2, ulong.MaxValue, 40);
+        harness.Worker.Run(() =>
+        {
+            harness.Images.ResetRecency(new[] { images[2] }, 39);
+            harness.Images.RunGarbageCollector();
+        });
+        Assert.False(harness.Images.Contains(images[2]));
+        Assert.Equal(3, images.Count(identifier => harness.Images.Contains(identifier)));
+        harness.Finish();
+        harness.Shutdown();
+    }
 }

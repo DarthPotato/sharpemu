@@ -67,7 +67,7 @@ public sealed partial class GuestImageCache
         var blocked = false;
         // Retired images still occupy memory until completion; do not retire the whole old
         // working set merely because that completion is pending.
-        while (CollectionMemoryBytes - (ulong)Interlocked.Read(ref _retiredImageMemoryBytes) > target)
+        while (CollectionMemoryBytes > target)
         {
             var before = _totalUsedMemory;
             Collect(_collectionTick, allowAggressive: true);
@@ -90,7 +90,7 @@ public sealed partial class GuestImageCache
         }
 
         if (!RetirementOverBudget && requiredBytes <= _criticalMemoryBytes &&
-            CollectionMemoryBytes <= _criticalMemoryBytes - requiredBytes)
+            TotalUsedMemory <= _criticalMemoryBytes - requiredBytes)
         {
             return;
         }
@@ -160,7 +160,28 @@ public sealed partial class GuestImageCache
         _device.Slabs.ReleaseUnused();
     }
 
+    private static readonly bool TraceCollection =
+        Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_COLLECT_TRACE") == "1";
+
     private void Collect(ulong tick, bool allowAggressive, bool reclaim = false)
+    {
+        if (!TraceCollection)
+        {
+            CollectCore(tick, allowAggressive, reclaim);
+            return;
+        }
+
+        var usedBefore = _totalUsedMemory;
+        var countBefore = _slots.Count;
+        CollectCore(tick, allowAggressive, reclaim);
+        Console.Error.WriteLine(
+            $"[IMAGE_COLLECT] tick={tick} aggressive={allowAggressive} reclaim={reclaim} images={countBefore}->{_slots.Count} " +
+            $"live={usedBefore}->{_totalUsedMemory} retired={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
+            $"pool_unused={_imageMemoryPool.UnusedBytes} pooled_backing={_backingPool?.PooledBytes ?? 0} " +
+            $"thresholds={_memoryPressureBytes}/{_criticalMemoryBytes}");
+    }
+
+    private void CollectCore(ulong tick, bool allowAggressive, bool reclaim)
     {
         var pressured = reclaim || CollectionMemoryBytes >= _memoryPressureBytes;
         var aggressive = reclaim || (allowAggressive && CollectionMemoryBytes >= _criticalMemoryBytes);
@@ -236,10 +257,11 @@ public sealed partial class GuestImageCache
                 aggressive = false;
             }
 
-            if (CollectionMemoryBytes < _memoryPressureBytes && pressured)
+            if (pressured && CollectionMemoryBytes < _memoryPressureBytes)
             {
-                deletions >>= 1;
-                pressured = false;
+                // Back under the threshold: stop. The oldest images went first, so what the
+                // next frames sample again stays resident.
+                break;
             }
         }
     }

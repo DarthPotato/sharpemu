@@ -115,11 +115,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     // The registered images' device memory plus the images retired but not yet destroyed.
     public ulong TotalUsedMemory => _totalUsedMemory + (ulong)Interlocked.Read(ref _retiredImageMemoryBytes);
 
-    // Memory under the cache's control that a collection can bring down: registered images,
-    // retired images that await GPU completion, free space inside the image blocks and the
-    // retained backings of destroyed images.
-    internal ulong CollectionMemoryBytes => TotalUsedMemory +
-        _imageMemoryPool.UnusedBytes + (_backingPool?.PooledBytes ?? 0);
+    // What decides whether images are evicted: the registered images, the working set the cache
+    // holds on purpose. Retired images are already on their way out (they only delay the memory
+    // until the GPU completes), and free block space and pooled backings are reusable by the next
+    // image: counting any of them made a cache that fits look full, so every frame deleted the
+    // previous frame's images, which were then created and uploaded again.
+    internal ulong CollectionMemoryBytes => _totalUsedMemory;
 
     // The cache is past its pressure threshold: collection should run without waiting for a frame.
     public bool MemoryUnderPressure => CollectionMemoryBytes >= _memoryPressureBytes;
@@ -128,7 +129,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     // them need that work finished, not another sweep.
     public bool RetirementOverBudget =>
         Interlocked.Read(ref _retiredImageMemoryBytes) > 256L * (long)MiB ||
-        (Interlocked.Read(ref _retiredImageMemoryBytes) > 0 && CollectionMemoryBytes >= _criticalMemoryBytes);
+        (Interlocked.Read(ref _retiredImageMemoryBytes) > 0 && TotalUsedMemory >= _criticalMemoryBytes);
 
     // Called with the views of an image that leaves the cache, before the image is freed. A heap that
     // holds descriptors of those views drops them; the views stay valid until the GPU work that used
