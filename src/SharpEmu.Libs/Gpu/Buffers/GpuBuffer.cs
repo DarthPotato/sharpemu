@@ -124,6 +124,7 @@ public unsafe class GpuBuffer : IDisposable
         _allocationSize = _slab?.Size ?? requirements.Size;
         var properties = device.GetMemoryTypeFlags(allocateInfo.MemoryTypeIndex);
         IsCoherent = (properties & MemoryPropertyFlags.HostCoherentBit) != 0;
+        IsDeviceLocal = (properties & MemoryPropertyFlags.DeviceLocalBit) != 0;
         if (_slab is null && (properties & MemoryPropertyFlags.HostVisibleBit) != 0)
         {
             void* pointer;
@@ -157,6 +158,10 @@ public unsafe class GpuBuffer : IDisposable
     public Span<byte> Mapped => _mapped == null ? Span<byte>.Empty : new Span<byte>(_mapped, checked((int)Size));
 
     public bool IsCoherent { get; }
+
+    // The memory is device-local; otherwise the GPU reaches it over the bus, where scattered
+    // shader writes are far slower than a copy.
+    public bool IsDeviceLocal { get; }
 
     // The host mapping of the whole buffer, or null for memory the host cannot map.
     public byte* MappedPointer => _mapped;
