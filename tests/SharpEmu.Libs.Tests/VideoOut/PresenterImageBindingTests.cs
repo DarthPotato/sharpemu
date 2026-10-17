@@ -128,10 +128,11 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
     }
 
     [Theory]
-    [InlineData(true, 1u, false)]
-    [InlineData(true, 2u, true)]
-    [InlineData(false, 1u, false)]
-    public unsafe void StencilStorage_PublishesRecordedWritesWithoutChangingDepth(bool recordDispatch, uint layers, bool sampledAlias)
+    [InlineData(true, 1u, false, 64u)]
+    [InlineData(true, 2u, true, 64u)]
+    [InlineData(false, 1u, false, 64u)]
+    [InlineData(true, 1u, false, 32u)]
+    public unsafe void StencilStorage_PublishesRecordedWritesWithoutChangingDepth(bool recordDispatch, uint layers, bool sampledAlias, uint viewSize)
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         if (!_vulkan.StorageImageExtendedFormats || !_vulkan.SupportsDynamicRendering)
@@ -150,8 +151,8 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         presenter.Run(() =>
         {
             var shape = new ShaderImageShape(false, true, true, false, TextureNumericClass.Uint);
-            var texture = new GuestDrawTexture(stencilAddress, 64, 64, 0, 0, [], false, true,
-                Descriptor: RegisterWords.Texture(stencilAddress, GuestPixelFormat.Bits8UInt, 64, 64,
+            var texture = new GuestDrawTexture(stencilAddress, viewSize, viewSize, 0, 0, [], false, true,
+                Descriptor: RegisterWords.Texture(stencilAddress, GuestPixelFormat.Bits8UInt, viewSize, viewSize,
                     type: GuestImageType.Color2DArray, tile: GuestTileMode.Depth, layers: layers, baseArray: layers - 1), Shape: shape);
             // The stencil range was a color image before the depth target took ownership.
             presenter.InvokeMethod("ResolveTexture", texture);
@@ -198,6 +199,9 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
                     workingImages.Add(working);
                     Assert.NotSame(attachment, working);
                     Assert.Equal(Format.R8Uint, working.Backing.Format);
+                    // A view smaller than the attachment (dynamic resolution) gets a storage image of the view's size.
+                    Assert.Equal(viewSize, working.Backing.Extent.Width);
+                    Assert.Equal(viewSize, working.Backing.Extent.Height);
                     Assert.NotEqual(0, (int)(working.Backing.Usage & ImageUsageFlags.StorageBit));
                     Assert.Equal(0, (int)(attachment.Backing.Usage & ImageUsageFlags.StorageBit));
                     var invalidStorage = ImageViewDescription.Default with
@@ -213,7 +217,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
                         if (sampledAlias)
                             Assert.Same(working, GetFieldValue(textures.GetValue(0)!, "CachedImage"));
                         presenter.RenderHost.BindPipeline(PipelineBindPoint.Compute, pipeline);
-                        presenter.RenderHost.Dispatch(32, 64, 1);
+                        presenter.RenderHost.Dispatch(viewSize / 2, viewSize, 1);
                         presenter.RenderHost.ShaderAccessBarrier();
                     }
                     else
@@ -239,7 +243,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         for (var layer = 0; layer < layers; layer++)
             for (var row = 0; row < 64; row++)
                 for (var column = 0; column < 64; column++)
-                    Assert.Equal((byte)(recordDispatch && layer == layers - 1 && column < 32 ? 0x39 : 0x37), stencil[layer * 64 * 64 + row * 64 + column]);
+                    Assert.Equal((byte)(recordDispatch && layer == layers - 1 && column < viewSize / 2 && row < viewSize ? 0x39 : 0x37), stencil[layer * 64 * 64 + row * 64 + column]);
         var depthBytes = harness.ReadImageBytes(attachment, ImageAspectFlags.DepthBit);
         for (var offset = 0; offset < depthBytes.Length; offset += sizeof(float))
             Assert.Equal(0.25f, BitConverter.ToSingle(depthBytes, offset));
