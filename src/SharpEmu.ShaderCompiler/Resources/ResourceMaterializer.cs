@@ -868,6 +868,23 @@ public static class ResourceMaterializer
         return baseLevel <= last ? last - baseLevel + 1 : 0;
     }
 
+    private static string Describe(ImageSpecialization image) =>
+        $"class={image.NumericClass} dimension={image.Dimension} mips={image.MipCount} conversion={image.ConversionFormat} swizzle=0x{image.ShaderSwizzle:X} cube={image.Cube}";
+
+    // Whether an instruction declaring one dimension addresses a descriptor of another:
+    // arrayness can differ, the spatial dimensionality and sample layout cannot.
+    private static bool DimensionAddressable(ImageDimension descriptor, ImageDimension declared) =>
+        descriptor == declared || (Family(descriptor) != 0 && Family(descriptor) == Family(declared));
+
+    private static int Family(ImageDimension dimension) => dimension switch
+    {
+        ImageDimension.Dim1D or ImageDimension.Dim1DArray => 1,
+        ImageDimension.Dim2D or ImageDimension.Dim2DArray => 2,
+        ImageDimension.Dim3D => 3,
+        ImageDimension.Dim2DMsaa or ImageDimension.Dim2DMsaaArray => 4,
+        _ => 0,
+    };
+
     private static bool Fail(string message)
     {
         SpecializationFailed(message);
@@ -1118,6 +1135,10 @@ public static class ResourceMaterializer
                 return Fail("indirect image specialization has an invalid key mapping");
             }
 
+            var declaredDimension = info.Images[rootIndex].Dimension;
+            var declaredCube = info.Images[rootIndex].Cube;
+            // Tables read through a sampler keep the strict rule; a load or store addresses one family and ignores the rest.
+            var typedNulls = !info.SampledPairs.Any(pair => pair.Image == (uint)rootIndex);
             var exemplar = DescriptorConstants.NoIndex;
             var resourceCount = 0;
             for (var resource = 0; resource < images.Count; resource++)
@@ -1128,18 +1149,34 @@ public static class ResourceMaterializer
                 }
 
                 resourceCount++;
-                if (exemplar == DescriptorConstants.NoIndex && !NullImageDescriptor(snapshot.Images[resource]))
+                if (exemplar == DescriptorConstants.NoIndex && !NullImageDescriptor(snapshot.Images[resource]) &&
+                    (!typedNulls || DimensionAddressable(images[resource].Dimension, declaredDimension)))
                 {
                     exemplar = (uint)resource;
                 }
             }
 
-            if (resourceCount < 2 || exemplar == DescriptorConstants.NoIndex)
+            if (resourceCount < 2 || exemplar == DescriptorConstants.NoIndex && !typedNulls)
             {
                 return Fail("indirect image specialization has no typed candidate");
             }
 
-            var imageClass = images[(int)exemplar];
+            // A table can hold only descriptors of another image family: keep the instruction's
+            // declared type and bind every candidate as a typed null.
+            var declaredImage = info.Images[rootIndex];
+            var imageClass = exemplar == DescriptorConstants.NoIndex
+                ? images[rootIndex] with
+                {
+                    NumericClass = declaredImage.NumericClass == ImageNumericClass.Unsupported
+                        ? declaredImage.Atomic ? ImageNumericClass.Uint : ImageNumericClass.Float
+                        : declaredImage.NumericClass,
+                    Dimension = declaredDimension,
+                    MipCount = declaredImage.MipCount,
+                    ConversionFormat = declaredImage.ConversionFormat,
+                    ShaderSwizzle = declaredImage.ShaderSwizzle,
+                    Cube = declaredCube,
+                }
+                : images[(int)exemplar];
             var separateSampledDimensions = info.Images[rootIndex].ResourceClass == ImageResourceClass.Sampled;
             for (var candidate = 0; candidate < images.Count; candidate++)
             {
@@ -1161,6 +1198,23 @@ public static class ResourceMaterializer
                         Cube = imageClass.Cube,
                     };
                     images[candidate] = image;
+                }
+
+                // A candidate of another image family than the instruction addresses can never be
+                // selected by this shader; bind it as a typed null instead of rejecting the table.
+                if (typedNulls && !DimensionAddressable(image.Dimension, declaredDimension))
+                {
+                    snapshot.Images[candidate] = new uint[snapshot.Images[candidate].Length];
+                    images[candidate] = image with
+                    {
+                        NumericClass = imageClass.NumericClass,
+                        Dimension = imageClass.Dimension,
+                        MipCount = imageClass.MipCount,
+                        ConversionFormat = imageClass.ConversionFormat,
+                        ShaderSwizzle = imageClass.ShaderSwizzle,
+                        Cube = imageClass.Cube,
+                    };
+                    continue;
                 }
 
                 // Each sampled candidate has its own binding and coordinate width.
@@ -1194,7 +1248,8 @@ public static class ResourceMaterializer
                             }).ToArray(),
                         });
                     }
-                    return Fail($"indirect image table at pc 0x{info.Images[rootIndex].FirstUsePc:x8} has incompatible candidates: exemplar={exemplar} candidate={candidate}");
+                    return Fail($"indirect image table at pc 0x{info.Images[rootIndex].FirstUsePc:x8} has incompatible candidates: exemplar={exemplar} candidate={candidate} " +
+                        $"(exemplar {Describe(imageClass)}; candidate {Describe(image)})");
                 }
             }
         }
