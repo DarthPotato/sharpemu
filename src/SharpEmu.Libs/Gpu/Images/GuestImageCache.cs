@@ -249,9 +249,45 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
     }
 
+    // Images the lookups in progress work with (overlap candidates and the images they copy
+    // from). Allocating a replacement collects under pressure and can wait without the lock;
+    // a candidate found earlier must still be there for its copy, so collection skips these.
+    private readonly Dictionary<ResourceSlotIdentifier, int> _lookupPins = new();
+
+    private void PinForLookup(ResourceSlotIdentifier imageIdentifier, List<ResourceSlotIdentifier> pinned)
+    {
+        _lookupPins[imageIdentifier] = _lookupPins.GetValueOrDefault(imageIdentifier) + 1;
+        pinned.Add(imageIdentifier);
+    }
+
+    private void UnpinLookup(List<ResourceSlotIdentifier> pinned)
+    {
+        foreach (var imageIdentifier in pinned)
+        {
+            if (_lookupPins.TryGetValue(imageIdentifier, out var count))
+            {
+                if (count <= 1) _lookupPins.Remove(imageIdentifier);
+                else _lookupPins[imageIdentifier] = count - 1;
+            }
+        }
+    }
+
     private ResourceSlotIdentifier LookUpImage(ref ImageRequest request, bool exactFormat)
     {
         using var held = _lock.Hold();
+        var pinned = new List<ResourceSlotIdentifier>();
+        try
+        {
+            return LookUpImageCore(ref request, exactFormat, pinned);
+        }
+        finally
+        {
+            UnpinLookup(pinned);
+        }
+    }
+
+    private ResourceSlotIdentifier LookUpImageCore(ref ImageRequest request, bool exactFormat, List<ResourceSlotIdentifier> pinned)
+    {
         if (TryReuseLookup(ref request, exactFormat, out var reused))
         {
             return reused;
@@ -263,6 +299,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
         foreach (var imageIdentifier in candidates)
         {
+            PinForLookup(imageIdentifier, pinned);
             if (HasSameBacking(_slots[imageIdentifier].Description, request.Description, exactFormat))
             {
                 result = imageIdentifier;

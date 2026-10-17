@@ -192,7 +192,7 @@ public sealed partial class GuestImageCache
             }
 
             var owner = _slots.TryGet(imageIdentifier);
-            if (owner == null || !owner.Registered || owner.DepthOwner.IsValid)
+            if (owner == null || !owner.Registered || owner.DepthOwner.IsValid || _lookupPins.ContainsKey(imageIdentifier))
             {
                 continue;
             }

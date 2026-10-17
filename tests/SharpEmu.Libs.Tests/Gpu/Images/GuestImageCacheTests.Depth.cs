@@ -429,6 +429,37 @@ public sealed unsafe partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // Creating the replacement image runs the allocation collection. The image being replaced was
+    // found but not touched, so under pressure it was old enough to be deleted before its copy.
+    [Fact]
+    public void DepthOverlapReplacement_KeepsItsCopySourceThroughAllocationPressure()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x100000, ReadWrite);
+        var depthAddress = address + 0x60000;
+        var stencilAddress = address + 0x70000;
+        harness.Write(depthAddress, Bytes(0.75f));
+        var depthOnly = LinearRequest(depthAddress, 0x10000, Format.D32Sfloat, GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1);
+        depthOnly = AsDepthTarget(depthOnly, Format.D32Sfloat);
+        var depthOnlyId = harness.Find(ref depthOnly);
+
+        var combined = depthOnly;
+        combined.Description.Stencil = new GuestSpan(stencilAddress, 0x10000);
+        combined.Description.PixelFormat = Format.D32SfloatS8Uint;
+        combined.View = combined.View with { Format = Format.D32SfloatS8Uint, Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+        // Everything cached is old and the allocation needs more than the critical level leaves.
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, 0, 0x10001, 81);
+            harness.Images.ResetRecency(new[] { depthOnlyId }, 81);
+        });
+        var combinedId = harness.Find(ref combined);
+        Assert.True(combinedId.IsValid);
+        Assert.NotEqual(depthOnlyId, combinedId);
+        harness.Shutdown();
+    }
+
     [Fact]
     public void LayeredMippedDepthAlias_UsesTheResourceMaximum()
     {
