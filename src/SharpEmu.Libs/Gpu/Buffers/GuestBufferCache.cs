@@ -2773,6 +2773,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             fixed (BufferCopy* pointer = batched)
             {
                 _device.Vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)batched.Length, pointer);
+                VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.BufferCopy);
             }
         }
 

@@ -23,7 +23,15 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
     internal bool PerCommandMarkers { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_DRAWS") == "1";
     private readonly List<(ulong Start, ulong End)> _spans = new();
 
-    internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow }
+    // The transfer kinds mark the emulator's own work recorded between guest draws: image
+    // uploads, downloads and copies, the GPU tiler, buffer copies and clears.
+    internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow, ImageUpload, ImageDownload, ImageCopy, Tiling, BufferCopy, Clear }
+
+    // The live profile, for transfer code that records without a reference to it. Set only
+    // while profiling (SHARPEMU_PROFILE_RENDER), so markers cost nothing otherwise.
+    internal static VulkanCommandProfile? Current { get; private set; }
+
+    private readonly object _gate = new();
     private readonly record struct IntervalKey(IntervalKind Kind, ulong Pipeline);
     private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third);
     private sealed class IntervalTotal
@@ -55,6 +63,7 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
         fixed (QueueFamilyProperties* pointer = families)
             vulkan.GetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, pointer);
         _timestampBits = families[queueFamily].TimestampValidBits;
+        Current = this;
         _write($"[PERF][GPU_INTERVAL] timestamp_bits={_timestampBits} timestamp_period_ns={_timestampPeriod} queries_per_buffer={QueryCapacity} max_buffers={BufferCapacity}");
     }
 
@@ -63,6 +72,11 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
     internal bool Supported => _timestampBits > 0 && _timestampPeriod > 0;
 
     public void BeginBuffer(CommandBuffer command)
+    {
+        lock (_gate) BeginBufferCore(command);
+    }
+
+    private void BeginBufferCore(CommandBuffer command)
     {
         if (!Supported)
             return;
@@ -97,6 +111,13 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
     public void WriteMarker(CommandBuffer command, IntervalKind kind, ulong pipeline = 0, uint first = 0, uint second = 0, uint third = 0)
     {
         if (!PerCommandMarkers && kind != IntervalKind.Tail)
+            return;
+        lock (_gate) WriteMarkerCore(command, kind, pipeline, first, second, third);
+    }
+
+    private void WriteMarkerCore(CommandBuffer command, IntervalKind kind, ulong pipeline, uint first, uint second, uint third)
+    {
+        if (!PerCommandMarkers && kind != IntervalKind.Tail)
         {
             return;
         }
@@ -119,6 +140,11 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
     }
 
     public void MarkSubmitted(nint command)
+    {
+        lock (_gate) MarkSubmittedCore(command);
+    }
+
+    private void MarkSubmittedCore(nint command)
     {
         if (_buffers.TryGetValue(command, out var queries))
             queries.Submitted = true;

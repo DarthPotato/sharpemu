@@ -331,6 +331,7 @@ public sealed unsafe partial class CachedImage
         fixed (BufferImageCopy* regions = uploadCopies)
         {
             _device.Vk.CmdCopyBufferToImage(command, buffer, Backing.Handle, ImageLayout.TransferDstOptimal, (uint)uploadCopies.Length, regions);
+            VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageUpload);
         }
 
         bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.TransferReadBit, MemoryAccess);
@@ -353,6 +354,7 @@ public sealed unsafe partial class CachedImage
         fixed (BufferImageCopy* regions = copies)
         {
             _device.Vk.CmdCopyImageToBuffer(command, Backing.Handle, ImageLayout.TransferSrcOptimal, buffer, (uint)copies.Length, regions);
+            VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageDownload);
         }
 
         bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
@@ -450,6 +452,7 @@ public sealed unsafe partial class CachedImage
         fixed (ImageCopy* regions = copies)
         {
             _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, (uint)copies.Length, regions);
+            VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageCopy);
         }
 
         Transition(ReadyLayout, ReadyAccess, null, command);
@@ -503,6 +506,7 @@ public sealed unsafe partial class CachedImage
         {
             var region = new ImageCopy { SrcSubresource = sourceLayers, DstSubresource = destinationLayers, Extent = extent };
             _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &region);
+            VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageCopy);
         }
         else
         {
@@ -562,6 +566,7 @@ public sealed unsafe partial class CachedImage
             ImageLayout.TransferDstOptimal,
             count,
             regions);
+        VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageCopy);
     }
 
     public static uint CalculateRowsPerCopy(ulong rowSize, uint rows, ulong capacity)
@@ -685,9 +690,11 @@ public sealed unsafe partial class CachedImage
                     var barrier = BufferBarrier(buffer.Handle, 0, copySize, AccessFlags.TransferReadBit, AccessFlags.TransferWriteBit);
                     VulkanSynchronization.PipelineBarrier(_device.Vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit, 0, null, 1, &barrier, 0, null);
                     _device.Vk.CmdCopyImageToBuffer(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, buffer.Handle, 1, &sourceCopy);
+                    VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageCopy);
                     barrier = BufferBarrier(buffer.Handle, 0, copySize, AccessFlags.TransferWriteBit, AccessFlags.TransferReadBit);
                     VulkanSynchronization.PipelineBarrier(_device.Vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit, 0, null, 1, &barrier, 0, null);
                     _device.Vk.CmdCopyBufferToImage(command, buffer.Handle, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &destinationCopy);
+                    VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageCopy);
                 }
             }
         }
@@ -745,6 +752,7 @@ public sealed unsafe partial class CachedImage
         Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
         source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
         _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, copyCount, copies);
+        VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageCopy);
         Transition(ReadyLayout, ReadyAccess, null, command);
     }
 
@@ -800,6 +808,7 @@ public sealed unsafe partial class CachedImage
         Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
         source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
         _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &copy);
+        VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.ImageCopy);
         Transition(ReadyLayout, ReadyAccess, null, command);
         source.Transition(ReadyLayout, ReadyAccess, null, command);
     }

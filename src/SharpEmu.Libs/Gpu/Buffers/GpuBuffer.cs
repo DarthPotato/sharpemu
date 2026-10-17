@@ -295,6 +295,7 @@ public unsafe class GpuBuffer : IDisposable
             0, null, 2, before, 0, null);
         var copy = new BufferCopy(sourceOffset, destinationOffset, size);
         vk.CmdCopyBuffer(native, source.Handle, Handle, 1, &copy);
+        VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.BufferCopy);
         var after = stackalloc BufferMemoryBarrier2[2];
         after[0] = source.CreateBarrier(sourceOffset, size, AccessFlags.TransferReadBit, sourceAfter);
         after[1] = CreateBarrier(destinationOffset, size, AccessFlags.TransferWriteBit, destinationAfter);
@@ -320,6 +321,7 @@ public unsafe class GpuBuffer : IDisposable
             native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
             0, null, 1, &before, 0, null);
         vk.CmdFillBuffer(native, Handle, offset, size, value);
+        VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.Clear);
         var after = CreateBarrier(offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
         VulkanSynchronization.PipelineBarrier(vk,
             native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
