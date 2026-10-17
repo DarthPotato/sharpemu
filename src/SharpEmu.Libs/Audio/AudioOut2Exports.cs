@@ -284,6 +284,13 @@ public static class AudioOut2Exports
     private static string PrimaryBackendName = "none";
     private static string SecondaryBackendName = "none";
     private static ulong PrimaryContextHandle;
+    // A failed host open is retried at most this often. Without it, a machine with no
+    // output device re-opens (and throws) on every grain.
+    private static readonly long BackendRetryTicks = Stopwatch.Frequency * 5;
+    private static long PrimaryBackendRetryAt;
+    private static long SecondaryBackendRetryAt;
+    private static bool PrimaryBackendFailureLogged;
+    private static bool SecondaryBackendFailureLogged;
     private static readonly object HostSubmitGate = new();
     private static Func<uint, IHostAudioStream?>? _streamFactoryForTests;
 
@@ -1268,29 +1275,12 @@ public static class AudioOut2Exports
             {
                 if (PrimaryBackend is null)
                 {
-                    try
-                    {
-                        var streamFactory = Volatile.Read(ref _streamFactoryForTests);
-                        if (streamFactory is not null)
-                        {
-                            PrimaryBackend = streamFactory(context.Frequency);
-                            PrimaryBackendName = PrimaryBackend is null ? "silent" : "test-primary";
-                        }
-                        else
-                        {
-                            var audio = HostPlatform.Current.Audio;
-                            PrimaryBackend = audio.OpenStereoPcm16Stream(
-                                context.Frequency,
-                                maxQueuedPcmBytes: 128 * 1024);
-                            PrimaryBackendName = audio.BackendName + "-primary";
-                        }
-                    }
-                    catch (Exception exception)
-                    {
-                        PrimaryBackendName = "silent";
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] AudioOut2 primary backend unavailable: {exception.Message}");
-                    }
+                    PrimaryBackend = OpenHostBackend(
+                        context.Frequency,
+                        "primary",
+                        ref PrimaryBackendName,
+                        ref PrimaryBackendRetryAt,
+                        ref PrimaryBackendFailureLogged);
                 }
 
                 backendName = PrimaryBackendName;
@@ -1300,34 +1290,69 @@ public static class AudioOut2Exports
 
             if (SecondaryBackend is null)
             {
-                try
-                {
-                    var streamFactory = Volatile.Read(ref _streamFactoryForTests);
-                    if (streamFactory is not null)
-                    {
-                        SecondaryBackend = streamFactory(context.Frequency);
-                        SecondaryBackendName = SecondaryBackend is null ? "silent" : "test-secondary";
-                    }
-                    else
-                    {
-                        var audio = HostPlatform.Current.Audio;
-                        SecondaryBackend = audio.OpenStereoPcm16Stream(
-                            context.Frequency,
-                            maxQueuedPcmBytes: 128 * 1024);
-                        SecondaryBackendName = audio.BackendName + "-secondary";
-                    }
-                }
-                catch (Exception exception)
-                {
-                    SecondaryBackendName = "silent";
-                    Console.Error.WriteLine(
-                        $"[LOADER][WARN] AudioOut2 secondary backend unavailable: {exception.Message}");
-                }
+                SecondaryBackend = OpenHostBackend(
+                    context.Frequency,
+                    "secondary",
+                    ref SecondaryBackendName,
+                    ref SecondaryBackendRetryAt,
+                    ref SecondaryBackendFailureLogged);
             }
 
             backendName = SecondaryBackendName;
             context.AttachBackend(SecondaryBackend);
             return SecondaryBackend;
+        }
+    }
+
+    // Caller holds HostBackendGate. Returns null (a silent, clock-paced port) when no
+    // stream can be opened; a host failure is not retried until retryAt.
+    private static IHostAudioStream? OpenHostBackend(
+        uint frequency,
+        string role,
+        ref string name,
+        ref long retryAt,
+        ref bool failureLogged)
+    {
+        var streamFactory = Volatile.Read(ref _streamFactoryForTests);
+        if (streamFactory is not null)
+        {
+            var stream = streamFactory(frequency);
+            name = stream is null ? "silent" : "test-" + role;
+            return stream;
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        if (now < retryAt)
+        {
+            return null;
+        }
+
+        try
+        {
+            var audio = HostPlatform.Current.Audio;
+            var stream = audio.OpenStereoPcm16Stream(frequency, maxQueuedPcmBytes: 128 * 1024);
+            name = audio.BackendName + "-" + role;
+            if (failureLogged)
+            {
+                Console.Error.WriteLine($"[LOADER][INFO] AudioOut2 {role} backend opened: {name}");
+                failureLogged = false;
+            }
+
+            return stream;
+        }
+        catch (Exception exception)
+        {
+            name = "silent";
+            retryAt = now + BackendRetryTicks;
+            if (!failureLogged)
+            {
+                failureLogged = true;
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] AudioOut2 {role} backend unavailable, output is silent " +
+                    $"(retrying every {BackendRetryTicks / Stopwatch.Frequency}s): {exception.Message}");
+            }
+
+            return null;
         }
     }
 
@@ -1527,6 +1552,10 @@ public static class AudioOut2Exports
             PrimaryBackendName = "none";
             SecondaryBackendName = "none";
             PrimaryContextHandle = 0;
+            PrimaryBackendRetryAt = 0;
+            SecondaryBackendRetryAt = 0;
+            PrimaryBackendFailureLogged = false;
+            SecondaryBackendFailureLogged = false;
         }
 
         Volatile.Write(ref _streamFactoryForTests, null);
