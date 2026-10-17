@@ -32,8 +32,10 @@ public sealed partial class GuestImageCacheTests
         Assert.True(harness.Images.IsMetadataCleared(entries[2], 0, out var fill));
         Assert.Equal(0xffffffffu, fill);
         Assert.False(harness.Images.IsMetadataCleared(entries[0], 0));
-        Assert.False(harness.Images.IsMetadataCleared(entries[2], 32));
-        Assert.False(harness.Images.SetMetadataSlice(entries[2], 32, true));
+        Assert.True(harness.Images.IsMetadataCleared(entries[2], 32));
+        Assert.False(harness.Images.IsMetadataCleared(entries[0], 32));
+        Assert.False(harness.Images.IsMetadataCleared(entries[2], SurfaceMetadata.MaxSlices));
+        Assert.False(harness.Images.SetMetadataSlice(entries[2], SurfaceMetadata.MaxSlices, true));
         Assert.False(harness.Images.IsMetadata(address + 0x3000));
         Assert.False(harness.Images.ClearMetadata(address + 0x3000));
         harness.Shutdown();
@@ -67,6 +69,29 @@ public sealed partial class GuestImageCacheTests
         Assert.True(harness.Images.SetMetadataSlice(htile, 1, true));
         Assert.True(harness.Images.IsMetadataCleared(htile, 1));
         Assert.False(harness.Images.MarkHtileRewritten(address + 0x8000));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void HtileTracksClearStateBeyond32Slices()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var htile = address + 0x4000;
+        harness.Images.RegisterHtileMetadataForTest(htile, 0x100 * 121, 121);
+        Assert.True(harness.Images.ClearMetadata(htile));
+        for (uint slice = 0; slice < 121; slice++)
+        {
+            Assert.True(harness.Images.IsMetadataCleared(htile, slice));
+        }
+
+        Assert.True(harness.Images.SetMetadataSlice(htile, 100, false));
+        Assert.True(harness.Images.IsMetadataCleared(htile, 99));
+        Assert.False(harness.Images.IsMetadataCleared(htile, 100));
+        Assert.True(harness.Images.IsMetadataCleared(htile, 101));
+        Assert.True(harness.Images.SetMetadataSlice(htile, 100, true));
+        Assert.True(harness.Images.IsMetadataCleared(htile, 100));
         harness.Shutdown();
     }
 

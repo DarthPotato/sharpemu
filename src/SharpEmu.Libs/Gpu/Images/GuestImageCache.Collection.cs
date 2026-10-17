@@ -415,7 +415,7 @@ public sealed partial class GuestImageCache
         }
 
         metadata.Kind = SurfaceMetadataKind.HTile;
-        metadata.ClearMask = 0;
+        metadata.SetFromMask(0);
     }
 
     internal void RegisterDccMetadataForTest(ulong address, ulong size)

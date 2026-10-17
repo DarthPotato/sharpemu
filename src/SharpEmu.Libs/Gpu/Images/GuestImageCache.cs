@@ -495,14 +495,15 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             var address = request.Description.Metadata.Range.Address;
             if (!_surfaceMetadata.TryGetValue(address, out var metadata))
             {
-                metadata = new SurfaceMetadata { Kind = SurfaceMetadataKind.HTile, ClearMask = image.Description.HtileClearMask };
+                metadata = new SurfaceMetadata { Kind = SurfaceMetadataKind.HTile };
+                metadata.SetFromMask(image.Description.HtileClearMask);
                 _surfaceMetadata.Add(address, metadata);
             }
             else if (metadata.Kind == SurfaceMetadataKind.PendingDcc)
             {
                 // A pending DCC fill uses the DCC encoding; it must not become HTile state.
                 metadata.Kind = SurfaceMetadataKind.HTile;
-                metadata.ClearMask = image.Description.HtileClearMask;
+                metadata.SetFromMask(image.Description.HtileClearMask);
                 metadata.FillValue = 0xffffffff;
                 metadata.FillSize = 0;
             }
