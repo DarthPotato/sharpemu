@@ -480,6 +480,7 @@ public static partial class Gen5SpirvTranslator
 
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
+                EmitSharedDeviceFunctions();
                 EmitRuntimeLookupFunctions();
                 EmitGfx10DeviceFormatFunction();
 
@@ -3916,13 +3917,8 @@ public static partial class Gen5SpirvTranslator
 
             if (TryGetSubdwordStoreInfo(instruction.Opcode, out var storeByteCount, out var sourceShift))
             {
-                EmitExecConditional(() =>
-                {
-                    var inRange = IsDeviceBufferByteRangeInRange(size, byteAddress, storeByteCount);
-                    var address = And64(IAdd64(baseAddress, Widen(byteAddress)), ULong(DeviceAddressMask));
-                    EmitConditional(inRange, () =>
-                        StoreDeviceBytes(address, LoadV(control.VectorData), storeByteCount, sourceShift, _module.ConstantBool(true)));
-                });
+                EmitExecConditional(() => CallDeviceBufferBytesStore(
+                    baseAddress, size, byteAddress, LoadV(control.VectorData), storeByteCount, sourceShift));
                 return true;
             }
 
@@ -3930,17 +3926,13 @@ public static partial class Gen5SpirvTranslator
             {
                 EmitExecConditional(() =>
                 {
+                    var values = new uint[control.DwordCount];
                     for (uint index = 0; index < control.DwordCount; index++)
                     {
-                        var componentAddress = index == 0
-                            ? byteAddress
-                            : IAdd(byteAddress, UInt(index * sizeof(uint)));
-                        StoreDeviceBufferWord(
-                            baseAddress,
-                            size,
-                            componentAddress,
-                            LoadV(control.VectorData + index));
+                        values[index] = LoadV(control.VectorData + index);
                     }
+
+                    CallDeviceBufferDwordStore(baseAddress, size, byteAddress, values);
                 });
                 return true;
             }
@@ -3970,14 +3962,12 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode.StartsWith("BufferLoadDword", StringComparison.Ordinal))
             {
+                var values = CallDeviceBufferDwordLoad(baseAddress, size, byteAddress, control.DwordCount);
                 for (uint index = 0; index < control.DwordCount; index++)
                 {
-                    var componentAddress = index == 0
-                        ? byteAddress
-                        : IAdd(byteAddress, UInt(index * sizeof(uint)));
                     StoreV(
                         control.VectorData + index,
-                        LoadDeviceBufferWord(baseAddress, size, componentAddress));
+                        _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, values, index));
                 }
 
                 return true;
@@ -4088,6 +4078,124 @@ public static partial class Gen5SpirvTranslator
             });
             return true;
         }
+
+        // Device-descriptor buffer accesses bounds check, page walk and (for sub-dword stores)
+        // atomically merge every dword they touch. Inlined at each site, the walks and their
+        // branches became most of a large compute module (a 5.4 MB module spent 204 s in the
+        // NVIDIA compiler), so the sites call one shared function per access shape instead, as
+        // the formatted loads do. A body is the unchanged inline sequence; the instruction PC
+        // the fault trace reports is passed as the last parameter.
+        private sealed record SharedDeviceFunction(uint Id, uint ReturnType, uint[] ParameterTypes, Func<uint[], uint> EmitBody);
+
+        private readonly Dictionary<string, SharedDeviceFunction> _sharedDeviceFunctions = new();
+        private readonly List<string> _sharedDeviceFunctionOrder = new();
+
+        private uint CallSharedDeviceFunction(
+            string name,
+            uint returnType,
+            uint[] parameterTypes,
+            Func<uint[], uint> emitBody,
+            params uint[] arguments)
+        {
+            if (!_sharedDeviceFunctions.TryGetValue(name, out var function))
+            {
+                function = new SharedDeviceFunction(_module.AllocateId(), returnType, parameterTypes, emitBody);
+                _sharedDeviceFunctions.Add(name, function);
+                _sharedDeviceFunctionOrder.Add(name);
+            }
+
+            var callArguments = new uint[arguments.Length + 2];
+            callArguments[0] = function.Id;
+            arguments.CopyTo(callArguments, 1);
+            callArguments[^1] = UInt(_deviceAddressInstructionPc);
+            if (returnType == _voidType)
+            {
+                _module.AddInstruction(SpirvOp.FunctionCall, _voidType, callArguments);
+                return 0;
+            }
+
+            return _module.AddInstruction(SpirvOp.FunctionCall, returnType, callArguments);
+        }
+
+        private void EmitSharedDeviceFunctions()
+        {
+            for (var index = 0; index < _sharedDeviceFunctionOrder.Count; index++)
+            {
+                var name = _sharedDeviceFunctionOrder[index];
+                var function = _sharedDeviceFunctions[name];
+                var type = _module.TypeFunction(function.ReturnType, [.. function.ParameterTypes, _uintType]);
+                _module.BeginFunction(function.ReturnType, type, function.Id, SpirvFunctionControl.DontInline);
+                _module.AddName(function.Id, name);
+                var parameters = function.ParameterTypes.Select(_module.AddFunctionParameter).ToArray();
+                _deviceAddressInstructionPcValue = _module.AddFunctionParameter(_uintType);
+                _module.AddLabel();
+                var result = function.EmitBody(parameters);
+                _deviceAddressInstructionPcValue = 0;
+                if (function.ReturnType == _voidType)
+                {
+                    _module.AddStatement(SpirvOp.Return);
+                }
+                else
+                {
+                    _module.AddStatement(SpirvOp.ReturnValue, result);
+                }
+
+                _module.EndFunction();
+            }
+        }
+
+        private uint CallDeviceBufferDwordLoad(uint baseAddress, uint size, uint byteAddress, uint dwordCount) =>
+            CallSharedDeviceFunction(
+                $"loadDeviceBufferDwords{dwordCount}",
+                _uvec4Type,
+                [_ulongType, _ulongType, _uintType],
+                parameters =>
+                {
+                    var result = new uint[4];
+                    for (uint index = 0; index < result.Length; index++)
+                    {
+                        result[index] = index < dwordCount
+                            ? LoadDeviceBufferWord(parameters[0], parameters[1],
+                                index == 0 ? parameters[2] : IAdd(parameters[2], UInt(index * sizeof(uint))))
+                            : UInt(0);
+                    }
+
+                    return _module.AddInstruction(SpirvOp.CompositeConstruct, _uvec4Type, result);
+                },
+                baseAddress, size, byteAddress);
+
+        private void CallDeviceBufferDwordStore(uint baseAddress, uint size, uint byteAddress, uint[] values) =>
+            CallSharedDeviceFunction(
+                $"storeDeviceBufferDwords{values.Length}",
+                _voidType,
+                [_ulongType, _ulongType, _uintType, .. values.Select(_ => _uintType)],
+                parameters =>
+                {
+                    for (uint index = 0; index < values.Length; index++)
+                    {
+                        StoreDeviceBufferWord(parameters[0], parameters[1],
+                            index == 0 ? parameters[2] : IAdd(parameters[2], UInt(index * sizeof(uint))),
+                            parameters[3 + index]);
+                    }
+
+                    return 0;
+                },
+                [baseAddress, size, byteAddress, .. values]);
+
+        private void CallDeviceBufferBytesStore(uint baseAddress, uint size, uint byteAddress, uint value, uint byteCount, uint sourceShift) =>
+            CallSharedDeviceFunction(
+                $"storeDeviceBufferBytes{byteCount}Shift{sourceShift}",
+                _voidType,
+                [_ulongType, _ulongType, _uintType, _uintType],
+                parameters =>
+                {
+                    var inRange = IsDeviceBufferByteRangeInRange(parameters[1], parameters[2], byteCount);
+                    var address = And64(IAdd64(parameters[0], Widen(parameters[2])), ULong(DeviceAddressMask));
+                    EmitConditional(inRange, () =>
+                        StoreDeviceBytes(address, parameters[3], byteCount, sourceShift, _module.ConstantBool(true)));
+                    return 0;
+                },
+                baseAddress, size, byteAddress, value);
 
         private void EmitDeviceBufferFormatLoad(
             uint baseAddress,
