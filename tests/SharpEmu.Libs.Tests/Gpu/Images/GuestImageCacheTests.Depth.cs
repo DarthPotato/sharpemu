@@ -499,6 +499,58 @@ public sealed unsafe partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    [Fact]
+    public void AlternatingStencilPlanes_WriteTheReleasedPlaneBack()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var stencilFormat = SupportedStencilFormat(_vulkan, SampleCountFlags.Count1Bit);
+        if (stencilFormat == Format.Undefined) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var depthAddress = address + 0xc000;
+        var firstPlane = address + 0xd000;
+        var secondPlane = address + 0xe000;
+        harness.Write(firstPlane, [0x11, 0x11, 0x11, 0x11]);
+        harness.Write(secondPlane, [0x22, 0x22, 0x22, 0x22]);
+        ImageRequest Bind(ulong plane)
+        {
+            var request = LinearRequest(depthAddress, 8, stencilFormat, GuestPixelFormat.Bits16UNorm, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 2, 1);
+            request = AsDepthTarget(request, stencilFormat);
+            request.Description.Stencil = new GuestSpan(plane, 4);
+            request.View = request.View with { Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+            return request;
+        }
+
+        byte[] Stencil(ResourceSlotIdentifier id) => harness.ReadImageBytes(harness.Image(id), ImageAspectFlags.StencilBit)[..4];
+
+        var first = Bind(firstPlane);
+        var depthId = harness.Acquire(ref first);
+        // The GPU writes the first plane through the depth image.
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(firstPlane, 4, 0x07070707)));
+        Assert.Equal(new byte[] { 0x07, 0x07, 0x07, 0x07 }, Stencil(depthId));
+
+        // The same depth image takes the second plane: the first one reaches guest memory.
+        var second = Bind(secondPlane);
+        Assert.Equal(depthId, harness.Acquire(ref second));
+        Assert.Equal(new byte[] { 0x22, 0x22, 0x22, 0x22 }, Stencil(depthId));
+        harness.Worker.Run(() => harness.Scheduler.Finish());
+        Assert.Equal(new byte[] { 0x07, 0x07, 0x07, 0x07 }, harness.Read(firstPlane, 4));
+
+        // A view of the released plane no longer resolves to the depth image: it is guest memory.
+        Assert.False(harness.ProxyAt(firstPlane, 4).IsValid);
+        var view = LinearRequest(firstPlane, 4, Format.R8Uint, GuestPixelFormat.Bits8UInt, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 1, 1);
+        var viewId = harness.Find(ref view);
+        Assert.NotEqual(depthId, viewId);
+        Assert.False(harness.Image(viewId).DepthOwner.IsValid);
+        Assert.False(harness.Image(viewId).Description.IsDepth);
+
+        // Back on the first plane, the depth image reloads what the GPU wrote.
+        first = Bind(firstPlane);
+        Assert.Equal(depthId, harness.Acquire(ref first));
+        Assert.Equal(new byte[] { 0x07, 0x07, 0x07, 0x07 }, Stencil(depthId));
+        harness.Shutdown();
+    }
+
     private static Format SupportedStencilFormat(SharpEmu.Libs.Tests.Gpu.Vulkan.HeadlessVulkan vulkan, SampleCountFlags samples)
     {
         const ImageUsageFlags usage = ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit | ImageUsageFlags.DepthStencilAttachmentBit;

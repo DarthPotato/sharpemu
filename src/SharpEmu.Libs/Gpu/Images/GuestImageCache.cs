@@ -541,6 +541,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         if (request.Description.HasStencil)
         {
+            if (image.Description.HasStencil && image.Description.Stencil != request.Description.Stencil)
+            {
+                ReleaseStencilPlane(imageIdentifier, image);
+            }
+
             image.Description.Stencil = request.Description.Stencil;
             RefreshStencilPlane(imageIdentifier, image, request.Description.Metadata.StencilCompressed);
         }
@@ -609,6 +614,34 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
             chain.MergedTailSequence = block.GpuWriteSequence;
             return;
+        }
+    }
+
+    // The depth image holds one guest stencil plane at a time. Before it takes another one (a
+    // title that alternates stencil buffers under one depth buffer), the plane it holds goes
+    // back to guest memory when the GPU changed it, and its association is dropped, so a view
+    // of that plane reads guest memory instead of the depth image's new plane.
+    private void ReleaseStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth)
+    {
+        var plane = depth.Description.Stencil;
+        var associations = new List<ResourceSlotIdentifier>();
+        foreach (var imageIdentifier in FindImagesInRange(plane.Address, plane.Size, pageOverlap: false))
+        {
+            if (_slots.TryGet(imageIdentifier) is { } candidate && candidate.DepthOwner == depthIdentifier)
+            {
+                associations.Add(imageIdentifier);
+            }
+        }
+
+        if (associations.Any(association => _slots[association].IsGpuModified))
+        {
+            WriteBackStencilPlane(depth, plane);
+        }
+
+        foreach (var association in associations)
+        {
+            _slots[association].ClearGpuModified();
+            DeleteImage(association);
         }
     }
 
