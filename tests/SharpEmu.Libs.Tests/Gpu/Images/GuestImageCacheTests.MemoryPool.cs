@@ -1,0 +1,190 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using SharpEmu.HLE.GpuMemory;
+using SharpEmu.Libs.Gpu.Buffers;
+using SharpEmu.Libs.Gpu.Images;
+using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.Libs.Tests.Gpu.Buffers;
+using SharpEmu.Libs.Tests.Gpu.Scheduling;
+using SharpEmu.Libs.Tests.Gpu.Vulkan;
+using Silk.NET.Vulkan;
+using Xunit;
+using static SharpEmu.Libs.Tests.Gpu.Images.ImageCacheTestSupport;
+
+namespace SharpEmu.Libs.Tests.Gpu.Images;
+
+// Images share device-memory blocks, and a full device is recovered from by freeing images.
+public sealed partial class GuestImageCacheTests
+{
+    private static ImageDescription SmallImage(ulong address, uint width = 4)
+    {
+        var size = (ulong)width * width * 4;
+        var description = LinearRequest(address, size, Format.R8G8B8A8Unorm, GuestPixelFormat.Bits8_8_8_8UNorm, GuestImageType.Color2D,
+            new Extent3D(width, width, 1), 1, 4, 1).Description;
+        if (address == 0)
+        {
+            description.Data = default;
+        }
+
+        return description;
+    }
+
+    // At least OptimalImageMemoryPool.DedicatedThreshold: needs a device allocation of its own.
+    private static ImageDescription LargeImage() => SmallImage(0, 4096);
+
+    [Fact]
+    public void ManyImages_ShareFewDeviceAllocations()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var device = _vulkan.DeviceInfo;
+        var before = device.LiveAllocations;
+        const int Count = 4200;
+        harness.Worker.Run(() =>
+        {
+            for (var index = 0; index < Count; index++)
+            {
+                harness.Images.InsertImageForTest(SmallImage(0));
+            }
+        });
+
+        // One allocation per image would pass the 4096 limit of common drivers.
+        var added = device.LiveAllocations - before;
+        Assert.InRange(added, 1, 64);
+        Assert.True(Count - added > 4000);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void OutOfDeviceMemory_ReclaimsOldImagesAndRetries()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var device = _vulkan.DeviceInfo;
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        ResourceSlotIdentifier old1 = default, old2 = default, current = default;
+        harness.Worker.Run(() =>
+        {
+            old1 = harness.Images.InsertImageForTest(SmallImage(address));
+            old2 = harness.Images.InsertImageForTest(SmallImage(address + 0x1000));
+            harness.Images.SetCollectionThresholds(ulong.MaxValue, ulong.MaxValue, ulong.MaxValue, 5);
+            current = harness.Images.InsertImageForTest(SmallImage(address + 0x2000));
+        });
+
+        // The device refuses memory until a command buffer was submitted and waited for.
+        var armedAt = 0UL;
+        var refusals = 0;
+        harness.Worker.Run(() =>
+        {
+            armedAt = harness.Scheduler.CurrentTick;
+            device.AllocationFailure = _ =>
+            {
+                refusals++;
+                return harness.Scheduler.CurrentTick == armedAt;
+            };
+        });
+        try
+        {
+            ResourceSlotIdentifier created = default;
+            harness.Worker.Run(() => created = harness.Images.InsertImageForTest(LargeImage()));
+            Assert.True(refusals > 0);
+            Assert.True(created.IsValid);
+            // The images of earlier frames went; the one the current frame touched stayed.
+            Assert.False(harness.Images.Contains(old1));
+            Assert.False(harness.Images.Contains(old2));
+            Assert.True(harness.Images.Contains(current));
+            Assert.True(harness.Image(created).Backing.Exists);
+        }
+        finally
+        {
+            device.AllocationFailure = null;
+        }
+
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void OutOfDeviceMemory_AfterReclaimFailsClearlyAndLeaksNothing()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        using var harness = new CacheHarness(_vulkan);
+        var device = _vulkan.DeviceInfo;
+        harness.Worker.Run(() => harness.Images.InsertImageForTest(SmallImage(0)));
+        var held = device.LiveAllocations;
+        device.AllocationFailure = _ => true;
+        try
+        {
+            var failure = Assert.Throws<SchedulerFatalException>(() =>
+                harness.Worker.Run(() => harness.Images.InsertImageForTest(LargeImage())));
+            Assert.Contains("vkAllocateMemory", failure.Message);
+            Assert.Contains("ErrorOutOfDeviceMemory", failure.Message);
+        }
+        finally
+        {
+            device.AllocationFailure = null;
+        }
+
+        // The idle pool memory went back to the device, and nothing of the failed image remains.
+        Assert.True(device.LiveAllocations <= held);
+        Assert.Equal(1, harness.Images.ImageCount);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void BufferOutOfDeviceMemory_ReclaimsAndRetries()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var device = _vulkan.DeviceInfo;
+        var address = harness.MapBacked(0x400000, ReadWrite);
+        var armedAt = 0UL;
+        var refusals = 0;
+        harness.Worker.Run(() =>
+        {
+            armedAt = harness.Scheduler.CurrentTick;
+            device.AllocationFailure = _ =>
+            {
+                refusals++;
+                return harness.Scheduler.CurrentTick == armedAt;
+            };
+        });
+        try
+        {
+            // Larger than a slab block, so the buffer needs an allocation of its own.
+            var identifier = harness.Worker.Run(() => harness.Cache.FindBuffer(address, 0x200000));
+            Assert.True(refusals > 0);
+            Assert.True(identifier.IsValid);
+        }
+        finally
+        {
+            device.AllocationFailure = null;
+        }
+
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void BufferOutOfDeviceMemory_AfterReclaimFailsClearly()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        using var harness = new CacheHarness(_vulkan);
+        var device = _vulkan.DeviceInfo;
+        var address = harness.MapBacked(0x400000, ReadWrite);
+        device.AllocationFailure = _ => true;
+        try
+        {
+            var failure = Assert.Throws<SchedulerFatalException>(() =>
+                harness.Worker.Run(() => harness.Cache.FindBuffer(address, 0x200000)));
+            Assert.Contains("vkAllocateMemory", failure.Message);
+        }
+        finally
+        {
+            device.AllocationFailure = null;
+        }
+
+        harness.Shutdown();
+    }
+}

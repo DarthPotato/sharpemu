@@ -7,7 +7,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 
 // The device facts the stores need: handles, memory types, limits, format support
 // and the count of live device-memory allocations made through this object.
-public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
+public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAllocator
 {
     private PhysicalDeviceMemoryProperties _memoryProperties;
     // Queried for every draw target from the render thread and from other threads; a hit takes no lock.
@@ -16,6 +16,13 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(Format, ImageType, ImageTiling, ImageUsageFlags, ImageCreateFlags), (Result Result, ImageFormatProperties Properties)> _imageFormatProperties = new();
     private int _liveAllocations;
     private int _peakAllocations;
+    private long _lastFailedAllocationBytes;
+
+    // The size of the latest device-memory allocation the driver refused, for failure reports.
+    public ulong LastFailedAllocationBytes => (ulong)Interlocked.Read(ref _lastFailedAllocationBytes);
+
+    // Tests make an allocation of the given size fail as an exhausted device would.
+    internal Func<ulong, bool>? AllocationFailure { get; set; }
 
     // VK_EXT_image_view_min_lod is enabled, so a view can clamp to a texture descriptor's MIN_LOD.
     public bool ImageViewMinLodSupported { get; init; }
@@ -120,8 +127,15 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     {
         fixed (MemoryAllocateInfo* pointer = &info)
         {
-            var result = Vk.AllocateMemory(Device, pointer, null, out memory);
-            if (result == Result.Success)
+            memory = default;
+            var result = AllocationFailure?.Invoke(info.AllocationSize) == true
+                ? Result.ErrorOutOfDeviceMemory
+                : Vk.AllocateMemory(Device, pointer, null, out memory);
+            if (result != Result.Success)
+            {
+                Interlocked.Exchange(ref _lastFailedAllocationBytes, checked((long)info.AllocationSize));
+            }
+            else
             {
                 var live = Interlocked.Increment(ref _liveAllocations);
                 int peak;

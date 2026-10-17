@@ -30,12 +30,62 @@ public sealed partial class GuestImageCache
         }
     }
 
-    private void Collect(ulong tick, bool allowAggressive)
+    // An allocation failed despite the cache's own accounting: the device is full. Retire every
+    // image collection allows, wait for the retired ones to be destroyed and hand the pools'
+    // idle memory back to the device.
+    public void ReclaimForAllocation()
     {
-        var pressured = _totalUsedMemory >= _memoryPressureBytes;
-        var aggressive = allowAggressive && _totalUsedMemory >= _criticalMemoryBytes;
-        var age = aggressive ? 160UL : pressured ? 80UL : 16UL;
-        if (tick < age && !pressured && !aggressive)
+        using var held = _lock.Hold();
+        ReclaimAfterFailedAllocation();
+    }
+
+    private void ReclaimAfterFailedAllocation()
+    {
+        for (var rounds = 0; rounds < 64; rounds++)
+        {
+            var before = _totalUsedMemory;
+            Collect(_collectionTick, allowAggressive: true, reclaim: true);
+            if (_totalUsedMemory == before)
+            {
+                break;
+            }
+        }
+
+        // Completion destroys the retired images and can call back into the cache, so the wait
+        // happens without its lock.
+        if (_scheduler.Active && !_scheduler.InsideTickCallback)
+        {
+            _lock.Exit();
+            try
+            {
+                _scheduler.Finish();
+            }
+            finally
+            {
+                _lock.Enter();
+            }
+        }
+
+        ReleaseUnusedMemoryCore();
+    }
+
+    // Idle memory the pools keep for reuse: retired backings and empty blocks. Registered
+    // images are untouched.
+    private void ReleaseUnusedMemoryCore()
+    {
+        _backingPool?.ReleaseRetained();
+        _imageMemoryPool.ReleaseRetained();
+    }
+
+    private void Collect(ulong tick, bool allowAggressive, bool reclaim = false)
+    {
+        var pressured = reclaim || _totalUsedMemory >= _memoryPressureBytes;
+        var aggressive = reclaim || (allowAggressive && _totalUsedMemory >= _criticalMemoryBytes);
+        // A reclaim keeps only the images the current frame touched: older ones are not needed
+        // by the work being recorded, and whatever that work already references is destroyed
+        // after its tick completes.
+        var age = reclaim ? 1UL : aggressive ? 160UL : pressured ? 80UL : 16UL;
+        if (tick < age && (reclaim || (!pressured && !aggressive)))
         {
             return;
         }
@@ -64,6 +114,12 @@ public sealed partial class GuestImageCache
                 continue;
             }
 
+            if (reclaim && (owner.Binding.IsBound || owner.Binding.IsTarget))
+            {
+                // The draw state being built still holds this image's views.
+                continue;
+            }
+
             if (owner.IsGpuModified)
             {
                 var safe = CanReadBack(owner);
@@ -86,6 +142,11 @@ public sealed partial class GuestImageCache
             }
 
             deletions -= DeleteImage(imageIdentifier);
+            if (reclaim)
+            {
+                continue;
+            }
+
             if (_totalUsedMemory < _criticalMemoryBytes && aggressive)
             {
                 deletions >>= 2;

@@ -1891,9 +1891,29 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             overlapping.Add(_registry.GetRegisteredIdentifier(index));
         }
 
-        var bufferIdentifier = _registry.AllocateBuffer(new GpuBuffer(
+        GpuBuffer CreateGpuBuffer() => new(
             _device, _scheduler, GpuBufferUsage.DeviceLocal, overlap.Begin,
-            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, allowSlab: true), overlap.Begin, overlap.End - overlap.Begin);
+            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, allowSlab: true);
+        GpuBuffer created;
+        try
+        {
+            created = CreateGpuBuffer();
+        }
+        catch (GpuBuffer.OutOfMemoryException)
+        {
+            // Images hold most of the device memory: free the ones that can go and try once more.
+            RequireImageCache().ReclaimForAllocation();
+            try
+            {
+                created = CreateGpuBuffer();
+            }
+            catch (GpuBuffer.OutOfMemoryException again)
+            {
+                throw SubmissionScheduler.Fatal(again.Message);
+            }
+        }
+
+        var bufferIdentifier = _registry.AllocateBuffer(created, overlap.Begin, overlap.End - overlap.Begin);
         foreach (var oldId in overlapping)
         {
             MergeOverlappingBuffer(bufferIdentifier, oldId, !overlap.HasStreamLeap);

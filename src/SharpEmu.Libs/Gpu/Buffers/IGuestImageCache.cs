@@ -20,4 +20,7 @@ public interface IGuestImageCache
     void InvalidateMemoryFromGpu(ulong address, ulong size);
 
     bool TrySynchronizeBufferFromImage(GpuBuffer buffer, ulong address, ulong size);
+
+    // Frees every image that can go and waits for retired ones, after an allocation failed.
+    void ReclaimForAllocation();
 }

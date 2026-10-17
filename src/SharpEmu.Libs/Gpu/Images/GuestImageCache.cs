@@ -28,6 +28,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly IGuestBackedSpace _backing;
     private readonly SlotTable<CachedImage> _slots = new();
     private readonly ImageBackingPool? _backingPool;
+    private readonly OptimalImageMemoryPool _imageMemoryPool;
     private readonly ImagePageOwnerTable _pageOwners = new();
     private readonly Dictionary<Format, ResourceSlotIdentifier> _nullImages = new();
     private RecencyQueue<ResourceSlotIdentifier> _recencyQueue = new();
@@ -53,6 +54,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
         _backingPool = ImageBackingPool.Enabled ? new ImageBackingPool(device) : null;
+        _imageMemoryPool = new OptimalImageMemoryPool(device);
     }
 
     public ulong TotalUsedMemory => _totalUsedMemory;
@@ -103,6 +105,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _disposed = true;
         _slots.ForEach((_, image) => image.Dispose());
         _backingPool?.Dispose();
+        _imageMemoryPool.ReleaseRetained();
         _tiler.Dispose();
         _blit.Dispose();
     }
@@ -621,7 +624,27 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ResourceSlotIdentifier InsertImage(in ImageDescription description)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
-        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool));
+        CachedImage image;
+        try
+        {
+            image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool);
+        }
+        catch (CachedImage.ImageOutOfMemoryException)
+        {
+            // The device can be full while the cache still holds images it no longer needs. Free
+            // what can go, wait for the retired images to be destroyed, and try once more.
+            ReclaimAfterFailedAllocation();
+            try
+            {
+                image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool);
+            }
+            catch (CachedImage.ImageOutOfMemoryException again)
+            {
+                throw SubmissionScheduler.Fatal(again.Message);
+            }
+        }
+
+        var imageIdentifier = _slots.Insert(image);
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
             AddToIndex(imageIdentifier);
