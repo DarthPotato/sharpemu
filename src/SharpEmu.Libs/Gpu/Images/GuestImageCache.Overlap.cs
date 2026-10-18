@@ -565,6 +565,29 @@ public sealed partial class GuestImageCache
         return replacementImageIdentifier;
     }
 
+    // Memory keeps its bytes when another image or a buffer write reuses part of it. An image
+    // whose GPU contents never reached guest memory moves them into the buffer over its range
+    // before it is dropped, so a later image over those bytes starts from them, not from stale
+    // guest memory. False when the contents cannot be copied; they are lost as before.
+    private bool PublishBeforeDrop(ResourceSlotIdentifier imageIdentifier)
+    {
+        var image = _slots[imageIdentifier];
+        if (!image.IsGpuModified || image.DepthOwner.IsValid || !image.SafeToDownload)
+        {
+            return false;
+        }
+
+        var range = image.Description.Data;
+        if (_bufferCache.ObtainBufferForImageWriteBack(range.Address, range.Size) is not { } buffer ||
+            !TryDownloadImageToBuffer(image, buffer))
+        {
+            return false;
+        }
+
+        image.ClearGpuModified();
+        return true;
+    }
+
     private OverlapResolution ResolveOverlap(in ImageDescription requested, ImageRole role, ResourceSlotIdentifier cachedImageIdentifier, ResourceSlotIdentifier mergedImageIdentifier)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageOverlap);
@@ -573,6 +596,11 @@ public sealed partial class GuestImageCache
         {
             return new OverlapResolution(mergedImageIdentifier);
         }
+
+        // Resolving can allocate a replacement, and an allocation under memory pressure collects
+        // images not used this tick. The image being resolved is the copy source of that
+        // replacement; touching it keeps it out of the collection.
+        TouchImage(cached);
 
         ref var cachedInfo = ref cached.Description;
         var currentTick = _scheduler.CurrentTick;
@@ -607,6 +635,7 @@ public sealed partial class GuestImageCache
             {
                 if (safeToDelete)
                 {
+                    PublishBeforeDrop(cachedImageIdentifier);
                     ReleaseImage(cachedImageIdentifier);
                 }
 
@@ -677,6 +706,7 @@ public sealed partial class GuestImageCache
 
         if (requested.Data.Address >= cachedInfo.Data.Address && safeToDelete)
         {
+            PublishBeforeDrop(cachedImageIdentifier);
             ReleaseImage(cachedImageIdentifier);
         }
 

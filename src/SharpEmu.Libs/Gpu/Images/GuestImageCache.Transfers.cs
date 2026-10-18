@@ -830,7 +830,11 @@ public sealed unsafe partial class GuestImageCache
             selected = proxy.DepthOwner;
         }
 
-        var image = _slots[selected];
+        return TryDownloadImageToBuffer(_slots[selected], buffer);
+    }
+
+    private bool TryDownloadImageToBuffer(CachedImage image, GpuBuffer buffer)
+    {
         ref readonly var info = ref image.Description;
         if (!buffer.IsInBounds(info.Data.Address, 1))
         {

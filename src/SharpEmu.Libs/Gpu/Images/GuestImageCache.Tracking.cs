@@ -518,7 +518,13 @@ public sealed partial class GuestImageCache
 
             if (image.IsGpuModified)
             {
-                image.ClearGpuModified();
+                // A partial write leaves the rest of the image's bytes in memory.
+                var range = image.Description.Data;
+                var fullyCovered = address <= range.Address && address + size >= range.Address + range.Size;
+                if (fullyCovered || !PublishBeforeDrop(imageIdentifier))
+                {
+                    image.ClearGpuModified();
+                }
             }
 
             image.MarkBufferModified();
