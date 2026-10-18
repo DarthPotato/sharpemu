@@ -199,12 +199,6 @@ internal sealed class RecordingRenderHost : IRenderHost
         return GuestMemory.TryRead(address, destination);
     }
 
-    // True when no pending GPU write owns the guest bytes, so a clean read may return them.
-    public bool GuestBytesAreClean { get; set; }
-
-    public bool TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
-        GuestBytesAreClean && GuestMemory.TryRead(address, destination);
-
     public ulong ClampMappedSize(ulong address, ulong size) => ClampOverride?.Invoke(address, size) ?? size;
 
     public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat)

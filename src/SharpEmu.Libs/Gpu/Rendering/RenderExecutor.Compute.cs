@@ -56,33 +56,35 @@ public sealed partial class RenderExecutor
         var useThreadDimensions = (dispatchInitiator & DispatchInitiatorUseThreadDimensions) != 0;
         // A zero dimension executes no work, so nothing needs the shader: skip before it is
         // materialized and compiled. The counts are real unless the host resolves an indirect
-        // dispatch on the GPU, which leaves them zero and the arguments in guest memory; those
-        // are read here only when no pending GPU write can change their contents.
-        var zeroDispatch = false;
-        if (indirectArgumentsAddress == 0 || useThreadDimensions)
+        // dispatch on the GPU, which leaves them zero and the arguments in guest memory.
+        if ((indirectArgumentsAddress == 0 || useThreadDimensions) && (groupsX == 0 || groupsY == 0 || groupsZ == 0))
         {
-            zeroDispatch = groupsX == 0 || groupsY == 0 || groupsZ == 0;
+            if (RenderTrace.Enabled && RenderTrace.ZeroDispatch())
+            {
+                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
+            }
+
+            return;
         }
-        else
+
+        if (TraceZeroIndirect && indirectArgumentsAddress != 0 && !useThreadDimensions)
         {
             Span<byte> arguments = stackalloc byte[3 * sizeof(uint)];
             if (_host.TryReadCleanGuestBytes(indirectArgumentsAddress, arguments))
             {
-                zeroDispatch = BinaryPrimitives.ReadUInt32LittleEndian(arguments) == 0 ||
-                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[sizeof(uint)..]) == 0 ||
-                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[(2 * sizeof(uint))..]) == 0;
+                var x = BinaryPrimitives.ReadUInt32LittleEndian(arguments);
+                var y = BinaryPrimitives.ReadUInt32LittleEndian(arguments[sizeof(uint)..]);
+                var z = BinaryPrimitives.ReadUInt32LittleEndian(arguments[(2 * sizeof(uint))..]);
+                if (x == 0 || y == 0 || z == 0)
+                {
+                    var count = ++_zeroIndirectCount;
+                    if (count <= 32 || count % 1000 == 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[GPU][INFO][ZERO_INDIRECT] count={count} address=0x{indirectArgumentsAddress:X} groups={x},{y},{z} shader=0x{compute.Address:X}");
+                    }
+                }
             }
-        }
-
-        if (zeroDispatch)
-        {
-            if (RenderTrace.Enabled && RenderTrace.ZeroDispatch())
-            {
-                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} " +
-                    $"indirect=0x{indirectArgumentsAddress:X16} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
-            }
-
-            return;
         }
 
         var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
@@ -773,6 +775,8 @@ public sealed partial class RenderExecutor
         return consumed || RefuseBoundedFill(program, $"copy refused by the host dst=0x{destination.Address:X} words={words} modulus={modulus}");
     }
 
+    private static readonly bool TraceZeroIndirect = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_ZERO_INDIRECT") == "1";
+    private long _zeroIndirectCount;
     private static readonly bool BoundedCopyEnabled = Environment.GetEnvironmentVariable("SHARPEMU_HOST_BOUNDED_COPY") != "0";
 
     private static bool IsPlainWordBuffer(BufferDescriptorWords descriptor) =>

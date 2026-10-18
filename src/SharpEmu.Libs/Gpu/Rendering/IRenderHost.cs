@@ -107,8 +107,7 @@ public interface IRenderHost
 
     bool TryReadGuest(ulong address, Span<byte> destination);
 
-    // Reads guest bytes only when no pending GPU write can change them: no GPU-dirty page or image
-    // owns them. False means the bytes are not known to be final.
+    // Reads guest bytes only when no pending GPU write can change them. False means not known final.
     bool TryReadCleanGuestBytes(ulong address, Span<byte> destination) => false;
 
     // The part of the range that is mapped from its start; zero when the start is unmapped.
