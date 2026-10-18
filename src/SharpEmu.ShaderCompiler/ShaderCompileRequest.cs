@@ -166,6 +166,11 @@ public sealed class ShaderCompileRequest
 
     public Gen5ShaderProgram Program { get; }
     public ShaderStage Stage { get; }
+    public Gen5TessellationInfo? Tessellation { get; init; }
+    // Merged LS/HS workgroups can contain several independently branching waves.
+    // The Vulkan lowering rendezvous all waves before an LDS phase transition.
+    public Gen5TessellationHullInfo? TessellationHull { get; init; }
+    public bool CooperativeWave64Workgroup { get; init; }
     public ulong Hash { get; }
     public MemoryAccessTable Memory { get; }
     public SpecializedResourceInfo Resources { get; }

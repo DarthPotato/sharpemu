@@ -360,6 +360,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint MemoryOffsetDword { get; init; }
     public uint MemoryOffsetCount { get; init; }
     public bool UsesDispatchThreadLimits { get; init; }
+    public bool UsesTessellationData { get; init; }
 
     // The pixel module writes an object/primitive ID target and reads the draw's object ID.
     public bool UsesObjectId { get; init; }
@@ -372,7 +373,9 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     public uint MipStatisticsCount { get; init; }
 
-    public uint MipStatisticsDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+    public uint TessellationDataDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+
+    public uint MipStatisticsDword => TessellationDataDword + (UsesTessellationData ? Gen5TessellationData.DwordCount : 0u);
 
     public uint ObjectIdDword => MipStatisticsDword + MipStatisticsCount;
 
@@ -614,15 +617,18 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         uint pushDataStartDword = 0,
         bool usesDispatchThreadLimits = false,
         bool usesObjectId = false,
-        bool usesMeshDrawParameters = false)
+        bool usesMeshDrawParameters = false,
+        bool usesTessellationData = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
         var memoryOffsetCount = (uint)info.Buffers.Count;
         var mipStatisticsCount = info.Images.Any(static image => image.MipStatistics) ? (uint)info.Images.Count : 0u;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 + (usesDispatchThreadLimits ? 3u : 0u) + mipStatisticsCount + (usesObjectId ? 1u : 0u) +
-            (usesMeshDrawParameters ? 6u : 0u);
-        var pushStart = PushData.StartFor(pushDataStartDword, shaderDataDwords);
+            (usesMeshDrawParameters ? 6u : 0u) + (usesTessellationData ? Gen5TessellationData.DwordCount : 0u);
+        // The fixed-function control bridge shares the domain stage's runtime buffer.
+        // Keep that ABI independent of per-stage push-data packing.
+        var pushStart = usesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataStartDword, shaderDataDwords);
         var descriptors = new List<DescriptorBinding>();
         if (info.Buffers.Count != 0)
         {
@@ -712,6 +718,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             MemoryOffsetDword = memoryOffsetDword,
             MemoryOffsetCount = memoryOffsetCount,
             UsesDispatchThreadLimits = usesDispatchThreadLimits,
+            UsesTessellationData = usesTessellationData,
             MipStatisticsCount = mipStatisticsCount,
             UsesObjectId = usesObjectId,
             UsesMeshDrawParameters = usesMeshDrawParameters,
@@ -728,6 +735,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         MemoryOffsetDword == other.MemoryOffsetDword &&
         MemoryOffsetCount == other.MemoryOffsetCount &&
         UsesDispatchThreadLimits == other.UsesDispatchThreadLimits &&
+        UsesTessellationData == other.UsesTessellationData &&
         MipStatisticsCount == other.MipStatisticsCount &&
         UsesObjectId == other.UsesObjectId &&
         UsesMeshDrawParameters == other.UsesMeshDrawParameters &&
@@ -766,7 +774,7 @@ public static class BindingLayoutValidator
         }
 
         var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor,
-            layout.UsesDispatchThreadLimits, layout.UsesObjectId, layout.UsesMeshDrawParameters);
+            layout.UsesDispatchThreadLimits, layout.UsesObjectId, layout.UsesMeshDrawParameters, layout.UsesTessellationData);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

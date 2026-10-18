@@ -310,7 +310,7 @@ public static partial class Gen5ShaderTranslator
                 : instruction with { Pc = (uint)rebasedPc, AddressOffset = unchecked(continuationDistance + instruction.ProgramOffset) });
         }
 
-        program = new Gen5ShaderProgram(entryAddress, instructions) { IsFusedProgram = true };
+        program = new Gen5ShaderProgram(entryAddress, instructions) { IsFusedProgram = true, FusedContinuationPc = continuationPc };
         error = string.Empty;
         return true;
     }
@@ -464,8 +464,11 @@ public static partial class Gen5ShaderTranslator
                 return true;
             }
 
+            // S_SWAPPC_B64 with NULL as its link destination discards the return
+            // address and is a tail transfer, as used by merged LS/HS programs.
             if (stopAtSetProgramCounter &&
-                string.Equals(name, "SSetpcB64", StringComparison.Ordinal) &&
+                (string.Equals(name, "SSetpcB64", StringComparison.Ordinal) ||
+                 (string.Equals(name, "SSwappcB64", StringComparison.Ordinal) && ((word >> 16) & 0x7F) == 125)) &&
                 (!coverForwardBranches || pc > furthestForwardBranchTarget))
             {
                 program = new Gen5ShaderProgram(address, instructions);

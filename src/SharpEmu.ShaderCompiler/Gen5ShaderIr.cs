@@ -381,6 +381,8 @@ public sealed record Gen5ShaderProgram(
 {
     public IReadOnlySet<uint> FunctionBufferAccesses { get; init; } = new HashSet<uint>();
     public bool IsFusedProgram { get; init; }
+    // First pc of the continuation half of a fused program (the HS of a merged LS/HS).
+    public uint? FusedContinuationPc { get; init; }
 
     private const uint PixelColorTargetCount = 8;
     private const int PixelColorMaskBits = 4;
