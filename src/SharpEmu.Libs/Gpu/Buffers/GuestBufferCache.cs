@@ -2758,12 +2758,15 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             }
 
             var command = _scheduler.Current;
+            // A buffer copy cannot be recorded inside a render pass. A batch can be open while
+            // one is active (a draw's device-address sweep opens it with the previous draw's
+            // pass still running), so the pass is ended on every upload; outside a pass this
+            // does nothing, and ending one also closes the batch. Consecutive uploads between
+            // two renders share one barrier pair: the copies run back to back and the closing
+            // barrier lands before the next draw or dispatch begins.
+            command.EndRendering();
             if (!_uploadBatchActive)
             {
-                // A buffer copy cannot be recorded inside a render pass. Consecutive uploads
-                // between two renders share one barrier pair: the copies run back to back and
-                // the closing barrier lands before the next draw or dispatch begins.
-                command.EndRendering();
                 BeginUploadBatch();
             }
 
