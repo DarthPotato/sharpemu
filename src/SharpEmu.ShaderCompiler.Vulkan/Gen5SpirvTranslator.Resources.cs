@@ -111,6 +111,15 @@ public static partial class Gen5SpirvTranslator
         private uint _deviceEntryScratch;
         private uint _deviceWordScratch;
         private uint _deviceBufferWordScratch;
+
+        // The missing pages an invocation met, as one word of the fault bitmap and its bits.
+        // A page walk only merges into them; the invocation publishes them once when it ends
+        // (FlushPendingDeviceFaults). An atomic per page walk made the driver compile shaders
+        // with many device accesses for tens of seconds. Faults are residency hints read
+        // after the dispatch: a page in a second bitmap word is reported by a later dispatch,
+        // once the pages of the first word are resident and no longer fault.
+        private uint _pendingFaultWord;
+        private uint _pendingFaultBits;
         private uint _pushDataBlockPointer;
         private uint _wordRuntimeArray;
         private uint _addressRuntimeArray;
@@ -297,6 +306,12 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_deviceWordScratch, "deviceAddressWord");
                 _interfaces.Add(_deviceEntryScratch);
                 _interfaces.Add(_deviceWordScratch);
+                _pendingFaultWord = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _pendingFaultBits = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _module.AddName(_pendingFaultWord, "pendingFaultWord");
+                _module.AddName(_pendingFaultBits, "pendingFaultBits");
+                _interfaces.Add(_pendingFaultWord);
+                _interfaces.Add(_pendingFaultBits);
                 if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor))
                 {
                     _deviceBufferWordScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
@@ -624,9 +639,9 @@ public static partial class Gen5SpirvTranslator
             });
             var entry = Load(_ulongType, _deviceEntryScratch);
             var mapped = _module.AddInstruction(SpirvOp.INotEqual, _boolType, entry, ULong(0));
-            EmitConditional(LogicalAnd(inTable, LogicalNot(mapped)), () =>
+            if (_request.TraceDeviceAddressFaults)
             {
-                if (_request.TraceDeviceAddressFaults)
+                EmitConditional(LogicalAnd(inTable, LogicalNot(mapped)), () =>
                 {
                     var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
                     var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(16));
@@ -641,14 +656,36 @@ public static partial class Gen5SpirvTranslator
                         for (var index = 0; index < values.Length; index++)
                             Store(BlockWordPointer(_faultBuffer, IAdd(recordStart, UInt((uint)index + 1))), values[index]);
                     });
-                }
-                var word = ShiftRightLogical(pageIndex, UInt(5));
-                var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
-                EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
-                    _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
-            });
+                });
+            }
+
+            // Merged by selects, not under a branch: a branch per page walk costs the driver
+            // nearly as much as the atomic it replaces.
+            var word = ShiftRightLogical(pageIndex, UInt(5));
+            var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
+            var pendingWord = Load(_uintType, _pendingFaultWord);
+            var pendingBits = Load(_uintType, _pendingFaultBits);
+            var merge = LogicalAnd(LogicalAnd(inTable, LogicalNot(mapped)), _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, pendingBits, UInt(0)),
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, pendingWord, word)));
+            Store(_pendingFaultWord, _module.AddInstruction(SpirvOp.Select, _uintType, merge, word, pendingWord));
+            Store(_pendingFaultBits, _module.AddInstruction(SpirvOp.Select, _uintType, merge, BitwiseOr(pendingBits, bit), pendingBits));
             var pointer = IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1)));
             return (pointer, mapped);
+        }
+
+        // Publishes the missing pages the invocation met, once, as it ends.
+        private void FlushPendingDeviceFaults()
+        {
+            if (_pendingFaultBits == 0)
+            {
+                return;
+            }
+
+            var bits = Load(_uintType, _pendingFaultBits);
+            var word = Load(_uintType, _pendingFaultWord);
+            EmitConditional(LogicalAnd(_module.AddInstruction(SpirvOp.INotEqual, _boolType, bits, UInt(0)), IsBlockWordInRange(_faultBuffer, word)), () =>
+                _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bits));
         }
 
         private uint DeviceWordPointer(uint pointerValue) =>

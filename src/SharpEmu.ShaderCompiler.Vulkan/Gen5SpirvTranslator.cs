@@ -396,6 +396,8 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
                 profile.Switch(ShaderTranslationProfile.Part.Finalization);
+                // Every exit (s_endpgm, an inactive invocation, a pixel kill) reaches here first.
+                FlushPendingDeviceFaults();
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&

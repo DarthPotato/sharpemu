@@ -329,6 +329,35 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
     }
 
     [Fact]
+    public void ManyPageWalks_PublishTheirMissingPagesWithOneAtomic()
+    {
+        // Four loads walk the page table; the missing pages merge into per-invocation state and
+        // the one AtomicOr on the fault buffer sits at the end of the program.
+        var program = Program(
+            MoveVector(0, OffsetRegister, 0),
+            GlobalMemory(4, "GlobalLoadDword", AddressLow, OffsetRegister, 1, 1, 0),
+            GlobalMemory(12, "GlobalLoadDword", AddressLow, OffsetRegister, 1, 1, 4),
+            GlobalMemory(20, "GlobalLoadDword", AddressLow, OffsetRegister, 1, 1, 8),
+            GlobalMemory(28, "GlobalLoadDword", AddressLow, OffsetRegister, 1, 1, 12),
+            BufferAccess(36, "BufferStoreDword", ResultRegister, 0, 1, vectorData: 1),
+            EndProgram(44));
+        var (plan, resources, layout) = Prepare(program);
+        var request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = 1, ThreadCountX = 1, ScratchDwords = 32 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        const uint OpAtomicOr = 241;
+        var atomics = 0;
+        for (var index = 5; index < shader.Spirv.Length / 4;)
+        {
+            var head = BinaryPrimitives.ReadUInt32LittleEndian(shader.Spirv.AsSpan(index * 4));
+            atomics += (head & 0xFFFF) == OpAtomicOr ? 1 : 0;
+            index += (int)(head >> 16);
+        }
+
+        output.WriteLine($"SPIR-V words: {shader.Spirv.Length / 4}, fault AtomicOr: {atomics}");
+        Assert.Equal(1, atomics);
+    }
+
+    [Fact]
     public void MissingPage_RecordsAFaultAndReadsZero()
     {
         var vulkan = fixture.Vulkan;
