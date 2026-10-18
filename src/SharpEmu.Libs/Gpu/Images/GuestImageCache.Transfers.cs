@@ -783,6 +783,8 @@ public sealed unsafe partial class GuestImageCache
             throw SubmissionScheduler.Fatal($"The image download plan is invalid: address=0x{image.Description.Data.Address:X16} size=0x{image.Description.Data.Size:X}.");
         }
 
+        ImageDownloadProfile.Record(image, destinationSize);
+
         if (plan.Depth)
         {
             if (destinationSize != image.Description.Data.Size)
@@ -891,6 +893,7 @@ public sealed unsafe partial class GuestImageCache
     public bool TrySynchronizeBufferFromImage(GpuBuffer buffer, ulong address, ulong size)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDownload);
+        using var downloadCause = ImageDownloadProfile.Begin(ImageDownloadProfile.Cause.BufferView);
         using var held = _lock.Hold();
         var matches = new List<ResourceSlotIdentifier>();
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: false))
@@ -1057,6 +1060,7 @@ public sealed unsafe partial class GuestImageCache
     private bool TryDownloadToGuest(ResourceSlotIdentifier imageIdentifier)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDownload);
+        using var downloadCause = ImageDownloadProfile.Begin(ImageDownloadProfile.Cause.Eviction);
         var image = _slots[imageIdentifier];
         if (image.DepthOwner.IsValid)
         {

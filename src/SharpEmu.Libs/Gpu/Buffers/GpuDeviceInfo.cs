@@ -232,8 +232,17 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         return entry.Result == Result.Success;
     }
 
+    // Live allocations by handle, with the source site that made them, so a memory diagnostic
+    // can say where device memory went. Allocations are infrequent (images, pool blocks, buffers).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, (ulong Size, bool DeviceLocal, string Site)> _liveAllocationInfo = new();
+
+    Result IDeviceMemoryAllocator.AllocateMemory(in MemoryAllocateInfo info, out DeviceMemory memory) =>
+        AllocateMemory(info, out memory, "ImageMemoryPool");
+
     // Every device-memory allocation goes through here so the live count stays exact.
-    public Result AllocateMemory(in MemoryAllocateInfo info, out DeviceMemory memory)
+    public Result AllocateMemory(in MemoryAllocateInfo info, out DeviceMemory memory,
+        [System.Runtime.CompilerServices.CallerFilePath] string site = "",
+        [System.Runtime.CompilerServices.CallerLineNumber] int line = 0)
     {
         fixed (MemoryAllocateInfo* pointer = &info)
         {
@@ -251,10 +260,38 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
                        Interlocked.CompareExchange(ref _peakAllocations, live, peak) != peak)
                 {
                 }
+
+                var deviceLocal = info.MemoryTypeIndex < MemoryTypeCount &&
+                    (GetMemoryTypeFlags(info.MemoryTypeIndex) & MemoryPropertyFlags.DeviceLocalBit) != 0;
+                var name = line == 0 ? site : $"{Path.GetFileNameWithoutExtension(site)}:{line}";
+                _liveAllocationInfo[memory.Handle] = (info.AllocationSize, deviceLocal, name);
             }
 
             return result;
         }
+    }
+
+    // Live device-local and other allocation bytes, and the sites holding the most device-local memory.
+    public string DescribeAllocations()
+    {
+        ulong deviceLocal = 0, other = 0;
+        var sites = new Dictionary<string, (ulong Bytes, int Count)>();
+        foreach (var (size, local, site) in _liveAllocationInfo.Values)
+        {
+            if (!local)
+            {
+                other += size;
+                continue;
+            }
+
+            deviceLocal += size;
+            sites.TryGetValue(site, out var total);
+            sites[site] = (total.Bytes + size, total.Count + 1);
+        }
+
+        var top = string.Join(" ", sites.OrderByDescending(entry => entry.Value.Bytes).Take(8)
+            .Select(entry => $"{entry.Key}={entry.Value.Bytes >> 20}MB/n{entry.Value.Count}"));
+        return $"allocated_device_local={deviceLocal} allocated_other={other} device_local_sites=[{top}]";
     }
 
     public void FreeMemory(DeviceMemory memory)
@@ -265,6 +302,7 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         }
 
         Vk.FreeMemory(Device, memory, null);
+        _liveAllocationInfo.TryRemove(memory.Handle, out _);
         Interlocked.Decrement(ref _liveAllocations);
     }
 }

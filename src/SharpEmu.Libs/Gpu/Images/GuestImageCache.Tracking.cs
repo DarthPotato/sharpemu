@@ -490,6 +490,7 @@ public sealed partial class GuestImageCache
         }
 
         using var held = _lock.Hold();
+        using var downloadCause = ImageDownloadProfile.Begin(ImageDownloadProfile.Cause.PartialGpuWrite);
         ImageDropTrace.CauseAddress = address;
         ImageDropTrace.CauseSize = size;
         try

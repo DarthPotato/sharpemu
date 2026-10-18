@@ -43,7 +43,7 @@ public sealed partial class GuestImageCache
             $"gpu_modified_tiled_bytes={modifiedTiledBytes} retired_image_bytes={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
             $"retained_backing_bytes={_backingPool?.PooledBytes ?? 0} collection_bytes={CollectionMemoryBytes} critical_bytes={_criticalMemoryBytes} " +
             $"system_memory_images={CachedImage.SystemMemoryImages} device_budget={deviceBudget} device_usage={deviceUsage} " +
-            $"buffer_cache_bytes={_bufferCache.TotalUsedMemory} image_pool_bytes={_imageMemoryPool.AllocatedBytes} largest={top}";
+            $"buffer_cache_bytes={_bufferCache.TotalUsedMemory} image_pool_bytes={_imageMemoryPool.AllocatedBytes} {_device.DescribeAllocations()} largest={top}";
     }
 
     // Allocation-time pressure is deliberately separate from the periodic sweep:

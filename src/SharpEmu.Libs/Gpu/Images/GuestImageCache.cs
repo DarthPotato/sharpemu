@@ -86,6 +86,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             imageBudget = Math.Min(imageBudget, cap);
         }
 
+        if (ImageCacheBudgetOverride is { } budgetOverride)
+        {
+            imageBudget = budgetOverride;
+        }
+
         _collectionStartBytes = Math.Max(imageBudget / 2, MiB);
         _memoryPressureBytes = Math.Max(imageBudget * 3 / 5, MiB);
         _criticalMemoryBytes = Math.Max(imageBudget * 7 / 10, MiB);
@@ -106,6 +111,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private static readonly ulong? ImageCacheBudgetCap =
         ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_CACHE_BUDGET_MB"), out var megabytes) && megabytes > 0
             ? megabytes * MiB
+            : null;
+
+    // SHARPEMU_IMAGE_CACHE_BUDGET_OVERRIDE_MB replaces the VRAM-derived budget, above it too, so
+    // collection starts later; images that no longer fit then go to system memory. Diagnostic.
+    private static readonly ulong? ImageCacheBudgetOverride =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_CACHE_BUDGET_OVERRIDE_MB"), out var overrideMegabytes) && overrideMegabytes > 0
+            ? overrideMegabytes * MiB
             : null;
 
     internal static ulong ComputeImageCacheBudget(ulong available, bool hasMemoryBudget)

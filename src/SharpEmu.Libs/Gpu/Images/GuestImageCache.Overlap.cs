@@ -580,6 +580,7 @@ public sealed partial class GuestImageCache
             return false;
         }
 
+        using var downloadCause = ImageDownloadProfile.Begin(ImageDownloadProfile.Cause.OverlapDrop);
         var range = image.Description.Data;
         if (_bufferCache.ObtainBufferForImageWriteBack(range.Address, range.Size) is not { } buffer ||
             !TryDownloadImageToBuffer(image, buffer))
