@@ -3918,6 +3918,8 @@ public static partial class Gen5SpirvTranslator
                         var bothMapped = LogicalAnd(firstMapped, secondMapped);
                         EmitConditional(bothMapped, () =>
                         {
+                            NoteDeviceWrite(firstAddress);
+                            NoteDeviceWrite(secondAddress);
                             var originalLow = EmitAtomic(
                                 atomicOp, _uintType, DeviceWordPointer(firstPointer), 1, 0x48,
                                 () => LoadV(control.VectorData), () => UInt(0));
@@ -3946,6 +3948,7 @@ public static partial class Gen5SpirvTranslator
                         var (pointer, mapped) = ResolveDeviceAddress(address);
                         EmitConditional(mapped, () =>
                         {
+                            NoteDeviceWrite(address);
                             var original = EmitBufferFloatAtomic(
                                 DeviceWordPointer(pointer),
                                 LoadV(control.VectorData),
@@ -3975,6 +3978,7 @@ public static partial class Gen5SpirvTranslator
                     var (pointer, mapped) = ResolveDeviceAddress(address);
                     EmitConditional(mapped, () =>
                     {
+                        NoteDeviceWrite(address);
                         var original = EmitAtomic(
                             atomicOperation,
                             _uintType,
