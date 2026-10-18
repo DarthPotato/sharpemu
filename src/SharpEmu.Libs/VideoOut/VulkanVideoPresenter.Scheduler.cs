@@ -117,11 +117,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        // The image store follows the buffer store; readback of linear images stays off.
+        // The image store follows the buffer store.
         private void CreateImageCache()
         {
             var (memory, _, backing) = RequireGuestMemory("image store");
-            _imageCache = new GuestImageCache(_deviceInfo, _scheduler, memory.Pages, _bufferCache, backing, readbackLinearImages: false);
+            // The guest reads linear GPU-written images back on the CPU (UE's exposure readback
+            // feeds View.PreExposure), so they are published to guest memory after their tick.
+            _imageCache = new GuestImageCache(_deviceInfo, _scheduler, memory.Pages, _bufferCache, backing, readbackLinearImages: true);
             _bufferCache.ImageCache = _imageCache;
             _samplerStore = new SamplerStore(_deviceInfo);
         }
