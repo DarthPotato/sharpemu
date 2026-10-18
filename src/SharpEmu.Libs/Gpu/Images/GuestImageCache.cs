@@ -507,6 +507,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             throw SubmissionScheduler.Fatal($"A texture must be found again before its view is acquired: address=0x{image.Description.Data.Address:X16} registered={image.Registered} proxy={image.DepthOwner.IsValid} rebind={image.Binding.NeedsRebind}.");
         }
 
+        if (hasData)
+        {
+            SynchronizeAliases(imageIdentifier);
+        }
+
         if (request.Role == ImageRole.StorageImage)
         {
             image.MarkGpuModified();
@@ -560,6 +565,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         TouchImage(image);
+        SynchronizeAliases(imageIdentifier);
         image.MarkGpuModified();
         image.Uses.RenderTarget = true;
         TraceVolumeState("color-acquire", image, request);
@@ -614,6 +620,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         TouchImage(image);
+        SynchronizeAliases(imageIdentifier);
         image.MarkGpuModified();
         image.Uses.DepthTarget = true;
         TraceVolumeState("depth-acquire", image, request);

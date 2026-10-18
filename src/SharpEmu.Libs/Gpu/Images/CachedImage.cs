@@ -495,8 +495,13 @@ public sealed unsafe partial class CachedImage : IDisposable
         _gpuModified = true;
         _bufferHoldsGpuContents = false;
         GpuWriteSequence = Interlocked.Increment(ref _gpuWriteCounter);
+        ContentSequence = GpuWriteSequence;
         _guestPieceHashes = null;
     }
+
+    // The GPU write the image contents reflect. A copy from a same-layout alias takes the
+    // source's sequence, so the alias is not copied back while neither image is written again.
+    public long ContentSequence { get; set; }
 
     public void ClearGpuModified() => _gpuModified = false;
 

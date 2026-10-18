@@ -236,6 +236,74 @@ public sealed partial class GuestImageCache
         destination.ClearBufferModified();
     }
 
+    // Two formats of one surface with the same layout are separate images over the same guest
+    // bytes, which the GPU writes through either of them. Before one is used, it copies the
+    // newest GPU contents among them, as unified guest memory would show them (the alias
+    // synchronization of other unified-memory emulators). Depth keeps its reinterpretation path.
+    private void SynchronizeAliases(ResourceSlotIdentifier imageIdentifier)
+    {
+        var image = _slots[imageIdentifier];
+        if (image.Description.IsDepth || ImageDescription.IsEmptyRange(image.Description.Data))
+        {
+            return;
+        }
+
+        var newest = ResourceSlotIdentifier.Invalid;
+        var newestContents = image.ContentSequence;
+        var newestStencil = ResourceSlotIdentifier.Invalid;
+        var newestStencilContents = newestContents;
+        foreach (var aliasIdentifier in FindImagesInRange(image.Description.Data.Address, image.Description.Data.Size, pageOverlap: false))
+        {
+            // A depth image's stencil plane of exactly this span, which the GPU wrote after this
+            // image last changed, is newer than the image (the guest memory under both is stale).
+            if (aliasIdentifier != imageIdentifier && _slots.TryGet(aliasIdentifier) is { DepthOwner.IsValid: true, IsGpuModified: true } plane &&
+                plane.Description.Data == image.Description.Data && plane.ContentSequence > newestStencilContents)
+            {
+                newestStencil = aliasIdentifier;
+                newestStencilContents = plane.ContentSequence;
+            }
+
+            if (aliasIdentifier == imageIdentifier || _slots.TryGet(aliasIdentifier) is not { } alias || !alias.Registered ||
+                alias.DepthOwner.IsValid || !alias.SafeToDownload || alias.ContentSequence <= newestContents ||
+                !IsSameLayoutAlias(image.Description, alias.Description))
+            {
+                continue;
+            }
+
+            newest = aliasIdentifier;
+            newestContents = alias.ContentSequence;
+        }
+
+        if (newestStencil.IsValid && newestStencilContents > newestContents)
+        {
+            // Only an 8-bit single-level image can show the plane; its values come from the owner.
+            var owner = _slots[_slots[newestStencil].DepthOwner];
+            if (image.Backing.Exists && image.Backing.Format == Format.R8Uint && CanWriteBackStencilPlane(owner) &&
+                image.Backing.MipLevels == 1 && image.Backing.Layers == owner.Backing.Layers &&
+                image.Backing.Extent.Width <= owner.Backing.Extent.Width && image.Backing.Extent.Height <= owner.Backing.Extent.Height)
+            {
+                owner.CopyStencilStorage(image, _bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: false);
+                // The copy is newer than guest memory, which a refresh must not paint over it.
+                TakeGpuOwnership(image);
+                image.ContentSequence = newestStencilContents;
+                return;
+            }
+        }
+
+        if (!newest.IsValid)
+        {
+            return;
+        }
+
+        CopyWholeImage(imageIdentifier, newest);
+        image.ContentSequence = newestContents;
+    }
+
+    private static bool IsSameLayoutAlias(in ImageDescription image, in ImageDescription alias) =>
+        !alias.IsDepth && alias.Data == image.Data && SameExtent(alias.Extent, image.Extent) && alias.Type == image.Type &&
+        alias.Samples == image.Samples && alias.BytesPerBlock == image.BytesPerBlock && alias.TileMode == image.TileMode &&
+        alias.Resources == image.Resources && SameMipLayout(alias, image);
+
     // Two sizes of one surface, as a dynamic-resolution title alternates between them.
     private static bool IsResizeSibling(in ImageDescription image, in ImageDescription candidate) =>
         !candidate.IsDepth && candidate.Data.Address == image.Data.Address && candidate.Data.Size != image.Data.Size &&
