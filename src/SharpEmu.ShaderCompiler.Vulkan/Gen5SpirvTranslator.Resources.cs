@@ -26,6 +26,30 @@ public static partial class Gen5SpirvTranslator
         out string error, ref ShaderTranslationProfile.Scope profile)
     {
         shader = default!;
+        if (request.CooperativeWave64Workgroup && (request.Stage != ShaderStage.Compute || request.WaveSize != 64 ||
+            (ulong)request.LocalSizeX * request.LocalSizeY * request.LocalSizeZ is 0 or > 256 ||
+            (request.LocalSizeX * request.LocalSizeY * request.LocalSizeZ) % 64 != 0))
+        {
+            error = "Cooperative wave64 requires a compute workgroup containing one to four complete waves.";
+            return false;
+        }
+
+        if (request.TessellationHull is not null &&
+            (request.Stage != ShaderStage.Compute || !request.CooperativeWave64Workgroup || !request.Bindings.UsesTessellationData))
+        {
+            error = "A merged hull program requires cooperative compute execution and tessellation runtime data.";
+            return false;
+        }
+
+        if (request.Stage == ShaderStage.TessellationEvaluation &&
+            (request.Tessellation is not { } tessellation ||
+             !Enum.IsDefined(tessellation.Domain) || !Enum.IsDefined(tessellation.Spacing) ||
+             tessellation.Spacing == Gen5TessellationSpacing.PowerOfTwo))
+        {
+            error = "Tessellation evaluation requires a supported tessellation configuration; power-of-two partitioning needs factor conversion.";
+            return false;
+        }
+
         try
         {
             BindingLayoutValidator.Validate(
@@ -150,6 +174,7 @@ public static partial class Gen5SpirvTranslator
                 ShaderStage.Vertex => Gen5SpirvStage.Vertex,
                 ShaderStage.Pixel => Gen5SpirvStage.Pixel,
                 ShaderStage.Mesh => Gen5SpirvStage.Mesh,
+                ShaderStage.TessellationEvaluation => Gen5SpirvStage.TessellationEvaluation,
                 _ => Gen5SpirvStage.Compute,
             };
             _pixelOutputBindings = request.PixelOutputs;
@@ -173,6 +198,12 @@ public static partial class Gen5SpirvTranslator
             if (_waveLaneCount == 32)
             {
                 _waveLowering = new NativeWave32Lowering(this);
+            }
+            else if (request.CooperativeWave64Workgroup)
+            {
+                // The waves of a cooperative workgroup run one block at a time through a workgroup
+                // dispatcher and meet at workgroup barriers, which only the emulated lowering models.
+                _waveLowering = new EmulatedWave64Lowering(this);
             }
             else if (request.HostWave64Supported ||
                      (_stage == Gen5SpirvStage.Mesh && request.Mesh?.DeviceSubgroupLaneCount == 64))
@@ -294,12 +325,18 @@ public static partial class Gen5SpirvTranslator
                 _interfaces.Add(_runtimeBufferBiases);
             }
 
-            if (info.UsesDeviceAddresses || _stage == Gen5SpirvStage.Mesh)
+            if (info.UsesDeviceAddresses || _stage == Gen5SpirvStage.Mesh || layout.UsesTessellationData)
             {
                 _module.AddCapability(SpirvCapability.PhysicalStorageBufferAddresses);
                 _module.SetPhysicalStorageBuffer64MemoryModel();
                 _physicalUintPointer = _module.TypePointer(SpirvStorageClass.PhysicalStorageBuffer, _uintType);
             }
+            if (request.TessellationHull is not null)
+            {
+                _tessellationVertexIndexScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _interfaces.Add(_tessellationVertexIndexScratch);
+            }
+
             if (info.UsesDeviceAddresses)
             {
                 var privateUlongPointer = _module.TypePointer(SpirvStorageClass.Private, _ulongType);

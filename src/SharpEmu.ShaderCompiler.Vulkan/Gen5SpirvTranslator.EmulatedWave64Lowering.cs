@@ -29,6 +29,10 @@ public static partial class Gen5SpirvTranslator
             // barrier, which other waves (possibly in other blocks) would never reach.
             private readonly uint _waveCount;
             private readonly bool _multiWave;
+            // The waves of a cooperative workgroup (a merged tessellation hull) run one block at a
+            // time through the workgroup dispatcher, so they meet at plain workgroup barriers and keep
+            // their exchange areas in a workgroup array of their own.
+            private readonly bool _cooperative;
             private readonly uint _waveStride;
             private uint _rendezvousEpoch;
             private Ir.Gen5Wave64HalfMaskPlan? _halfMaskPlan;
@@ -44,7 +48,8 @@ public static partial class Gen5SpirvTranslator
                 _context = context;
                 var threads = (ulong)context._localSizeX * context._localSizeY * context._localSizeZ;
                 _waveCount = (uint)Math.Max((threads + GuestWaveLaneCount - 1) / GuestWaveLaneCount, 1);
-                _multiWave = _waveCount > 1;
+                _cooperative = context._request.CooperativeWave64Workgroup;
+                _multiWave = _waveCount > 1 && !_cooperative;
                 _waveStride = _multiWave ? ExchangeDwordCount + 1 : ExchangeDwordCount;
             }
 
@@ -55,7 +60,7 @@ public static partial class Gen5SpirvTranslator
             private bool UsesExchange => _context.UsesSubgroupOperations();
 
             public uint ReserveLdsDwords(uint guestDwordCount) =>
-                UsesExchange && guestDwordCount < LdsDwordCount
+                UsesExchange && !_cooperative && guestDwordCount < LdsDwordCount
                     ? guestDwordCount + ExchangeTotalDwords
                     : guestDwordCount;
 
@@ -67,7 +72,7 @@ public static partial class Gen5SpirvTranslator
                     return;
                 }
 
-                if (context._lds != 0 && context._stage != Gen5SpirvStage.Mesh)
+                if (context._lds != 0 && context._stage != Gen5SpirvStage.Mesh && !_cooperative)
                 {
                     // Metal exposes 32 KiB of threadgroup memory on the Apple
                     // GPUs we target. Reuse the tail of guest LDS so the
@@ -90,6 +95,10 @@ public static partial class Gen5SpirvTranslator
                 _exchangeOffset = 0;
                 context._module.AddName(_exchange, "wave64Exchange");
                 context._interfaces.Add(_exchange);
+                if (_cooperative)
+                {
+                    context.DeclareCooperativeWaveScratch();
+                }
             }
 
             public void DeclareFunctionResources()
@@ -282,6 +291,9 @@ public static partial class Gen5SpirvTranslator
                     lowerValue);
             }
 
+            // The element pointer type of the workgroup array holding the exchange areas.
+            internal uint ExchangeElementPointer => _exchangeElementPointer;
+
             public uint BroadcastLane(uint value, uint lane) =>
                 ExchangeValue(
                     _context._module.AddInstruction(
@@ -393,7 +405,7 @@ public static partial class Gen5SpirvTranslator
             private uint WaveExchangeBase()
             {
                 var context = _context;
-                if (!_multiWave)
+                if (!_multiWave && !_cooperative)
                 {
                     return context.UInt(_exchangeOffset);
                 }
