@@ -92,8 +92,11 @@ public sealed unsafe partial class CachedImage
             };
         }
 
-        // Depth values must not be interpolated, and Vulkan forbids a filtered depth blit.
-        var filter = (aspect & ImageAspectFlags.DepthBit) != 0 ? Filter.Nearest : Filter.Linear;
+        // Depth values must not be interpolated, and Vulkan forbids a filtered depth blit. Nor
+        // may a format without linear filtering (integer formats such as R8_UINT) blit linearly.
+        var linearFilterable = (_device.GetFormatProperties(source.Backing.Format).OptimalTilingFeatures &
+            FormatFeatureFlags.SampledImageFilterLinearBit) != 0;
+        var filter = (aspect & ImageAspectFlags.DepthBit) != 0 || !linearFilterable ? Filter.Nearest : Filter.Linear;
         fixed (ImageBlit* blits = regions)
         {
             _device.Vk.CmdBlitImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal,
