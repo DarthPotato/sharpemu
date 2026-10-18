@@ -250,7 +250,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false,
-        ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0)
+        ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool requiresDeviceAddress = false)
     {
         CompleteGuestPublications?.Invoke(guestAddress, size, isWritten ? PublicationAccess.Write : PublicationAccess.OverlaidRead);
         if (isWritten && ImageClearTrace.Enabled) ImageCache?.TraceGuestWrite("shader-buffer-write", guestAddress, size, shaderHash: traceShaderHash);
@@ -269,7 +269,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             RequireImageCache().InvalidateMemoryFromGpu(guestAddress, size);
         }
 
-        if (!isWritten &&
+        // A caller that needs a physical address cannot take the transient stream copy.
+        if (!requiresDeviceAddress && !isWritten &&
             !_tracker.HasGpuDirtyPages(guestAddress, size) &&
             _tracker.HasCpuDirtyPages(guestAddress, size) &&
             (size <= CachingPageSize || (!isTexelBuffer && _tracker.IsCpuWriteHotRange(guestAddress, size))))

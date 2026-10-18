@@ -29,6 +29,7 @@ public sealed record ShaderSource(RegisteredShader Registered, ulong Hash, uint[
         ShaderStage.Vertex => "vertex",
         ShaderStage.Pixel => "pixel",
         ShaderStage.Mesh => "mesh",
+        ShaderStage.TessellationEvaluation => "domain",
         _ => "compute",
     };
 }
@@ -46,6 +47,8 @@ public sealed class StageCompileOptions
     public ComputeInputInfo? ComputeInfo { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
     public MeshDrawConfiguration? MeshInfo { get; init; }
+    public Gen5TessellationInfo? Tessellation { get; init; }
+    public Gen5TessellationHullInfo? TessellationHull { get; init; }
 }
 
 // The key of a program entry: what the emitter reads besides the resource specialization.
@@ -193,6 +196,24 @@ internal sealed class ShaderProgramCache
     public int ProgramCount => _programs.Count;
 
     public IEnumerable<ProgramSourceEntry> Entries => _programs.Values.Concat(_linkedPrograms.Values);
+
+    private readonly Dictionary<(BindingLayout Layout, Gen5TessellationDomain Domain), (ShaderProgram Vertex, ShaderProgram Control)> _tessellationBridges = [];
+
+    // The fixed-function control stage beside a domain stage, and the vertex stage a tessellated pipeline requires.
+    public (ShaderProgram Vertex, ShaderProgram Control) GetTessellationBridge(BindingLayout layout, Gen5TessellationDomain domain)
+    {
+        if (_tessellationBridges.TryGetValue((layout, domain), out var bridge)) return bridge;
+        var shaders = _compiler.CompileTessellationBridge(layout, domain);
+        ShaderProgram Create(IGuestCompiledShader shader, ShaderStage stage)
+        {
+            var id = ++_nextProgramId;
+            return new(id, _host.CreateShaderModule(shader, stage, 0, id));
+        }
+
+        bridge = (Create(shaders.Vertex, ShaderStage.Vertex), Create(shaders.Control, ShaderStage.TessellationEvaluation));
+        _tessellationBridges.Add((layout, domain), bridge);
+        return bridge;
+    }
 
     // The decoded instructions of a program, shared by every static variant of the same code.
     public Gen5ShaderProgram Decode(ShaderSource source)
@@ -402,7 +423,7 @@ internal sealed class ShaderProgramCache
             foreach (var candidate in entry.Permutations)
             {
                 var layout = candidate.Bindings;
-                if (layout.PushDataStartDword == PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount) && candidate.Specialization.Equals(specialization))
+                if (layout.PushDataStartDword == (layout.UsesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount)) && candidate.Specialization.Equals(specialization))
                 {
                     stage = CreateStageResources(candidate.Program, snapshot, source, options);
                     layout.AdvancePushData(ref pushDataCursor);
@@ -451,6 +472,7 @@ internal sealed class ShaderProgramCache
         switch (stage)
         {
             case ShaderStage.Vertex:
+            case ShaderStage.TessellationEvaluation:
                 StageStaticKey.Build(options.VertexInfo ?? throw new ArgumentException("The vertex lookup has no vertex input info."), options.RequiredVertexOutputCount, _staticState);
                 break;
             case ShaderStage.Pixel:
@@ -473,12 +495,34 @@ internal sealed class ShaderProgramCache
                 StageStaticKey.Build(options.ComputeInfo ?? throw new ArgumentException("The compute lookup has no compute input info."), _staticState);
                 break;
         }
+
+        if (options.Tessellation is { } tessellation)
+        {
+            _staticState.Add((uint)tessellation.Domain);
+            _staticState.Add((uint)tessellation.Spacing);
+            _staticState.Add(tessellation.PointMode ? 1u : 0);
+            _staticState.Add(tessellation.Clockwise ? 1u : 0);
+        }
+
+        if (options.TessellationHull is { } hull)
+        {
+            _staticState.Add(hull.InputControlPoints);
+            _staticState.Add(hull.OutputControlPoints);
+            _staticState.Add(hull.PatchesPerGroup);
+            _staticState.Add(hull.HullEntryPc);
+        }
     }
 
     private ProgramSourceEntry CreateEntry(ShaderSource source, StageCompileOptions options)
     {
         using var planningScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPlanning);
         var program = Decode(source);
+        if (options.TessellationHull is not null)
+        {
+            program = Gen5TessellationLowering.PrepareMergedHull(program,
+                checked(source.UserDataBase + (uint)source.UserData.Length - 2));
+        }
+
         var dumpPlanning = CompiledShaderDump.ShouldWrite(source.Address, source.Hash);
         if (dumpPlanning) ShaderPlanningDump.WriteInput(source, program);
         EmbeddedVertexFetchPlan? fetch = null;
@@ -705,7 +749,8 @@ internal sealed class ShaderProgramCache
             layout = AllocateLayout(program, plan, resources, source.UserDataBase, (uint)source.UserData.Length, pushDataCursor,
                 source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions, source.Stage,
                 usesObjectId: source.Stage == ShaderStage.Pixel && options.PixelOutputs.Any(static output => output.ObjectPrimitiveId),
-                usesMeshDrawParameters: source.Stage == ShaderStage.Mesh);
+                usesMeshDrawParameters: source.Stage == ShaderStage.Mesh,
+                usesTessellationData: options.Tessellation is not null || options.TessellationHull is not null);
         }
         catch (ResourcePlanException exception)
         {
@@ -818,7 +863,7 @@ internal sealed class ShaderProgramCache
         var id = ++_nextProgramId;
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
         var info = CreateProgramInfo(source, entry, resources, layout, request, compiled.InputLocationMask);
-        if (source.Stage == ShaderStage.Compute &&
+        if (source.Stage == ShaderStage.Compute && options.TessellationHull is null &&
             _host.ShaderPrewarm is { } prewarm &&
             _codeCaptures.TryGetValue((source.Hash, source.CodeSize, source.ContinuationAddressOffset), out var capture))
         {
@@ -859,15 +904,17 @@ internal sealed class ShaderProgramCache
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
+            case ShaderStage.TessellationEvaluation:
             {
                 var info = options.VertexInfo!;
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
                     WaveSize = 32,
+                    Tessellation = options.Tessellation,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     IeeeMode = info.IeeeMode,
                     ScratchDwords = info.ScratchDwords,
-                    EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
+                    EnableGraphicsSubgroupOperations = source.Stage != ShaderStage.TessellationEvaluation && enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
@@ -943,13 +990,13 @@ internal sealed class ShaderProgramCache
             default:
                 return BuildComputeRequest(entry.Plan, resources, layout, options.ComputeInfo!, options.ComputeSystemRegisters,
                     sharedInt64Atomics, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve, _host.ComputeWave64SubgroupNative,
-                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!));
+                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!), options.TessellationHull);
         }
     }
 
     private static BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
         uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, ShaderStage stage,
-        bool usesObjectId = false, bool usesMeshDrawParameters = false) =>
+        bool usesObjectId = false, bool usesMeshDrawParameters = false, bool usesTessellationData = false) =>
         BindingLayout.Allocate(
             resources.Info,
             BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount, plan.Graph.ExcludedUserDataRegisters),
@@ -959,14 +1006,19 @@ internal sealed class ShaderProgramCache
             pushDataCursor,
             usesDispatchThreadLimits: usesDispatchThreadLimits,
             usesObjectId: usesObjectId,
-            usesMeshDrawParameters: usesMeshDrawParameters);
+            usesMeshDrawParameters: usesMeshDrawParameters,
+            usesTessellationData: usesTessellationData);
 
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool execGuardElision,
-        bool signedZeroInfNanPreserve, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false) =>
+        bool signedZeroInfNanPreserve, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
+        Gen5TessellationHullInfo? tessellationHull = null) =>
         new(plan, resources, layout)
         {
             WaveSize = info.WaveSize,
+            TessellationHull = tessellationHull,
+            // The waves of a merged hull branch independently inside one workgroup.
+            CooperativeWave64Workgroup = tessellationHull is not null,
             HostWave64Supported = info.WaveSize == 64 && hostWave64Supported,
             HostComputeSubgroup32 = info.WaveSize == 64 && !hostWave64Supported && hostComputeSubgroup32,
             EnableExecGuardElision = info.WaveSize != 64 || execGuardElision,
@@ -1136,9 +1188,12 @@ internal sealed class ShaderProgramCache
                 ShaderStage.Vertex => ShaderStageKind.Vertex,
                 ShaderStage.Pixel => ShaderStageKind.Pixel,
                 ShaderStage.Mesh => ShaderStageKind.Mesh,
+                ShaderStage.TessellationEvaluation => ShaderStageKind.TessellationEvaluation,
                 _ => ShaderStageKind.Compute,
             },
             Hash = source.Hash,
+            TessellationFactorBuffer = request.TessellationHull is { } hull
+                ? checked((int)Gen5TessellationLowering.FindFactorBuffer(entry.Plan, hull.HullEntryPc)) : -1,
             UserDataBase = source.UserDataBase,
             UserDataCount = (uint)source.UserData.Length,
             ParameterExportMask = entry.Program.ParameterExportMask,

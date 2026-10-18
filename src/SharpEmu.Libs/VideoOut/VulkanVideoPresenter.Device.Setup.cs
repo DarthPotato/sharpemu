@@ -841,6 +841,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _supportsPreciseOcclusion = supportedFeatures.OcclusionQueryPrecise;
             var enabledFeatures = new PhysicalDeviceFeatures
             {
+                TessellationShader = supportedFeatures.TessellationShader,
                 DepthBounds = supportedFeatures.DepthBounds,
                 GeometryShader = supportedFeatures.GeometryShader,
                 OcclusionQueryPrecise = supportedFeatures.OcclusionQueryPrecise,

@@ -11,6 +11,7 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 // Everything a host pipeline creation reads for one graphics pipeline.
 public sealed class GraphicsPipelineDescription
 {
+    public TessellationPipelineStages? Tessellation { get; init; }
     public required PipelineRenderingState Rendering { get; init; }
     public required PipelineVertexInputState VertexInput { get; init; }
     public required VertexInputInfo VertexInfo { get; init; }
@@ -21,6 +22,8 @@ public sealed class GraphicsPipelineDescription
     public ShaderProgramInfo? PixelStage { get; init; }
     public required PipelineStaticParameters StaticParameters { get; init; }
 }
+
+public sealed record TessellationPipelineStages(ShaderProgram Control, ShaderProgram Evaluation, uint InputControlPoints);
 
 public sealed class ComputePipelineDescription
 {

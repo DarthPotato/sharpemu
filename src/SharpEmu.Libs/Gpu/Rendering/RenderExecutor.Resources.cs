@@ -483,6 +483,11 @@ public sealed partial class RenderExecutor
                 MeshDrawTrace.Recorded();
             }
         }
+        else if (state.Programs.Tessellation is not null)
+        {
+            // A batch of whole patches: the control points come from the guest rings, not from vertex buffers.
+            _host.Draw(draw.Count, 1, 0, 0);
+        }
         else if (emission.IndirectArgumentsAddress != 0)
         {
             // Uploads and shader writes end with barriers to all commands, so the
@@ -503,7 +508,8 @@ public sealed partial class RenderExecutor
         var writeStages = PipelineStageFlags.None;
         if (HasBufferWrites(vertexInput.Stage))
         {
-            writeStages |= meshInput is null ? PipelineStageFlags.VertexShaderBit : PipelineStageFlags.MeshShaderBitExt;
+            writeStages |= meshInput is not null ? PipelineStageFlags.MeshShaderBitExt
+                : vertexInput.Tessellation is null ? PipelineStageFlags.VertexShaderBit : PipelineStageFlags.TessellationEvaluationShaderBit;
         }
 
         if (state.PixelActive && HasBufferWrites(pixelInput.Stage))

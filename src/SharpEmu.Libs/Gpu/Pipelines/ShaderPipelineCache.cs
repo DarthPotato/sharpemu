@@ -174,11 +174,25 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         MeshDrawConfiguration? mesh)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        var tessellated = mesh is null && IsMergedTessellationMask(context.ShaderStages);
+        Gen5TessellationInfo? tessellation = null;
+        if (tessellated)
+        {
+            if (!Gen5TessellationInfo.TryDecode(shaderInterface.TessellationFactorParameter, out var configuration, out var tessellationError))
+            {
+                throw SubmissionScheduler.Fatal(tessellationError);
+            }
+
+            tessellation = configuration;
+        }
+
         var vertexSource = PrepareSource(
-            vertex.ExportAddress, mesh is null ? ShaderStage.Vertex : ShaderStage.Mesh,
-            mesh is null ? "vertex" : "mesh", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
+            vertex.ExportAddress, tessellated ? ShaderStage.TessellationEvaluation : mesh is null ? ShaderStage.Vertex : ShaderStage.Mesh,
+            tessellated ? "domain" : mesh is null ? "vertex" : "mesh", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
             probeWrittenRegisters: true, VertexUserDataBase, vertex.GeometryUserDataAddress);
-        var vertexInfo = mesh is null ? PrepareVertexInput(vertexSource, shaderInterface, context) : new VertexInputInfo();
+        // A domain stage reads its control points from the guest rings, so it has no vertex input to resolve.
+        var vertexInfo = tessellated ? new VertexInputInfo { PositionExportControl = shaderInterface.VertexOutputControl }
+            : mesh is null ? PrepareVertexInput(vertexSource, shaderInterface, context) : new VertexInputInfo();
         vertexInfo.IeeeMode = vertex.GeometryResource1.IeeeMode;
         ShaderSource? pixelSource = null;
         PixelInputInfo? pixelInfo = null;
@@ -248,7 +262,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             if (!TryPrepareProgram(
                 vertexSource,
                 mesh is null
-                    ? new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount }
+                    ? new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount, Tessellation = tessellation }
                     : new StageCompileOptions
                     {
                         MeshInfo = mesh, RequiredVertexOutputCount = (int)attributeCount,
@@ -266,9 +280,27 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             pixelInfo.Stage = pixelStage;
         }
 
+        TessellationDrawPrograms? tessellationPrograms = null;
+        if (tessellated)
+        {
+            lock (_gate)
+            {
+                tessellationPrograms = PrepareTessellationHull(vertex, shaderInterface, tessellation!.Value);
+                var bridge = _programs.GetTessellationBridge(vertexStage.Program!.Bindings!, tessellation.Value.Domain);
+                vertexInfo = new VertexInputInfo
+                {
+                    PositionExportControl = vertexInfo.PositionExportControl,
+                    IeeeMode = vertexInfo.IeeeMode,
+                    Stage = vertexStage,
+                    Tessellation = new(bridge.Control, vertexProgram, tessellationPrograms.HullConfiguration.InputControlPoints),
+                };
+                vertexProgram = bridge.Vertex;
+            }
+        }
+
         SolidColorClear? solidClear = null;
         var disableBlending = false;
-        if (mesh is null && pixelInfo is not null)
+        if (mesh is null && pixelInfo is not null && !tessellated)
         {
             var vertexProgramWords = _programs.Decode(vertexSource);
             var pixelProgramWords = _programs.Decode(pixelSource!);
@@ -286,6 +318,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return new GraphicsPrograms
         {
             Vertex = vertexProgram,
+            Tessellation = tessellationPrograms,
             Pixel = pixelProgramHandle,
             VertexInput = vertexInfo,
             MeshInput = mesh,
@@ -768,6 +801,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts, lookup.Rendering, lookup.StaticParameters, lookup.VertexInput);
         lookup.VertexProgramId = vertexProgram.Id;
         lookup.PixelProgramId = pixelInput is not null ? pixelProgram.Id : 0;
+        lookup.Tessellation = vertexInput.Tessellation;
         lock (_pipelineGate)
         {
             if (_graphicsPipelines.TryGetValue(lookup, out var cached))
@@ -833,6 +867,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             primitiveRestartEnabled, disableBlending, vertexProgram, pixelProgram, noAttachmentSampleCounts, renderingState, parameters, vertexState);
         return new GraphicsPipelineDescription
         {
+            Tessellation = vertexInput.Tessellation,
             Rendering = renderingState,
             VertexInput = vertexState,
             VertexInfo = vertexInput,
@@ -939,7 +974,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
 
         var depthState = withDepth ? depth.Target.State : default;
-        var rectangleList = topology == PrimitiveTopology.PatchList;
+        // A patch list without tessellation stages carries legacy rectangles, which are never
+        // culled. Tessellated patches rasterize as ordinary triangles and keep the guest's culling.
+        var rectangleList = topology == PrimitiveTopology.PatchList && vertexInput.Tessellation is null;
         var mode = context.RasterMode;
         parameters.NegativeOneToOne = !context.Clip.DirectXClipSpace;
         parameters.DepthClipEnable = context.Clip.IsZClipEnabled;
@@ -984,6 +1021,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         Rendering = description.Rendering,
         VertexProgramId = description.VertexProgram.Id,
         PixelProgramId = description.PixelInfo is not null ? description.PixelProgram.Id : 0,
+        Tessellation = description.Tessellation,
         VertexInput = description.VertexInput,
         StaticParameters = description.StaticParameters,
     };

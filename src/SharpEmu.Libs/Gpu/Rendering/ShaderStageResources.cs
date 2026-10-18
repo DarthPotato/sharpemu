@@ -3,6 +3,7 @@
 
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
 
@@ -15,6 +16,7 @@ public enum ShaderStageKind
     Pixel,
     Compute,
     Mesh,
+    TessellationEvaluation,
 }
 
 public enum ImageResourceClass : byte
@@ -43,6 +45,7 @@ public class ShaderProgramInfo
     public const int NoScalarRegister = -1;
 
     public ShaderStageKind Stage { get; init; }
+    public int TessellationFactorBuffer { get; init; } = -1;
     public ulong Hash { get; init; }
     public uint UserDataBase { get; init; }
     public uint UserDataCount { get; init; }
@@ -98,6 +101,20 @@ public readonly record struct ShaderStageResources(ShaderProgramInfo? Program, R
     }
 
     public MeshDrawParameters? MeshDraw { get; init; }
+
+    public uint[]? TessellationData { get; init; }
+
+    public void WriteTessellationData(Span<uint> shaderData)
+    {
+        if (Program?.Bindings is not { UsesTessellationData: true } layout) return;
+        if (TessellationData is not { Length: (int)Gen5TessellationData.DwordCount } data ||
+            shaderData.Length != layout.ShaderDataDwordCount)
+        {
+            throw SubmissionScheduler.Fatal("The tessellation stage has missing runtime data or invalid shader data.");
+        }
+
+        data.CopyTo(shaderData[(int)layout.TessellationDataDword..]);
+    }
 
     public void WriteDispatchThreadLimits(Span<uint> shaderData)
     {
@@ -168,6 +185,7 @@ public readonly record struct ClipSpaceTransform(
 
 public sealed class VertexInputInfo
 {
+    public Pipelines.TessellationPipelineStages? Tessellation { get; init; }
     public const int MaxBuffers = 32;
 
     public VertexInputBuffer[] Buffers { get; init; } = [];

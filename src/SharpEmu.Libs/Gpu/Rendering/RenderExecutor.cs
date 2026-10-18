@@ -7,6 +7,7 @@ using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.VideoOut;
+using SharpEmu.ShaderCompiler;
 using Silk.NET.Vulkan;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
 
@@ -49,6 +50,7 @@ public sealed partial class RenderExecutor
         (stages & ~VgtShaderStagesWaveSizeBits) is 0x02002000 or 0x00002000 or 0x00002030;
     private const uint MaxOutputPerSubgroupLimit = 0x40;
     private static int _geometryWarningShown;
+    private static int _tessellationWarningShown;
 
     private readonly IRenderHost _host;
     private readonly IShaderPipelineProvider _pipelines;
@@ -251,6 +253,17 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        if (Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages))
+        {
+            if (IsSupportedTessellation(banks))
+            {
+                DrawTessellationIndexed(submitId, banks, arguments);
+            }
+
+            TraceDisposition("tessellation");
+            return;
+        }
+
         if (!HasValidVertexShader(shader))
         {
             TraceDisposition("missing-vertex-shader");
@@ -407,6 +420,19 @@ public sealed partial class RenderExecutor
         {
             TraceDrawTargets(banks, "metadata-operation");
             _host.ResetBindings();
+            return;
+        }
+
+        if (Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages))
+        {
+            var tessellationVertexOffset = unchecked((int)arguments.FirstVertex +
+                (arguments.OffsetSource == DrawOffsetSource.IndirectArguments ? 0 : (int)userConfig.IndexOffset));
+            if (IsSupportedTessellation(banks))
+            {
+                DrawTessellation(submitId, banks, arguments.VertexCount, arguments.InstanceCount, 0, 0, tessellationVertexOffset, arguments.FirstInstance);
+            }
+
+            TraceDrawTargets(banks, "tessellation");
             return;
         }
 
@@ -597,6 +623,40 @@ public sealed partial class RenderExecutor
     }
 
     private static bool IsKnownGeometryOutputPrimitiveType(uint value) => value <= 4;
+
+    // A tessellation configuration the bridge cannot express skips the draw, as an
+    // unsupported geometry stage does, instead of stopping the emulator.
+    private static bool IsSupportedTessellation(RegisterBanks banks)
+    {
+        var shaderInterface = banks.Context.ShaderInterface;
+        string? error = null;
+        if (!Gen5TessellationInfo.TryDecode(shaderInterface.TessellationFactorParameter, out var tessellation, out var factorError))
+        {
+            error = factorError;
+        }
+        else if (tessellation.Spacing == Gen5TessellationSpacing.PowerOfTwo)
+        {
+            error = "power-of-two partitioning needs factor conversion";
+        }
+        else if (!Gen5TessellationHullInfo.TryDecode(shaderInterface.LocalHullConfiguration, 0, out _, out var hullError))
+        {
+            error = hullError;
+        }
+
+        if (error is null)
+        {
+            return true;
+        }
+
+        if (Interlocked.Exchange(ref _tessellationWarningShown, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"Warning: the title uses an unsupported tessellation configuration; those draw calls are skipped. {error} " +
+                $"tf_param=0x{shaderInterface.TessellationFactorParameter:X8} ls_hs_config=0x{shaderInterface.LocalHullConfiguration:X8}");
+        }
+
+        return false;
+    }
 
     private bool IsUnsupportedGeometryStage(RegisterBanks banks, bool autoDraw)
     {
