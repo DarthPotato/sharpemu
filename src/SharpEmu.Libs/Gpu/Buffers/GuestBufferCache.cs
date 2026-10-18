@@ -44,6 +44,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly IGpuQueueRelay _relay;
     private readonly GuestBufferUploader _uploader;
     private readonly IGuestBackedSpace _backing;
+    private readonly ICpuMemory _guest;
+
+    // False for addresses the guest never mapped. A shader that follows a bad pointer there
+    // reads zeros, as on the console; caching that memory only fills VRAM with junk buffers.
+    internal bool IsGuestMemoryMapped(ulong guestAddress, ulong size) => _guest.CanRead(guestAddress, size);
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
     private readonly GpuBuffer _bdaPageTable;
@@ -73,6 +78,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _scheduler = scheduler;
         _relay = relay;
         _backing = backing;
+        _guest = guest;
         _faults = new BdaFaultProcessor(device, scheduler, this, CachingPageBits, CachingPageCount);
         _gds = new GpuBuffer(device, scheduler, GpuBufferUsage.Stream, 0, GpuBuffer.AllFlags, GdsBufferSize);
         _bdaPageTable = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, BdaPageTableSize);
@@ -978,6 +984,58 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private ulong _bdaTouchTick = ulong.MaxValue;
     private ulong _bdaTouchMapping;
 
+    // Ranges shaders reached through device addresses outside the GPU mappings: pointers
+    // into ordinary guest memory, which the GPU reads too. Only a fault reveals them, so
+    // they are kept and touched like the mappings. Otherwise their buffers age out while
+    // still in use, fault again, and the cache collects and re-creates them every frame.
+    private readonly SpanSet _deviceAddressFaultSpans = new();
+
+    // Fault ranges inside a known guest mapping; they are forgotten once it is unmapped.
+    private readonly SpanSet _mappedDeviceAddressFaultSpans = new();
+
+    internal void NoteDeviceAddressFault(ulong guestAddress, ulong size, bool insideGuestMapping = false)
+    {
+        _deviceAddressFaultSpans.Add(guestAddress, size);
+        if (insideGuestMapping)
+            _mappedDeviceAddressFaultSpans.Add(guestAddress, size);
+    }
+
+    // A guest buffer the GPU reads through pointers (a per-frame ring, for one) is reached a
+    // page at a time, and every first touch reads zeros for that frame. A fault therefore
+    // brings in the aligned window around it, clipped to the guest mapping that holds it.
+    internal const ulong DeviceAddressFaultWindow = 2UL << 20;
+
+    internal static GuestSpan DeviceAddressFaultSpan(ulong pageAddress, ulong pageSize, ulong mappingStart, ulong mappingLength)
+    {
+        if (mappingLength == 0 || pageAddress < mappingStart || pageAddress - mappingStart >= mappingLength)
+        {
+            return new GuestSpan(pageAddress, pageSize);
+        }
+
+        var mappingEnd = mappingStart + mappingLength;
+        var windowStart = Math.Max(pageAddress & ~(DeviceAddressFaultWindow - 1), mappingStart);
+        var windowEnd = Math.Min((pageAddress & ~(DeviceAddressFaultWindow - 1)) + DeviceAddressFaultWindow, mappingEnd);
+        return new GuestSpan(windowStart, windowEnd - windowStart);
+    }
+
+    // Forgets fault ranges whose guest mapping is gone, so their buffers can age out again.
+    private void PruneUnmappedDeviceAddressFaults()
+    {
+        List<GuestSpan>? unmapped = null;
+        _mappedDeviceAddressFaultSpans.ForEach((start, size) =>
+        {
+            if (!KernelMemoryCompatExports.TryGetMappedRange(start, out var mappingStart, out var mappingLength) ||
+                start + size > mappingStart + mappingLength)
+                (unmapped ??= []).Add(new GuestSpan(start, size));
+        });
+        if (unmapped is null) return;
+        foreach (var span in unmapped)
+        {
+            _mappedDeviceAddressFaultSpans.Remove(span.Address, span.Size);
+            _deviceAddressFaultSpans.Remove(span.Address, span.Size);
+        }
+    }
+
     public static ulong MappingKey(IReadOnlyCollection<GuestSpan> spans)
     {
         var mapping = (ulong)spans.Count;
@@ -1012,6 +1070,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             {
                 foreach (var span in spans)
                     TouchBuffersInRange(span.Address, span.Size);
+                PruneUnmappedDeviceAddressFaults();
+                _deviceAddressFaultSpans.ForEach(_touchBuffersInRange ??= TouchBuffersInRange);
                 _bdaTouchTick = _retirementPolicy.CurrentTick;
                 _bdaTouchMapping = mapping;
             }
@@ -1033,6 +1093,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private Action<ulong, ulong>? _uploadDirtyBuffersInRange;
+    private Action<ulong, ulong>? _touchBuffersInRange;
     private long _bdaSweepEpoch = -1;
     private ulong _bdaSweepMapping;
 

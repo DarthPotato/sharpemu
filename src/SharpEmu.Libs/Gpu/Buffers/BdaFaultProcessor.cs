@@ -4,6 +4,7 @@
 using System.Runtime.InteropServices;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.Libs.Kernel;
 using SharpEmu.ShaderCompiler.Vulkan;
 using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Vulkan;
@@ -265,7 +266,17 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             var count = Math.Min((uint)faults[0], MaxPageFaults - 1);
             for (var index = 1; index <= count; index++)
             {
-                _faultRanges.Add(faults[index], _pageSize);
+                var insideMapping = KernelMemoryCompatExports.TryGetMappedRange(faults[index], out var mappingStart, out var mappingLength);
+                if (!insideMapping && !_cache.IsGuestMemoryMapped(faults[index], _pageSize))
+                {
+                    continue;
+                }
+
+                var window = insideMapping
+                    ? GuestBufferCache.DeviceAddressFaultSpan(faults[index], _pageSize, mappingStart, mappingLength)
+                    : new GuestSpan(faults[index], _pageSize);
+                _faultRanges.Add(window.Address, window.Size);
+                _cache.NoteDeviceAddressFault(window.Address, window.Size, insideMapping);
                 GuestGpuMemoryHook.SelectDeviceFaultTracePage(faults[index]);
                 if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(faults[index], _pageSize))
                     SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(faults[index], _pageSize,
