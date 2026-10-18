@@ -694,10 +694,10 @@ public sealed class RenderExecutorStateTests : IDisposable
         AssertOrder(
             "preparation_begin",
             "prepare_bindings Vertex",
-            "bind_resources 2",
-            "upload_transient 6 align=16",
             "wrap_refused acquire_color",
             "acquire_color 0",
+            "bind_resources 2",
+            "upload_transient 6 align=16",
             "commit Graphics",
             "draw_indexed 3 1 0 0 0",
             "preparation_end",

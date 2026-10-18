@@ -398,6 +398,9 @@ internal static unsafe partial class VulkanVideoPresenter
             return address;
         }
 
+        public void PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges) =>
+            _bufferCache.PrepareBufferAllocations(ranges);
+
         public BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten)
         {
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, isWritten);

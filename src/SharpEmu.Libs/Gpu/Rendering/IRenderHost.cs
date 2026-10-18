@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -124,6 +125,9 @@ public interface IRenderHost
     void TransitionDepthAttachment(in DepthAttachmentState depth, ImageLayout layout, ImageAspectFlags writeAspects);
 
     BufferBinding NullBuffer { get; }
+
+    // Finishes the buffer allocation merges these ranges can trigger, before any of them is obtained.
+    void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges);
 
     BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten);
 

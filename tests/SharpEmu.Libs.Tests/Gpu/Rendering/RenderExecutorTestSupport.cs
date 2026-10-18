@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.GpuCommands;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
@@ -259,9 +260,8 @@ internal sealed class RecordingRenderHost : IRenderHost
         Calls.Add($"cpu_write {address:X} {data.Length:X}");
     }
 
-    public BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten)
+    private Allocation ResolveAllocation(ulong address, ulong size)
     {
-        TryWrapRing("obtain");
         var end = address + size;
         var owner = _allocations.Find(a => !a.Deleted && a.Start <= address && end <= a.End);
         if (owner is null)
@@ -284,6 +284,27 @@ internal sealed class RecordingRenderHost : IRenderHost
             _allocations.Add(owner);
         }
 
+        return owner;
+    }
+
+    public void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges)
+    {
+        for (var index = 0; index < ranges.Length; index++)
+        {
+            var range = ranges[index];
+            var overlaps = _allocations.Any(allocation => !allocation.Deleted &&
+                allocation.Start < range.End && range.Address < allocation.End);
+            for (var other = 0; !overlaps && other < ranges.Length; other++)
+                overlaps = other != index && ranges[other].Address < range.End && range.Address < ranges[other].End;
+            if (overlaps) _ = ResolveAllocation(range.Address, range.Size);
+        }
+    }
+
+    public BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten)
+    {
+        TryWrapRing("obtain");
+        var owner = ResolveAllocation(address, size);
+        var end = address + size;
         for (var page = address & ~(PageSize - 1); page < end; page += PageSize)
         {
             if (_dirtyPages.Remove(page))

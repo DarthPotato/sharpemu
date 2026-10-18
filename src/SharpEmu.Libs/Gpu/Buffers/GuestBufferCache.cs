@@ -208,6 +208,41 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return CreateBuffer(guestAddress, size);
     }
 
+    // Resolves every allocation merge the ranges can trigger, so a draw does not capture a buffer
+    // handle that a later acquisition of the same draw replaces.
+    public void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges)
+    {
+        // Draws have few ranges; keep that common case off the managed heap.
+        Span<GuestSpan> pages = ranges.Length <= 64 ? stackalloc GuestSpan[ranges.Length] : new GuestSpan[ranges.Length];
+        for (var index = 0; index < ranges.Length; index++)
+        {
+            var range = ranges[index];
+            if (!IsValidRange(range.Address, range.Size) ||
+                !PageOwnerTable.TryGetPageRange(range.Address, range.Size, out var first, out var end))
+                throw SubmissionScheduler.Fatal($"The prepared buffer allocation range is invalid: address=0x{range.Address:X16} size=0x{range.Size:X16}.");
+            pages[index] = new GuestSpan(first * CachingPageSize, (end - first) * CachingPageSize);
+        }
+        pages.Sort(static (left, right) => left.Address.CompareTo(right.Address));
+
+        for (var index = 0; index < pages.Length;)
+        {
+            var range = pages[index];
+            var next = index + 1;
+            // AcquireVertexBuffers also coalesces touching byte ranges. Reserve their
+            // whole union now, so its later acquisition cannot replace a shader binding.
+            while (next < pages.Length && pages[next].Address <= range.End)
+            {
+                range = new GuestSpan(range.Address, Math.Max(range.End, pages[next].End) - range.Address);
+                next++;
+            }
+
+            // Disjoint read-only geometry can still use the stream ring, without another cache allocation.
+            if (next > index + 1 || _registry.HasOverlap(range.Address, range.Size))
+                _ = FindBuffer(range.Address, range.Size);
+            index = next;
+        }
+    }
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false,
         ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0)
     {
