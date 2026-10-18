@@ -1040,8 +1040,39 @@ public sealed class SpirvModuleBuilder
     public void AddStatement(SpirvOp opcode, params uint[] operands) =>
         Emit(_functions, opcode, operands);
 
+    private readonly List<(int Position, uint Id, uint Type, Func<uint> Emit)> _deferredValues = [];
+
+    // A value used here whose instructions depend on what the rest of the function emits (such
+    // as which registers it ends up declaring). The returned id is defined in place, but `emit`
+    // only runs when the function ends; its instructions are then moved to this point, so they
+    // see the state the function had here.
+    internal uint DeferValue(uint resultType, Func<uint> emit)
+    {
+        var id = AllocateId();
+        _deferredValues.Add((_functions.Count, id, resultType, emit));
+        return id;
+    }
+
+    private void EmitDeferredValues()
+    {
+        // From the last position back, so moving one block of words does not shift the
+        // positions still waiting.
+        for (var index = _deferredValues.Count - 1; index >= 0; index--)
+        {
+            var (position, id, type, emit) = _deferredValues[index];
+            var start = _functions.Count;
+            Emit(_functions, SpirvOp.CopyObject, type, id, emit());
+            var words = _functions.GetRange(start, _functions.Count - start);
+            _functions.RemoveRange(start, words.Count);
+            _functions.InsertRange(position, words);
+        }
+
+        _deferredValues.Clear();
+    }
+
     public void EndFunction()
     {
+        EmitDeferredValues();
         // Registers are discovered while emitting the body. SPIR-V requires every
         // Function variable to precede the entry block's executable instructions.
         if (_functionVariables.Count != 0)

@@ -97,14 +97,32 @@ public sealed class Gen5MoveRelativeSpirvTests
     private static void AssertResolvesUnknownRelativeRegisters(byte[] spirv, string opcode)
     {
         // Either the file is an array indexed at run time (SHARPEMU_VGPR_DYNAMIC_ARRAY=1), or
-        // the computed register number selects among all 256 per-register variables.
+        // the computed register number selects among the per-register variables: a dynamic
+        // write declares (and keeps selectable) the whole file, while a program that only reads
+        // through a computed number selects among every register it declares.
+        var dynamicWrite = opcode != "V_MOVRELS_B32";
+        var declared = CountVectorRegisterNames(spirv);
         Assert.True(
-            HasDynamicVectorRegisterAccess(spirv) || CountInstructions(spirv, SelectOpcode) >= 255,
-            $"{opcode} must preserve every register its runtime index can name");
+            HasDynamicVectorRegisterAccess(spirv) ||
+            (dynamicWrite ? CountInstructions(spirv, SelectOpcode) >= 255 : declared > 0 && CountInstructions(spirv, SelectOpcode) >= declared),
+            $"{opcode} must preserve every register its runtime index can name (declared={declared})");
         SharpEmu.ShaderCompiler.Tests.Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(spirv);
     }
 
     private const uint SelectOpcode = 169;
+
+    // Counts the OpName debug names "v<n>" the translator gives its vector register variables.
+    private static int CountVectorRegisterNames(byte[] spirv) =>
+        EnumerateInstructions(spirv).Count(instruction =>
+        {
+            // OpName = 5: (opcode, target, literal string...).
+            if (instruction.Op != 5 || instruction.WordCount < 3)
+                return false;
+            var bytes = spirv.AsSpan(instruction.Offset + 8, (instruction.WordCount - 2) * sizeof(uint));
+            var end = bytes.IndexOf((byte)0);
+            var name = System.Text.Encoding.ASCII.GetString(end < 0 ? bytes : bytes[..end]);
+            return name.Length > 1 && name[0] == 'v' && name.Skip(1).All(char.IsAsciiDigit);
+        });
 
     private static int CountInstructions(byte[] spirv, uint opcode) =>
         EnumerateInstructions(spirv).Count(instruction => instruction.Item1 == opcode);

@@ -43,4 +43,37 @@ public sealed class MoveRelativeRegisterDeviceTests(HeadlessVulkanFixture fixtur
         Assert.Equal(registers[9], BinaryPrimitives.ReadUInt32LittleEndian(runner.ReadBack(result, 0, sizeof(uint))));
         harness.AssertNoValidationMessages();
     }
+
+    // Without a dynamic write, the computed read selects only among the registers the program
+    // names; any other register was never written and reads zero, as in the whole file.
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(31u)]
+    [InlineData(100u)]
+    [InlineData(480u)]
+    public void DynamicRead_ReadsANamedRegisterOrZero(uint offset)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var program = Program(
+            MoveScalarRegister(0, 124, 8),
+            Vop1(4, "VMovB32", 5, Gen5Operand.Scalar(9)),
+            Vop1(8, "VMovrelsB32", 2, Gen5Operand.Vector(5)),
+            BufferAccess(12, "BufferStoreDword", 4, vectorData: 2),
+            EndProgram(20));
+        var (plan, resources, layout) = Prepare(program);
+        var request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = 1, ThreadCountX = 1 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        using var harness = new ImageTestHarness(vulkan!);
+        using var runner = new LayoutComputeRunner(harness, request, shader.Spirv);
+        var result = runner.CreateBuffer(64);
+        var registers = new uint[256];
+        registers[6] = 64;
+        registers[8] = offset;
+        registers[9] = 0x1234_5678;
+        harness.Run(() => runner.Dispatch(registers,
+            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [result] }, 1));
+        Assert.Equal(offset == 0 ? registers[9] : 0u, BinaryPrimitives.ReadUInt32LittleEndian(runner.ReadBack(result, 0, sizeof(uint))));
+        harness.AssertNoValidationMessages();
+    }
 }

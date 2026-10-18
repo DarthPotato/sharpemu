@@ -8479,24 +8479,30 @@ public static partial class Gen5SpirvTranslator
             _pairedLanes && _laneHalf == 1 ? _upperVectorRegisters : _vectorRegisters;
 
         // Without the array file a computed register number selects among the per-register
-        // variables of the whole (masked) file: a few hundred selects at the V_MOVREL site
-        // instead of turning every register access of the program into an array access, which
-        // drivers keep in memory rather than registers. Never-written registers read zero, as
-        // the zero-initialized array did.
+        // variables at the V_MOVREL site instead of turning every register access of the
+        // program into an array access, which drivers keep in memory rather than registers.
+        // A register the function never declares is never written and reads zero, as the
+        // zero-initialized array did, so the selects only cover the registers the function
+        // ends up declaring; they are emitted once it is complete and placed at this site.
+        // A dynamic write declares the whole file, so it keeps every register selectable.
         private uint LoadVDynamic(uint registerIndex)
         {
             if (_vectorRegisters != 0)
                 return Load(_uintType, DynamicVectorPointer(registerIndex));
 
             var masked = BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1));
-            var value = LoadV(0);
-            for (uint register = 1; register < VectorRegisterCount; register++)
+            var variables = CurrentVectorRegisterVariables();
+            return _module.DeferValue(_uintType, () =>
             {
-                value = _module.AddInstruction(SpirvOp.Select, _uintType,
-                    _module.AddInstruction(SpirvOp.IEqual, _boolType, masked, UInt(register)), LoadV(register), value);
-            }
+                var value = UInt(0);
+                foreach (var (register, variable) in variables.OrderBy(entry => entry.Key))
+                {
+                    value = _module.AddInstruction(SpirvOp.Select, _uintType,
+                        _module.AddInstruction(SpirvOp.IEqual, _boolType, masked, UInt(register)), Load(_uintType, variable), value);
+                }
 
-            return value;
+                return value;
+            });
         }
 
         private void StoreVDynamic(uint registerIndex, uint value)
