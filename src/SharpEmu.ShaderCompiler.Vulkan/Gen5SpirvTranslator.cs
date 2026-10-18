@@ -171,6 +171,10 @@ public static partial class Gen5SpirvTranslator
         private bool _needsDynamicVectorArray;
         private static readonly bool DynamicVectorArrayEnabled = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_VGPR_DYNAMIC_ARRAY"), "1", StringComparison.Ordinal);
+        // SHARPEMU_MOVREL_FULL_FILE=1 makes an unbounded V_MOVRELS read select among the whole
+        // register file again instead of the registers the function declares.
+        private static readonly bool MovrelFullFileEnabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_MOVREL_FULL_FILE"), "1", StringComparison.Ordinal);
         private readonly Dictionary<uint, uint> _packedHalfRegisterVariables = [];
         private uint _scc;
         private uint _vcc;
@@ -8492,8 +8496,15 @@ public static partial class Gen5SpirvTranslator
 
             var masked = BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1));
             var variables = CurrentVectorRegisterVariables();
+            var prefix = CurrentVectorRegisterPrefix();
             return _module.DeferValue(_uintType, () =>
             {
+                if (MovrelFullFileEnabled)
+                {
+                    for (uint register = 0; register < VectorRegisterCount; register++)
+                        RegisterVariable(variables, register, prefix);
+                }
+
                 var value = UInt(0);
                 foreach (var (register, variable) in variables.OrderBy(entry => entry.Key))
                 {
