@@ -1302,7 +1302,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 AccessFlags.ShaderWriteBit,
                 AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit | AccessFlags.VertexAttributeReadBit | AccessFlags.IndexReadBit |
                 AccessFlags.UniformReadBit | AccessFlags.TransferReadBit | AccessFlags.TransferWriteBit |
-                AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit);
+                AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit | AccessFlags.IndirectCommandReadBit);
 
         public void ShaderWriteHazardBarrier() =>
             RecordMemoryBarrier(
