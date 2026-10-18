@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -55,12 +56,30 @@ public sealed partial class RenderExecutor
         var useThreadDimensions = (dispatchInitiator & DispatchInitiatorUseThreadDimensions) != 0;
         // A zero dimension executes no work, so nothing needs the shader: skip before it is
         // materialized and compiled. The counts are real unless the host resolves an indirect
-        // dispatch on the GPU, which leaves them zero and the arguments in guest memory.
-        if ((indirectArgumentsAddress == 0 || useThreadDimensions) && (groupsX == 0 || groupsY == 0 || groupsZ == 0))
+        // dispatch on the GPU, which leaves them zero and the arguments in guest memory; those
+        // are read here only when no pending GPU write can change their contents.
+        var zeroDispatch = false;
+        if (indirectArgumentsAddress == 0 || useThreadDimensions)
+        {
+            zeroDispatch = groupsX == 0 || groupsY == 0 || groupsZ == 0;
+        }
+        else
+        {
+            Span<byte> arguments = stackalloc byte[3 * sizeof(uint)];
+            if (_host.TryReadCleanGuestBytes(indirectArgumentsAddress, arguments))
+            {
+                zeroDispatch = BinaryPrimitives.ReadUInt32LittleEndian(arguments) == 0 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[sizeof(uint)..]) == 0 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[(2 * sizeof(uint))..]) == 0;
+            }
+        }
+
+        if (zeroDispatch)
         {
             if (RenderTrace.Enabled && RenderTrace.ZeroDispatch())
             {
-                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
+                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} " +
+                    $"indirect=0x{indirectArgumentsAddress:X16} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
             }
 
             return;

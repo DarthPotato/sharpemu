@@ -178,6 +178,33 @@ public sealed class RenderExecutorComputeTests : IDisposable
     }
 
     [Fact]
+    public void IndirectDispatchWithCleanZeroArguments_IsSkippedBeforeTheProgramLookup()
+    {
+        _host.GuestBytesAreClean = true;
+        _host.GuestMemory.TryWrite(RecordingRenderHost.MemoryBase + 0x400, new byte[12]);
+
+        _executor.Dispatch(1, Banks(), 0, 0, 0, 0x41, indirectArgumentsAddress: RecordingRenderHost.MemoryBase + 0x400);
+
+        AssertNotDispatched();
+        Assert.Empty(_pipelines.Calls);
+    }
+
+    [Fact]
+    public void IndirectDispatchWithCleanNonZeroArguments_IsNotSkipped()
+    {
+        _host.GuestBytesAreClean = true;
+        var arguments = new byte[12];
+        arguments[0] = 4;
+        arguments[4] = 1;
+        arguments[8] = 1;
+        _host.GuestMemory.TryWrite(RecordingRenderHost.MemoryBase + 0x400, arguments);
+
+        _executor.Dispatch(1, Banks(), 0, 0, 0, 0x41, indirectArgumentsAddress: RecordingRenderHost.MemoryBase + 0x400);
+
+        Assert.NotEmpty(_pipelines.Calls);
+    }
+
+    [Fact]
     public void IndirectDispatchResolvedOnTheGpu_IsNotSkippedByItsZeroPlaceholderCounts()
     {
         _executor.Dispatch(1, Banks(), 0, 0, 0, 0x41, indirectArgumentsAddress: RecordingRenderHost.MemoryBase + 0x400);

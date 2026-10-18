@@ -261,6 +261,9 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        bool IRenderHost.TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
+            TryReadResidentGuestBytes(address, destination, clean: true);
+
         // The same ownership rules as the two word readers, checked once for a whole range.
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
