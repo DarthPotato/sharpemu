@@ -20,36 +20,64 @@ public sealed class SurfaceMetadata
     public const uint MaxSlices = 2048;
 
     public SurfaceMetadataKind Kind;
-    public uint ClearMask;
+    private uint _clearMask;
+    private bool _upperSlicesClear;
+    private readonly HashSet<uint> _upperSliceExceptions = new();
+    internal uint DccSliceCount = 32;
+
+    public uint ClearMask
+    {
+        get => _clearMask;
+        set
+        {
+            _clearMask = value;
+            _upperSlicesClear = value == uint.MaxValue;
+            _upperSliceExceptions.Clear();
+        }
+    }
+
+    internal bool IsSliceClear(uint slice) => slice < 32
+        ? (_clearMask & (1u << (int)slice)) != 0
+        : _upperSlicesClear != _upperSliceExceptions.Contains(slice);
+
+    internal void SetSliceClear(uint slice, bool clear)
+    {
+        if (slice < 32)
+        {
+            if (clear) _clearMask |= 1u << (int)slice;
+            else _clearMask &= ~(1u << (int)slice);
+        }
+        else if (clear == _upperSlicesClear)
+        {
+            _upperSliceExceptions.Remove(slice);
+        }
+        else
+        {
+            _upperSliceExceptions.Add(slice);
+        }
+    }
+
     public uint FillValue = 0xffffffff;
     public ulong FillSize;
     public ulong Size;
-    private System.Collections.BitArray? _upperSlices;
-
     // Sets slices 0-31 from the mask; the rest follow an all-clear or all-uncleared mask.
-    public void SetFromMask(uint mask)
-    {
-        ClearMask = mask;
-        if (mask == uint.MaxValue)
-            (_upperSlices ??= new System.Collections.BitArray((int)(MaxSlices - 32))).SetAll(true);
-        else
-            _upperSlices?.SetAll(false);
-    }
+    public void SetFromMask(uint mask) => ClearMask = mask;
 
-    public bool IsSliceCleared(uint slice) =>
-        slice < 32 ? (ClearMask & (1u << (int)slice)) != 0 : slice < MaxSlices && _upperSlices is { } upper && upper[(int)(slice - 32)];
+    // Color targets track up to their layer count, HTile up to MaxSlices, the other kinds 32.
+    internal bool TracksSlice(uint slice) => slice < Kind switch
+    {
+        SurfaceMetadataKind.Dcc => DccSliceCount,
+        SurfaceMetadataKind.HTile => MaxSlices,
+        _ => 32u,
+    };
+
+    public bool IsSliceCleared(uint slice) => slice < MaxSlices && IsSliceClear(slice);
 
     public bool SetSlice(uint slice, bool isClear)
     {
         if (slice >= MaxSlices)
             return false;
-        if (slice < 32)
-        {
-            ClearMask = isClear ? ClearMask | (1u << (int)slice) : ClearMask & ~(1u << (int)slice);
-            return true;
-        }
-
-        (_upperSlices ??= new System.Collections.BitArray((int)(MaxSlices - 32)))[(int)(slice - 32)] = isClear;
+        SetSliceClear(slice, isClear);
         return true;
     }
 
@@ -59,4 +87,8 @@ public sealed class SurfaceMetadata
     // A dispatch rewrote these HTile words in place; their clear state is read from the
     // words before the depth target is next bound.
     public bool RewrittenByGpu;
+
+    public ulong RangeSize;
+    public bool NativeColorClear;
+    public bool Invalidated;
 }

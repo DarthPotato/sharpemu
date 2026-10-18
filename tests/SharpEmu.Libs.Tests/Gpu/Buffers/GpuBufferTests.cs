@@ -55,6 +55,26 @@ public sealed class GpuBufferTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void FixtureDisposalFreesRetainedSlabMemory()
+    {
+        var fixture = new HeadlessVulkanFixture();
+        if (fixture.Vulkan is not { } vulkan) return;
+        var info = vulkan.DeviceInfo;
+        try
+        {
+            using (var worker = new CacheWorker(vulkan))
+            using (var buffer = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal,
+                0, GpuBuffer.AllFlags, 0x1000, allowSlab: true))
+            {
+                Assert.True(info.LiveAllocations > 0);
+            }
+            Assert.True(info.LiveAllocations > 0);
+        }
+        finally { fixture.Dispose(); }
+        Assert.Equal(0, info.LiveAllocations);
+    }
+
+    [Fact]
     public void IsInBounds_IsOverflowSafe()
     {
         if (_vulkan is null) return;

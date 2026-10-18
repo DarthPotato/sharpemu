@@ -1,5 +1,6 @@
 {
   "_languageName": "Eesti",
+  "Options.Env.SkipRt.Desc": "Skip compute shaders that use ray tracing. Off by default.\nThis can remove effects or cause incorrect graphics. Restart the game after a change.",
   "Options.Env.StrictCompute.Desc": "Peata arvutus- ja joonistusvarjutajate tagasilükkamisel (vaikimisi).\nLülita välja, et mõjutatud töö vahele jätta. Võimalikud on puuduvad pildid, vead või hangumine. Pärast muudatust taaskäivita mäng.",
   "Options.Env.PerformanceProfile.Desc": "Logi jõudlusajad ja FPS alates järgmisest mängu käivitamisest.\nSee võib jõudlust vähendada.",
   "Options.Env.PerformanceFrameTrace.Desc": "Säilita viimased 4096 esitamisintervalli ja kirjuta need sulgemisel logisse.\nVajab jõudluse profileerimist. Jälje salvestamiseks sulge mäng tavapäraselt.",
@@ -43,6 +44,7 @@
   "Library.Empty.AddFolder": "＋ Lisa mängukaust",
 
   "Library.Loading": "Teeki laaditakse…",
+  "Library.ScanningFolder": "Kausta skannitakse…",
   "Library.Stat.Version": "Versioon",
   "Library.Stat.Installed": "Paigaldatud",
   "Library.Stat.TitleId": "Title ID",
@@ -259,6 +261,7 @@
 ,
   "Trophies.Title": "Trofeed",
   "Trophies.None": "Sellel mängul pole trofeesid.",
+  "Trophies.Loading": "Trofeesid laaditakse…",
   "Trophies.Hidden": "Peidetud trofee",
   "Trophies.HiddenDescription": "Klõpsa selle trofee avaldamiseks.",
   "Trophies.Locked": "Pole veel saadud",

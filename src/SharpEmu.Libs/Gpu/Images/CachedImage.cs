@@ -75,6 +75,7 @@ public sealed unsafe partial class CachedImage : IDisposable
     private bool _bufferHoldsGpuContents;
 
     public ImageDescription Description;
+    internal SurfaceMetadata? MetadataRegistration;
     public readonly ImageBacking Backing = new();
     public readonly List<CachedImageView> Views = new();
     public ImageUses Uses;
@@ -88,7 +89,7 @@ public sealed unsafe partial class CachedImage : IDisposable
     public int RecencyEntryIndex;
 
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
-        ImageBackingPool? pool = null, OptimalImageMemoryPool? memoryPool = null)
+        ImageBackingPool? pool = null, OptimalImageMemoryPool? memoryPool = null, Action? reportAllocationFailure = null)
     {
         _device = device;
         _scheduler = scheduler;
@@ -144,10 +145,11 @@ public sealed unsafe partial class CachedImage : IDisposable
         }
 
         var vk = device.Vk;
-        var createResult = vk.CreateImage(device.Device, &create, null, out Backing.Handle);
-        if (createResult != Result.Success)
+        var creationResult = vk.CreateImage(device.Device, &create, null, out Backing.Handle);
+        if (creationResult != Result.Success)
         {
-            throw CreateFailure(create, "vkCreateImage", createResult, 0);
+            reportAllocationFailure?.Invoke();
+            throw CreateFailure(create, "vkCreateImage", creationResult);
         }
 
         var dedicated = new MemoryDedicatedRequirements { SType = StructureType.MemoryDedicatedRequirements };
@@ -173,6 +175,7 @@ public sealed unsafe partial class CachedImage : IDisposable
             PNext = dedicated.RequiresDedicatedAllocation ? &dedicatedInfo : null,
         };
         var allocated = Result.ErrorOutOfDeviceMemory;
+        var allocationAttempted = false;
         for (uint index = 0; index < device.MemoryTypeCount; index++)
         {
             if ((requirements.MemoryTypeBits & (1u << (int)index)) == 0 ||
@@ -182,6 +185,7 @@ public sealed unsafe partial class CachedImage : IDisposable
             }
 
             allocateInfo.MemoryTypeIndex = index;
+            allocationAttempted = true;
             if (_memoryPool is not null && !dedicated.RequiresDedicatedAllocation)
             {
                 allocated = _memoryPool.Allocate(requirements, index, out var placement);
@@ -207,13 +211,15 @@ public sealed unsafe partial class CachedImage : IDisposable
             vk.DestroyImage(device.Device, Backing.Handle, null);
             Backing.Handle = default;
             Backing.Memory = default;
+            reportAllocationFailure?.Invoke();
+            var operation = allocationAttempted ? "vkAllocateMemory" : "select_device_local_memory_type";
             // Running out of memory is recoverable: the cache can free images and try again.
             if (allocated is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
             {
-                throw new ImageOutOfMemoryException(CreateFailureMessage(create, "vkAllocateMemory", allocated, requirements.Size));
+                throw new ImageOutOfMemoryException(CreateFailureMessage(create, operation, allocated, requirements.Size, requirements.MemoryTypeBits));
             }
 
-            throw CreateFailure(create, "vkAllocateMemory", allocated, requirements.Size);
+            throw CreateFailure(create, operation, allocated, requirements.Size, requirements.MemoryTypeBits);
         }
 
         var bindResult = vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, _memoryPlacement?.Offset ?? 0);
@@ -223,7 +229,8 @@ public sealed unsafe partial class CachedImage : IDisposable
             ReleaseMemory();
             Backing.Handle = default;
             Backing.Memory = default;
-            throw CreateFailure(create, "vkBindImageMemory", bindResult, requirements.Size);
+            reportAllocationFailure?.Invoke();
+            throw CreateFailure(create, "vkBindImageMemory", bindResult, requirements.Size, requirements.MemoryTypeBits);
         }
 
         Backing.AllocationSize = requirements.Size;
@@ -244,11 +251,12 @@ public sealed unsafe partial class CachedImage : IDisposable
         Backing.Memory = default;
     }
 
-    private Exception CreateFailure(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
-        SubmissionScheduler.Fatal(CreateFailureMessage(create, operation, result, requiredBytes));
+    private Exception CreateFailure(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes = 0, uint memoryTypeBits = 0) =>
+        SubmissionScheduler.Fatal(CreateFailureMessage(create, operation, result, requiredBytes, memoryTypeBits));
 
-    private string CreateFailureMessage(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
-        $"The image could not be created: operation={operation} result={result} required_bytes={requiredBytes} " +
+    private string CreateFailureMessage(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes, uint memoryTypeBits = 0) =>
+        $"The image could not be created: operation={operation} result={result} result_code={(int)result} required_bytes={requiredBytes} " +
+        $"samples={create.Samples} memory_type_bits=0x{memoryTypeBits:X} " +
         $"extent={create.Extent.Width}x{create.Extent.Height}x{create.Extent.Depth} format={create.Format}({(int)create.Format}) " +
         $"layers={create.ArrayLayers} levels={create.MipLevels} usage=0x{(uint)create.Usage:X} flags=0x{(uint)create.Flags:X} " +
         $"live_allocations={_device.LiveAllocations} allocation_limit={_device.MaxMemoryAllocationCount} " +

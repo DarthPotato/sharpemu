@@ -623,26 +623,50 @@ public sealed partial class GuestImageCache
         var expanded = _slots[expandedImageIdentifier];
         var source = _slots[sourceImageIdentifier];
         expanded.Uses = source.Uses;
+        var firstLayer = !source.IsBufferModified && !source.IsCpuDirty && source.Backing.Exists &&
+            CanUploadArrayGrowthSuffix(source.Description, description)
+            ? source.Description.Resources.Layers : 0;
+        try
+        {
+            PopulateFromGuest(expandedImageIdentifier, ImageRequest.Refresh(description, UploadRole(source)),
+                firstLayer == 0 ? "expand" : "expand-partial", firstLayer);
+            var mip = source.Description.FindMatchingMipLevel(description);
+            var layer = source.Description.FindMatchingArraySlice(description, mip);
+            if (layer >= 0)
+            {
+                CopyIntoMip(expandedImageIdentifier, sourceImageIdentifier, (uint)mip, (uint)layer);
+            }
+            else
+            {
+                CopyWholeImage(expandedImageIdentifier, sourceImageIdentifier);
+            }
+        }
+        catch
+        {
+            ReleaseImage(expandedImageIdentifier);
+            throw;
+        }
+
         if (source.Binding.IsBound || source.Binding.IsTarget)
         {
             source.Binding.NeedsRebind = true;
         }
 
-        PopulateFromGuest(expandedImageIdentifier, ImageRequest.Refresh(description, UploadRole(source)), "expand");
-        var mip = source.Description.FindMatchingMipLevel(description);
-        var layer = source.Description.FindMatchingArraySlice(description, mip);
-        if (layer >= 0)
-        {
-            CopyIntoMip(expandedImageIdentifier, sourceImageIdentifier, (uint)mip, (uint)layer);
-        }
-        else
-        {
-            CopyWholeImage(expandedImageIdentifier, sourceImageIdentifier);
-        }
-
         ReleaseImage(sourceImageIdentifier);
         return expandedImageIdentifier;
     }
+
+    internal static bool CanUploadArrayGrowthSuffix(in ImageDescription source, in ImageDescription destination) =>
+        source.Type == GuestImageType.Color2D && destination.Type == GuestImageType.Color2D &&
+        !source.IsDepth && !destination.IsDepth && !source.IsBlock && !destination.IsBlock &&
+        !source.HasMetadata && !destination.HasMetadata && !source.HasStencil && !destination.HasStencil &&
+        !source.Bgra16 && !destination.Bgra16 &&
+        source.Metadata.Compression == DisplayCompression.Uncompressed && destination.Metadata.Compression == DisplayCompression.Uncompressed &&
+        source.Samples == 1 && destination.Samples == 1 && source.Resources.Levels == 1 && destination.Resources.Levels == 1 &&
+        source.Resources.Layers > 0 && source.Resources.Layers < destination.Resources.Layers &&
+        source.Data.Address == destination.Data.Address && source.GuestFormat == destination.GuestFormat &&
+        source.Pitch == destination.Pitch && SameExtent(source.Extent, destination.Extent) &&
+        source.FindMatchingArraySlice(destination, 0) == 0;
 
     // A compute shader writes the blocks of a compressed image through an
     // uncompressed view, but the driver could not give that image storage usage.
@@ -678,45 +702,19 @@ public sealed partial class GuestImageCache
         }
 
         var association = ResourceSlotIdentifier.Invalid;
-        var stale = new List<ResourceSlotIdentifier>();
         foreach (var imageIdentifier in FindImagesInRange(stencil.Address, stencil.Size, pageOverlap: false))
         {
+            // Only an image of exactly this span can stand for the plane: the stencil upload detiles the
+            // whole depth extent from it. A proxy of another span or extent belongs to another surface
+            // and stays; a standalone image of the span (a dynamic-resolution view of the plane may be
+            // smaller than the depth image) becomes the proxy, and an image of another size (a texture
+            // reading part of the plane) is a separate resource.
             var owner = _slots.TryGet(imageIdentifier);
-            if (owner == null || owner.Description.Data.Address != stencil.Address)
-            {
-                continue;
-            }
-
-            // Only an image of exactly this span can stand for the plane: the stencil upload
-            // detiles the whole depth extent from it. A stencil proxy of another span is left
-            // over from an earlier surface at this address and is replaced; any other image of
-            // another size (a texture reading part of the plane) is a separate resource. A proxy
-            // of this span that another depth image owns holds that image's writes, not this
-            // one's: it is replaced too (Ghost of Yotei copies its depth buffer into a second
-            // depth image that shares the stencil plane).
-            if (owner.Description.Data.Size == stencil.Size && (!owner.DepthOwner.IsValid || owner.DepthOwner == depthImageIdentifier))
+            if (owner != null && owner.Description.Data == stencil &&
+                (!owner.DepthOwner.IsValid || owner.Description.Extent.Equals(depth.Description.Extent)))
             {
                 association = imageIdentifier;
             }
-            else if (owner.DepthOwner.IsValid)
-            {
-                stale.Add(imageIdentifier);
-            }
-        }
-
-        // The replaced plane belongs to another depth image. What the GPU wrote to it reaches
-        // guest memory before the association goes, as when a depth image changes planes, and
-        // the new association loads it from there.
-        foreach (var imageIdentifier in stale)
-        {
-            var proxy = _slots[imageIdentifier];
-            if (proxy.IsGpuModified)
-            {
-                WriteBackStencilPlane(_slots[proxy.DepthOwner], proxy.Description.Data);
-                proxy.ClearGpuModified();
-            }
-
-            DeleteImage(imageIdentifier);
         }
 
         if (!association.IsValid)
@@ -729,12 +727,35 @@ public sealed partial class GuestImageCache
 
         var record = _slots[association];
 
+        // A proxy another depth image owns holds that image's writes, not this one's (Ghost of Yotei
+        // copies its depth buffer into a second depth image that shares the stencil plane). What the GPU
+        // wrote reaches guest memory before the plane changes owner, and the new owner loads it from there.
+        if (record.DepthOwner.IsValid && record.DepthOwner != depthImageIdentifier)
+        {
+            if (record.IsGpuModified)
+            {
+                if (_slots.TryGet(record.DepthOwner) is { } previousOwner && CanWriteBackStencilPlane(previousOwner))
+                {
+                    WriteBackStencilPlane(previousOwner, record.Description.Data);
+                }
+
+                record.ClearGpuModified();
+            }
+
+            record.InvalidateCpuWrite(record.Description.Data.Address, record.Description.Data.Size);
+        }
+
         // An image a shader wrote through a color view before this depth target took the plane
         // (Ghost of Yotei builds the stencil its lighting reads that way) is the association now,
         // and holds the plane's newest values: they move into the depth image's stencil aspect.
         var takeContents = record.Backing.Exists && !record.DepthOwner.IsValid && record.IsGpuModified &&
                            TakeStandaloneStencilPlane(depth, association);
         TouchImage(record);
+        // Release the former image watch on conversion. Keep an active stencil watch on reuse.
+        if (!record.DepthOwner.IsValid)
+        {
+            UnwatchImage(association);
+        }
         record.AssociateDepth(depthImageIdentifier);
         if (takeContents)
         {

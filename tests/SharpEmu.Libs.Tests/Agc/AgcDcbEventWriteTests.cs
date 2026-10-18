@@ -66,7 +66,7 @@ public sealed class AgcDcbEventWriteTests
     }
 
     [Fact]
-    public void DcbEventWrite_RejectsAnAddressForAnEventWithoutAPayload()
+    public void DcbEventWrite_IgnoresAnAddressForAnEventWithoutAPayload()
     {
         var memory = new FakeCpuMemory(BaseAddress, 0x2000);
         var ctx = NewContext(memory);
@@ -75,8 +75,10 @@ public sealed class AgcDcbEventWriteTests
 
         AgcExports.DcbEventWrite(ctx);
 
-        Assert.Equal(0ul, ctx[CpuRegister.Rax]);
-        Assert.Equal(PacketAddress, ReadUInt64(memory, CommandBufferAddress + 0x10));
+        // The address belongs to counter events only: the packet stays two dwords without it.
+        Assert.Equal(PacketAddress, ctx[CpuRegister.Rax]);
+        Assert.Equal(0x16u, ReadUInt32(memory, PacketAddress + 4));
+        Assert.Equal(PacketAddress + 8, ReadUInt64(memory, CommandBufferAddress + 0x10));
     }
 
     private static CpuContext NewContext(FakeCpuMemory memory)

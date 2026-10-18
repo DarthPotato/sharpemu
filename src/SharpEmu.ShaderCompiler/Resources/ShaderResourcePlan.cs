@@ -48,6 +48,9 @@ public sealed class ShaderResourcePlan
     internal RawReadPrefetchPlan? RawReadPrefetch { get; set; }
     private readonly object _compileGate = new();
     private CompiledResourceEvaluator? _compiledEvaluator;
+    private CompiledResourceTransaction? _compiledTransaction;
+    private CompiledResourceTransaction? _compiledTableTransaction;
+    internal ResourceMaterializer.SpecializationGuard? SpecializationGuard;
     private int _compiledEvaluatorState;
 
     internal CompiledResourceEvaluator? CompiledEvaluator
@@ -75,9 +78,45 @@ public sealed class ShaderResourcePlan
                 compiled = null;
             }
 
+            try
+            {
+                _compiledTransaction = CompiledResourceTransaction.Build(this);
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            {
+                _compiledTransaction = null;
+            }
+
+            try
+            {
+                _compiledTableTransaction = CompiledResourceTransaction.Build(this, tableOnly: true);
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            {
+                _compiledTableTransaction = null;
+            }
+
             _compiledEvaluator = compiled;
             Volatile.Write(ref _compiledEvaluatorState, 2);
             return compiled;
+        }
+    }
+
+    internal CompiledResourceTransaction? CompiledTransaction
+    {
+        get
+        {
+            _ = CompiledEvaluator;
+            return Volatile.Read(ref _compiledEvaluatorState) == 2 ? _compiledTransaction : null;
+        }
+    }
+
+    internal CompiledResourceTransaction? CompiledTableTransaction
+    {
+        get
+        {
+            _ = CompiledEvaluator;
+            return Volatile.Read(ref _compiledEvaluatorState) == 2 ? _compiledTableTransaction : null;
         }
     }
 
@@ -88,7 +127,9 @@ public sealed class ShaderResourcePlan
         IReadOnlySet<uint>? fixedFunctionVertexLoads = null, Action<ShaderResourcePlan>? beforeResourceTracking = null, uint waveSize = 64,
         RuntimeDescriptorMode runtimeDescriptors = RuntimeDescriptorMode.Disabled)
     {
-        var graph = ScalarGraphDiskCache.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
+        // Mesh system inputs are not uniform user data, even when a GS pointer occupies s0:s1.
+        var graph = ScalarGraphDiskCache.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize,
+            excludedUserDataRegisters: stage == ShaderStage.Mesh ? 0xFCUL : 0);
         var plan = new ShaderResourcePlan(graph, stage, hash);
         var reads = ResourceTableReadPlanner.Plan(graph, stage, hash);
         var memo = new Dictionary<ScalarValue, ScalarValue>();
@@ -128,6 +169,8 @@ public sealed class ShaderResourcePlan
         plan.RuntimeDescriptors = runtimeDescriptors;
         plan.DescriptorSources = tracked.Sources;
         plan.Info = tracked.Info;
+        if (program.Instructions.Any(instruction => instruction.Control is ShaderCallFaultControl))
+            plan.Info.UsesDeviceAddresses = true;
         plan.IndirectImages = tracked.IndirectImages;
         plan.BufferCandidateTables = tracked.BufferCandidateTables;
         plan.DynamicReads = plan.DynamicReads.Where(read => !tracked.IndirectReads.Contains(read)).ToList();

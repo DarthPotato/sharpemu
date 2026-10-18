@@ -182,11 +182,13 @@ public enum SpirvOp : ushort
     GroupNonUniformShuffleUp = 347,
     GroupNonUniformShuffleDown = 348,
     GroupNonUniformUMin = 354,
+    SetMeshOutputsExt = 5295,
 }
 
 public enum SpirvCapability : uint
 {
     Shader = 1,
+    ShaderLayer = 69,
     InterpolationFunction = 52,
     FragmentBarycentricKhr = 5284,
     ClipDistance = 32,
@@ -212,14 +214,14 @@ public enum SpirvCapability : uint
     GroupNonUniformArithmetic = 63,
     GroupNonUniformBallot = 64,
     GroupNonUniformShuffle = 65,
-    ShaderLayer = 5253,
-    ShaderViewportIndex = 5254,
+    ShaderViewportIndex = 70,
     ShaderViewportIndexLayerExt = 5254,
     ShaderNonUniform = 5301,
     RuntimeDescriptorArray = 5302,
     SampledImageArrayNonUniformIndexing = 5307,
     PhysicalStorageBufferAddresses = 5347,
     SignedZeroInfNanPreserve = 4466,
+    MeshShadingExt = 5283,
 }
 
 // The function-control mask of OpFunction. Only None exists on purpose: NVIDIA miscompiles repeated
@@ -250,6 +252,7 @@ public enum SpirvExecutionModel : uint
     Vertex = 0,
     Fragment = 4,
     GLCompute = 5,
+    MeshExt = 5365,
 }
 
 public enum SpirvExecutionMode : uint
@@ -258,6 +261,9 @@ public enum SpirvExecutionMode : uint
     DepthReplacing = 12,
     LocalSize = 17,
     SignedZeroInfNanPreserve = 4461,
+    OutputVertices = 26,
+    OutputPrimitivesExt = 5270,
+    OutputTrianglesExt = 5298,
 }
 
 public enum SpirvDecoration : uint
@@ -275,6 +281,7 @@ public enum SpirvDecoration : uint
     Offset = 35,
     NoContraction = 42,
     NonWritable = 24,
+    PerPrimitiveExt = 5271,
     NonUniform = 5300,
 }
 
@@ -303,6 +310,8 @@ public enum SpirvBuiltIn : uint
     SampleId = 18,
     SampleMask = 20,
     FragDepth = 22,
+    PrimitiveTriangleIndicesExt = 5296,
+    CullPrimitiveExt = 5299,
     PrimitiveId = 7,
 }
 
@@ -635,10 +644,7 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
-    // An array type of its own, never shared with TypeArray's cache. A layout decoration (ArrayStride, for an array in a
-    // block or push-constant struct) is only valid on types used with explicit-layout storage classes, so the array a block
-    // decorates must not be the one a Private or Function variable of the same element and length uses.
-    public uint TypeLayoutArray(uint elementType, uint count)
+    public uint TypeArrayDistinct(uint elementType, uint count)
     {
         var length = Constant(TypeInt(32, false), count);
         var id = AllocateId();
@@ -813,9 +819,12 @@ public sealed class SpirvModuleBuilder
     }
 
     public uint BeginFunction(uint returnType, uint functionType)
+        => BeginFunction(returnType, functionType, 0);
+
+    public uint BeginFunction(uint returnType, uint functionType, uint functionControl)
     {
         var id = AllocateId();
-        Emit(_functions, SpirvOp.Function, returnType, id, 0, functionType);
+        Emit(_functions, SpirvOp.Function, returnType, id, functionControl, functionType);
         return id;
     }
 

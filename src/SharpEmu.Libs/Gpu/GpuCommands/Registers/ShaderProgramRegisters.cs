@@ -185,6 +185,7 @@ public sealed class VertexStageRegisters
     public HullResource1 HullResource1;
     public HullResource2 HullResource2;
     public ulong GeometryAddress;
+    public ulong GeometryUserDataAddress;
     public GeometryResource1 GeometryResource1;
     public GeometryResource2 GeometryResource2;
     public UserScalarRegisters HullUserScalars = new();
@@ -216,6 +217,8 @@ public sealed class VertexStageRegisters
 public sealed class PixelStageRegisters
 {
     public ulong Address;
+    public ulong UserDataAddress;
+    public ulong AuxiliaryTableAddress;
     public PixelResource1 Resource1;
     public PixelResource2 Resource2;
     public UserScalarRegisters UserScalars = new();
