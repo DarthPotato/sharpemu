@@ -34,7 +34,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly ImageBackingPool? _backingPool;
     private readonly OptimalImageMemoryPool _imageMemoryPool;
     private readonly ImagePageOwnerTable _pageOwners = new();
-    private readonly Dictionary<Format, ResourceSlotIdentifier> _nullImages = new();
+    private readonly Dictionary<NullImageKey, ResourceSlotIdentifier> _nullImages = new();
     private RecencyQueue<ResourceSlotIdentifier> _recencyQueue = new();
     private readonly HashSet<ResourceSlotIdentifier> _scheduledReadbacks = new();
     private readonly SortedList<ulong, SurfaceMetadata> _surfaceMetadata = new();
@@ -851,10 +851,17 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
     }
 
+    private readonly record struct NullImageKey(Format Format, GuestPixelFormat GuestFormat, GuestImageType Type, uint Samples, uint Layers);
+
     private ResourceSlotIdentifier GetNullImage(in ImageRequest request)
     {
-        var format = request.Description.PixelFormat;
-        if (_nullImages.TryGetValue(format, out var found))
+        var key = new NullImageKey(
+            request.Description.PixelFormat,
+            request.Description.GuestFormat,
+            request.Description.Type,
+            request.Description.Samples,
+            request.Description.Resources.Layers);
+        if (_nullImages.TryGetValue(key, out var found))
         {
             return found;
         }
@@ -862,16 +869,16 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         var description = ImageDescription.Create();
         description.PixelFormat = request.Description.PixelFormat;
         description.GuestFormat = request.Description.GuestFormat;
-        description.Type = GuestImageType.Color2D;
+        description.Type = request.Description.Type;
         description.Extent = new Extent3D(1, 1, 1);
-        description.Resources = SubresourceCount.Single;
+        description.Resources = new SubresourceCount(1, key.Layers);
         description.Pitch = 1;
         description.BytesPerBlock = Math.Max(request.Description.BytesPerBlock, 1);
-        description.Samples = 1;
+        description.Samples = Math.Max(request.Description.Samples, 1);
         description.TileMode = GuestTileMode.Linear;
         description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = description.BytesPerBlock, Pitch = 1, Height = 1 };
         var imageIdentifier = InsertImage(description);
-        _nullImages.Add(format, imageIdentifier);
+        _nullImages.Add(key, imageIdentifier);
         return imageIdentifier;
     }
 

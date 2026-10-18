@@ -39,7 +39,7 @@ public static partial class ImageRequestBuilders
             ? GuestImageType.Color3D
             : shape.OneDimensional ? GuestImageType.Color1D : GuestImageType.Color2D;
         description.Extent = new Extent3D(1, 1, 1);
-        description.Resources = SubresourceCount.Single;
+        description.Resources = new SubresourceCount(1, shape.Cube ? 6u : 1u);
         description.BytesPerBlock = 4;
         description.Samples = shape.Multisampled ? 4u : 1u;
         description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = 0, Pitch = 1, Height = 1 };
@@ -48,10 +48,13 @@ public static partial class ImageRequestBuilders
             Format = format,
             Type = shape.Volume
                 ? ImageViewType.Type3D
+                : shape.Cube
+                    ? ImageViewType.TypeCube
                 : shape.OneDimensional
                     ? shape.Arrayed ? ImageViewType.Type1DArray : ImageViewType.Type1D
                     : shape.Arrayed ? ImageViewType.Type2DArray : ImageViewType.Type2D,
             Aspect = depthCompare ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit,
+            LayerCount = shape.Cube ? 6u : 1u,
             Usage = storage ? ImageUsageFlags.StorageBit : ImageUsageFlags.SampledBit,
         };
         return new ImageRequest(description, view, storage ? ImageRole.StorageImage : ImageRole.Texture);

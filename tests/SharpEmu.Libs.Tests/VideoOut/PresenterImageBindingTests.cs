@@ -670,6 +670,29 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
     }
 
     [Fact]
+    public void NullTexture_OfDifferentShapes_GetsSeparateImagesOfThatShape()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var flat = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, false,
+            Descriptor: [], Shape: new ShaderImageShape(false, false, false, false, TextureNumericClass.Float));
+        var cube = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, false,
+            Descriptor: [], Shape: new ShaderImageShape(false, false, false, false, TextureNumericClass.Float) with { Cube = true });
+
+        var flatResource = presenter.Run(() => AcquireTexture(presenter, flat));
+        var cubeResource = presenter.Run(() => AcquireTexture(presenter, cube));
+        var flatRequest = (ImageRequest)GetFieldValue(flatResource, "Request");
+        var cubeRequest = (ImageRequest)GetFieldValue(cubeResource, "Request");
+        Assert.Equal(ImageViewType.Type2D, flatRequest.View.Type);
+        Assert.Equal(ImageViewType.TypeCube, cubeRequest.View.Type);
+        Assert.Equal(6u, cubeRequest.Description.Resources.Layers);
+        Assert.Equal(2, presenter.Harness.Images.NullImageCount);
+        presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
+    [Fact]
     public void ColorTarget_IsFoundInTheStoreAndBoundForTheDraw()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
