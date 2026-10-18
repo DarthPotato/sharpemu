@@ -1587,6 +1587,7 @@ public sealed partial class ResourceTracker
             IndirectImage = new IndirectImageSelector(materialSourceIndex, heapSourceIndex, selectorStride, selectorOffset, 0)
             {
                 SelectorValues = IndirectSelectorValues.Create(_plan, selector),
+                SelectorBound = IndirectSelectorBound.TryCreate(_plan, selector),
                 MaterialImmediate = materialMemory.Offset,
             },
         };

@@ -672,7 +672,43 @@ public static partial class ResourceMaterializer
                 diagnostic.ProvenOffsets = provenOffsets ?? [];
             }
         }
-        if (provenOffsets is null && probeCount > MaxIndirectImageProbes)
+        // A selector the shader clamps or masks reaches exactly selector * stride + offset for
+        // selector in [0, bound]; that set is proven, so it replaces the exhaustive enumeration
+        // of every residue + k * step (the product wraps modulo 2^32 for an unbounded selector).
+        IEnumerable<ulong> offsets;
+        if (provenOffsets is not null)
+        {
+            offsets = provenOffsets.Select(offset => (ulong)offset);
+        }
+        else if (indirect.SelectorBound is { } bound)
+        {
+            var last = (ulong)bound;
+            if (last * indirect.SelectorStride + indirect.SelectorOffset <= uint.MaxValue)
+            {
+                last = indirect.SelectorOffset > limit ? 0 : Math.Min(last, (limit - indirect.SelectorOffset) / indirect.SelectorStride);
+            }
+
+            if (last + 1 > MaxIndirectImageProbes)
+            {
+                failure = ResourceMaterializationFailure.ImageCapacityExceeded;
+                return Detail($"indirect image {Hex(image.FirstUsePc)}: selector bound {bound} needs {last + 1} probes, over {MaxIndirectImageProbes} " +
+                    $"(material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
+            }
+
+            if (diagnostic is not null)
+            {
+                diagnostic.SelectionMode = "clamp_bounded";
+            }
+
+            offsets = Enumerable.Range(0, (int)last + 1)
+                .Select(selector => unchecked((ulong)((uint)selector * indirect.SelectorStride + indirect.SelectorOffset)))
+                .Distinct();
+        }
+        else if (probeCount <= MaxIndirectImageProbes)
+        {
+            offsets = Enumerable.Range(0, (int)probeCount).Select(index => residue + (ulong)index * step);
+        }
+        else
         {
             // A table this large cannot be enumerated into bindings; a host that reads descriptors at run time serves it.
             failure = ResourceMaterializationFailure.ImageCapacityExceeded;
@@ -682,8 +718,6 @@ public static partial class ResourceMaterializer
 
         var keys = new List<uint> { 0 };
         var seen = new HashSet<uint> { 0 };
-        var offsets = provenOffsets is not null ? provenOffsets.Select(offset => (ulong)offset) :
-            Enumerable.Range(0, (int)probeCount).Select(index => residue + (ulong)index * step);
         foreach (var offset in offsets)
         {
             if (!ReadScalarBufferWord(material.Dwords, (uint)offset, indirect.MaterialImmediate, inputs, out var key))
