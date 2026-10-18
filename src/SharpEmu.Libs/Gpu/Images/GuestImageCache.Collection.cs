@@ -267,7 +267,9 @@ public sealed partial class GuestImageCache
                         if (profile) _collectionBufferOverlapRetentions++;
                         continue;
                     }
-                    if (safe && owner.Description.IsTiled)
+                    // A tiled image is read back and detiled like a linear one; uploads over its range wait
+                    // for that readback, so under pressure it is retired instead of held forever.
+                    if (safe && owner.Description.IsTiled && !pressured)
                     {
                         if (profile) _collectionTiledRetentions++;
                         continue;
