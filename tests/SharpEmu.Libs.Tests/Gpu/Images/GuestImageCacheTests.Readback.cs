@@ -677,4 +677,74 @@ public sealed partial class GuestImageCacheTests
         harness.Finish();
         harness.Shutdown();
     }
+
+    [Fact]
+    public void UnsynchronizedGpuImageTest_MatchesItsRangesWithoutAllocating()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        const ulong size = 0x1000;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var request = LinearRequest(address, size, Format.R8G8B8A8Unorm, GuestPixelFormat.Bits8_8_8_8UNorm,
+            GuestImageType.Color2D, new Extent3D(32, 32, 1), 1, 4, 1);
+        var image = harness.Acquire(ref request);
+
+        bool Agrees(ulong probe) => harness.Worker.Run(() =>
+            harness.Images.HasUnsynchronizedGpuImage(probe, 4) == (harness.Images.UnsynchronizedGpuImageRanges(probe, 4).Count != 0));
+        Assert.True(Agrees(address + 0x40));
+        Assert.False(harness.Worker.Run(() => harness.Images.HasUnsynchronizedGpuImage(address + 0x40, 4)));
+
+        harness.Image(image).MarkGpuModified();
+        Assert.True(harness.Worker.Run(() => harness.Images.HasUnsynchronizedGpuImage(address + 0x40, 4)));
+        Assert.True(Agrees(address + 0x40));
+        Assert.True(Agrees(address + size + 0x40));
+
+        // Resource reads ask this for every guest word; it must not allocate.
+        var allocated = harness.Worker.Run(() =>
+        {
+            _ = harness.Images.HasUnsynchronizedGpuImage(address + size + 0x40, 4);
+            var before = GC.GetAllocatedBytesForCurrentThread();
+            for (var index = 0; index < 1000; index++)
+            {
+                _ = harness.Images.HasUnsynchronizedGpuImage(address + 0x40, 4);
+                _ = harness.Images.HasUnsynchronizedGpuImage(address + size + 0x40, 4);
+            }
+
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        });
+        Assert.Equal(0, allocated);
+        harness.Shutdown();
+    }
+
+    // A buffer view over several images hands the shader their bytes; every covered image
+    // whose GPU contents are still only in the image publishes them, not just the first.
+    [Fact]
+    public void BufferSynchronization_PublishesEveryCoveredGpuImage()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        const ulong size = 0x1000;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address, Bytes(0x01020304u));
+        harness.Write(address + 0x4000, Bytes(0x05060708u));
+        var first = LinearRequest(address, size, Format.R32Uint, GuestPixelFormat.Bits32UInt,
+            GuestImageType.Color2D, new Extent3D(1024, 1, 1), 1, 4, 1);
+        var second = LinearRequest(address + 0x4000, size, Format.R32Uint, GuestPixelFormat.Bits32UInt,
+            GuestImageType.Color2D, new Extent3D(1024, 1, 1), 1, 4, 1);
+        var firstId = harness.Acquire(ref first);
+        var secondId = harness.Acquire(ref second);
+        harness.MarkGpuWritten(firstId);
+        harness.MarkGpuWritten(secondId);
+
+        harness.Worker.Run(() =>
+        {
+            using var buffer = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler, GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, 0x8000);
+            Assert.True(harness.Images.TrySynchronizeBufferFromImage(buffer, address, 0x8000));
+            harness.Scheduler.Finish();
+        });
+
+        Assert.True(harness.Image(firstId).BufferHoldsGpuContents);
+        Assert.True(harness.Image(secondId).BufferHoldsGpuContents);
+        harness.Shutdown();
+    }
 }

@@ -820,17 +820,47 @@ public sealed unsafe partial class GuestImageCache
             }
         }
 
-        if (!selected.IsValid)
+        var synchronized = false;
+        if (selected.IsValid)
         {
-            return false;
+            var target = selected;
+            if (_slots.TryGet(target) is { DepthOwner.IsValid: true } proxy)
+            {
+                target = proxy.DepthOwner;
+            }
+
+            synchronized = TryDownloadImageToBuffer(_slots[target], buffer);
         }
 
-        if (_slots.TryGet(selected) is { DepthOwner.IsValid: true } proxy)
+        // Every other image the view covers is memory the shader can read or partly
+        // rewrite: its GPU-only contents move into the buffer before the bind hands
+        // the range to the buffer. Aliased images are left out, their order unknown.
+        var covered = new List<ResourceSlotIdentifier>();
+        foreach (var identifier in FindImagesInRange(address, size, pageOverlap: false))
         {
-            selected = proxy.DepthOwner;
+            if (identifier != selected && _slots.TryGet(identifier) is { DepthOwner.IsValid: false } candidate &&
+                candidate.Description.Data.Address >= address &&
+                candidate.Description.Data.Size <= address + size - candidate.Description.Data.Address)
+            {
+                covered.Add(identifier);
+            }
         }
 
-        return TryDownloadImageToBuffer(_slots[selected], buffer);
+        foreach (var identifier in covered)
+        {
+            var image = _slots[identifier];
+            if (image.BufferHoldsGpuContents || !CanReadBack(image) ||
+                (selected.IsValid && _slots[selected].Overlaps(image.Description.Data.Address, image.Description.Data.Size)) ||
+                covered.Any(other => other != identifier &&
+                    _slots[other].Overlaps(image.Description.Data.Address, image.Description.Data.Size)))
+            {
+                continue;
+            }
+
+            synchronized |= TryDownloadImageToBuffer(image, buffer);
+        }
+
+        return synchronized;
     }
 
     private bool TryDownloadImageToBuffer(CachedImage image, GpuBuffer buffer)

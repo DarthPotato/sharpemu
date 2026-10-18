@@ -228,6 +228,24 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var owned = IsGpuOwnedForCleanRead(address, sizeof(uint));
             _concurrentAssumptions?.Record(ConcurrentQuery.CleanWord, address, sizeof(uint), owned);
+            if (owned && _concurrentAssumptions is null && _scheduler.Active && _imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
+            {
+                // A word a previous GPU pass wrote into an image is read once that pass's bytes are back in guest
+                // memory, as the command processor would see them: an image's contents go through
+                // its buffer view first, then the buffer comes back to guest memory.
+                foreach (var (imageAddress, imageSize) in _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)))
+                {
+                    _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
+                }
+
+                if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) || _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
+                {
+                    _ = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint));
+                }
+
+                owned = IsGpuOwnedForCleanRead(address, sizeof(uint));
+            }
+
             if (owned)
             {
                 return false;
