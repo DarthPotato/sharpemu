@@ -294,6 +294,30 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void ADeviceAddressWriteMakesThePageGpuOwnedAndItsBytesDownload()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.FindBuffer(address, 0x10000);
+            var read = harness.Cache.ObtainBufferForImage(address, 256);
+            Assert.False(harness.Cache.HasGpuDirtyPages(address, Page), "pre");
+            // The shader stored through a device address; the GPU reports the page afterwards.
+            read.Buffer.Fill(read.Offset, 4, 0xCAFEF00D);
+            harness.Cache.NoteDeviceAddressWrites(address, Page);
+            Assert.True(harness.Cache.HasGpuDirtyPages(address, Page), "pages");
+            Assert.True(harness.Cache.HasGpuDirtyBytes(address, Page), "bytes");
+            Assert.False(harness.Cache.HasGpuDirtyPages(address + Page, Page));
+        });
+        Assert.True(harness.Store.DownloadToCpu(address, 4));
+        Assert.Equal(0xCAFEF00DU, BitConverter.ToUInt32(harness.Read(address, 4)));
+        Assert.False(harness.Cache.HasGpuDirtyBytes(address, Page));
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void MergedAllocationPreservesBothGpuWrittenRanges()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;

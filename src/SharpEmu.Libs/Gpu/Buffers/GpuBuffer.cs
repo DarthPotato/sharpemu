@@ -156,6 +156,9 @@ public unsafe class GpuBuffer : IDisposable
 
     public bool IsCoherent { get; }
 
+    // The host mapping of the whole buffer, or null for memory the host cannot map.
+    public byte* MappedPointer => _mapped;
+
     public GpuBufferUsage Usage { get; }
 
     public ulong CpuAddress { get; }

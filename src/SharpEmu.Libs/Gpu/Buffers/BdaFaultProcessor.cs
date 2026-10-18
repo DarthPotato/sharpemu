@@ -11,6 +11,8 @@ using Silk.NET.Vulkan;
 namespace SharpEmu.Libs.Gpu.Buffers;
 
 // Turns the GPU fault bitmap into buffers: a compute pass lists faulted pages per area.
+// The fault buffer holds two bitmaps of the same size: pages a shader needed but found
+// unmapped, then pages a shader wrote through a device address. The same pass lists each.
 public sealed unsafe class BdaFaultProcessor : IDisposable
 {
     private const int MaxPendingFaults = 8;
@@ -287,6 +289,15 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                     SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(start, size,
                         $"device-address-fault-prepared scan_tick={scanTick} submission_tick={_scheduler.CurrentTick} registered={_cache.IsRegionRegistered(start, size)}");
             });
+            // Written pages beyond the list capacity stay in the bitmap for the next scan.
+            _writtenDownloadBuffer.Invalidate(offset, PageFaultAreaSize);
+            var written = MemoryMarshal.Cast<byte, ulong>(_writtenDownloadBuffer.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
+            var writtenCount = Math.Min((uint)written[0], MaxPageFaults - 1);
+            for (var index = 1; index <= writtenCount; index++)
+            {
+                _cache.NoteDeviceAddressWrites(written[index], _pageSize);
+            }
+
             _faultAreas[area] = 0;
         });
 

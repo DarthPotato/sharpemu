@@ -132,6 +132,26 @@ public sealed class GuestPageTrackerTests : IDisposable
     }
 
     [NativePageProtectionFact]
+    public void GpuWrittenPagesLeaveCpuDirtyPagesWithTheCpuAndCountThem()
+    {
+        var address = Allocate(2);
+        _tracker.ForEachUploadRange(address, Page, false, (_, _) => { }, () => { });
+        Assert.False(_tracker.HasCpuDirtyPages(address, Page));
+        Assert.True(_tracker.HasCpuDirtyPages(address + Page, Page));
+
+        Assert.Equal(1, _tracker.MarkGpuWrittenPages(address, Page * 2));
+
+        Assert.True(_tracker.HasGpuDirtyPages(address, Page));
+        Assert.False(_tracker.HasGpuDirtyPages(address + Page, Page));
+        Assert.True(_tracker.HasCpuDirtyPages(address + Page, Page));
+
+        _tracker.ClearGpuDirtyPages(address, Page);
+
+        _tracker.UntrackMemory(address, Page * 2);
+        Release(address, Page * 2);
+    }
+
+    [NativePageProtectionFact]
     public void CpuDirtyUploadArmsWriteProtectionAndExplicitDirtinessReleasesIt()
     {
         var address = Allocate(2);
