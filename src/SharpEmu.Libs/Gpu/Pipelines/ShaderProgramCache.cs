@@ -879,6 +879,7 @@ internal sealed class ShaderProgramCache
                 Info = options.ComputeInfo!,
                 SystemRegisters = options.ComputeSystemRegisters,
                 Specialization = specialization.Clone(),
+                RuntimeDescriptors = plan.RuntimeDescriptors,
             });
         }
 
@@ -1036,7 +1037,8 @@ internal sealed class ShaderProgramCache
 
     internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
         bool sharedInt64Atomics, bool execGuardElision, bool signedZeroInfNanPreserve, out IGuestCompiledShader? compiled,
-        out BindingLayout? layout, out string error, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false)
+        out BindingLayout? layout, out string error, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
+        bool runtimeImageDescriptorsSupported = false)
     {
         compiled = null;
         layout = null;
@@ -1047,8 +1049,13 @@ internal sealed class ShaderProgramCache
                 return false;
             }
 
+            // Plan as the draw did: the mode the program ended up with when the host serves runtime
+            // descriptors (OnDemand, or Preferred after PreferRuntimeDescriptors), else none.
+            var runtimeDescriptors = !runtimeImageDescriptorsSupported ? RuntimeDescriptorMode.Disabled
+                : record.RuntimeDescriptors == RuntimeDescriptorMode.Preferred ? RuntimeDescriptorMode.Preferred
+                : RuntimeDescriptorMode.OnDemand;
             var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, record.Hash, record.UserDataBase, record.UserDataCount,
-                waveSize: record.Info.WaveSize);
+                waveSize: record.Info.WaveSize, runtimeDescriptors: runtimeDescriptors);
             var resources = ResourceMaterializer.ApplyTo(plan, record.Specialization);
             layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
                 record.Info.DispatchThreadDimensions, ShaderStage.Compute);
