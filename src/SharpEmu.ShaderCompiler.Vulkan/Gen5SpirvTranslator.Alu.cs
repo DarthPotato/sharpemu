@@ -4036,14 +4036,7 @@ public static partial class Gen5SpirvTranslator
                 return shuffled;
             }
 
-            var activeWord = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                Load(_boolType, _exec),
-                UInt(1),
-                UInt(0));
-            var sourceActive = IsNotZero(
-                ShuffleLane(activeWord, targetLane));
+            var sourceActive = IsGuestLaneExecActive(targetLane);
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -4073,20 +4066,14 @@ public static partial class Gen5SpirvTranslator
             var sourceAvailable = inRange;
             if (!control.FetchInactive)
             {
-                var activeWord = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    Load(_boolType, _exec),
-                    UInt(1),
-                    UInt(0));
-                var shuffledActive = _pairedMeshLanes
-                    ? ShufflePairedValue(_pairedActiveWords[0], _pairedActiveWords[1], safeTarget)
-                    : ShuffleLane(activeWord, safeTarget);
+                var sourceActive = _pairedMeshLanes
+                    ? IsNotZero(ShufflePairedValue(_pairedActiveWords[0], _pairedActiveWords[1], safeTarget))
+                    : IsGuestLaneExecActive(safeTarget);
                 sourceAvailable = _module.AddInstruction(
                     SpirvOp.LogicalAnd,
                     _boolType,
                     sourceAvailable,
-                    IsNotZero(shuffledActive));
+                    sourceActive);
             }
 
             return _module.AddInstruction(
@@ -4260,9 +4247,28 @@ public static partial class Gen5SpirvTranslator
             var bankEnabled = IsNotZero(BitwiseAnd(
                 UInt(control.BankMask),
                 ShiftLeftLogical(UInt(1), bank)));
-            var sourceAllowsWrite = control.BoundControl
-                ? _module.ConstantBool(true)
-                : inRange;
+            // ISA: with BOUND_CTRL clear, a lane whose source is out of range, inactive
+            // (fetch-inactive off) or absent from the host subgroup keeps its old
+            // destination; with BOUND_CTRL set it is written with zero instead.
+            uint sourceAllowsWrite;
+            if (control.BoundControl)
+            {
+                sourceAllowsWrite = _module.ConstantBool(true);
+            }
+            else if (control.FetchInactive || _pairedMeshLanes)
+            {
+                sourceAllowsWrite = inRange;
+            }
+            else
+            {
+                GetDppSourceLane(control, out var sourceLane, out _);
+                var safeSource = _module.AddInstruction(
+                    SpirvOp.Select, _uintType, inRange, sourceLane, lane);
+                safeSource = BitwiseAnd(safeSource, UInt(NativeLaneMask));
+
+                sourceAllowsWrite = _module.AddInstruction(
+                    SpirvOp.LogicalAnd, _boolType, inRange, IsGuestLaneExecActive(safeSource));
+            }
             return _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,
@@ -5192,14 +5198,7 @@ public static partial class Gen5SpirvTranslator
                 return shuffled;
             }
 
-            var activeWord = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                Load(_boolType, _exec),
-                UInt(1),
-                UInt(0));
-            var sourceActive = IsNotZero(
-                ShuffleLane(activeWord, targetLane));
+            var sourceActive = IsGuestLaneExecActive(targetLane);
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,

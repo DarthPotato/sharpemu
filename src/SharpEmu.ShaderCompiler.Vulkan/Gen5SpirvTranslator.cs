@@ -9124,6 +9124,38 @@ public static partial class Gen5SpirvTranslator
                         ? BitwiseAnd(lane, UInt(PairedHalfLaneCount - 1))
                         : lane);
 
+        // True when the host invocation behind a guest lane exists and is EXEC-active. A
+        // subgroup ballot has no bit for an absent or inactive invocation, so a partial
+        // graphics subgroup (fragment quads never launched) reads as inactive instead of
+        // the undefined result of shuffling from a lane that is not there. The lane is
+        // masked the same way ShuffleLane masks it, so both address the same invocation.
+        private uint IsGuestLaneExecActive(uint lane)
+        {
+            if (_subgroupInvocationIdInput == 0)
+            {
+                return Load(_boolType, _exec);
+            }
+
+            var ballot = _module.AddInstruction(
+                SpirvOp.GroupNonUniformBallot, _uvec4Type, UInt(3), Load(_boolType, _exec));
+            uint word;
+            if (_waveLowering is NativeWave64Lowering)
+            {
+                word = _module.AddInstruction(
+                    SpirvOp.VectorExtractDynamic, _uintType, ballot, ShiftRightLogical(lane, UInt(5)));
+            }
+            else
+            {
+                // Every other lowering owns at most a 32-lane host subgroup, whose ballot is
+                // word 0; the upper half of an emulated wave64 sits in another subgroup, so
+                // the lane is its position within the 32-lane half (the shuffle wraps alike).
+                word = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, ballot, 0);
+            }
+
+            return IsNotZero(BitwiseAnd(
+                ShiftRightLogical(word, BitwiseAnd(lane, UInt(31))), UInt(1)));
+        }
+
         private uint CurrentLaneBit() =>
             _waveLowering.CurrentLaneBit();
 
