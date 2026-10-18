@@ -99,7 +99,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var work = new ConcurrentQueue<(ComputePrewarmRecord Record, ShaderCodeCapture Code)>(pending);
-            var workerCount = Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
+            // The game waits for prewarm by default, so the workers have the CPU to themselves.
+            // One driver compile of a multi-megabyte compute module peaks near 1.1 GB of RAM, so
+            // the default stays at one worker per two logical processors, at most 6;
+            // SHARPEMU_SHADER_PREWARM_WORKERS sets the count.
+            var workerCount = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SHADER_PREWARM_WORKERS"), out var requestedWorkers) && requestedWorkers > 0
+                ? Math.Min(requestedWorkers, Environment.ProcessorCount)
+                : Math.Clamp(Environment.ProcessorCount / 2, 1, 6);
             var remaining = workerCount;
             var host = (IShaderPipelineHost)this;
             var sharedInt64Atomics = host.SharedInt64AtomicsEnabled;
