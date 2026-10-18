@@ -39,6 +39,25 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void SubpageImageUpload_PreservesTheOtherTexturesInItsTrackerPage()
+    {
+        if (_vulkan is null) return;
+        using var fatal = new FatalScope();
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address + 0x100, Bytes(0xffffffffu));
+        harness.Write(address + 0x400, Bytes(0xff000000u));
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.FindBuffer(address, 0x10000);
+            _ = harness.Cache.ObtainBufferForImage(address + 0x400, 256);
+        });
+        var (source, offset) = harness.Worker.Run(() => harness.Cache.ObtainBufferForImage(address + 0x100, 256));
+        Assert.Equal(Bytes(0xffffffffu), harness.ReadBufferBytes(source, offset, 4));
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void UnalignedImageObtainUploadsTheWholeDirtyPageToItsBufferOwner()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;

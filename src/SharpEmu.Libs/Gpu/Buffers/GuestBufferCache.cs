@@ -256,6 +256,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("A buffer request requires a command buffer that is recording.");
         }
 
+        if (isWritten && isTexelBuffer)
+        {
+            // Preserving a partial image write can merge this buffer with the image's whole
+            // backing range. Finish that before returning a handle the shader will write.
+            RequireImageCache().InvalidateMemoryFromGpu(guestAddress, size);
+        }
+
         if (!isWritten &&
             !_tracker.HasGpuDirtyPages(guestAddress, size) &&
             _tracker.HasCpuDirtyPages(guestAddress, size) &&
@@ -335,9 +342,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             owner = _registry.GetBuffer(FindBuffer(guestAddress, size));
         }
 
-        if (owner != null && !cpuModified && (!gpuModified || hasDirtyBufferSource))
+        if (owner != null && (!gpuModified || hasDirtyBufferSource))
         {
             TouchBuffer(owner);
+            if (cpuModified)
+            {
+                // Tracking clears complete pages, even for a subpage image. The regular
+                // uploader stages those complete runs; staging only the image would copy
+                // unprepared bytes over neighbouring textures and mark them clean.
+                _ = SynchronizeBuffer(owner, guestAddress, size, isWritten: false, isTexelBuffer: true,
+                    preserveCpuWriteHotPages: false, readImageBacking: true);
+            }
+
             return (owner, owner.Offset(guestAddress));
         }
 
@@ -374,9 +390,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         // Tracking reports whole dirty pages, which can extend beyond the image's
         // staging slice. Upload those pages through the normal buffer uploader so
         // every byte marked clean is copied from its actual guest backing.
-        _ = SynchronizeBuffer(owner, guestAddress, size, false, false);
+        _ = SynchronizeBuffer(owner, guestAddress, size, isWritten: false, isTexelBuffer: true,
+            preserveCpuWriteHotPages: false, readImageBacking: true);
         return (owner, owner.Offset(guestAddress));
     }
+
+    private GuestBufferSourceReader? _tryReadImageSource;
+
+    // Image acquisition already holds the image-cache lock. Read CPU-owned backing
+    // directly instead of faulting through guest memory and reentering that cache.
+    private bool TryReadImageSource(ulong address, Span<byte> destination) =>
+        ResidentImageBacking.TryRead(_backing, address, destination);
 
     public void WriteHostMemory(ulong guestAddress, ReadOnlySpan<byte> data)
     {
@@ -1998,7 +2022,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private bool SynchronizeBuffer(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer,
-        bool preserveCpuWriteHotPages = true)
+        bool preserveCpuWriteHotPages = true, bool readImageBacking = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySynchronization);
         var startedAt = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -2009,7 +2033,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             if (BufferUploadProfile.Enabled)
                 BufferUploadProfile.Record(guestAddress, size, 0, 0, 0, System.Diagnostics.Stopwatch.GetTimestamp() - startedAt);
-            return isTexelBuffer && SynchronizeTexelFromImage(buffer, guestAddress, size);
+            return isTexelBuffer && !readImageBacking && SynchronizeTexelFromImage(buffer, guestAddress, size);
         }
 
         profileScope.SwitchPhase(isWritten
@@ -2023,10 +2047,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _uploadCollector ??= collector;
         }
 
-        collector.Begin(this, buffer, guestAddress, size);
+        collector.Begin(this, buffer, guestAddress, size, readImageBacking ? _tryReadImageSource ??= TryReadImageSource : null);
         try
         {
-            return SynchronizeBufferCore(collector, buffer, guestAddress, size, isWritten, isTexelBuffer, preserveCpuWriteHotPages, startedAt);
+            return SynchronizeBufferCore(collector, buffer, guestAddress, size, isWritten, isTexelBuffer, preserveCpuWriteHotPages, readImageBacking, startedAt);
         }
         finally
         {
@@ -2042,6 +2066,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         private GpuBuffer _buffer = null!;
         private ulong _guestAddress;
         private ulong _size;
+        private GuestBufferSourceReader? _readSource;
         public readonly List<BufferCopy> Copies = new();
         public ulong TotalSize;
         public GpuBuffer? Source;
@@ -2056,16 +2081,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 Copies.Add(new BufferCopy(TotalSize, _buffer.Offset(address), bytes));
                 TotalSize += bytes;
             };
-            Upload = () => Source = _cache._uploader.PrepareSource(_buffer.CpuAddress, CollectionsMarshal.AsSpan(Copies), TotalSize, _guestAddress, _size);
+            Upload = () => Source = _cache._uploader.PrepareSource(_buffer.CpuAddress, CollectionsMarshal.AsSpan(Copies), TotalSize, _guestAddress, _size, _readSource);
         }
 
-        public void Begin(GuestBufferCache cache, GpuBuffer buffer, ulong guestAddress, ulong size)
+        public void Begin(GuestBufferCache cache, GpuBuffer buffer, ulong guestAddress, ulong size, GuestBufferSourceReader? readSource)
         {
             InUse = true;
             _cache = cache;
             _buffer = buffer;
             _guestAddress = guestAddress;
             _size = size;
+            _readSource = readSource;
         }
 
         public void End()
@@ -2073,6 +2099,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             InUse = false;
             _cache = null!;
             _buffer = null!;
+            _readSource = null;
             Copies.Clear();
             TotalSize = 0;
             Source = null;
@@ -2082,7 +2109,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     [ThreadStatic] private static UploadCollector? _uploadCollector;
 
     private bool SynchronizeBufferCore(UploadCollector collector, GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten,
-        bool isTexelBuffer, bool preserveCpuWriteHotPages, long startedAt)
+        bool isTexelBuffer, bool preserveCpuWriteHotPages, bool readImageBacking, long startedAt)
     {
         var copies = collector.Copies;
         _tracker.ForEachUploadRange(guestAddress, size, isWritten, collector.Collect, collector.Upload, preserveCpuWriteHotPages);
@@ -2137,7 +2164,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             BufferUploadProfile.Record(guestAddress, size, copies.Count, totalSize, hotBytes, elapsedTicks);
         }
 
-        return isTexelBuffer && SynchronizeTexelFromImage(buffer, guestAddress, size);
+        return isTexelBuffer && !readImageBacking && SynchronizeTexelFromImage(buffer, guestAddress, size);
     }
 
     private bool SynchronizeTexelFromImage(GpuBuffer buffer, ulong guestAddress, ulong size)
