@@ -882,6 +882,42 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return imageIdentifier;
     }
 
+    // The attachment owns one stencil storage image per view size; the cache counts its bytes.
+    public CachedImage AcquireStencilStorageImage(ResourceSlotIdentifier imageIdentifier, uint width, uint height)
+    {
+        using var held = _lock.Hold();
+        var attachment = _slots[imageIdentifier];
+        TouchImage(attachment);
+        CollectForAllocation((ulong)width * height * attachment.Backing.Layers);
+        var before = attachment.AccountedSize;
+        CachedImage storage;
+        try
+        {
+            storage = attachment.GetOrCreateStencilStorageImage(width, height);
+        }
+        catch (CachedImage.ImageOutOfMemoryException)
+        {
+            // Same recovery as any other image creation: free what can go, then try once more.
+            ReclaimAfterFailedAllocation();
+            before = attachment.AccountedSize;
+            try
+            {
+                storage = attachment.GetOrCreateStencilStorageImage(width, height);
+            }
+            catch (CachedImage.ImageOutOfMemoryException again)
+            {
+                throw SubmissionScheduler.Fatal(again.Message);
+            }
+        }
+
+        if (attachment.Registered)
+        {
+            _totalUsedMemory += attachment.AccountedSize - before;
+        }
+
+        return storage;
+    }
+
     private ResourceSlotIdentifier InsertImage(in ImageDescription description,
         [System.Runtime.CompilerServices.CallerMemberName] string creationPath = "")
     {

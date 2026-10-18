@@ -78,6 +78,7 @@ public sealed unsafe partial class CachedImage : IDisposable
     internal SurfaceMetadata? MetadataRegistration;
     public readonly ImageBacking Backing = new();
     public readonly List<CachedImageView> Views = new();
+    private readonly Dictionary<(uint Width, uint Height), CachedImage> _stencilStorageImages = new();
     public ImageUses Uses;
     public ImageBindingState Binding;
     public bool Registered;
@@ -529,7 +530,50 @@ public sealed unsafe partial class CachedImage : IDisposable
     // The device allocation, not the guest byte range: a tiled image reserves more than its
     // guest payload (tiling, mip alignment, driver requirements), and the allocation is what
     // the memory pool actually holds and releases.
-    public ulong AccountedSize => Backing.Exists ? Backing.AllocationSize : 0;
+    public ulong AccountedSize
+    {
+        get
+        {
+            var bytes = Backing.Exists ? Backing.AllocationSize : 0;
+            foreach (var image in _stencilStorageImages.Values)
+            {
+                bytes += image.AccountedSize;
+            }
+
+            return bytes;
+        }
+    }
+
+    public int StencilStorageImageCount => _stencilStorageImages.Count;
+
+    // Queue order permits reuse: every preparation first refreshes the storage image from the
+    // attachment and publishes its writes before the next use. The attachment owns the result.
+    public CachedImage GetOrCreateStencilStorageImage(uint width, uint height)
+    {
+        if (!_stencilStorageImages.TryGetValue((width, height), out var image))
+        {
+            image = CreateStencilStorageImage(width, height);
+            _stencilStorageImages.Add((width, height), image);
+        }
+
+        return image;
+    }
+
+    public IEnumerable<ImageView> GetOwnedViews()
+    {
+        foreach (var cached in Views)
+        {
+            yield return cached.View;
+        }
+
+        foreach (var storage in _stencilStorageImages.Values)
+        {
+            foreach (var view in storage.GetOwnedViews())
+            {
+                yield return view;
+            }
+        }
+    }
 
     // Hashes the first and last partial tracker page of the guest data through the backing alias.
     public ulong HashGuestEdges()
@@ -680,6 +724,12 @@ public sealed unsafe partial class CachedImage : IDisposable
     // Immediate destruction; the owner waits for GPU work before disposing.
     public void Dispose()
     {
+        foreach (var storage in _stencilStorageImages.Values)
+        {
+            storage.Dispose();
+        }
+
+        _stencilStorageImages.Clear();
         foreach (var cached in Views)
         {
             _device.Vk.DestroyImageView(_device.Device, cached.View, null);

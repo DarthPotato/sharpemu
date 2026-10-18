@@ -130,9 +130,13 @@ public sealed partial class GuestImageCache
             _surfaceMetadata.Remove(image.Description.Metadata.Range.Address);
         }
 
-        if (ViewsRetired is { } retired && image.Views.Count != 0)
+        if (ViewsRetired is { } retired)
         {
-            retired([.. image.Views.Select(static cached => cached.View)]);
+            var views = image.GetOwnedViews().ToArray();
+            if (views.Length != 0)
+            {
+                retired(views);
+            }
         }
 
         var retiredBytes = checked((long)image.AccountedSize);

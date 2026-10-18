@@ -777,7 +777,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _imageCache.MarkGpuWritten(attachmentIdentifier);
             }
 
-            storage = attachment.CreateStencilStorageImage(description.Extent.Width, description.Extent.Height);
+            storage = _imageCache.AcquireStencilStorageImage(attachmentIdentifier, description.Extent.Width, description.Extent.Height);
             stencilImages.Add(attachment, storage);
             storage.Binding.ShaderWrite = writeBack;
             if (writeBack)

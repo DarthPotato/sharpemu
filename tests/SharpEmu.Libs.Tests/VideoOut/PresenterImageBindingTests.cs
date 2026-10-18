@@ -330,7 +330,8 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         });
 
         harness.Finish();
-        Assert.All(workingImages, image => Assert.False(image.Backing.Exists));
+        // The attachment owns its stencil storage images and keeps them for the next draw.
+        Assert.All(workingImages, image => Assert.True(image.Backing.Exists));
         var stencil = harness.ReadImageBytes(attachment, ImageAspectFlags.StencilBit);
         for (var layer = 0; layer < layers; layer++)
             for (var row = 0; row < 64; row++)
@@ -401,6 +402,56 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         Assert.Empty(fatal.Messages);
         harness.Finish();
         harness.Shutdown();
+    }
+
+    [Fact]
+    public void StencilStorage_IsCachedPerSizeOnTheAttachmentAndCounted()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        if (!_vulkan.StorageImageExtendedFormats || !_vulkan.SupportsDynamicRendering)
+        {
+            Assert.False(ReferenceShaders.Required, "Stencil storage tests need extended storage formats and dynamic rendering.");
+            return;
+        }
+        using var fatal = new FatalScope();
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var region = harness.MapBacked(0x200000, ReadWrite);
+        CachedImage attachment = null!, first = null!, again = null!, smaller = null!;
+        ulong accountedBefore = 0, accountedAfterFirst = 0, accountedAfterSecond = 0, usedBefore = 0, usedAfter = 0;
+        presenter.Run(() =>
+        {
+            var target = new GuestDepthTarget(region, region, 64, 64, 3, 0, 1f, false,
+                Registers: RegisterWords.Depth(region, 64, 64, stencilBase: region + 0x80000));
+            var depth = presenter.InvokeMethod("DiscoverDepthTarget", target)!;
+            presenter.InvokeMethod("AcquireDepthAttachment", depth, GuestDepthState.Default);
+            var identifier = (ResourceSlotIdentifier)GetFieldValue(depth, "ImageIdentifier");
+            attachment = (CachedImage)GetFieldValue(depth, "Image");
+            presenter.RenderHost.ResetBindings();
+
+            accountedBefore = attachment.AccountedSize;
+            usedBefore = harness.Images.CollectionMemoryBytes;
+            first = harness.Images.AcquireStencilStorageImage(identifier, 64, 64);
+            accountedAfterFirst = attachment.AccountedSize;
+            again = harness.Images.AcquireStencilStorageImage(identifier, 64, 64);
+            smaller = harness.Images.AcquireStencilStorageImage(identifier, 32, 32);
+            accountedAfterSecond = attachment.AccountedSize;
+            usedAfter = harness.Images.CollectionMemoryBytes;
+        });
+
+        Assert.Same(first, again);
+        Assert.NotSame(first, smaller);
+        Assert.Equal(2, attachment.StencilStorageImageCount);
+        Assert.True(accountedAfterFirst > accountedBefore);
+        Assert.True(accountedAfterSecond > accountedAfterFirst);
+        Assert.Equal(accountedAfterSecond - accountedBefore, usedAfter - usedBefore);
+        Assert.Empty(fatal.Messages);
+        harness.Finish();
+        harness.Shutdown();
+        // Both storage images went with the attachment.
+        Assert.False(first.Backing.Exists);
+        Assert.False(smaller.Backing.Exists);
     }
 
     [Theory]

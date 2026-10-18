@@ -78,16 +78,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         foreach (var (attachment, storage) in stencilImages)
                         {
-                            try
-                            {
-                                if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
-                                    StencilStorageWriteBackImages.Contains(attachment))
-                                    attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
-                            }
-                            finally
-                            {
-                                owner._scheduler.QueueCompletionAction(storage.Dispose);
-                            }
+                            // The attachment owns the storage image and releases it with itself.
+                            if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
+                                StencilStorageWriteBackImages.Contains(attachment))
+                                attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
                         }
                     }
 
