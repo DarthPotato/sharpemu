@@ -8,7 +8,17 @@ namespace SharpEmu.Libs.Gpu.Scheduling;
 
 public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 {
-    internal static Action<string> OnFatal = message => Environment.FailFast(message);
+    internal static Action<string> OnFatal = message =>
+    {
+        // Diagnostic: give a crash-dump tool (such as the Vulkan crash diagnostic layer, which
+        // writes its log on another thread when the device is lost) time to finish first.
+        if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FATAL_DELAY_MS"), out var delay) && delay > 0)
+        {
+            Thread.Sleep(delay);
+        }
+
+        Environment.FailFast(message);
+    };
 
     [ThreadStatic]
     private static SubmissionScheduler? _callbackOwner;
