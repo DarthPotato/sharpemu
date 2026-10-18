@@ -1437,17 +1437,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 _batchSerial >= hot.MutedUntil)
             {
                 _eagerCandidates.Add(key);
-                HotWritePending |= hot.Strikes == 0;
             }
         }
     }
 
-    public bool HotWritePending { get; private set; }
-
     public void OnBatchSubmitted()
     {
         _batchSerial++;
-        HotWritePending = false;
         if (AsyncReadback is not { } readback)
         {
             return;
