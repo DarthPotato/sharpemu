@@ -77,7 +77,7 @@ public sealed partial class GuestImageCache
     // depth image over the plane loads it from there instead of stale bytes.
     // The number of images retired: the image and the stencil planes associated with it, or zero
     // when it was not registered.
-    private int DeleteImage(ResourceSlotIdentifier imageIdentifier, bool publishStencil = true)
+    private int DeleteImage(ResourceSlotIdentifier imageIdentifier, string reason, bool publishStencil = true)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDelete);
         var image = _slots.TryGet(imageIdentifier);
@@ -111,13 +111,18 @@ public sealed partial class GuestImageCache
                     associated.ClearGpuModified();
                 }
 
-                retiredImages += DeleteImage(association, publishStencil);
+                retiredImages += DeleteImage(association, "depth-association", publishStencil);
             }
         }
 
         if (image.IsGpuModified)
         {
             throw SubmissionScheduler.Fatal($"A GPU-modified image cannot be deleted before its contents are resolved: address=0x{image.Description.Data.Address:X16} size=0x{image.Description.Data.Size:X}.");
+        }
+
+        if (ImageChurnTrace.Enabled)
+        {
+            NoteImageDeleted(image, reason);
         }
 
         _scheduledReadbacks.Remove(imageIdentifier);
@@ -159,7 +164,7 @@ public sealed partial class GuestImageCache
         return retiredImages;
     }
 
-    private void ReleaseImage(ResourceSlotIdentifier imageIdentifier)
+    private void ReleaseImage(ResourceSlotIdentifier imageIdentifier, string reason)
     {
         var image = _slots[imageIdentifier];
         TraceVolumeState("release", image, ImageRequest.Refresh(image.Description, ImageRole.Texture));
@@ -168,7 +173,7 @@ public sealed partial class GuestImageCache
             image.ClearGpuModified();
         }
 
-        DeleteImage(imageIdentifier);
+        DeleteImage(imageIdentifier, reason);
     }
 
     private void TouchImage(CachedImage image)
@@ -690,7 +695,7 @@ public sealed partial class GuestImageCache
                 owner.ClearGpuModified();
             }
 
-            DeleteImage(imageIdentifier, publishStencil: false);
+            DeleteImage(imageIdentifier, "guest-unmap", publishStencil: false);
         }
     }
 }

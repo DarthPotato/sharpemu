@@ -362,7 +362,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
             else if (resolved.Description.Resources < request.Description.Resources)
             {
-                ReleaseImage(result);
+                ReleaseImage(result, "lookup-fewer-resources");
                 result = ResourceSlotIdentifier.Invalid;
             }
             else if (!resolved.SupportsViewType(request.View) &&
@@ -764,7 +764,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         foreach (var association in associations)
         {
             _slots[association].ClearGpuModified();
-            DeleteImage(association);
+            DeleteImage(association, "stencil-plane-release");
         }
     }
 
@@ -945,6 +945,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         var imageIdentifier = _slots.Insert(image);
         _createdImageCount++;
+        if (ImageChurnTrace.Enabled)
+        {
+            NoteImageCreated(image);
+        }
+
         ReportLargeImageCreation(_slots[imageIdentifier], creationPath);
         ReportImageLifetime(_slots[imageIdentifier], "recreate");
         if (RenderPhaseProfile.Enabled)
