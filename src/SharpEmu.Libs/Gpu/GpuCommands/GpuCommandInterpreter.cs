@@ -407,6 +407,16 @@ public sealed partial class GpuCommandInterpreter
         return BinaryPrimitives.ReadUInt32LittleEndian(bytes);
     }
 
+    // Several operand dwords in one read: each operand read can wait for the render thread.
+    internal void ReadOperandBytes(ulong address, Span<byte> destination)
+    {
+        RenderPhaseProfile.RecordCommandRead(RenderPhaseProfile.CommandReadKind.Operand32, destination.Length);
+        if (!_host.TryReadGuestOperand(address, destination))
+        {
+            throw _host.Fatal($"The command stream cannot read guest memory: address=0x{address:X16} size={destination.Length}.");
+        }
+    }
+
     internal ulong ReadQword(ulong address)
     {
         RenderPhaseProfile.RecordCommandRead(RenderPhaseProfile.CommandReadKind.Operand64, sizeof(ulong));
