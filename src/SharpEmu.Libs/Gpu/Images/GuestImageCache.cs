@@ -42,6 +42,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ulong _collectionStartBytes;
     private ulong _memoryPressureBytes;
     private ulong _criticalMemoryBytes;
+    // The whole image budget: the memory the cache may hold before it takes back what the frame
+    // in progress may still use. The thresholds above are targets the collections aim for.
+    private ulong _hardLimitBytes;
     private long _retiredImageMemoryBytes;
     // The retired bytes of each tick that has retired images, oldest first.
     private readonly Queue<RetiredTick> _retiredTicks = new();
@@ -86,13 +89,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _collectionStartBytes = Math.Max(imageBudget / 2, MiB);
         _memoryPressureBytes = Math.Max(imageBudget * 3 / 5, MiB);
         _criticalMemoryBytes = Math.Max(imageBudget * 7 / 10, MiB);
+        _hardLimitBytes = Math.Max(imageBudget, _criticalMemoryBytes);
         if (Interlocked.Exchange(ref _budgetLogged, 1) == 0)
         {
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Image cache budget source={(_device.HasMemoryBudget ? "VK_EXT_memory_budget" : "device-local heap size")} " +
                 $"heap={_device.DeviceLocalHeapBytes} budget={_device.DeviceLocalBudgetBytes} " +
                 $"usage={_device.DeviceLocalUsageBytes} available={_device.DeviceLocalAvailableBytes} " +
-                $"image_budget={imageBudget} thresholds={_collectionStartBytes}/{_memoryPressureBytes}/{_criticalMemoryBytes}");
+                $"image_budget={imageBudget} thresholds={_collectionStartBytes}/{_memoryPressureBytes}/{_criticalMemoryBytes}/{_hardLimitBytes}");
         }
     }
 
@@ -132,10 +136,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     public bool MemoryUnderPressure => CollectionMemoryBytes >= _memoryPressureBytes;
 
     // Retired images hold device memory until the work that used them completes; too many of
-    // them need that work finished, not another sweep.
+    // them, or a cache at its hard limit, need that work finished, not another sweep. Between the
+    // critical threshold and the hard limit they are simply destroyed as their ticks complete:
+    // waiting for them there drained the GPU on every allocation of a frame larger than the target.
     public bool RetirementOverBudget =>
         Interlocked.Read(ref _retiredImageMemoryBytes) > RetiredBudgetBytes ||
-        (Interlocked.Read(ref _retiredImageMemoryBytes) > 0 && TotalUsedMemory >= _criticalMemoryBytes);
+        (Interlocked.Read(ref _retiredImageMemoryBytes) > 0 && TotalUsedMemory >= _hardLimitBytes);
 
     private const long RetiredBudgetBytes = 256L * (long)MiB;
 
