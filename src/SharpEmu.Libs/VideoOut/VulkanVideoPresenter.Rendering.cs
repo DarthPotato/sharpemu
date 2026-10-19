@@ -818,6 +818,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceBackBit, state.BackStencil.Reference);
             }
 
+            // The bounds only matter while the test is on; they are set when it turns on or they change.
+            if (_supportsDepthBounds && state.DepthBoundsTestEnabled && (!known || !last.DepthBoundsTestEnabled ||
+                state.DepthMinBounds != last.DepthMinBounds || state.DepthMaxBounds != last.DepthMaxBounds))
+            {
+                _vk.CmdSetDepthBounds(command, state.DepthMinBounds, state.DepthMaxBounds);
+            }
+
             if (_colorWriteEnableApi is { } colorWriteEnable && state.ColorWriteCount != 0)
             {
                 var enables = stackalloc Bool32[RenderingState.ColorAttachmentCapacity];

@@ -985,9 +985,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         parameters.Samples = samples;
         parameters.SampleShadingEnable = pixelActive && samples > 1 && pixelInput!.SampleShading;
         parameters.WithDepth = withDepth;
+        // The bounds themselves are dynamic state: games move them every draw (light volumes).
         parameters.DepthBoundsTestEnable = depthState.DepthBoundsTestEnabled;
-        parameters.DepthMinBounds = depthState.DepthMinBounds;
-        parameters.DepthMaxBounds = depthState.DepthMaxBounds;
         parameters.StencilTestEnable = depthState.StencilTestEnabled;
         parameters.StencilFront = withDepth ? depthState.FrontOperations : StencilOperations.Default;
         parameters.StencilBack = withDepth ? depthState.BackOperations : StencilOperations.Default;
