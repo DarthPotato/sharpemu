@@ -21,8 +21,8 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
     private const int SampleShadingOffset = 11;
     private const int WithDepthOffset = 12;
     private const int DepthBoundsTestOffset = 13;
-    private const int DepthMinBoundsOffset = 14;
-    private const int DepthMaxBoundsOffset = 18;
+    // Bytes 14..21 held the depth bounds, which are dynamic state; they stay zero so the other
+    // offsets of stored keys do not move.
     private const int StencilTestOffset = 22;
     private const int StencilFrontOffset = 23;
     private const int StencilBackOffset = 39;
@@ -76,10 +76,6 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
 
     private void SetUInt(int offset, uint value) => BinaryPrimitives.WriteUInt32LittleEndian(_bytes.AsSpan(offset), value);
 
-    private float GetFloat(int offset) => BinaryPrimitives.ReadSingleLittleEndian(_bytes.AsSpan(offset));
-
-    private void SetFloat(int offset, float value) => BinaryPrimitives.WriteSingleLittleEndian(_bytes.AsSpan(offset), value);
-
     private StencilOperations GetStencil(int offset) => new(
         (StencilOp)GetUInt(offset),
         (StencilOp)GetUInt(offset + 4),
@@ -102,8 +98,6 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
     public bool SampleShadingEnable { get => GetBool(SampleShadingOffset); set => SetBool(SampleShadingOffset, value); }
     public bool WithDepth { get => GetBool(WithDepthOffset); set => SetBool(WithDepthOffset, value); }
     public bool DepthBoundsTestEnable { get => GetBool(DepthBoundsTestOffset); set => SetBool(DepthBoundsTestOffset, value); }
-    public float DepthMinBounds { get => GetFloat(DepthMinBoundsOffset); set => SetFloat(DepthMinBoundsOffset, value); }
-    public float DepthMaxBounds { get => GetFloat(DepthMaxBoundsOffset); set => SetFloat(DepthMaxBoundsOffset, value); }
     public bool StencilTestEnable { get => GetBool(StencilTestOffset); set => SetBool(StencilTestOffset, value); }
     public StencilOperations StencilFront { get => GetStencil(StencilFrontOffset); set => SetStencil(StencilFrontOffset, in value); }
     public StencilOperations StencilBack { get => GetStencil(StencilBackOffset); set => SetStencil(StencilBackOffset, in value); }
