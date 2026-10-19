@@ -22,7 +22,7 @@ on the GPU.
 - Small, separate commits, each with a test, each explainable in a few lines (upstream rejected a 30k-line
   PR; we land small root-cause PRs). One topic per branch: `cloud/<topic>`.
 - English for code, commits and comments; the report (see Deliverable) in French.
-- No Co-Authored-By trailer in commits.
+- Commits are authored by the owner: run `git config user.name "foufouadi"` and `git config user.email "attar.foued@gmail.com"` first. No Co-Authored-By trailer, no mention of Claude, Anthropic or "Generated with Claude Code" anywhere, and never open a pull request (push `cloud/*` branches only).
 
 ## History you need
 
