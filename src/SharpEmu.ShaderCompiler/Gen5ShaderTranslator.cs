@@ -1339,6 +1339,7 @@ public static partial class Gen5ShaderTranslator
             0x378 => "VPermlanex16B32",
             // GFX10 16-bit integer ALU, VOP3-only.
             0x304 => "VSubNcU16",
+            0x305 => "VMulLoU16",
             0x307 => "VLshrrevB16",
             0x308 => "VAshrrevI16",
             0x309 => "VMaxU16",
@@ -1409,8 +1410,20 @@ public static partial class Gen5ShaderTranslator
         // loudly at emission rather than being silently mis-emitted.
         name = opcode switch
         {
+            0x00 => "VPkMadI16",
+            0x01 => "VPkMulLoU16",
             0x02 => "VPkAddI16",
             0x03 => "VPkSubI16",
+            0x04 => "VPkLshlrevB16",
+            0x05 => "VPkLshrrevB16",
+            0x06 => "VPkAshrrevI16",
+            0x07 => "VPkMaxI16",
+            0x08 => "VPkMinI16",
+            0x09 => "VPkMadU16",
+            0x0A => "VPkAddU16",
+            0x0B => "VPkSubU16",
+            0x0C => "VPkMaxU16",
+            0x0D => "VPkMinU16",
             0x0E => "VPkFmaF16",
             0x0F => "VPkAddF16",
             0x10 => "VPkMulF16",
