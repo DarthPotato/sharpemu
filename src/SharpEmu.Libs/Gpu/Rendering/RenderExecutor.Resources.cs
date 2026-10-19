@@ -47,7 +47,7 @@ public sealed partial class RenderExecutor
 
     // Lets the buffer cache finish every allocation merge the geometry acquisitions below can
     // trigger, so no shader descriptor holds a buffer that one of them replaces.
-    private void PrepareDrawBufferAllocations(VertexInputInfo vertexInput, in IndexSource index, ulong indirectAddress)
+    private void PrepareDrawBufferAllocations(VertexInputInfo vertexInput, in IndexSource index, ulong indirectAddress, ulong indirectSize)
     {
         var buffers = vertexInput.Buffers;
         if (buffers.Length > VertexInputInfo.MaxBuffers)
@@ -68,7 +68,7 @@ public sealed partial class RenderExecutor
         if (index.Enabled && index.HostData is null)
             ranges[count++] = new GuestSpan(index.Address, index.Size);
         if (indirectAddress != 0)
-            ranges[count++] = new GuestSpan(indirectAddress, IndexedIndirectArgumentsSize);
+            ranges[count++] = new GuestSpan(indirectAddress, indirectSize);
         _host.PrepareBufferAllocations(ranges[..count]);
     }
 
@@ -276,6 +276,7 @@ public sealed partial class RenderExecutor
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;
         var meshInput = state.Programs.MeshInput;
+        var indirectSize = emission.Indexed ? IndexedIndirectArgumentsSize : AutoIndirectArgumentsSize;
         using var preparation = _host.BeginPreparation();
         using var indirectMesh = meshInput is not null && emission.IndirectArgumentsAddress != 0
             ? _host.PrepareIndirectMeshDraw(new IndirectMeshDrawRequest(emission.IndirectArgumentsAddress,
@@ -369,7 +370,7 @@ public sealed partial class RenderExecutor
         // shader descriptor, vertex binding or index binding takes a buffer handle.
         if (meshInput is null)
         {
-            PrepareDrawBufferAllocations(vertexInput, in indexSource, emission.IndirectArgumentsAddress);
+            PrepareDrawBufferAllocations(vertexInput, in indexSource, emission.IndirectArgumentsAddress, indirectSize);
         }
 
         if (vertexProgram.UsesDeviceAddresses || (pixelProgram?.UsesDeviceAddresses ?? false))
@@ -386,7 +387,7 @@ public sealed partial class RenderExecutor
         var vertexBuffers = meshInput is null ? AcquireVertexBuffers(vertexInput) : [];
         var indexBuffer = meshInput is null ? AcquireIndexBuffer(in indexSource) : default;
         var indirectArguments = meshInput is null && emission.IndirectArgumentsAddress != 0
-            ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, IndexedIndirectArgumentsSize, isWritten: false)
+            ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, indirectSize, isWritten: false)
             : default;
         // Nothing after the pipeline touches guest memory.
         var pipeline = _pipelines.CreateGraphicsPipeline(
@@ -492,7 +493,14 @@ public sealed partial class RenderExecutor
         {
             // Uploads and shader writes end with barriers to all commands, so the
             // indirect read sees them.
-            _host.DrawIndexedIndirect(indirectArguments);
+            if (emission.Indexed)
+            {
+                _host.DrawIndexedIndirect(indirectArguments);
+            }
+            else
+            {
+                _host.DrawIndirect(indirectArguments);
+            }
         }
         else
         {
