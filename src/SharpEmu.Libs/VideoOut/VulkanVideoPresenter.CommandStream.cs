@@ -373,6 +373,34 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadGuestWaitOperand(ulong address, Span<byte> destination) =>
             OnCommandThread ? ReadOnCommandThread(address, destination) : TryReadGuestOperand(address, destination);
 
+        // On the command thread every record is read in one render-thread callback, so the queued
+        // work is run once rather than once per record.
+        public bool TryReadGuestOperandRecords(ulong address, ulong stride, int recordSize, Span<byte> destination)
+        {
+            if (!OnCommandThread)
+            {
+                return ReadOperandRecords(address, stride, recordSize, destination);
+            }
+
+            var buffer = new byte[destination.Length];
+            var read = _commandThread!.Run(() => ReadOperandRecords(address, stride, recordSize, buffer));
+            buffer.CopyTo(destination);
+            return read;
+        }
+
+        private bool ReadOperandRecords(ulong address, ulong stride, int recordSize, Span<byte> destination)
+        {
+            for (var offset = 0; offset < destination.Length; offset += recordSize)
+            {
+                if (!TryReadGuestOperand(address + ((ulong)(offset / recordSize) * stride), destination.Slice(offset, recordSize)))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         public bool TryReadGuestOperand(ulong address, Span<byte> destination)
         {
             if (OnCommandThread)

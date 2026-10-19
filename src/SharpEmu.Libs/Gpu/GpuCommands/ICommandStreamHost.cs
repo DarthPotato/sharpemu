@@ -93,6 +93,22 @@ public interface ICommandStreamHost
     // write, unlike the packets themselves. A host that defers work completes it first.
     bool TryReadGuestOperand(ulong address, Span<byte> destination) => TryReadGuest(address, destination);
 
+    // Reads operand records of one size spaced by a stride (the entries of an indirect
+    // multi-draw) into consecutive slots of the destination, skipping the bytes between them.
+    // A host that defers work completes it once for all of them.
+    bool TryReadGuestOperandRecords(ulong address, ulong stride, int recordSize, Span<byte> destination)
+    {
+        for (var offset = 0; offset < destination.Length; offset += recordSize)
+        {
+            if (!TryReadGuestOperand(address + ((ulong)(offset / recordSize) * stride), destination.Slice(offset, recordSize)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Reads the label a wait polls. A stale value only suspends the wait until a retry, so a host
     // that runs work behind the stream need not complete it first.
     bool TryReadGuestWaitOperand(ulong address, Span<byte> destination) => TryReadGuestOperand(address, destination);

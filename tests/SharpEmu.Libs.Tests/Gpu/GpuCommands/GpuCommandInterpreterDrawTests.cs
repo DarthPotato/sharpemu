@@ -220,6 +220,31 @@ public sealed class GpuCommandInterpreterDrawTests
     }
 
     [Fact]
+    public void IndexedIndirectMulti_ReadsEachRecordOnceAndSkipsTheStrideGap()
+    {
+        var runner = new StreamRunner();
+        runner.Host.WriteWords(Arguments, new uint[]
+        {
+            3, 1, 2, 0, 0, 0xDEAD, 0xDEAD, 0xDEAD,
+            6, 2, 4, 5, 1, 0xDEAD, 0xDEAD, 0xDEAD,
+            9, 1, 0, 0, 0,
+        });
+
+        runner.Run(
+            SetBase(Arguments, dispatch: false),
+            StreamRunner.Packet(PacketOpcode.IndexBase, StreamRunner.Low(Indices), StreamRunner.High(Indices)),
+            StreamRunner.Packet(PacketOpcode.IndexType, 0),
+            StreamRunner.Packet(PacketOpcode.IndexBufferSize, 64),
+            StreamRunner.Packet(PacketOpcode.DrawIndexIndirectMulti, 0, 0, 0, 0, 3, 0, 0, 32, 2));
+
+        Assert.Equal(
+            new[] { (3u, Indices + 4, 1u, 0, 0u), (6u, Indices + 8, 2u, 5, 1u), (9u, Indices, 1u, 0, 0u) },
+            runner.Host.IndexedDraws.Select(draw => (draw.IndexCount, draw.IndexAddress, draw.InstanceCount, draw.BaseVertex, draw.FirstInstance)));
+        var argumentReads = runner.Host.GuestReads.Where(address => address >= Arguments && address < Arguments + 96).ToArray();
+        Assert.Equal(new[] { Arguments, Arguments + 32, Arguments + 64 }, argumentReads);
+    }
+
+    [Fact]
     public void Dispatches_DirectAndBothIndirectEncodings()
     {
         var runner = new StreamRunner();
