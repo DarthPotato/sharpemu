@@ -1018,16 +1018,28 @@ public static class PadExports
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        foreach (var time in times)
+        var active = false;
+        for (var index = 0; index < times.Length; index++)
         {
-            if (elapsed >= time && elapsed < time + 0.4)
+            var time = times[index];
+            if (elapsed < time)
             {
-                return true;
+                continue;
+            }
+
+            // A press stays down until one sample has seen it, so a game that reads
+            // the pad less often than every 0.4 s still gets it.
+            if (elapsed < time + 0.4 || Volatile.Read(ref AutoCrossSampled[index]) == 0)
+            {
+                active = true;
+                Volatile.Write(ref AutoCrossSampled[index], 1);
             }
         }
 
-        return false;
+        return active;
     }
+
+    private static readonly int[] AutoCrossSampled = new int[AutoCrossTimes.Length];
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>
     private static uint ToOrbisButtons(HostGamepadButtons buttons)
