@@ -1211,6 +1211,24 @@ internal static unsafe partial class VulkanVideoPresenter
             CountDraw();
         }
 
+        void IRenderHost.DrawIndirect(BufferBinding arguments)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            var command = BeginBatchedGuestCommands();
+            // The executor sends rectangle lists here only when the device fills them natively.
+            if (_boundGraphicsPipeline is { RectangleList: true } entry)
+            {
+                BindNativeRectangleList(entry, command);
+            }
+
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            _vk.CmdDrawIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 16);
+            _occlusionQueries?.TraceDraw();
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
+                _boundGraphicsPipeline?.Id ?? 0, 0, 0);
+            CountDraw();
+        }
+
         void IRenderHost.DrawMeshTasks(uint groupCountX, uint groupCountY, uint groupCountZ)
         {
             if (_cmdDrawMeshTasks is null)
