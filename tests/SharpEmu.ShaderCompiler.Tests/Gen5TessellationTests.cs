@@ -207,6 +207,47 @@ public sealed class Gen5TessellationTests
         Assert.Equal(2, stored.Count);
     }
 
+    // A graphics stage runs once per vertex or pixel: its private LDS is not cleared whole in
+    // every invocation but zeroed one dword at a time, the first time the dword is addressed.
+    [Theory]
+    [InlineData(ShaderStage.TessellationEvaluation)]
+    [InlineData(ShaderStage.Vertex)]
+    [InlineData(ShaderStage.Pixel)]
+    public void GraphicsStages_ZeroPrivateLdsLazily(ShaderStage stage)
+    {
+        var program = Program(
+            DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(7), Gen5Operand.Vector(5)], []),
+            DataShare(8, "DsReadB32", false, [Gen5Operand.Vector(7)], [10], 4),
+            new Gen5ShaderInstruction(16, Gen5ShaderEncoding.Exp, "Exp", [0u, 0u],
+                [Gen5Operand.Vector(10), Gen5Operand.Vector(6), Gen5Operand.Vector(5), Gen5Operand.Source(242)], [],
+                new Gen5ExportControl(12, 15, false, true, false)), EndProgram(24));
+        var (plan, resources, layout) = Prepare(stage == ShaderStage.Pixel ? Program(
+            DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(7), Gen5Operand.Vector(5)], []),
+            DataShare(8, "DsReadB32", false, [Gen5Operand.Vector(7)], [10], 4),
+            BufferAccess(16, "BufferStoreDword", 4, vectorData: 10, offsetEnabled: true, vectorAddress: 7),
+            EndProgram(24)) : program, stage);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = 32,
+            PixelOutputs = stage == ShaderStage.Pixel ? [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)] : [],
+            Tessellation = stage == ShaderStage.TessellationEvaluation
+                ? new(Gen5TessellationDomain.Quads, Gen5TessellationSpacing.Equal, false, false) : null,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Gen5MipStatisticsTests.ValidateWhenAvailable(shader.Spirv);
+        var instructions = Instructions(shader.Spirv).ToArray();
+        uint Named(string name) => Assert.Single(instructions, i => i.Op == SpirvOp.Name &&
+            System.Text.Encoding.ASCII.GetString(System.Runtime.InteropServices.MemoryMarshal.AsBytes(i.Args.AsSpan(1))).TrimEnd('\0') == name).Args[0];
+        var lds = Assert.Single(instructions, i => i.Op == SpirvOp.Variable && i.Args[1] == Named("lds"));
+        var written = Assert.Single(instructions, i => i.Op == SpirvOp.Variable && i.Args[1] == Named("ldsWritten"));
+        // Result type, id and storage class only: no initializer on the array, one on the bitmap.
+        Assert.Equal(3, lds.Args.Length);
+        Assert.Equal(4, written.Args.Length);
+        // The write and the read each mark their dword in the bitmap before using it.
+        Assert.Equal(2, instructions.Count(i => i.Op == SpirvOp.Store && instructions.Any(chain =>
+            chain.Op == SpirvOp.AccessChain && chain.Args[1] == i.Args[0] && chain.Args[2] == written.Args[1])));
+    }
+
     [Fact]
     public void Evaluation_MissingConfigurationIsAnExplicitFailure()
     {

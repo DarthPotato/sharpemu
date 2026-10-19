@@ -186,6 +186,9 @@ public static partial class Gen5SpirvTranslator
         private uint _storageBlockPointer;
         private uint _storageUintPointer;
         private uint _lds;
+        // Bitmap of the private LDS dwords this invocation has addressed; zero when the array
+        // is zero-initialized instead (DeclareLds).
+        private uint _ldsWritten;
         private uint _ldsElementPointer;
         private uint _lds64ElementPointer;
         private uint _ldsDwordMask;
@@ -772,14 +775,28 @@ public static partial class Gen5SpirvTranslator
             var ldsPointer = _module.TypePointer(storageClass, ldsArrayType);
             _ldsElementPointer = _module.TypePointer(storageClass, _uintType);
             _lds64ElementPointer = _module.TypePointer(storageClass, _ulongType);
-            _lds = storageClass == SpirvStorageClass.Workgroup
-                ? _module.AddGlobalVariable(ldsPointer, storageClass)
-                : _module.AddGlobalVariable(
-                    ldsPointer,
-                    storageClass,
-                    _module.ConstantNull(ldsArrayType));
+            // A private array must read zero where this invocation has not written. A zero
+            // initializer clears the whole array (8 KiB) in every invocation: the array is
+            // dynamically indexed, so drivers keep it in local memory and the clear is real
+            // memory traffic once per invocation: per fragment for a pixel shader, per vertex for an
+            // NGG vertex or domain shader. The array is
+            // uninitialized instead, and a zero-initialized bitmap of addressed dwords (1/32 of
+            // the size) lets LdsPointer zero a slot the first time it is addressed: loads, stores
+            // and atomics keep the zero-read semantics.
+            var lazilyZeroed = storageClass == SpirvStorageClass.Private;
+            _lds = _module.AddGlobalVariable(ldsPointer, storageClass);
             _module.AddName(_lds, "lds");
             _interfaces.Add(_lds);
+            if (lazilyZeroed)
+            {
+                var bitmapType = _module.TypeArray(_uintType, (arrayDwordCount + 31) / 32);
+                _ldsWritten = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, bitmapType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(bitmapType));
+                _module.AddName(_ldsWritten, "ldsWritten");
+                _interfaces.Add(_ldsWritten);
+            }
         }
 
         internal static SpirvImageFormat DecodeStorageImageFormat(
@@ -2962,11 +2979,31 @@ public static partial class Gen5SpirvTranslator
                 // Mask the dword index into the array bounds. The private LDS is a
                 // power-of-two dword count, so this prevents out-of-bounds access when a
                 // graphics-stage scratch write uses an arbitrary computed byte address.
-                return _module.AddInstruction(
+                var index = BitwiseAnd(dwordIndex, UInt(_ldsDwordMask));
+                var privatePointer = _module.AddInstruction(
                     SpirvOp.AccessChain,
                     _ldsElementPointer,
                     _lds,
-                    BitwiseAnd(dwordIndex, UInt(_ldsDwordMask)));
+                    index);
+                if (_ldsWritten != 0)
+                {
+                    var wordPointer = _module.AddInstruction(
+                        SpirvOp.AccessChain,
+                        _privateUintPointer,
+                        _ldsWritten,
+                        ShiftRightLogical(index, UInt(5)));
+                    var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(index, UInt(31)));
+                    var word = Load(_uintType, wordPointer);
+                    var unwritten = _module.AddInstruction(
+                        SpirvOp.IEqual, _boolType, BitwiseAnd(word, bit), UInt(0));
+                    EmitConditional(unwritten, () =>
+                    {
+                        Store(privatePointer, UInt(0));
+                        Store(wordPointer, BitwiseOr(word, bit));
+                    });
+                }
+
+                return privatePointer;
             }
 
             if (_stage == Gen5SpirvStage.Mesh)
