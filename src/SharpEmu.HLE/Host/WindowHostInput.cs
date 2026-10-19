@@ -40,4 +40,6 @@ internal sealed class WindowHostInput : IHostInput
 
     public bool IsKeyDown(int virtualKey) =>
         HostWindowInputSource.Current?.IsKeyDown(virtualKey) ?? false;
+
+    public void EndKeyboardSample() => HostWindowInputSource.Current?.EndKeyboardSample();
 }

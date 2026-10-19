@@ -46,4 +46,10 @@ public interface IHostInput
 
     /// <summary>Windows virtual-key code semantics; other backends translate.</summary>
     bool IsKeyDown(int virtualKey);
+
+    /// <summary>
+    /// Ends one keyboard sample. A key pressed and released between two samples reports
+    /// down until this call, so a short tap is not lost when the game reads input rarely.
+    /// </summary>
+    void EndKeyboardSample() { }
 }

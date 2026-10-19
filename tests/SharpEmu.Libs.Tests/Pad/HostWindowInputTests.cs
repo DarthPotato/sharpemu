@@ -39,6 +39,30 @@ public sealed class HostWindowInputTests
     }
 
     [Fact]
+    public void KeyTappedBetweenSamplesReportsDownUntilTheSampleEnds()
+    {
+        HostWindowInput.Connect();
+        try
+        {
+            var source = Assert.IsAssignableFrom<IHostWindowInputSource>(HostWindowInputSource.Current);
+            HostWindowInput.SetKey(0x0D, true);
+            HostWindowInput.SetKey(0x0D, false);
+
+            Assert.True(source.IsKeyDown(0x0D));
+            source.EndKeyboardSample();
+            Assert.False(source.IsKeyDown(0x0D));
+
+            HostWindowInput.SetKey(0x0D, true);
+            source.EndKeyboardSample();
+            Assert.True(source.IsKeyDown(0x0D));
+        }
+        finally
+        {
+            HostWindowInput.Disconnect();
+        }
+    }
+
+    [Fact]
     public void ConnectedGamepadStateIsExposedByWindowSource()
     {
         var expected = new HostGamepadState(

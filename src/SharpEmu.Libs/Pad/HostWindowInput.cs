@@ -10,6 +10,8 @@ public static class HostWindowInput
 {
     private static readonly object Gate = new();
     private static readonly HashSet<int> PressedKeys = new();
+    // Keys pressed since the last keyboard sample; they report down until that sample ends.
+    private static readonly HashSet<int> LatchedKeys = new();
     private static bool _focused;
     private static bool _gamepadConnected;
     private static string? _gamepadName;
@@ -24,6 +26,7 @@ public static class HostWindowInput
             _focused = true;
             _gamepadOutput = gamepadOutput;
             PressedKeys.Clear();
+            LatchedKeys.Clear();
         }
 
         HostWindowInputSource.Set(Source);
@@ -39,6 +42,7 @@ public static class HostWindowInput
             _gamepadState = default;
             _gamepadOutput = null;
             PressedKeys.Clear();
+            LatchedKeys.Clear();
         }
 
         HostWindowInputSource.Clear(Source);
@@ -52,6 +56,7 @@ public static class HostWindowInput
             if (!focused)
             {
                 PressedKeys.Clear();
+                LatchedKeys.Clear();
             }
         }
     }
@@ -63,6 +68,7 @@ public static class HostWindowInput
             if (down)
             {
                 PressedKeys.Add(virtualKey);
+                LatchedKeys.Add(virtualKey);
             }
             else
             {
@@ -117,7 +123,15 @@ public static class HostWindowInput
         {
             lock (Gate)
             {
-                return PressedKeys.Contains(virtualKey);
+                return PressedKeys.Contains(virtualKey) || LatchedKeys.Contains(virtualKey);
+            }
+        }
+
+        public void EndKeyboardSample()
+        {
+            lock (Gate)
+            {
+                LatchedKeys.Clear();
             }
         }
 
