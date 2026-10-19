@@ -111,7 +111,9 @@ public sealed unsafe partial class GuestImageCache
             plan.SwapBgra16 = info.Bgra16;
         }
 
-        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, info.Resources.Levels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
+        // The layout covers the whole guest chain; the levels before FirstLevel are dropped below.
+        var guestLevels = info.FirstLevel + info.Resources.Levels;
+        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
         plan.Regions = plan.Layout.BuildCopies();
         if (info.IsDepth)
         {
@@ -130,17 +132,57 @@ public sealed unsafe partial class GuestImageCache
 
         if (plan.Tiled)
         {
-            if (!plan.Layout.TryBuildTileTransfers(info.Data.Size, plan.Regions, info.Resources.Levels, out var tiles))
+            if (!plan.Layout.TryBuildTileTransfers(info.Data.Size, plan.Regions, guestLevels, out var tiles))
             {
                 return plan;
             }
 
             plan.Tiles = tiles;
+        }
+
+        if (info.FirstLevel != 0)
+        {
+            KeepResidentLevels(plan, info.FirstLevel);
+        }
+
+        if (plan.Tiled)
+        {
             plan.LinearSize = LinearSizeOf(plan.Tiles);
         }
 
         plan.Valid = true;
         return plan;
+    }
+
+    // Only the resident levels have host levels: guest level L lands on host level L - firstLevel.
+    // Each tile transfer belongs to the copy region at its index, so both lists drop the same entries;
+    // the remaining ones keep their linear offsets.
+    private static void KeepResidentLevels(ColorTransferPlan plan, uint firstLevel)
+    {
+        var kept = 0;
+        for (var index = 0; index < plan.Regions.Count; index++)
+        {
+            var region = plan.Regions[index];
+            if (region.ImageSubresource.MipLevel < firstLevel)
+            {
+                continue;
+            }
+
+            region.ImageSubresource.MipLevel -= firstLevel;
+            plan.Regions[kept] = region;
+            if (plan.Tiled)
+            {
+                plan.Tiles[kept] = plan.Tiles[index];
+            }
+
+            kept++;
+        }
+
+        plan.Regions.RemoveRange(kept, plan.Regions.Count - kept);
+        if (plan.Tiled)
+        {
+            plan.Tiles.RemoveRange(kept, plan.Tiles.Count - kept);
+        }
     }
 
     private static Exception InvalidAttachmentUpload(in ImageDescription info, CachedImage image) =>
@@ -153,7 +195,8 @@ public sealed unsafe partial class GuestImageCache
     {
         ref readonly var info = ref image.Description;
         var plan = new ImageDownloadPlan { Depth = info.IsDepth };
-        if (info.Samples != 1 || image.Backing.Samples != 1)
+        // An image of a streamed texture's resident levels does not hold the guest chain it would write back.
+        if (info.Samples != 1 || image.Backing.Samples != 1 || info.FirstLevel != 0)
         {
             return plan;
         }

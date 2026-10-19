@@ -107,7 +107,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
         Backing.Format = Description.PixelFormat;
         Backing.ImageType = HostImageType(Description.Type);
-        Backing.Extent = Description.Extent;
+        Backing.Extent = Description.HostExtent;
         Backing.GuestPitch = Description.Pitch;
         Backing.Layers = Description.IsVolume ? 1 : Description.Resources.Layers;
         Backing.MipLevels = Description.Resources.Levels;
