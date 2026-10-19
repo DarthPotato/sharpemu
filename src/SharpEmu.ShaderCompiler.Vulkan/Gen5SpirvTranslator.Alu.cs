@@ -2238,7 +2238,7 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(
                     SpirvOp.LogicalAnd,
                     _boolType,
-                    Equal(lowBits, halfWay),
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, lowBits, halfWay),
                     IsNotZero(BitwiseAnd(quotient, UInt(1)))));
             var subnormal = IAdd(quotient, SelectU(roundUp, UInt(1), UInt(0)));
 
