@@ -1697,7 +1697,9 @@ public sealed partial class ScalarValueGraph
         private void ApplyMemory(Gen5ShaderInstruction instruction, RegisterState state)
         {
             ScalarValue? vectorRead = null;
-            if (_recording && _graph.Memory.TryGetIndex(instruction.Pc, 0, out var memoryIndex))
+            // Propagate load values during the fixpoint walk too: recording alone cannot
+            // carry a uniform VGPR value across a basic-block boundary.
+            if (_graph.Memory.TryGetIndex(instruction.Pc, 0, out var memoryIndex))
             {
                 var binding = instruction.Control switch
                 {
@@ -1721,12 +1723,27 @@ public sealed partial class ScalarValueGraph
                     _ => null,
                 };
 
+                // ScalarBufferWord models one raw word at a byte offset. Indexed and
+                // formatted loads need different address/data semantics; atomics can
+                // return different values per lane even at a uniform address.
                 if (binding is not null && instruction.Control is Gen5BufferMemoryControl bufferControl &&
-                    !instruction.Opcode.Contains("Store", StringComparison.Ordinal) &&
-                    instruction.Destinations.FirstOrDefault(destination => destination.Kind == Gen5OperandKind.VectorRegister) is { } vectorDestination)
+                    instruction.Opcode == "BufferLoadDword" && !bufferControl.IndexEnabled &&
+                    instruction.Destinations.Any(destination => destination.Kind == Gen5OperandKind.VectorRegister))
                 {
                     var handle = binding.Handle!;
-                    var offset = state.ReadVector(bufferControl.VectorAddress);
+                    // Without IDXEN or OFFEN the access reads no VGPR: every lane loads the
+                    // same dword at the V# base plus the instruction offset.
+                    var offset = bufferControl.OffsetEnabled
+                        ? state.ReadVector(bufferControl.VectorAddress)
+                        : _graph.Constant(0u);
+                    // SOFFSET adds to the address like the VGPR offset does.
+                    var scalarOffset = instruction.Sources.Count > 2 ? Read(instruction.Sources[2], state) : _graph.Constant(0u);
+                    if (!(scalarOffset.IsConstant && scalarOffset.ConstantU32 == 0))
+                    {
+                        offset = offset.IsUndefined || scalarOffset.IsUndefined
+                            ? _graph.Undefined(ScalarValueType.U32)
+                            : _graph.Operation(ScalarOperation.IAdd32, ScalarValueType.U32, offset, scalarOffset);
+                    }
                     // A lane-varying address loads a lane-varying value.
                     if (!offset.IsUndefined)
                     {
@@ -1735,7 +1752,10 @@ public sealed partial class ScalarValueGraph
                     }
                 }
 
-                _graph.Accesses[memoryIndex] = binding;
+                if (_recording)
+                {
+                    _graph.Accesses[memoryIndex] = binding;
+                }
             }
 
             foreach (var destination in instruction.Destinations)

@@ -538,7 +538,7 @@ public sealed class ScalarValueGraphTests
     public void DivergentVectorValue_IsRejected()
     {
         var perLane = Program(
-            BufferLoad(0, 0, dwords: 1),
+            BufferAccess(0, "BufferLoadDword", 0, indexEnabled: true),
             ReadFirstLane(8, 8, 4),
             MoveScalar(12, 9, 0),
             MoveScalar(16, 10, 16),
