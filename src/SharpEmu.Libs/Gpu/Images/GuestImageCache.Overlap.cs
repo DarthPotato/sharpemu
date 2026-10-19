@@ -302,7 +302,7 @@ public sealed partial class GuestImageCache
     private static bool IsSameLayoutAlias(in ImageDescription image, in ImageDescription alias) =>
         !alias.IsDepth && alias.Data == image.Data && SameExtent(alias.Extent, image.Extent) && alias.Type == image.Type &&
         alias.Samples == image.Samples && alias.BytesPerBlock == image.BytesPerBlock && alias.TileMode == image.TileMode &&
-        alias.Resources == image.Resources && SameMipLayout(alias, image);
+        alias.Resources == image.Resources && alias.FirstLevel == image.FirstLevel && SameMipLayout(alias, image);
 
     // Two sizes of one surface, as a dynamic-resolution title alternates between them.
     private static bool IsResizeSibling(in ImageDescription image, in ImageDescription candidate) =>
@@ -310,7 +310,7 @@ public sealed partial class GuestImageCache
         !SameExtent(candidate.Extent, image.Extent) && candidate.Type == image.Type &&
         candidate.Samples == image.Samples && candidate.BytesPerBlock == image.BytesPerBlock &&
         candidate.TileMode == image.TileMode && candidate.Resources == image.Resources &&
-        candidate.PixelFormat == image.PixelFormat;
+        candidate.FirstLevel == 0 && image.FirstLevel == 0 && candidate.PixelFormat == image.PixelFormat;
 
     // A freshly created size of a surface copies the shared rectangle of the newest
     // GPU-written sibling, so switching the render resolution keeps the previous
@@ -605,6 +605,21 @@ public sealed partial class GuestImageCache
         ref var cachedInfo = ref cached.Description;
         var currentTick = _scheduler.CurrentTick;
         var safeToDelete = currentTick - Math.Min(currentTick, cached.LastAccessTick) > TicksBeforeRemoval;
+        if (requested.FirstLevel != 0 || cachedInfo.FirstLevel != 0)
+        {
+            // An image of a streamed chain's resident levels shares only an identical chain (the
+            // same-backing match). It is a copy of guest memory that a lookup recreates cheaply, so
+            // another resource over its range replaces it; a request for resident levels over
+            // another image is a separate texture (the lookup took the whole chain when that image
+            // holds GPU contents).
+            if (cachedInfo.FirstLevel != 0 && !cached.IsGpuModified)
+            {
+                cached.Binding.NeedsRebind |= cached.Binding.IsBound || cached.Binding.IsTarget;
+                ReleaseImage(cachedImageIdentifier, "overlap-resident-levels");
+            }
+
+            return new OverlapResolution(mergedImageIdentifier);
+        }
         var requestedBlock = requested.BytesPerBlock * requested.Samples;
         var cachedBlock = cachedInfo.BytesPerBlock * cachedInfo.Samples;
         var requestedBlockExtent = requested.BlockExtent;

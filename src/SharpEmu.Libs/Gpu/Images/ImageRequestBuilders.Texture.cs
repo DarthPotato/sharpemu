@@ -120,13 +120,15 @@ public static partial class ImageRequestBuilders
     // The view follows the compiled module: a volume, a layer window to the last layer, or one layer.
     private static ImageViewDescription TextureView(
         in TextureDescriptorWords descriptor, in ShaderImageShape shape, Format format, bool shaderConversion, uint viewLevels, uint imageLayers,
-        ulong shaderHash, int imageIndex)
+        ulong shaderHash, int imageIndex, uint firstLevel)
     {
+        // The image's levels count from its first resident guest level.
+        var baseLevel = descriptor.BaseLevel - firstLevel;
         var mapping = shape.Storage || shaderConversion ? default : ViewFormatRules.ComponentMapping(DestinationSwizzle(descriptor));
         var usage = shape.Storage ? ImageUsageFlags.StorageBit : ImageUsageFlags.SampledBit;
         if (shape.Volume)
         {
-            return WithMinLod(new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, descriptor.BaseLevel, viewLevels, 0, 1, mapping, usage), descriptor, shape);
+            return WithMinLod(new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, baseLevel, viewLevels, 0, 1, mapping, usage), descriptor, shape, firstLevel);
         }
 
         var baseLayer = descriptor.BaseArray;
@@ -143,15 +145,16 @@ public static partial class ImageRequestBuilders
         var type = shape.OneDimensional
             ? shape.Arrayed ? ImageViewType.Type1DArray : ImageViewType.Type1D
             : shape.Arrayed ? ImageViewType.Type2DArray : ImageViewType.Type2D;
-        return WithMinLod(new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, descriptor.BaseLevel, viewLevels, baseLayer, layerCount, mapping, usage), descriptor, shape);
+        return WithMinLod(new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, baseLevel, viewLevels, baseLayer, layerCount, mapping, usage), descriptor, shape, firstLevel);
     }
 
     // MIN_LOD (4.8 fixed point, absolute mip levels) keeps sampling off mips a streamed texture has not
     // loaded yet; ignoring it sampled the unloaded mip 0 of Astro Bot's stadium sky and bloom spread its
     // garbage HDR values over the screen. Storage views address levels explicitly and are not clamped.
-    private static ImageViewDescription WithMinLod(ImageViewDescription view, in TextureDescriptorWords descriptor, in ShaderImageShape shape)
+    private static ImageViewDescription WithMinLod(ImageViewDescription view, in TextureDescriptorWords descriptor, in ShaderImageShape shape, uint firstLevel)
     {
-        var minLod = descriptor.MinLod / 256f;
+        // The view's levels are host levels, which start at the image's first guest level.
+        var minLod = descriptor.MinLod / 256f - firstLevel;
         if (shape.Storage || minLod <= view.BaseLevel)
         {
             return view;
@@ -159,6 +162,31 @@ public static partial class ImageRequestBuilders
 
         return view with { MinLod = Math.Min(minLod, view.BaseLevel + view.LevelCount - 1) };
     }
+
+    // The same texture as an image of the whole guest mip chain, viewed from the descriptor's base
+    // level: the request a texture gets when its larger mips are mapped or another image holds them.
+    public static ImageRequest WithWholeMipChain(in ImageRequest request)
+    {
+        var firstLevel = request.Description.FirstLevel;
+        if (firstLevel == 0)
+        {
+            return request;
+        }
+
+        var whole = request;
+        whole.Description.Resources = new SubresourceCount(request.Description.Resources.Levels + firstLevel, request.Description.Resources.Layers);
+        whole.Description.FirstLevel = 0;
+        whole.View = RebaseView(request.View, firstLevel);
+        return whole;
+    }
+
+    // A view of an image whose first level is `levels` guest levels lower than the view was built for.
+    public static ImageViewDescription RebaseView(in ImageViewDescription view, uint levels) =>
+        levels == 0 ? view : view with
+        {
+            BaseLevel = view.BaseLevel + levels,
+            MinLod = view.MinLod == 0 ? 0 : view.MinLod + levels,
+        };
 
     public static uint DestinationSwizzle(in TextureDescriptorWords descriptor) =>
         ViewFormatRules.PackDestinationSelect(descriptor.DestinationSelectX, descriptor.DestinationSelectY, descriptor.DestinationSelectZ, descriptor.DestinationSelectW);
@@ -409,6 +437,20 @@ public static partial class ImageRequestBuilders
             PopulateTextureMipLayout(ref description);
         }
 
+        // A sampled texture whose descriptor starts past mip 0 never reads the levels before it, and a
+        // streamed texture has not even mapped them: the request holds only the levels from there.
+        // The image cache returns it to the whole chain when that memory is mapped, so a texture view
+        // of a lower mip of a rendered or fully loaded chain stays the same image (WithWholeMipChain).
+        var firstLevel = !storage && !volume && samples == 1 && baseLevel > 0 && baseLevel < levels &&
+                         description.Metadata.Kind == MetadataKind.None && !description.IsDepth
+            ? baseLevel
+            : 0u;
+        if (firstLevel != 0)
+        {
+            description.FirstLevel = firstLevel;
+            description.Resources = new SubresourceCount(levels - firstLevel, imageLayers);
+        }
+
         if (tolerateInvalid && !shape.Volume && descriptor.BaseArray >= description.Resources.Layers)
         {
             return Reject($"The texture base layer is outside the image: baseLayer={descriptor.BaseArray} layers={description.Resources.Layers} address=0x{address:X16}.",
@@ -416,7 +458,7 @@ public static partial class ImageRequestBuilders
         }
 
         var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewLevels, description.Resources.Layers,
-            shaderHash, imageIndex);
+            shaderHash, imageIndex, firstLevel);
         if (!shape.R128 && descriptor.MetadataCompress && !description.IsDepth && !shaderConversion &&
             tile == GuestTileMode.RenderTarget && levels == 1 && samples == 1 &&
             type is GuestImageType.Color2D or GuestImageType.Color2DArray or GuestImageType.Color3D &&
