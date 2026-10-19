@@ -149,11 +149,14 @@ public sealed partial class GuestImageCache
         if (_scheduler.Active)
         {
             // The image keeps its device memory until the work that may use it completes.
+            var tick = _scheduler.CurrentTick;
+            NoteRetired(tick, retiredBytes);
             Interlocked.Add(ref _retiredImageMemoryBytes, retiredBytes);
             _scheduler.QueueCompletionAction(() =>
             {
                 _slots.Erase(imageIdentifier);
                 Interlocked.Add(ref _retiredImageMemoryBytes, -retiredBytes);
+                NoteRetired(tick, -retiredBytes);
             });
         }
         else

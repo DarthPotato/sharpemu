@@ -212,6 +212,47 @@ public sealed partial class GuestImageCacheTests
     }
 
     [Fact]
+    public void RetirementOverBudget_WaitsForTheOldTicksOnly()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        ResourceSlotIdentifier older = default;
+        ResourceSlotIdentifier newer = default;
+        harness.Worker.Run(() =>
+        {
+            older = harness.Images.InsertImageForTest(SmallImage(address, 64));
+            newer = harness.Images.InsertImageForTest(SmallImage(address + 0x10000, 64));
+        });
+        var olderBytes = harness.Image(older).AccountedSize;
+        var newerBytes = harness.Image(newer).AccountedSize;
+        harness.Worker.Run(() =>
+        {
+            harness.Images.DeleteImageForTest(older);
+            harness.Scheduler.Flush();
+            harness.Images.DeleteImageForTest(newer);
+        });
+
+        // Room for the newer retirement only: the older tick must complete, the recording one need not.
+        harness.Images.SetCollectionThresholds(1, newerBytes + 1, newerBytes + 1, 10);
+        Assert.True(harness.Images.RetirementOverBudget);
+        var recording = harness.Scheduler.CurrentTick;
+        harness.Worker.Run(harness.Images.ReleaseRetiredImages);
+
+        Assert.Equal(recording, harness.Scheduler.CurrentTick);
+        Assert.Equal(newerBytes, harness.Images.TotalUsedMemory);
+        Assert.False(harness.Images.RetirementOverBudget);
+
+        // When the recording tick holds the excess, it is submitted and waited for.
+        harness.Images.SetCollectionThresholds(1, 1, 1, 10);
+        harness.Worker.Run(harness.Images.ReleaseRetiredImages);
+        Assert.NotEqual(recording, harness.Scheduler.CurrentTick);
+        Assert.Equal(0UL, harness.Images.TotalUsedMemory);
+        Assert.NotEqual(0UL, olderBytes);
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void AllocationNearTheBudgetRetiresOldImagesFirst()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
