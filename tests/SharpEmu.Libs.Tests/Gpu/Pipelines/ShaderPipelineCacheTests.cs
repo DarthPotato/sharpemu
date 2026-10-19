@@ -130,6 +130,20 @@ public sealed class ShaderPipelineCacheTests : IDisposable
     }
 
     [Fact]
+    public void RenderingStateReset_MatchesANewInstance()
+    {
+        var reused = new PipelineRenderingState { ColorCount = 3, DepthFormat = Format.D32Sfloat, DepthSamples = 4 };
+        reused.ColorFormats[2] = Format.R8G8B8A8Unorm;
+        reused.ColorSamples[2] = 4;
+        reused.SampleLocationWords[5] = 0x1234;
+
+        reused.Reset();
+
+        Assert.Equal(new PipelineRenderingState(), reused);
+        Assert.Equal(new PipelineRenderingState().GetHashCode(), reused.GetHashCode());
+    }
+
+    [Fact]
     public void DisableBlending_ClearsTheBlendEnableButKeepsTheFactors()
     {
         var programs = Programs();
