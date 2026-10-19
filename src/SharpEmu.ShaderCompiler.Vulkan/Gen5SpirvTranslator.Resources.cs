@@ -670,6 +670,9 @@ public static partial class Gen5SpirvTranslator
         // fault and resolves to an invalid pointer; an address past the table reads as unmapped.
         private uint _deviceAddressInstructionPc;
 
+        // The pc a shared function received as a parameter, in place of the translation-time constant.
+        private uint _deviceAddressInstructionPcValue;
+
         private (uint Pointer, uint Valid) ResolveDeviceAddress(uint address64)
         {
             var masked = And64(address64, ULong(DeviceAddressMask));
@@ -696,7 +699,7 @@ public static partial class Gen5SpirvTranslator
                     EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
                     {
                         uint[] values = [UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)),
-                            UInt(_deviceAddressInstructionPc), Narrow(address64),
+                            _deviceAddressInstructionPcValue != 0 ? _deviceAddressInstructionPcValue : UInt(_deviceAddressInstructionPc), Narrow(address64),
                             Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, address64, ULong(32))),
                             UInt((uint)_request.Stage), UInt(0)];
                         for (var index = 0; index < values.Length; index++)

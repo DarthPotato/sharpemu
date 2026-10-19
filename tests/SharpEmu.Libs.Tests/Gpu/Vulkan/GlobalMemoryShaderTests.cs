@@ -329,6 +329,81 @@ public sealed class GlobalMemoryShaderTests(HeadlessVulkanFixture fixture, ITest
         Assert.Equal(expected, RunOnce(vulkan, shader, initial));
     }
 
+    // The format exists only in the V# loaded at run time, so the whole element is decoded on
+    // the device: four components, each converted with the number format the descriptor names.
+    [Theory]
+    [InlineData(14u, 7u, 0u)]
+    [InlineData(14u, 7u, 3u)]
+    [InlineData(10u, 0u, 0u)]
+    [InlineData(10u, 0u, 5u)]
+    [InlineData(10u, 4u, 3u)]
+    [InlineData(5u, 0u, 2u)]
+    public void DeviceDescriptorFormattedLoads_DecodeAFourComponentRunTimeFormat(
+        uint dataFormat, uint numberFormat, uint offset)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        uint format = 0;
+        for (uint candidate = 1; candidate < 128 && format == 0; candidate++)
+        {
+            if (Gfx10UnifiedFormat.TryDecode(candidate, out var decodedData, out var decodedNumber) &&
+                decodedData == dataFormat && decodedNumber == numberFormat)
+            {
+                format = candidate;
+            }
+        }
+
+        Assert.NotEqual(0u, format);
+        const uint size = 64;
+        var initial = CreateInput();
+        for (var index = 0; index < 64; index++) initial[index] = (byte)(index * 0x13 + 0x21);
+        WriteDeviceDescriptor(initial, size, (format << 12) | IdentitySwizzle);
+
+        var expected = (byte[])initial.Clone();
+        initial.AsSpan(0, 16).CopyTo(expected.AsSpan(MemoryOffset, 16));
+        uint[] components = dataFormat switch
+        {
+            14 => Enumerable.Range(0, 4).Select(index => ReadWord(initial, (int)offset + index * 4)).ToArray(),
+            10 => Enumerable.Range(0, 4).Select(index =>
+                numberFormat == 0 ? BitConverter.SingleToUInt32Bits(initial[(int)offset + index] / 255f) : initial[(int)offset + index]).ToArray(),
+            _ => Enumerable.Range(0, 4).Select(index =>
+                index < 2 ? BitConverter.SingleToUInt32Bits(((initial[(int)offset + index * 2] | (initial[(int)offset + index * 2 + 1] << 8)) & 0xFFFF) / 65535f)
+                    : index == 3 ? BitConverter.SingleToUInt32Bits(1f) : 0u).ToArray(),
+        };
+        for (var index = 0; index < 4; index++) WriteWord(expected, MemoryOffset + index * 4, components[index]);
+
+        var words = new List<uint>
+        {
+            0xE0380000, 0x80000400,
+            0x7E000000u | (20u << 17) | (2u << 9) | 256u,
+            0xF4000000u | (10u << 18) | (16u << 6), (20u << 25) | DescriptorOffset,
+            0xBF8CC07F,
+            // buffer_load_format_xyzw v[4:7], v0, s[16:19], soffset=offset
+            0xE0000000 | (3u << 18), ((0x80u + offset) << 24) | 0x040400,
+            0xE0780000 | MemoryOffset, 0x80000400,
+            0xBF810000,
+        };
+        var shader = CompileProgram(DecodeProgram(words), BaseScalars());
+        var actual = RunOnce(vulkan, shader, initial);
+        Assert.Equal(expected.Length, actual.Length);
+        for (var index = 0; index < expected.Length; index++)
+        {
+            if (index >= MemoryOffset && index < MemoryOffset + 16) continue;
+            Assert.True(expected[index] == actual[index], $"byte {index}");
+        }
+
+        for (var index = 0; index < 4; index++)
+        {
+            var want = ReadWord(expected, MemoryOffset + index * 4);
+            var got = ReadWord(actual, MemoryOffset + index * 4);
+            // A normalized component divides on the device, which may round one ulp away.
+            Assert.True(
+                want == got || (numberFormat == 0 && Math.Abs((long)want - got) <= 1),
+                $"component {index}: expected 0x{want:X8}, got 0x{got:X8}");
+        }
+    }
+
     // Every formatted load of a run-time format decodes its layout from one shared table and
     // joins two dwords, so a program of many loads stays small.
     [Fact]
@@ -375,7 +450,8 @@ public sealed class GlobalMemoryShaderTests(HeadlessVulkanFixture fixture, ITest
         Assert.True(perLoad < PerLoadWordBudget, $"{perLoad} words per formatted load");
     }
 
-    // Measured 2183 after the change, 10242 before (fault tracing on, nine loads minus one over eight).
+    // Measured 729 (the shared function is emitted once), 2183 inline in a loop, 10242 unrolled
+    // (fault tracing on, nine loads minus one over eight).
     private const int PerLoadWordBudget = 3000;
 
     [Theory]

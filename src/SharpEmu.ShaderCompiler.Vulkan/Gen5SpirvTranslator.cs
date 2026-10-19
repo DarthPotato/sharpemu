@@ -478,6 +478,7 @@ public static partial class Gen5SpirvTranslator
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
                 EmitRuntimeLookupFunctions();
+                EmitGfx10DeviceFormatFunction();
 
                 var model = _stage switch
                 {
@@ -4060,51 +4061,35 @@ public static partial class Gen5SpirvTranslator
             }
             else
             {
-                // The layout is only known at run time. One loop body decodes, loads and
-                // converts a component, so the module carries it once instead of four times.
-                EnsureGfx10FormatLoopScratch();
-                var preheader = _module.AllocateId();
-                var header = _module.AllocateId();
-                var body = _module.AllocateId();
-                var continueLabel = _module.AllocateId();
-                var mergeLabel = _module.AllocateId();
-                var next = _module.AllocateId();
-                _module.AddStatement(SpirvOp.Branch, preheader);
-                _module.AddLabel(preheader);
-                _module.AddStatement(SpirvOp.Branch, header);
-                _module.AddLabel(header);
-                var counter = _module.AddInstruction(
-                    SpirvOp.Phi, _uintType, UInt(0), preheader, next, continueLabel);
-                var more = _module.AddInstruction(SpirvOp.ULessThan, _boolType, counter, UInt(4));
-                _module.AddStatement(SpirvOp.LoopMerge, mergeLabel, continueLabel, 0);
-                _module.AddStatement(SpirvOp.BranchConditional, more, body, mergeLabel);
-                _module.AddLabel(body);
-                var value = LoadGfx10DeviceBufferFormatComponent(
-                    baseAddress,
-                    size,
-                    byteAddress,
-                    dataFormat,
-                    numberFormat,
-                    counter,
-                    out var inBoundsComponent);
-                Store(Gfx10FormatLoopSlot(_gfx10FormatValueScratch, counter), value);
-                Store(
-                    Gfx10FormatLoopSlot(_gfx10FormatBoundsScratch, counter),
-                    _module.AddInstruction(SpirvOp.Select, _uintType, inBoundsComponent, UInt(1), UInt(0)));
-                _module.AddStatement(SpirvOp.Branch, continueLabel);
-                _module.AddLabel(continueLabel);
-                _module.AddStatement(SpirvOp.IAdd, _uintType, next, counter, UInt(1));
-                _module.AddStatement(SpirvOp.Branch, header);
-                _module.AddLabel(mergeLabel);
+                // The layout is only known at run time. The element's dwords are fetched once
+                // (two page walks instead of two per component) and every component is
+                // extracted from them, so the driver compiles one small body per access.
+                EnsureGfx10DeviceFormatScratch();
+                if (_gfx10DeviceFormatFunction == 0)
+                {
+                    _gfx10DeviceFormatFunction = _module.AllocateId();
+                }
+
+                _module.AddInstruction(
+                    SpirvOp.FunctionCall,
+                    _voidType,
+                    [
+                        _gfx10DeviceFormatFunction,
+                        baseAddress,
+                        size,
+                        byteAddress,
+                        dataFormat,
+                        numberFormat,
+                        UInt(_deviceAddressInstructionPc),
+                    ]);
                 for (uint component = 0; component < 4; component++)
                 {
                     canonical[component] = Load(
-                        _uintType,
-                        Gfx10FormatLoopSlot(_gfx10FormatValueScratch, UInt(component)));
+                        _uintType, Gfx10DeviceFormatSlot(_gfx10DeviceFormatValues, component));
                     componentBounds[component] = _module.AddInstruction(
                         SpirvOp.INotEqual,
                         _boolType,
-                        Load(_uintType, Gfx10FormatLoopSlot(_gfx10FormatBoundsScratch, UInt(component))),
+                        Load(_uintType, Gfx10DeviceFormatSlot(_gfx10DeviceFormatBounds, component)),
                         UInt(0));
                 }
             }
@@ -4148,6 +4133,213 @@ public static partial class Gen5SpirvTranslator
                     numberFormat,
                     packedD16,
                     d16High);
+            }
+        }
+
+        private uint _gfx10DeviceFormatFunction;
+        private uint _gfx10DeviceFormatValues;
+        private uint _gfx10DeviceFormatBounds;
+
+        // The four component values and in-bounds flags a run-time-format load hands back.
+        private void EnsureGfx10DeviceFormatScratch()
+        {
+            if (_gfx10DeviceFormatValues != 0)
+            {
+                return;
+            }
+
+            var arrayType = _module.TypeArray(_uintType, 4);
+            var pointerType = _module.TypePointer(SpirvStorageClass.Private, arrayType);
+            uint NewScratch(string name)
+            {
+                var zero = UInt(0);
+                var variable = _module.AddGlobalVariable(
+                    pointerType,
+                    SpirvStorageClass.Private,
+                    _module.ConstantComposite(arrayType, [zero, zero, zero, zero]));
+                _module.AddName(variable, name);
+                _interfaces.Add(variable);
+                return variable;
+            }
+
+            _gfx10DeviceFormatValues = NewScratch("deviceFormatValues");
+            _gfx10DeviceFormatBounds = NewScratch("deviceFormatBounds");
+        }
+
+        private uint Gfx10DeviceFormatSlot(uint scratch, uint index) =>
+            _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, scratch, UInt(index));
+
+        private void EmitGfx10DeviceFormatFunction()
+        {
+            if (_gfx10DeviceFormatFunction == 0)
+            {
+                return;
+            }
+
+            var type = _module.TypeFunction(
+                _voidType, [_ulongType, _ulongType, _uintType, _uintType, _uintType, _uintType]);
+            // SpirvFunctionControl.None, deliberately: DontInline compiles 50CD in 8.8 s instead
+            // of 30 s on an RTX 5070, because the driver otherwise inlines the body at all 128
+            // sites, but a DontInline lookup function was miscompiled on NVIDIA (see
+            // LookupRuntimeDescriptor), so it is not used until that is understood.
+            const SpirvFunctionControl control = SpirvFunctionControl.None;
+            _module.BeginFunction(_voidType, type, _gfx10DeviceFormatFunction, control);
+            _module.AddName(_gfx10DeviceFormatFunction, "loadDeviceFormatElement");
+            var baseAddress = _module.AddFunctionParameter(_ulongType);
+            var size = _module.AddFunctionParameter(_ulongType);
+            var byteAddress = _module.AddFunctionParameter(_uintType);
+            var dataFormat = _module.AddFunctionParameter(_uintType);
+            var numberFormat = _module.AddFunctionParameter(_uintType);
+            _deviceAddressInstructionPcValue = _module.AddFunctionParameter(_uintType);
+            _module.AddLabel();
+            var canonical = new uint[4];
+            var componentBounds = new uint[4];
+            LoadGfx10DeviceFormatElement(
+                baseAddress, size, byteAddress, dataFormat, numberFormat, canonical, componentBounds);
+            _deviceAddressInstructionPcValue = 0;
+            for (uint component = 0; component < 4; component++)
+            {
+                Store(Gfx10DeviceFormatSlot(_gfx10DeviceFormatValues, component), canonical[component]);
+                Store(
+                    Gfx10DeviceFormatSlot(_gfx10DeviceFormatBounds, component),
+                    _module.AddInstruction(SpirvOp.Select, _uintType, componentBounds[component], UInt(1), UInt(0)));
+            }
+
+            _module.AddStatement(SpirvOp.Return);
+            _module.EndFunction();
+        }
+
+        // An element is at most 16 bytes, so it spans at most five aligned dwords and at most
+        // two pages. Each dword is read at most once, through the walk of the page holding it,
+        // and reads zero when it lies past the buffer, in an unmapped page or beyond the
+        // element, as LoadDeviceBufferElementWord does. Each component then takes its own bits
+        // out of those dwords with the element-level bounds semantic of the per-component path.
+        private void LoadGfx10DeviceFormatElement(
+            uint baseAddress,
+            uint size,
+            uint byteAddress,
+            uint dataFormat,
+            uint numberFormat,
+            uint[] canonical,
+            uint[] componentBounds)
+        {
+            const int maxDwords = 5;
+            var layouts = new (uint ByteOffset, uint BitOffset, uint BitCount)[4];
+            for (uint component = 0; component < 4; component++)
+            {
+                layouts[component] = LoadGfx10ComponentLayout(dataFormat, UInt(component));
+            }
+
+            var alignedStart = BitwiseAnd(byteAddress, UInt(~3u));
+            var elementBytes = LoadGfx10AccessByteSize(dataFormat, 4);
+            var span = ShiftRightLogical(
+                IAdd(IAdd(BitwiseAnd(byteAddress, UInt(3)), elementBytes), UInt(3)),
+                UInt(2));
+            var lastIndex = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, span, UInt(0)),
+                _module.AddInstruction(SpirvOp.ISub, _uintType, span, UInt(1)),
+                UInt(0));
+
+            uint DwordAddress(uint offset) => And64(
+                IAdd64(baseAddress, Widen(offset)),
+                ULong(DeviceAddressMask & ~3ul));
+            uint PageOf(uint address) => _module.AddInstruction(
+                SpirvOp.ShiftRightLogical, _ulongType, address, ULong(DeviceAddressPageBits));
+
+            var firstAddress = DwordAddress(alignedStart);
+            var lastAddress = DwordAddress(IAdd(alignedStart, ShiftLeftLogical(lastIndex, UInt(2))));
+            var (firstPointer, firstValid) = ResolveDeviceAddress(firstAddress);
+            var (lastPointer, lastValid) = ResolveDeviceAddress(lastAddress);
+            var firstPage = PageOf(firstAddress);
+
+            var dwords = new uint[maxDwords];
+            for (uint index = 0; index < maxDwords; index++)
+            {
+                var offset = IAdd(alignedStart, UInt(index * 4));
+                uint pointer;
+                uint valid;
+                if (index == 0)
+                {
+                    pointer = firstPointer;
+                    valid = firstValid;
+                }
+                else
+                {
+                    var address = DwordAddress(offset);
+                    var onFirstPage = _module.AddInstruction(
+                        SpirvOp.IEqual, _boolType, PageOf(address), firstPage);
+                    pointer = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _ulongType,
+                        onFirstPage,
+                        IAdd64(firstPointer, ULong(index * 4)),
+                        IAdd64(lastPointer, ISub64(address, lastAddress)));
+                    valid = _module.AddInstruction(SpirvOp.Select, _boolType, onFirstPage, firstValid, lastValid);
+                }
+
+                var wanted = LogicalAnd(
+                    _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, span, UInt(index)),
+                    LogicalAnd(valid, ULessThan64(Widen(offset), size)));
+                Store(_deviceWordScratch, UInt(0));
+                EmitConditional(wanted, () =>
+                    Store(_deviceWordScratch, _module.AddInstruction(SpirvOp.Load, _uintType, DeviceWordPointer(pointer), 2u, 4u)));
+                dwords[index] = Load(_uintType, _deviceWordScratch);
+            }
+
+            uint PickDword(uint index)
+            {
+                var picked = dwords[0];
+                for (uint candidate = 1; candidate < maxDwords; candidate++)
+                {
+                    picked = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.IEqual, _boolType, index, UInt(candidate)),
+                        dwords[candidate],
+                        picked);
+                }
+
+                return picked;
+            }
+
+            for (uint component = 0; component < 4; component++)
+            {
+                var (byteOffset, bitOffset, bitCount) = layouts[component];
+                var componentAddress = IAdd(byteAddress, byteOffset);
+                var componentBytes = ShiftRightLogical(IAdd(IAdd(bitOffset, bitCount), UInt(7)), UInt(3));
+                var lastByteOffset = _module.AddInstruction(SpirvOp.ISub, _uintType, componentBytes, UInt(1));
+                var hasComponent = _module.AddInstruction(SpirvOp.INotEqual, _boolType, bitCount, UInt(0));
+                var inRange = IsDeviceBufferElementInRange(size, componentAddress, lastByteOffset);
+                var accessAllowed = LogicalAnd(hasComponent, inRange);
+                componentBounds[component] = _module.AddInstruction(
+                    SpirvOp.LogicalOr, _boolType, LogicalNot(hasComponent), inRange);
+                var byteInDword = BitwiseAnd(componentAddress, UInt(3));
+                var shift = ShiftLeftLogical(byteInDword, UInt(3));
+                var dwordIndex = ShiftRightLogical(
+                    _module.AddInstruction(
+                        SpirvOp.ISub, _uintType, BitwiseAnd(componentAddress, UInt(~3u)), alignedStart),
+                    UInt(2));
+                var crossesDword = _module.AddInstruction(
+                    SpirvOp.UGreaterThan, _boolType, IAdd(byteInDword, componentBytes), UInt(4));
+                var low = _module.AddInstruction(
+                    SpirvOp.Select, _uintType, accessAllowed, PickDword(dwordIndex), UInt(0));
+                var high = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    LogicalAnd(accessAllowed, crossesDword),
+                    PickDword(IAdd(dwordIndex, UInt(1))),
+                    UInt(0));
+                var packed = FunnelShiftRight(low, high, shift);
+                var raw = _module.AddInstruction(SpirvOp.BitFieldUExtract, _uintType, packed, bitOffset, bitCount);
+                var converted = ConvertGfx10BufferComponent(raw, bitCount, numberFormat, dataFormat);
+                canonical[component] = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    hasComponent,
+                    converted,
+                    AbsentGfx10Component(UInt(component), numberFormat));
             }
         }
 
@@ -4586,36 +4778,6 @@ public static partial class Gen5SpirvTranslator
                 UInt(0));
         }
 
-        private uint _gfx10FormatValueScratch;
-        private uint _gfx10FormatBoundsScratch;
-
-        private void EnsureGfx10FormatLoopScratch()
-        {
-            if (_gfx10FormatValueScratch != 0)
-            {
-                return;
-            }
-
-            var arrayType = _module.TypeArray(_uintType, 4);
-            var pointerType = _module.TypePointer(SpirvStorageClass.Private, arrayType);
-            uint NewScratch(string name)
-            {
-                var zero = UInt(0);
-                var variable = _module.AddGlobalVariable(
-                    pointerType,
-                    SpirvStorageClass.Private,
-                    _module.ConstantComposite(arrayType, [zero, zero, zero, zero]));
-                _module.AddName(variable, name);
-                _interfaces.Add(variable);
-                return variable;
-            }
-
-            _gfx10FormatValueScratch = NewScratch("gfx10FormatValues");
-            _gfx10FormatBoundsScratch = NewScratch("gfx10FormatBounds");
-        }
-
-        private uint Gfx10FormatLoopSlot(uint scratch, uint index) =>
-            _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, scratch, index);
 
         private void EmitBufferFormatLoad(
             int bindingIndex,
