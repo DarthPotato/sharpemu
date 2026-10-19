@@ -996,6 +996,12 @@ public static partial class Gen5SpirvTranslator
                         destination,
                         SpirvOp.IAdd);
                     break;
+                case "VMulLoU16":
+                    result = EmitInteger16Binary(
+                        instruction,
+                        destination,
+                        SpirvOp.IMul);
+                    break;
                 case "VAddcU32":
                 case "VAddCoCiU32":
                     result = EmitAddWithCarry(instruction);
@@ -1617,6 +1623,24 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     break;
+                case "VPkMadI16":
+                case "VPkMadU16":
+                case "VPkMulLoU16":
+                case "VPkLshlrevB16":
+                case "VPkLshrrevB16":
+                case "VPkAshrrevI16":
+                case "VPkMaxI16":
+                case "VPkMinI16":
+                case "VPkAddU16":
+                case "VPkSubU16":
+                case "VPkMaxU16":
+                case "VPkMinU16":
+                    if (!TryEmitPackedInt16(instruction, out result, out error))
+                    {
+                        return false;
+                    }
+
+                    break;
                 case "VPkFmacF16":
                     result = EmitPackedF16Fmac(instruction, destination);
                     break;
@@ -1886,6 +1910,66 @@ public static partial class Gen5SpirvTranslator
         // src1. The packed integer result is modulo 16 bits in each lane; the
         // signed and unsigned forms therefore share the same bit-level
         // implementation.
+        // The packed 16-bit integer VOP3P ops: each half of vdst is the operation on the halves
+        // op_sel (low result) and op_sel_hi (high result) pick from each source. A clamped add,
+        // subtract or multiply-add would saturate; it is rejected rather than wrapped.
+        private bool TryEmitPackedInt16(Gen5ShaderInstruction instruction, out uint result, out string error)
+        {
+            result = 0;
+            error = string.Empty;
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                error = $"missing vop3p control for {instruction.Opcode}";
+                return false;
+            }
+
+            var opcode = instruction.Opcode;
+            var mad = opcode is "VPkMadI16" or "VPkMadU16";
+            if (control.Clamp && (mad || opcode is "VPkAddU16" or "VPkSubU16"))
+            {
+                error = $"{opcode}: clamped packed 16-bit integer results are not supported";
+                return false;
+            }
+
+            var sourceCount = mad ? 3 : 2;
+            var sources = new uint[sourceCount];
+            for (var index = 0; index < sourceCount; index++)
+            {
+                sources[index] = GetRawSource(instruction, index);
+            }
+
+            uint Half(int source, uint mask) => BitwiseAnd(
+                ((mask >> source) & 1) != 0 ? ShiftRightLogical(sources[source], UInt(16)) : sources[source],
+                UInt(0xFFFF));
+            uint SignExtend(uint value) => Bitcast(_uintType, ShiftRightArithmetic(
+                Bitcast(_intType, ShiftLeftLogical(value, UInt(16))), UInt(16)));
+
+            uint Compute(uint mask)
+            {
+                var a = Half(0, mask);
+                var b = Half(1, mask);
+                return opcode switch
+                {
+                    "VPkMulLoU16" => _module.AddInstruction(SpirvOp.IMul, _uintType, a, b),
+                    "VPkMadI16" or "VPkMadU16" => IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, a, b), Half(2, mask)),
+                    "VPkAddU16" => IAdd(a, b),
+                    "VPkSubU16" => ISubU(a, b),
+                    "VPkLshlrevB16" => ShiftLeftLogical(b, BitwiseAnd(a, UInt(15))),
+                    "VPkLshrrevB16" => ShiftRightLogical(b, BitwiseAnd(a, UInt(15))),
+                    "VPkAshrrevI16" => Bitcast(_uintType, ShiftRightArithmetic(Bitcast(_intType, SignExtend(b)), BitwiseAnd(a, UInt(15)))),
+                    "VPkMaxU16" => Ext(41, _uintType, a, b),
+                    "VPkMinU16" => Ext(38, _uintType, a, b),
+                    _ => Bitcast(_uintType, Ext(opcode == "VPkMaxI16" ? 42u : 39u, _intType,
+                        Bitcast(_intType, SignExtend(a)), Bitcast(_intType, SignExtend(b)))),
+                };
+            }
+
+            var low = BitwiseAnd(Compute(control.OpSelMask), UInt(0xFFFF));
+            var high = BitwiseAnd(Compute(control.OpSelHiMask), UInt(0xFFFF));
+            result = BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
+            return true;
+        }
+
 
         // V_FMA_MIX_F32 / _MIXLO_F16 / _MIXHI_F16 (VOP3P opcodes 0x20 / 0x21 /
         // 0x22). Unlike the packed v_pk_* ops these compute a single f32

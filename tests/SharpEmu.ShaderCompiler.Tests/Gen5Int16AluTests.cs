@@ -18,6 +18,7 @@ public sealed class Gen5Int16AluTests
     {
         { 0x303, "VAddNcU16" },
         { 0x304, "VSubNcU16" },
+        { 0x305, "VMulLoU16" },
         { 0x307, "VLshrrevB16" },
         { 0x308, "VAshrrevI16" },
         { 0x309, "VMaxU16" },
