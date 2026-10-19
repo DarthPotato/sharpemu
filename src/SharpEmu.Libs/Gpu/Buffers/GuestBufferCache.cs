@@ -1164,6 +1164,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
+    // Called once per guest frame; see GuestPageTracker.DecayCpuWriteHeat.
+    public void DecayCpuWriteHeat() => _tracker.DecayCpuWriteHeat();
+
     public void RunGarbageCollector()
     {
         using var foreignRead = _device.Slabs.BeginForeignRead();

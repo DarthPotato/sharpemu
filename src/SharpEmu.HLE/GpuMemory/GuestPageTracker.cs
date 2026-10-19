@@ -132,6 +132,26 @@ public sealed class GuestPageTracker
         return count;
     }
 
+    // Hot pages stay writable and CPU-dirty, so every sync copies them whole, and with no write
+    // fault nothing ever told the tracker they cooled down: a ring the CPU fills a little at a
+    // time became hot once and was copied in full forever. Once a frame they lose their heat; the
+    // next sync copies them once more and protects them again, and only pages the CPU keeps
+    // rewriting within a frame turn hot again.
+    public void DecayCpuWriteHeat()
+    {
+        RejectUploadCallbackReentry();
+        for (var index = 0; index < _regions.Length; index++)
+        {
+            if (Volatile.Read(ref _regions[index]) is not { HasCpuWriteHeat: true } region)
+            {
+                continue;
+            }
+
+            using var regionLock = region.Lock.Hold();
+            region.ResetCpuWriteHeat(region.BaseAddress, TrackerLayout.BlockBytes);
+        }
+    }
+
     public void MarkCpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Cpu, enable: true, create: true);
 
     public void MarkGpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Gpu, enable: true, create: true);

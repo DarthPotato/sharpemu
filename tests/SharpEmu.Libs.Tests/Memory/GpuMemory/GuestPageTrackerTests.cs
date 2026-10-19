@@ -653,6 +653,34 @@ public sealed class GuestPageTrackerTests : IDisposable
         Release(address, Page);
     }
 
+    // A hot page is never protected, so no fault tells the tracker the CPU stopped writing it:
+    // without the frame decay every later sync copied it whole.
+    [NativePageProtectionFact]
+    public void FrameDecayReturnsHotPagesToWriteTracking()
+    {
+        var address = Allocate(1);
+        _tracker.ForEachUploadRange(address, Page, false, NoRange, NoUpload);
+        _tracker.MarkCpuDirtyPages(address, Page);
+        _tracker.ForEachUploadRange(address, Page, false, NoRange, NoUpload);
+        _tracker.MarkCpuDirtyPages(address, Page);
+        Assert.True(_tracker.IsCpuWriteHotRange(address, Page));
+
+        _tracker.DecayCpuWriteHeat();
+        Assert.False(_tracker.IsCpuWriteHotRange(address, Page));
+
+        // The pending CPU bytes are copied once more; then the page is clean and protected.
+        var uploads = 0;
+        _tracker.ForEachUploadRange(address, Page, false, (_, _) => uploads++, NoUpload);
+        Assert.Equal(1, uploads);
+        Assert.False(_tracker.HasCpuDirtyPages(address, Page));
+        Assert.False(IsWritable(address));
+        _tracker.ForEachUploadRange(address, Page, false, (_, _) => uploads++, NoUpload);
+        Assert.Equal(1, uploads);
+
+        _tracker.UntrackMemory(address, Page);
+        Release(address, Page);
+    }
+
     [NativePageProtectionFact]
     public void RepeatedCpuWritesKeepReadOnlyHotPagesWritableAndDirty()
     {
