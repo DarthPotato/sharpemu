@@ -938,6 +938,28 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // A committed draw keeps only the bindings that own a staging buffer (TexturesWithStaging);
+        // they go back to the pool when its submission retires. The rest are free once the
+        // preparation closes, and returning them here keeps the pool from allocating per draw.
+        private void ReturnUnretainedTextures(PreparedStageBindings stage, bool committed)
+        {
+            foreach (var texture in stage.Descriptors.Images)
+            {
+                if (texture is not null && !(committed && texture.StagingBuffer.Handle != 0))
+                {
+                    ReturnTextureResource(texture);
+                }
+            }
+
+            foreach (var texture in stage.RuntimeImages)
+            {
+                if (texture is not null && !(committed && texture.StagingBuffer.Handle != 0))
+                {
+                    ReturnTextureResource(texture);
+                }
+            }
+        }
+
         private void ReturnStageScratch(PreparedStageBindings stage)
         {
             // CommitBindings copies texture references into submission-owned
