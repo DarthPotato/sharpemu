@@ -21,11 +21,17 @@ internal sealed class SpirvModuleInspector
     public Dictionary<uint, uint> FunctionControls { get; } = [];
     public Dictionary<uint, int> CallCounts { get; } = [];
 
+    // The words of every function body and the loop-control masks of the loops it declares.
+    public Dictionary<uint, int> FunctionWords { get; } = [];
+    public Dictionary<uint, List<uint>> FunctionLoopControls { get; } = [];
+
     public SpirvModuleInspector(byte[] spirv)
     {
         var words = new uint[spirv.Length / 4];
         Buffer.BlockCopy(spirv, 0, words, 0, spirv.Length);
         var offset = 5;
+        uint function = 0;
+        var functionStart = 0;
         while (offset < words.Length)
         {
             var wordCount = (int)(words[offset] >> 16);
@@ -33,6 +39,18 @@ internal sealed class SpirvModuleInspector
             Opcodes.Add(opcode);
             switch ((SpirvOp)opcode)
             {
+                case SpirvOp.Function when wordCount >= 5:
+                    FunctionControls[words[offset + 2]] = words[offset + 3];
+                    function = words[offset + 2];
+                    functionStart = offset;
+                    FunctionLoopControls[function] = [];
+                    break;
+                case SpirvOp.FunctionEnd:
+                    FunctionWords[function] = offset + wordCount - functionStart;
+                    break;
+                case SpirvOp.LoopMerge when wordCount >= 4:
+                    FunctionLoopControls[function].Add(words[offset + 3]);
+                    break;
                 case SpirvOp.Name:
                     Names[words[offset + 1]] = DecodeString(words, offset + 2, offset + wordCount);
                     break;
@@ -44,9 +62,6 @@ internal sealed class SpirvModuleInspector
                     break;
                 case SpirvOp.Capability:
                     Capabilities.Add(words[offset + 1]);
-                    break;
-                case SpirvOp.Function when wordCount >= 5:
-                    FunctionControls[words[offset + 2]] = words[offset + 3];
                     break;
                 case SpirvOp.FunctionCall when wordCount >= 4:
                     CallCounts[words[offset + 3]] = CallCounts.GetValueOrDefault(words[offset + 3]) + 1;

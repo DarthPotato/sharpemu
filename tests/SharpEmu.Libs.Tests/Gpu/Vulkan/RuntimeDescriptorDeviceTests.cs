@@ -269,6 +269,71 @@ public sealed class RuntimeDescriptorDeviceTests(HeadlessVulkanFixture fixture, 
         output.WriteLine($"Verified runtime image sampling after {scenario.RoundsRun} ticks on {vulkan.DeviceName}; validation={vulkan.ValidationEnabled}.");
     }
 
+    // A key whose home entry another key took sits further along its probe sequence; the lookup walks
+    // there, past the other key, which must not match although it holds a valid slot.
+    [Fact]
+    public void SampleLoop_FindsKeysPlacedPastACollidingEntry()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, runtimeDescriptors: true))
+        {
+            return;
+        }
+
+        const int Count = 3;
+        using var scenario = new Scenario(vulkan, LoopProgram("ImageSampleLz", EntryBytes, (uint)Count, withSampler: true), EntryBytes * (uint)Count);
+        float[] expected = [0.25f, 0.5f, 0.75f];
+        var tableData = new byte[EntryBytes * (uint)Count];
+        for (var index = 0; index < Count; index++)
+        {
+            var word = (uint)(ImageBase >> 8) + (uint)index * 0x10;
+            WriteEntry(tableData, index, EntryBytes, ImageWords((ulong)word << 8, Format32Float));
+            scenario.AddImage(word, Format.R32Sfloat, GuestPixelFormat.Bits32Float, Floats(expected[index]));
+        }
+
+        scenario.TableBytes = scenario.Runner.CreateBuffer(tableData);
+        var sampler = scenario.Runner.CreateSampler(Filter.Nearest);
+        var table = scenario.Runner.CreateBuffer(MemoryMarshal.AsBytes(RuntimeDescriptorTable.Build([], []).AsSpan()));
+        for (var round = 0; round < 8 && scenario.Registry.Images.Count < Count; round++)
+        {
+            scenario.Round(sampler, table, out table);
+        }
+
+        Assert.Equal(Count, scenario.Registry.Images.Count);
+        var registered = scenario.Registry.Images.Values.Select(entry => (entry.Key, entry.Slot)).ToList();
+        // The S# words are zero (nearest, clamp): the one sampler the rounds registered.
+        List<(uint[] Key, uint Slot)> samplers = [(new uint[RuntimeDescriptorTable.SamplerWordCount], scenario.Heap.GetOrCreateSamplerSlot(sampler))];
+
+        // Twice as many entries as keys: 16 entries. Each key's home entry goes to a decoy of another
+        // descriptor that hashes there and points at another image's slot.
+        const uint Capacity = 16;
+        var placed = new List<(uint[] Key, uint Slot)>();
+        for (var index = 0; index < registered.Count; index++)
+        {
+            var key = registered[index].Key;
+            var home = RuntimeDescriptorTable.Hash(key) & (Capacity - 1);
+            var decoy = (uint[])key.Clone();
+            for (decoy[^1] = 1; (RuntimeDescriptorTable.Hash(decoy) & (Capacity - 1)) != home; decoy[^1]++)
+            {
+            }
+
+            placed.Add((decoy, registered[(index + 1) % registered.Count].Slot));
+        }
+
+        placed.AddRange(registered);
+        var words = RuntimeDescriptorTable.Build(placed, samplers);
+        Assert.Equal(Capacity, words[RuntimeDescriptorTable.ImageCapacityDword]);
+        table = scenario.Runner.CreateBuffer(MemoryMarshal.AsBytes(words.AsSpan()));
+        scenario.Round(sampler, table, out _);
+        for (var index = 0; index < Count; index++)
+        {
+            Assert.Equal(BitConverter.SingleToUInt32Bits(expected[index]), scenario.ResultWord(index));
+        }
+
+        Assert.Equal(0, scenario.LastImageMisses);
+        scenario.Harness.AssertNoValidationMessages();
+    }
+
     // The host registers descriptors, grows the table and frees heap slots between the draws of one command buffer
     // that is still recording. None of that may invalidate the buffer: the heap is update-after-bind, and a
     // superseded table or a read miss buffer is only destroyed once the submission that bound it has completed.

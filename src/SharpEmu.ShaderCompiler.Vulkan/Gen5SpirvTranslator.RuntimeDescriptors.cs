@@ -295,12 +295,27 @@ public static partial class Gen5SpirvTranslator
         }
 
         // A bounded linear probe of the host table; slot 0 and a recorded miss when the table does not
-        // hold the key.
+        // hold the key. The host places a key in the first empty entry of its probe sequence and never
+        // removes one, so the probe stops at the key or at the first empty entry.
+        //
+        // The probes are one loop body rather than ProbeCount unrolled copies: the driver inlines this
+        // function at every access (it must not be DontInline, see LookupRuntimeDescriptor), and eight
+        // copies of a ten-word compare per image access made a pixel shader with a few hundred samples
+        // megabytes of SPIR-V and its pipeline tens of seconds to compile.
         private uint EmitRuntimeDescriptorProbe(uint[] key, bool image, uint active)
         {
             var table = _runtimeDescriptorTable;
-            var capacity = LoadBlockWord(table, UInt(image ? RuntimeDescriptorTable.ImageCapacityDword : RuntimeDescriptorTable.SamplerCapacityDword));
-            var entries = LoadBlockWord(table, UInt(image ? RuntimeDescriptorTable.ImageEntriesDword : RuntimeDescriptorTable.SamplerEntriesDword));
+            var tableLength = StorageBlockLength(table);
+            uint LoadTableWord(uint dwordIndex)
+            {
+                var inRange = _module.AddInstruction(SpirvOp.ULessThan, _boolType, dwordIndex, tableLength);
+                var safeIndex = _module.AddInstruction(SpirvOp.Select, _uintType, inRange, dwordIndex, UInt(0));
+                var value = Load(_uintType, BlockWordPointer(table, safeIndex));
+                return _module.AddInstruction(SpirvOp.Select, _uintType, inRange, value, UInt(0));
+            }
+
+            var capacity = LoadTableWord(UInt(image ? RuntimeDescriptorTable.ImageCapacityDword : RuntimeDescriptorTable.SamplerCapacityDword));
+            var entries = LoadTableWord(UInt(image ? RuntimeDescriptorTable.ImageEntriesDword : RuntimeDescriptorTable.SamplerEntriesDword));
             var entryDwords = image ? RuntimeDescriptorTable.ImageEntryDwords : RuntimeDescriptorTable.SamplerEntryDwords;
             var mask = _module.AddInstruction(SpirvOp.ISub, _uintType, capacity, UInt(1));
             var hash = UInt(RuntimeDescriptorTable.HashSeed);
@@ -311,22 +326,48 @@ public static partial class Gen5SpirvTranslator
             }
 
             var empty = _module.AddInstruction(SpirvOp.IEqual, _boolType, capacity, UInt(0));
-            var slotPlusOne = UInt(0);
-            for (uint probe = 0; probe < RuntimeDescriptorTable.ProbeCount; probe++)
+            var preheader = _module.AllocateId();
+            var header = _module.AllocateId();
+            var body = _module.AllocateId();
+            var continueLabel = _module.AllocateId();
+            var mergeLabel = _module.AllocateId();
+            var nextProbe = _module.AllocateId();
+            var nextSlotPlusOne = _module.AllocateId();
+            var nextDone = _module.AllocateId();
+            _module.AddStatement(SpirvOp.Branch, preheader);
+            _module.AddLabel(preheader);
+            _module.AddStatement(SpirvOp.Branch, header);
+            _module.AddLabel(header);
+            var probe = _module.AddInstruction(SpirvOp.Phi, _uintType, UInt(0), preheader, nextProbe, continueLabel);
+            var slotPlusOne = _module.AddInstruction(SpirvOp.Phi, _uintType, UInt(0), preheader, nextSlotPlusOne, continueLabel);
+            var done = _module.AddInstruction(SpirvOp.Phi, _boolType, empty, preheader, nextDone, continueLabel);
+            var more = LogicalAnd(LogicalNot(done),
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, probe, UInt(RuntimeDescriptorTable.ProbeCount)));
+            _module.AddStatement(SpirvOp.LoopMerge, mergeLabel, continueLabel, LoopControlDontUnroll);
+            _module.AddStatement(SpirvOp.BranchConditional, more, body, mergeLabel);
+            _module.AddLabel(body);
+            var index = BitwiseAnd(IAdd(hash, probe), mask);
+            var entry = IAdd(entries, _module.AddInstruction(SpirvOp.IMul, _uintType, index, UInt(entryDwords)));
+            // One bounds check per entry: an entry the table does not hold whole reads as vacant.
+            var inRange = _module.AddInstruction(SpirvOp.ULessThan, _boolType, IAdd(entry, UInt(entryDwords - 1)), tableLength);
+            var safeEntry = _module.AddInstruction(SpirvOp.Select, _uintType, inRange, entry, UInt(0));
+            var stored = _module.AddInstruction(SpirvOp.Select, _uintType, inRange,
+                Load(_uintType, BlockWordPointer(table, safeEntry)), UInt(0));
+            var vacant = _module.AddInstruction(SpirvOp.IEqual, _boolType, stored, UInt(0));
+            var match = LogicalNot(vacant);
+            for (var word = 0; word < key.Length; word++)
             {
-                var index = BitwiseAnd(IAdd(hash, UInt(probe)), mask);
-                var entry = IAdd(entries, _module.AddInstruction(SpirvOp.IMul, _uintType, index, UInt(entryDwords)));
-                var stored = LoadBlockWord(table, entry);
-                var match = LogicalAnd(LogicalNot(empty), _module.AddInstruction(SpirvOp.INotEqual, _boolType, stored, UInt(0)));
-                for (var word = 0; word < key.Length; word++)
-                {
-                    var tableWord = LoadBlockWord(table, IAdd(entry, UInt((uint)word + 1)));
-                    match = LogicalAnd(match, _module.AddInstruction(SpirvOp.IEqual, _boolType, tableWord, key[word]));
-                }
-
-                var take = LogicalAnd(match, _module.AddInstruction(SpirvOp.IEqual, _boolType, slotPlusOne, UInt(0)));
-                slotPlusOne = _module.AddInstruction(SpirvOp.Select, _uintType, take, stored, slotPlusOne);
+                var tableWord = Load(_uintType, BlockWordPointer(table, IAdd(safeEntry, UInt((uint)word + 1))));
+                match = LogicalAnd(match, _module.AddInstruction(SpirvOp.IEqual, _boolType, tableWord, key[word]));
             }
+
+            _module.AddStatement(SpirvOp.Select, _uintType, nextSlotPlusOne, match, stored, UInt(0));
+            _module.AddStatement(SpirvOp.LogicalOr, _boolType, nextDone, match, vacant);
+            _module.AddStatement(SpirvOp.Branch, continueLabel);
+            _module.AddLabel(continueLabel);
+            _module.AddStatement(SpirvOp.IAdd, _uintType, nextProbe, probe, UInt(1));
+            _module.AddStatement(SpirvOp.Branch, header);
+            _module.AddLabel(mergeLabel);
 
             var missing = _module.AddInstruction(SpirvOp.IEqual, _boolType, slotPlusOne, UInt(0));
             // Only an active lane reads its descriptor; an inactive one may hold anything.
@@ -335,6 +376,9 @@ public static partial class Gen5SpirvTranslator
             return _module.AddInstruction(SpirvOp.Select, _uintType, missing, UInt(0),
                 _module.AddInstruction(SpirvOp.ISub, _uintType, slotPlusOne, UInt(1)));
         }
+
+        // SPIR-V LoopControl: a hint that the loop is not to be unrolled.
+        private const uint LoopControlDontUnroll = 0x2;
 
         private void RecordRuntimeDescriptorMiss(uint[] key, bool image, uint hash)
         {
@@ -360,11 +404,14 @@ public static partial class Gen5SpirvTranslator
             EmitConditional(_module.AddInstruction(SpirvOp.ULessThan, _boolType, record, UInt(capacity)), () =>
             {
                 var first = IAdd(UInt(offset), _module.AddInstruction(SpirvOp.IMul, _uintType, record, UInt(recordDwords)));
-                for (var word = 0; word < key.Length; word++)
+                // The record is contiguous: its last dword in range puts every one of them in range.
+                EmitConditional(IsBlockWordInRange(misses, IAdd(first, UInt((uint)key.Length - 1))), () =>
                 {
-                    var dword = IAdd(first, UInt((uint)word));
-                    EmitConditional(IsBlockWordInRange(misses, dword), () => Store(BlockWordPointer(misses, dword), key[word]));
-                }
+                    for (var word = 0; word < key.Length; word++)
+                    {
+                        Store(BlockWordPointer(misses, IAdd(first, UInt((uint)word))), key[word]);
+                    }
+                });
             });
         }
     }
