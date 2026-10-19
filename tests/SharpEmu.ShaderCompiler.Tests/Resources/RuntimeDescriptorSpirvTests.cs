@@ -99,6 +99,24 @@ public sealed class RuntimeDescriptorSpirvTests
         Assert.Equal(3, module.FunctionControls.Count);
     }
 
+    // The driver inlines each lookup at every access, so its body is what a sample costs to compile:
+    // one probe in a loop that is not unrolled, not ProbeCount copies of the compare (the image
+    // lookup was 4713 words unrolled).
+    [Fact]
+    public void LookupsProbeTheTableInOneLoop()
+    {
+        var (_, module, _) = Compile(LoopProgram("ImageSample"));
+
+        foreach (var name in new[] { "lookupRuntimeImage", "lookupRuntimeSampler" })
+        {
+            var function = FunctionNamed(module, name);
+            Assert.Equal([LoopControlDontUnroll], module.FunctionLoopControls[function]);
+            Assert.True(module.FunctionWords[function] < 1000, $"{name}: {module.FunctionWords[function]} words");
+        }
+    }
+
+    private const uint LoopControlDontUnroll = 0x2;
+
     [Fact]
     public void ImageLoadFetchesThroughTheArrayOfItsNumericView()
     {
