@@ -40,7 +40,7 @@ public sealed partial class GuestImageCache
         Collect(tick, allowAggressive: false, midFrame: !endsFrame);
         if (CollectionMemoryBytes >= _criticalMemoryBytes)
         {
-            Collect(tick, allowAggressive: true);
+            Collect(tick, allowAggressive: true, midFrame: !endsFrame);
         }
     }
 
@@ -53,19 +53,24 @@ public sealed partial class GuestImageCache
     // Allocation-time pressure is separate from the periodic sweep: a burst of draws can create
     // thousands of images before the next frame boundary. Destruction still goes through
     // DeleteImage's completion action, so no image is freed while the current tick can use it.
+    // Below the hard limit it takes only images neither this frame nor the previous one used
+    // (CollectCore): a frame samples again what the previous one did, so evicting those to stay
+    // under the critical target recreated, uploaded and read back the whole working set on every
+    // frame larger than the target. The flip's collection removes what the frame did not use.
     private void CollectForAllocation(ulong requiredBytes)
     {
         FinishRetiredImagesForAllocation(requiredBytes);
-        // A burst can contain only newly touched images. Once the recency walk finds nothing
-        // evictable, repeating it for every allocation in the same tick is wasted work; the next
-        // collection makes older images eligible.
-        if (_allocationCollectionBlocked)
+        var current = CollectionMemoryBytes;
+        if (requiredBytes > _criticalMemoryBytes || current <= _criticalMemoryBytes - requiredBytes)
         {
             return;
         }
 
-        var current = CollectionMemoryBytes;
-        if (requiredBytes > _criticalMemoryBytes || current <= _criticalMemoryBytes - requiredBytes)
+        // A burst can contain only newly touched images. Once the recency walk finds nothing
+        // evictable, repeating it for every allocation in the same tick is wasted work; the next
+        // collection makes older images eligible. Past the hard limit the previous frame's images
+        // are eligible as well, so the walk runs again.
+        if (_allocationCollectionBlocked && current < _hardLimitBytes)
         {
             return;
         }
@@ -77,7 +82,7 @@ public sealed partial class GuestImageCache
         while (CollectionMemoryBytes > target)
         {
             var before = _totalUsedMemory;
-            Collect(_collectionTick, allowAggressive: true);
+            Collect(_collectionTick, allowAggressive: true, midFrame: true);
             if (_totalUsedMemory == before)
             {
                 blocked = true;
@@ -96,8 +101,8 @@ public sealed partial class GuestImageCache
             return;
         }
 
-        if (!RetirementOverBudget && requiredBytes <= _criticalMemoryBytes &&
-            TotalUsedMemory <= _criticalMemoryBytes - requiredBytes)
+        if (!RetirementOverBudget && requiredBytes <= _hardLimitBytes &&
+            TotalUsedMemory <= _hardLimitBytes - requiredBytes)
         {
             return;
         }
@@ -144,12 +149,12 @@ public sealed partial class GuestImageCache
         _scheduler.RunCompletedOperations();
     }
 
-    // The retired bytes that leave the registered images and this allocation under the
-    // critical threshold, and within the retirement budget.
+    // The retired bytes that leave the registered images and this allocation under the hard
+    // limit, and within the retirement budget.
     private long RetiredBytesAllowed(ulong requiredBytes)
     {
         var used = _totalUsedMemory + requiredBytes;
-        var room = requiredBytes <= _criticalMemoryBytes && used <= _criticalMemoryBytes ? _criticalMemoryBytes - used : 0;
+        var room = requiredBytes <= _hardLimitBytes && used <= _hardLimitBytes ? _hardLimitBytes - used : 0;
         return (long)Math.Min((ulong)RetiredBudgetBytes, room);
     }
 
@@ -273,7 +278,7 @@ public sealed partial class GuestImageCache
             $"[IMAGE_COLLECT] tick={tick} aggressive={allowAggressive} reclaim={reclaim} midFrame={midFrame} images={countBefore}->{_slots.Count} " +
             $"live={usedBefore}->{_totalUsedMemory} retired={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
             $"pool_unused={_imageMemoryPool.UnusedBytes} pooled_backing={_backingPool?.PooledBytes ?? 0} " +
-            $"thresholds={_memoryPressureBytes}/{_criticalMemoryBytes}");
+            $"thresholds={_memoryPressureBytes}/{_criticalMemoryBytes}/{_hardLimitBytes}");
     }
 
     private const int MaxExaminedPerSweep = 1024;
@@ -289,8 +294,14 @@ public sealed partial class GuestImageCache
         // frame has not sampled it yet: the pressured sweep would delete what the next draws use
         // and they would create and upload it again, so it keeps the normal age there; only the
         // critical and allocation passes reclaim the previous frame's images before the flip.
+        // The critical and allocation passes in the middle of a frame keep the previous frame's
+        // images too (age 2) until the cache reaches its hard limit: those are the frame's working
+        // set, and evicting them only moved the recreation a few draws later.
         var profile = SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled;
-        var age = pressured && !midFrame ? 1UL : 16UL;
+        var age = !pressured ? 16UL
+            : !midFrame ? 1UL
+            : !allowAggressive ? 16UL
+            : CollectionMemoryBytes >= _hardLimitBytes ? 1UL : 2UL;
         if (tick < age)
         {
             return;
@@ -323,6 +334,7 @@ public sealed partial class GuestImageCache
                     // every candidate and the budget below counts retirements, not candidates visited.
                     return false;
                 });
+                PreferImagesWithoutGpuContents(candidates);
             }
 
             foreach (var imageIdentifier in candidates)
@@ -422,6 +434,30 @@ public sealed partial class GuestImageCache
         }
     }
 
+    // Orders the candidates so that images guest memory already holds go first, oldest first in
+    // each group. Evicting one costs nothing now and an upload if it comes back; evicting a
+    // GPU-written image first reads it back, which waits for the GPU.
+    private void PreferImagesWithoutGpuContents(List<ResourceSlotIdentifier> candidates)
+    {
+        var written = new List<ResourceSlotIdentifier>();
+        var kept = 0;
+        for (var index = 0; index < candidates.Count; index++)
+        {
+            var imageIdentifier = candidates[index];
+            if (_slots.TryGet(imageIdentifier) is { IsGpuModified: true })
+            {
+                written.Add(imageIdentifier);
+            }
+            else
+            {
+                candidates[kept++] = imageIdentifier;
+            }
+        }
+
+        candidates.RemoveRange(kept, candidates.Count - kept);
+        candidates.AddRange(written);
+    }
+
     // Publishes every scheduled linear GPU-written image to guest memory.
     public void FlushScheduledReadbacks()
     {
@@ -439,11 +475,12 @@ public sealed partial class GuestImageCache
     }
 
     // Test seams: thresholds, the recency order and the private state the tests inspect.
-    internal void SetCollectionThresholds(ulong trigger, ulong pressure, ulong critical, ulong tick)
+    internal void SetCollectionThresholds(ulong trigger, ulong pressure, ulong critical, ulong tick, ulong hardLimit = 0)
     {
         _collectionStartBytes = trigger;
         _memoryPressureBytes = pressure;
         _criticalMemoryBytes = critical;
+        _hardLimitBytes = hardLimit != 0 ? hardLimit : critical;
         _collectionTick = tick;
     }
 
