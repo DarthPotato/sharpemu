@@ -7,7 +7,9 @@ namespace SharpEmu.Libs.Gpu.Images;
 
 public sealed partial class GuestImageCache
 {
-    private const int LookupSlots = 256;
+    // A frame looks up thousands of distinct textures (bindless sets); slots are direct-mapped,
+    // so a table smaller than that working set evicts its own entries before they are reused.
+    private const int LookupSlots = 4096;
 
     private static readonly bool LookupMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_LOOKUP_MEMO") != "0";
 
