@@ -43,6 +43,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ulong _memoryPressureBytes;
     private ulong _criticalMemoryBytes;
     private long _retiredImageMemoryBytes;
+    // The retired bytes of each tick that has retired images, oldest first.
+    private readonly Queue<RetiredTick> _retiredTicks = new();
     private ulong _collectionTick;
     private bool _allocationCollectionBlocked;
     private uint _queryEpoch;
@@ -132,8 +134,10 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     // Retired images hold device memory until the work that used them completes; too many of
     // them need that work finished, not another sweep.
     public bool RetirementOverBudget =>
-        Interlocked.Read(ref _retiredImageMemoryBytes) > 256L * (long)MiB ||
+        Interlocked.Read(ref _retiredImageMemoryBytes) > RetiredBudgetBytes ||
         (Interlocked.Read(ref _retiredImageMemoryBytes) > 0 && TotalUsedMemory >= _criticalMemoryBytes);
+
+    private const long RetiredBudgetBytes = 256L * (long)MiB;
 
     // Called with the views of an image that leaves the cache, before the image is freed. A heap that
     // holds descriptors of those views drops them; the views stay valid until the GPU work that used

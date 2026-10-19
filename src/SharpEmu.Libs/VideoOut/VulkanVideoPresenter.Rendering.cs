@@ -211,7 +211,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (images.RetirementOverBudget)
                 {
-                    _scheduler.Finish();
+                    images.ReleaseRetiredImages();
                     if (images.MemoryUnderPressure)
                     {
                         images.ReleaseUnusedMemory();

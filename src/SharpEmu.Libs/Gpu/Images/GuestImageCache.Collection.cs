@@ -108,7 +108,7 @@ public sealed partial class GuestImageCache
         _lock.Exit();
         try
         {
-            _scheduler.Finish();
+            ReleaseRetiredImagesCore(RetiredBytesAllowed(requiredBytes));
         }
         finally
         {
@@ -117,6 +117,94 @@ public sealed partial class GuestImageCache
 
         ReleaseUnusedMemoryCore();
         _allocationCollectionBlocked = false;
+    }
+
+    // Waits until the retired images fit the budget again: first the ones whose work already
+    // completed, then the oldest ticks, and the recording tick only when it holds the excess.
+    // A full drain stalled every draw that came after a tick with many retirements.
+    public void ReleaseRetiredImages() => ReleaseRetiredImagesCore(RetiredBytesAllowed(1));
+
+    private void ReleaseRetiredImagesCore(long allowedBytes)
+    {
+        _scheduler.RunCompletedOperations();
+        var retired = Interlocked.Read(ref _retiredImageMemoryBytes);
+        if (retired <= allowedBytes)
+        {
+            return;
+        }
+
+        var tick = OldestTickReleasing(retired - allowedBytes);
+        if (tick >= _scheduler.CurrentTick)
+        {
+            _scheduler.Finish();
+            return;
+        }
+
+        _scheduler.Wait(tick);
+        _scheduler.RunCompletedOperations();
+    }
+
+    // The retired bytes that leave the registered images and this allocation under the
+    // critical threshold, and within the retirement budget.
+    private long RetiredBytesAllowed(ulong requiredBytes)
+    {
+        var used = _totalUsedMemory + requiredBytes;
+        var room = requiredBytes <= _criticalMemoryBytes && used <= _criticalMemoryBytes ? _criticalMemoryBytes - used : 0;
+        return (long)Math.Min((ulong)RetiredBudgetBytes, room);
+    }
+
+    private sealed class RetiredTick(ulong tick)
+    {
+        public ulong Tick { get; } = tick;
+        public long Bytes { get; set; }
+    }
+
+    private void NoteRetired(ulong tick, long bytes)
+    {
+        lock (_retiredTicks)
+        {
+            RetiredTick? entry = null;
+            foreach (var candidate in _retiredTicks)
+            {
+                if (candidate.Tick == tick)
+                {
+                    entry = candidate;
+                    break;
+                }
+            }
+
+            if (entry is null)
+            {
+                entry = new RetiredTick(tick);
+                _retiredTicks.Enqueue(entry);
+            }
+
+            entry.Bytes += bytes;
+            while (_retiredTicks.TryPeek(out var oldest) && oldest.Bytes == 0)
+            {
+                _retiredTicks.Dequeue();
+            }
+        }
+    }
+
+    // The first tick whose completion, with every tick before it, frees at least this many
+    // retired bytes; the recording tick when only it does.
+    private ulong OldestTickReleasing(long bytes)
+    {
+        lock (_retiredTicks)
+        {
+            var released = 0L;
+            foreach (var entry in _retiredTicks)
+            {
+                released += entry.Bytes;
+                if (released >= bytes)
+                {
+                    return entry.Tick;
+                }
+            }
+        }
+
+        return _scheduler.CurrentTick;
     }
 
     // An allocation failed despite the cache's own accounting: the device is full. Retire every
