@@ -10,6 +10,9 @@ public interface IHostWindowInputSource
 
     bool IsKeyDown(int virtualKey);
 
+    // Ends one keyboard sample: keys pressed and released since the previous sample stop reporting down.
+    void EndKeyboardSample() { }
+
     int GetGamepadStates(Span<HostGamepadState> destination);
 
     string? DescribeConnectedGamepad();

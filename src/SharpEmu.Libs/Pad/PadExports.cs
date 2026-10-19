@@ -915,6 +915,7 @@ public static class PadExports
         var rightY = acceptsKeyboardInput ? ReadAnalogStick(input.IsKeyDown(0x49), input.IsKeyDown(0x4B)) : (byte)128;
         var l2 = acceptsKeyboardInput && input.IsKeyDown(0x52) ? (byte)255 : (byte)0;
         var r2 = acceptsKeyboardInput && input.IsKeyDown(0x46) ? (byte)255 : (byte)0;
+        input.EndKeyboardSample();
         var gamepadType = HostGamepadType.Generic;
         var connection = HostGamepadConnection.Unknown;
         var motion = default(HostMotionState);
