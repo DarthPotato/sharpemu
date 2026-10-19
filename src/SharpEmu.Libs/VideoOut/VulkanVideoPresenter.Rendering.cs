@@ -118,7 +118,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 finally
                 {
-                    foreach (var stage in Stages) owner.ReturnStageScratch(stage);
+                    foreach (var stage in Stages)
+                    {
+                        owner.ReturnUnretainedTextures(stage, Committed);
+                        owner.ReturnStageScratch(stage);
+                    }
+
                     Stages.Clear();
                 }
             }
