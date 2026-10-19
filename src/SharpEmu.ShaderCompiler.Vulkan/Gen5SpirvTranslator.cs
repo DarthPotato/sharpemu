@@ -2758,27 +2758,48 @@ public static partial class Gen5SpirvTranslator
                     return true;
                 }
                 case "DsReadI8":
+                case "DsReadU8":
+                case "DsReadI16":
+                case "DsReadU16":
                 {
                     if (instruction.Destinations.Count < 1 || instruction.Sources.Count < 1)
                     {
-                        error = "missing LDS signed byte read operand";
+                        error = "missing LDS sub-dword read operand";
                         return false;
                     }
 
+                    var bits = instruction.Opcode.EndsWith("8", StringComparison.Ordinal) ? 8u : 16u;
                     var address = GetRawSource(instruction, 0);
-                    var byteAddress = control.SingleOffsetBytes == 0
-                        ? address
-                        : IAdd(address, UInt(control.SingleOffsetBytes));
                     var word = Load(_uintType, LdsPointer(address, control.SingleOffsetBytes));
-                    var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
-                    var packed = ShiftRightLogical(word, shift);
-                    var signedByte = _module.AddInstruction(
-                        SpirvOp.BitFieldSExtract,
-                        _intType,
-                        Bitcast(_intType, packed),
-                        UInt(0),
-                        UInt(8));
-                    StoreV(instruction.Destinations[0].Value, Bitcast(_uintType, signedByte));
+                    var packed = ShiftRightLogical(word, LdsSubwordShift(address, control.SingleOffsetBytes, bits));
+                    var value = instruction.Opcode is "DsReadI8" or "DsReadI16"
+                        ? Bitcast(_uintType, _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, packed),
+                            UInt(0),
+                            UInt(bits)))
+                        : BitwiseAnd(packed, UInt((1u << (int)bits) - 1));
+                    StoreV(instruction.Destinations[0].Value, value);
+                    return true;
+                }
+                case "DsWriteB8":
+                case "DsWriteB16":
+                {
+                    if (instruction.Sources.Count < 2)
+                    {
+                        error = "missing LDS sub-dword write source";
+                        return false;
+                    }
+
+                    var bits = instruction.Opcode == "DsWriteB8" ? 8u : 16u;
+                    var address = GetRawSource(instruction, 0);
+                    var shift = LdsSubwordShift(address, control.SingleOffsetBytes, bits);
+                    var fieldMask = UInt((1u << (int)bits) - 1);
+                    StoreLdsBits(
+                        LdsPointer(address, control.SingleOffsetBytes),
+                        ShiftLeftLogical(fieldMask, shift),
+                        ShiftLeftLogical(BitwiseAnd(GetRawSource(instruction, 1), fieldMask), shift));
                     return true;
                 }
                 case "DsReadB64":
@@ -3064,6 +3085,42 @@ public static partial class Gen5SpirvTranslator
             var active = LdsWriteCondition(pointer);
             // Inactive lanes must not read and write back another lane's shared value.
             EmitConditional(active, () => Store(pointer, value));
+        }
+
+        // Bit position of a byte or halfword inside its LDS dword. Halfwords are taken as
+        // 2-byte aligned, as compilers emit them; a halfword at byte 3 would straddle two
+        // dwords, which this dword-array LDS does not model.
+        private uint LdsSubwordShift(uint address, uint offsetBytes, uint bits)
+        {
+            var byteAddress = offsetBytes == 0 ? address : IAdd(address, UInt(offsetBytes));
+            return ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(bits == 8 ? 3u : 2u)), UInt(3));
+        }
+
+        // Replaces the bits under mask in an LDS dword. Other lanes may write the other
+        // bytes of the same dword in the same instruction, so workgroup LDS clears and
+        // sets the bits with atomics instead of a read-modify-write.
+        private void StoreLdsBits(uint pointer, uint mask, uint bits)
+        {
+            var active = Load(_boolType, _exec);
+            if (_ldsPointerInBounds.TryGetValue(pointer, out var inBounds))
+            {
+                active = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, active, inBounds);
+            }
+
+            EmitConditional(active, () =>
+            {
+                var clear = _module.AddInstruction(SpirvOp.Not, _uintType, mask);
+                if (!_ldsIsWorkgroup)
+                {
+                    Store(pointer, BitwiseOr(BitwiseAnd(Load(_uintType, pointer), clear), bits));
+                    return;
+                }
+
+                EmitAtomic(SpirvOp.AtomicAnd, _uintType, pointer, scope: 2, semantics: 0x108,
+                    value: () => clear, comparator: () => clear);
+                EmitAtomic(SpirvOp.AtomicOr, _uintType, pointer, scope: 2, semantics: 0x108,
+                    value: () => bits, comparator: () => bits);
+            });
         }
 
         private bool TryEmitDataShareAtomic(
