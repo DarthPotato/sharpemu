@@ -48,6 +48,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _supportsDualSourceBlend;
         private bool _supportsDepthBiasClamp;
         private bool _supportsShaderSignedZeroInfNanPreserveFloat32;
+        private bool _floatControlsExactFloat16Conversion;
+        private bool _supportsExactFloat16Conversion;
         private uint _maxColorAttachments;
         private Device _device;
         private PipelineCache _pipelineCache;
@@ -649,6 +651,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 descriptorIndexingProperties.MaxUpdateAfterBindDescriptorsInAllPools);
             _supportsShaderSignedZeroInfNanPreserveFloat32 =
                 floatControls.ShaderSignedZeroInfNanPreserveFloat32;
+            // 16-bit modes are set without touching the 32/64-bit ones, which needs full independence.
+            _floatControlsExactFloat16Conversion =
+                floatControls.ShaderRoundingModeRtefloat16 &&
+                floatControls.ShaderDenormPreserveFloat16 &&
+                floatControls.RoundingModeIndependence == ShaderFloatControlsIndependence.IndependenceAll &&
+                floatControls.DenormBehaviorIndependence == ShaderFloatControlsIndependence.IndependenceAll;
             if (pushDescriptorProperties.PNext != null)
             {
                 _meshShaderLimits = new MeshShaderLimits(
@@ -733,6 +741,8 @@ internal static unsafe partial class VulkanVideoPresenter
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan shaderSignedZeroInfNanPreserveFloat32 " +
                 $"enabled={_supportsShaderSignedZeroInfNanPreserveFloat32}");
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Vulkan exact float16 conversion enabled={_supportsExactFloat16Conversion}");
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan graphics subgroup operations " +
                 $"enabled={GraphicsSubgroupOperationsEnabled} " +
@@ -1030,6 +1040,9 @@ internal static unsafe partial class VulkanVideoPresenter
             _supportsMeshShader = meshExtensionAvailable && meshFeatures.MeshShader &&
                 vulkan13Features.ComputeFullSubgroups &&
                 ((ShaderStageFlags)Volatile.Read(ref _nativeSubgroupShaderStages) & ShaderStageFlags.MeshBitExt) != 0;
+            // Shaders convert f16 natively only when the device rounds to nearest even and keeps
+            // denormals at 16 bits, so the conversion is exact; otherwise they emulate it in integers.
+            _supportsExactFloat16Conversion = _floatControlsExactFloat16Conversion && vulkan12Features.ShaderFloat16;
             var supportsTimelineSemaphore = vulkan12Features.TimelineSemaphore;
             var supportsBufferDeviceAddress = vulkan12Features.BufferDeviceAddress;
             var supportsSharedInt64Atomics = vulkan12Features.ShaderSharedInt64Atomics;
@@ -1216,6 +1229,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     TimelineSemaphore = true,
                     BufferDeviceAddress = true,
                     ShaderSharedInt64Atomics = supportsSharedInt64Atomics,
+                    ShaderFloat16 = _supportsExactFloat16Conversion,
                     ShaderOutputLayer = _supportsShaderLayer,
                     ShaderOutputViewportIndex = supportsViewportIndexLayer,
                     RuntimeDescriptorArray = _supportsRuntimeDescriptors,

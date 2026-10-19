@@ -36,7 +36,7 @@ public sealed class PackedF16LiteralDeviceTests(HeadlessVulkanFixture fixture) :
             BufferAccess(48, "BufferStoreDwordx2", 4, dwords: 2, vectorData: 20, offsetEnabled: true, vectorAddress: 1),
             EndProgram(56));
         var (plan, resources, layout) = Prepare(program);
-        var request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = 64 };
+        var request = new ShaderCompileRequest(plan, resources, layout) { ExactFloat16ConversionSupported = vulkan.ExactFloat16Conversion, LocalSizeX = 64 };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         using var harness = new ImageTestHarness(vulkan);
         using var runner = new LayoutComputeRunner(harness, request, shader.Spirv);

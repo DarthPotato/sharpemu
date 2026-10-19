@@ -500,6 +500,11 @@ public static partial class Gen5SpirvTranslator
                         SpirvExecutionMode.SignedZeroInfNanPreserve,
                         32);
                 }
+                if (_request.ExactFloat16ConversionSupported)
+                {
+                    _module.AddExecutionMode(main, SpirvExecutionMode.DenormPreserve, 16);
+                    _module.AddExecutionMode(main, SpirvExecutionMode.RoundingModeRte, 16);
+                }
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
                     _module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
@@ -566,6 +571,13 @@ public static partial class Gen5SpirvTranslator
             {
                 _module.AddExtension("SPV_KHR_float_controls");
                 _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
+            }
+            if (_request.ExactFloat16ConversionSupported)
+            {
+                _module.AddExtension("SPV_KHR_float_controls");
+                _module.AddCapability(SpirvCapability.Float16);
+                _module.AddCapability(SpirvCapability.DenormPreserve);
+                _module.AddCapability(SpirvCapability.RoundingModeRte);
             }
             if (_stage == Gen5SpirvStage.Mesh)
             {

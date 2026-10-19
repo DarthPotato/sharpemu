@@ -220,6 +220,10 @@ public sealed class ShaderCompileRequest
     // 32-bit ones, which is not atomic as a pair.
     public bool SupportsSharedInt64Atomics { get; init; }
     public bool ShaderSignedZeroInfNanPreserveFloat32Supported { get; init; }
+
+    // The device enables shaderFloat16 and guarantees round-to-nearest-even and denormal
+    // preservation for 16-bit floats, so f16<->f32 conversions are emitted as OpFConvert.
+    public bool ExactFloat16ConversionSupported { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];

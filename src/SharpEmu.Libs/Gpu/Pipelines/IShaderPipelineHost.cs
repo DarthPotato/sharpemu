@@ -72,6 +72,10 @@ internal interface IShaderPipelineHost
     // emitted as real 64-bit atomics instead of a non-atomic 32-bit pair.
     bool SharedInt64AtomicsEnabled { get; }
     bool ShaderSignedZeroInfNanPreserveFloat32Supported => false;
+
+    // The device rounds f16 conversions to nearest even and preserves 16-bit denormals, so a shader
+    // converts f16 natively instead of through the integer emulation.
+    bool ExactFloat16ConversionSupported => false;
     bool ExecGuardElisionEnabled => true;
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;

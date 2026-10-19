@@ -220,7 +220,9 @@ public enum SpirvCapability : uint
     RuntimeDescriptorArray = 5302,
     SampledImageArrayNonUniformIndexing = 5307,
     PhysicalStorageBufferAddresses = 5347,
+    DenormPreserve = 4464,
     SignedZeroInfNanPreserve = 4466,
+    RoundingModeRte = 4467,
     MeshShadingExt = 5283,
 }
 
@@ -273,7 +275,9 @@ public enum SpirvExecutionMode : uint
     OriginUpperLeft = 7,
     DepthReplacing = 12,
     LocalSize = 17,
+    DenormPreserve = 4459,
     SignedZeroInfNanPreserve = 4461,
+    RoundingModeRte = 4462,
     OutputVertices = 26,
     OutputPrimitivesExt = 5270,
     OutputTrianglesExt = 5298,
@@ -426,6 +430,7 @@ public sealed class SpirvModuleBuilder
     // The value of every 32-bit integer and boolean constant, for folding instructions over them.
     private readonly Dictionary<uint, uint> _scalarConstantValues = [];
     private readonly HashSet<SpirvCapability> _declaredCapabilities = [];
+    private readonly HashSet<string> _declaredExtensions = [];
     private readonly Dictionary<string, uint> _extInstImports = [];
     private uint _nextId = 1;
     private uint? _voidType;
@@ -442,8 +447,13 @@ public sealed class SpirvModuleBuilder
         }
     }
 
-    public void AddExtension(string extension) =>
-        EmitWithString(_extensions, SpirvOp.Extension, [], extension);
+    public void AddExtension(string extension)
+    {
+        if (_declaredExtensions.Add(extension))
+        {
+            EmitWithString(_extensions, SpirvOp.Extension, [], extension);
+        }
+    }
 
     public uint ImportExtInst(string name)
     {

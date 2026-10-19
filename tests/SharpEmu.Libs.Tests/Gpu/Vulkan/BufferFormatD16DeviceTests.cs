@@ -43,7 +43,7 @@ public sealed class BufferFormatD16DeviceTests(HeadlessVulkanFixture fixture) : 
             BindingLayout.UsesGlobalDataShare(program),
             ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
             BindingLayout.ReadsShaderBase(program));
-        var request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = 1, ThreadCountX = 1 };
+        var request = new ShaderCompileRequest(plan, resources, layout) { ExactFloat16ConversionSupported = vulkan.ExactFloat16Conversion, LocalSizeX = 1, ThreadCountX = 1 };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
 
         var memory = new byte[DataBytes];

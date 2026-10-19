@@ -902,6 +902,7 @@ internal sealed class ShaderProgramCache
         var enableGraphicsSubgroups = _host.GraphicsSubgroupOperationsEnabled;
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
         var signedZeroInfNanPreserve = _host.ShaderSignedZeroInfNanPreserveFloat32Supported;
+        var exactFloat16 = _host.ExactFloat16ConversionSupported;
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
@@ -918,6 +919,7 @@ internal sealed class ShaderProgramCache
                     EnableGraphicsSubgroupOperations = source.Stage != ShaderStage.TessellationEvaluation && enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
+                    ExactFloat16ConversionSupported = exactFloat16,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
                     PositionExportControl = info.PositionExportControl,
@@ -947,6 +949,7 @@ internal sealed class ShaderProgramCache
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
+                    ExactFloat16ConversionSupported = exactFloat16,
                     PixelOutputs = options.PixelOutputs,
                     PixelDepthExportEnable = info.DepthExportEnable,
                     PixelInputEnable = options.PixelInputEnable,
@@ -991,7 +994,7 @@ internal sealed class ShaderProgramCache
             default:
                 return BuildComputeRequest(entry.Plan, resources, layout, options.ComputeInfo!, options.ComputeSystemRegisters,
                     sharedInt64Atomics, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve, _host.ComputeWave64SubgroupNative,
-                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!), options.TessellationHull);
+                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!), options.TessellationHull, exactFloat16);
         }
     }
 
@@ -1013,7 +1016,7 @@ internal sealed class ShaderProgramCache
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool execGuardElision,
         bool signedZeroInfNanPreserve, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
-        Gen5TessellationHullInfo? tessellationHull = null) =>
+        Gen5TessellationHullInfo? tessellationHull = null, bool exactFloat16 = false) =>
         new(plan, resources, layout)
         {
             WaveSize = info.WaveSize,
@@ -1028,6 +1031,7 @@ internal sealed class ShaderProgramCache
             ScratchDwords = info.ScratchDwords,
             SupportsSharedInt64Atomics = sharedInt64Atomics,
             ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
+            ExactFloat16ConversionSupported = exactFloat16,
             ComputeSystemRegisters = systemRegisters,
             LocalDataShareDwords = info.LocalDataShareDwords,
             LocalSizeX = Math.Max(info.ThreadsX, 1),
@@ -1038,7 +1042,7 @@ internal sealed class ShaderProgramCache
     internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
         bool sharedInt64Atomics, bool execGuardElision, bool signedZeroInfNanPreserve, out IGuestCompiledShader? compiled,
         out BindingLayout? layout, out string error, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
-        bool runtimeImageDescriptorsSupported = false)
+        bool runtimeImageDescriptorsSupported = false, bool exactFloat16Conversion = false)
     {
         compiled = null;
         layout = null;
@@ -1060,7 +1064,8 @@ internal sealed class ShaderProgramCache
             layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
                 record.Info.DispatchThreadDimensions, ShaderStage.Compute);
             var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
-                sharedInt64Atomics, execGuardElision, signedZeroInfNanPreserve, hostWave64Supported, hostComputeSubgroup32);
+                sharedInt64Atomics, execGuardElision, signedZeroInfNanPreserve, hostWave64Supported, hostComputeSubgroup32,
+                exactFloat16: exactFloat16Conversion);
             return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
         }
         catch (Exception exception)

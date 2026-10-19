@@ -240,6 +240,12 @@ public static partial class Gen5SpirvTranslator
                         _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, raw));
                     break;
                 }
+                case "VCvtF16F32" when _request.ExactFloat16ConversionSupported:
+                    result = EmitFloatToHalf(Bitcast(_uintType, GetFloatSource(instruction, 0)));
+                    break;
+                case "VCvtF32F16" when _request.ExactFloat16ConversionSupported:
+                    result = EmitHalfToFloat(GetRawSource(instruction, 0));
+                    break;
                 case "VCvtF16F32":
                 {
                     var vector = _module.AddInstruction(
@@ -2168,6 +2174,14 @@ public static partial class Gen5SpirvTranslator
         // Mirrors the branchless HalfToFloat reference validated against System.Half.
         private uint EmitHalfToFloat(uint halfBits)
         {
+            if (_request.ExactFloat16ConversionSupported)
+            {
+                // The 16-bit pattern is component 0 of the u32 viewed as two halves; widening is exact.
+                var halves = Bitcast(HalfVector2Type(), halfBits);
+                var half = _module.AddInstruction(SpirvOp.CompositeExtract, _module.TypeFloat(16), halves, 0u);
+                return Bitcast(_uintType, _module.AddInstruction(SpirvOp.FConvert, _floatType, half));
+            }
+
             var sign = ShiftLeftLogical(BitwiseAnd(halfBits, UInt(0x8000)), UInt(16));
             var exponent = BitwiseAnd(ShiftRightLogical(halfBits, UInt(10)), UInt(0x1F));
             var mantissa = BitwiseAnd(halfBits, UInt(0x3FF));
@@ -2199,6 +2213,22 @@ public static partial class Gen5SpirvTranslator
         // branchless FloatToHalf reference validated exhaustively against System.Half.
         private uint EmitFloatToHalf(uint bits)
         {
+            if (_request.ExactFloat16ConversionSupported)
+            {
+                // RoundingModeRTE and DenormPreserve (16) make the narrowing round to nearest even and
+                // keep subnormals, as the integer sequence below does. A NaN has no specified payload or
+                // sign under OpFConvert (NVIDIA returns 0x7FFF), so it is rebuilt the way the integer
+                // sequence does: the f32 sign over a quiet NaN.
+                var halfType = _module.TypeFloat(16);
+                var value = Bitcast(_floatType, bits);
+                var half = _module.AddInstruction(SpirvOp.FConvert, halfType, value);
+                var pair = _module.AddInstruction(
+                    SpirvOp.CompositeConstruct, HalfVector2Type(), half, _module.Constant(halfType, 0));
+                var narrowed = Bitcast(_uintType, pair);
+                var quietNan = BitwiseOr(BitwiseAnd(ShiftRightLogical(bits, UInt(16)), UInt(0x8000)), UInt(0x7E00));
+                return SelectU(_module.AddInstruction(SpirvOp.IsNan, _boolType, value), quietNan, narrowed);
+            }
+
             var sign = BitwiseAnd(ShiftRightLogical(bits, UInt(16)), UInt(0x8000));
             var absolute = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
 
@@ -2246,6 +2276,8 @@ public static partial class Gen5SpirvTranslator
             var finite = SelectU(isSubnormal, subnormal, normal);
             return SelectU(isInfinityNan, infinityNan, BitwiseOr(sign, finite));
         }
+
+        private uint HalfVector2Type() => _module.TypeVector(_module.TypeFloat(16), 2);
 
         private uint SelectU(uint condition, uint whenTrue, uint whenFalse) =>
             _module.AddInstruction(SpirvOp.Select, _uintType, condition, whenTrue, whenFalse);

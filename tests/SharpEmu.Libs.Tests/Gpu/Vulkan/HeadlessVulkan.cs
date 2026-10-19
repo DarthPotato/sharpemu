@@ -49,6 +49,9 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     public bool SupportsTessellationShader { get; private init; }
     public bool SupportsFillRectangle { get; private init; }
     public bool SupportsMeshShaders { get; private init; }
+
+    // shaderFloat16 is enabled and the device rounds f16 to nearest even and preserves denormals.
+    public bool ExactFloat16Conversion { get; private init; }
     public uint SubgroupSize
     {
         get
@@ -458,6 +461,32 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             timelineFeatures.PNext = &robustness2Features;
         }
 
+        // Native f16 conversion needs shaderFloat16 and per-width RTE/denorm-preserve control (the
+        // presenter's rule for ExactFloat16ConversionSupported).
+        var float16Features = new PhysicalDeviceShaderFloat16Int8Features
+        {
+            SType = StructureType.PhysicalDeviceShaderFloat16Int8Features,
+        };
+        var float16Query = new PhysicalDeviceFeatures2 { SType = StructureType.PhysicalDeviceFeatures2, PNext = &float16Features };
+        vk.GetPhysicalDeviceFeatures2(physical, &float16Query);
+        var floatControls = new PhysicalDeviceFloatControlsProperties { SType = StructureType.PhysicalDeviceFloatControlsProperties };
+        var floatControlsQuery = new PhysicalDeviceProperties2 { SType = StructureType.PhysicalDeviceProperties2, PNext = &floatControls };
+        vk.GetPhysicalDeviceProperties2(physical, &floatControlsQuery);
+        var exactFloat16 = float16Features.ShaderFloat16 && floatControls.ShaderRoundingModeRtefloat16 &&
+            floatControls.ShaderDenormPreserveFloat16 &&
+            floatControls.RoundingModeIndependence == ShaderFloatControlsIndependence.IndependenceAll &&
+            floatControls.DenormBehaviorIndependence == ShaderFloatControlsIndependence.IndependenceAll;
+        if (exactFloat16)
+        {
+            float16Features = new PhysicalDeviceShaderFloat16Int8Features
+            {
+                SType = StructureType.PhysicalDeviceShaderFloat16Int8Features,
+                ShaderFloat16 = true,
+                PNext = timelineFeatures.PNext,
+            };
+            timelineFeatures.PNext = &float16Features;
+        }
+
         var extensionNames = new List<string>();
         if (runtimeDescriptors) extensionNames.Add(robustness2Extension);
         if (meshShaders)
@@ -507,6 +536,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SupportsFillRectangle = fillRectangle,
             SupportsRuntimeDescriptors = runtimeDescriptors,
             SupportsMeshShaders = meshShaders,
+            ExactFloat16Conversion = exactFloat16,
         };
         if (validation)
         {
