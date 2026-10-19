@@ -224,12 +224,14 @@ public enum SpirvCapability : uint
     MeshShadingExt = 5283,
 }
 
-// The function-control mask of OpFunction. Only None exists on purpose: NVIDIA miscompiles repeated
-// calls of one DontInline function (every call returns the first call's result when the calls sit in a
-// uniform loop and the result indexes a descriptor array), so no function of ours may ask for it.
+// The function-control mask of OpFunction. NVIDIA miscompiles repeated calls of one DontInline
+// function whose result indexes a descriptor array (every call returns the first call's result when
+// the calls sit in a uniform loop), so a lookup function must not ask for it. DontInline is only for
+// functions that return loaded data, such as the runtime-format device buffer load.
 public enum SpirvFunctionControl : uint
 {
     None = 0,
+    DontInline = 2,
 }
 
 public enum SpirvStorageClass : uint

@@ -197,10 +197,4 @@ public sealed class RuntimeDescriptorSpirvTests
             Assert.NotEmpty(module.CallCounts);
         }
     }
-
-    [Fact]
-    public void TheBuilderCannotExpressDontInline()
-    {
-        Assert.Equal(["None"], Enum.GetNames<SpirvFunctionControl>());
-    }
 }

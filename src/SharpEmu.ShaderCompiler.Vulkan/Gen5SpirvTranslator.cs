@@ -4169,6 +4169,9 @@ public static partial class Gen5SpirvTranslator
         private uint Gfx10DeviceFormatSlot(uint scratch, uint index) =>
             _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, scratch, UInt(index));
 
+        private static readonly bool DeviceFormatFunctionInlined =
+            Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_FORMAT_INLINE") == "1";
+
         private void EmitGfx10DeviceFormatFunction()
         {
             if (_gfx10DeviceFormatFunction == 0)
@@ -4178,11 +4181,12 @@ public static partial class Gen5SpirvTranslator
 
             var type = _module.TypeFunction(
                 _voidType, [_ulongType, _ulongType, _uintType, _uintType, _uintType, _uintType]);
-            // SpirvFunctionControl.None, deliberately: DontInline compiles 50CD in 8.8 s instead
-            // of 30 s on an RTX 5070, because the driver otherwise inlines the body at all 128
-            // sites, but a DontInline lookup function was miscompiled on NVIDIA (see
-            // LookupRuntimeDescriptor), so it is not used until that is understood.
-            const SpirvFunctionControl control = SpirvFunctionControl.None;
+            // DontInline: inlined, the body is expanded at every call site (128 in Ghost of Yotei's
+            // 0x50CD2471C58963E1) and 50CD / B3A2 / B21E take 28.7 / 40.9 / 30.0 s to compile on an
+            // RTX 5070 instead of 8.8 / 8.1 / 7.3 s. Its result is loaded data, not a descriptor index,
+            // so the NVIDIA DontInline miscompile of lookup functions does not apply.
+            // SHARPEMU_DEVICE_FORMAT_INLINE=1 lets the driver inline it.
+            var control = DeviceFormatFunctionInlined ? SpirvFunctionControl.None : SpirvFunctionControl.DontInline;
             _module.BeginFunction(_voidType, type, _gfx10DeviceFormatFunction, control);
             _module.AddName(_gfx10DeviceFormatFunction, "loadDeviceFormatElement");
             var baseAddress = _module.AddFunctionParameter(_ulongType);
