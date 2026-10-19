@@ -343,4 +343,46 @@ public sealed partial class GuestImageCacheTests
         harness.Finish();
         harness.Shutdown();
     }
+
+    // Collection also runs between the submissions of a frame. Under pressure the images the
+    // previous frame used are still the ones the rest of this frame samples: deleting them there
+    // recreated and uploaded them again before the flip. Only the critical level retires them.
+    [Fact]
+    public void MidFramePressureKeepsThePreviousFramesImages()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const uint Width = 1024;
+        const ulong Size = (ulong)Width * Width * 4;
+        var address = harness.MapBacked(4 * Size, ReadWrite);
+        var images = new List<ResourceSlotIdentifier>();
+        harness.Worker.Run(() =>
+        {
+            for (var index = 0u; index < 4; index++)
+            {
+                images.Add(harness.Images.InsertImageForTest(SmallImage(address + index * Size, Width)));
+            }
+        });
+
+        var used = harness.Images.CollectionMemoryBytes;
+        var threshold = used - used / 8;
+        harness.Images.SetCollectionThresholds(1, threshold, ulong.MaxValue, 40);
+        harness.Worker.Run(() =>
+        {
+            // Every image was last used by the previous frame.
+            harness.Images.ResetRecency(Array.Empty<ResourceSlotIdentifier>(), 39);
+            for (var submission = 0; submission < 8; submission++)
+            {
+                harness.Images.RunGarbageCollector(endsFrame: false);
+            }
+        });
+        Assert.All(images, identifier => Assert.True(harness.Images.Contains(identifier)));
+
+        // Past the critical level one of them goes even mid-frame.
+        harness.Images.SetCollectionThresholds(1, threshold, threshold, 40);
+        harness.Worker.Run(() => harness.Images.RunGarbageCollector(endsFrame: false));
+        Assert.Equal(3, images.Count(identifier => harness.Images.Contains(identifier)));
+        harness.Finish();
+        harness.Shutdown();
+    }
 }

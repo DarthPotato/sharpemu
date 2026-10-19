@@ -37,7 +37,7 @@ public sealed partial class GuestImageCache
             return;
         }
 
-        Collect(tick, allowAggressive: false);
+        Collect(tick, allowAggressive: false, midFrame: !endsFrame);
         if (CollectionMemoryBytes >= _criticalMemoryBytes)
         {
             Collect(tick, allowAggressive: true);
@@ -258,19 +258,19 @@ public sealed partial class GuestImageCache
     private static readonly bool TraceCollection =
         Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_COLLECT_TRACE") == "1";
 
-    private void Collect(ulong tick, bool allowAggressive, bool reclaim = false)
+    private void Collect(ulong tick, bool allowAggressive, bool reclaim = false, bool midFrame = false)
     {
         if (!TraceCollection)
         {
-            CollectCore(tick, allowAggressive, reclaim);
+            CollectCore(tick, allowAggressive, reclaim, midFrame);
             return;
         }
 
         var usedBefore = _totalUsedMemory;
         var countBefore = _slots.Count;
-        CollectCore(tick, allowAggressive, reclaim);
+        CollectCore(tick, allowAggressive, reclaim, midFrame);
         Console.Error.WriteLine(
-            $"[IMAGE_COLLECT] tick={tick} aggressive={allowAggressive} reclaim={reclaim} images={countBefore}->{_slots.Count} " +
+            $"[IMAGE_COLLECT] tick={tick} aggressive={allowAggressive} reclaim={reclaim} midFrame={midFrame} images={countBefore}->{_slots.Count} " +
             $"live={usedBefore}->{_totalUsedMemory} retired={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
             $"pool_unused={_imageMemoryPool.UnusedBytes} pooled_backing={_backingPool?.PooledBytes ?? 0} " +
             $"thresholds={_memoryPressureBytes}/{_criticalMemoryBytes}");
@@ -278,16 +278,19 @@ public sealed partial class GuestImageCache
 
     private const int MaxExaminedPerSweep = 1024;
 
-    private void CollectCore(ulong tick, bool allowAggressive, bool reclaim)
+    private void CollectCore(ulong tick, bool allowAggressive, bool reclaim, bool midFrame)
     {
         var pressured = reclaim || CollectionMemoryBytes >= _memoryPressureBytes;
         var aggressive = reclaim || (allowAggressive && CollectionMemoryBytes >= _criticalMemoryBytes);
         // Under pressure only the images the current frame touched are kept: the work being
         // recorded needs those, and whatever it already references is destroyed after its
         // tick completes. Waiting more frames as memory fills would stop reclamation in a
-        // slow title.
+        // slow title. Mid-frame, though, an image is a frame old only because the rest of the
+        // frame has not sampled it yet: the pressured sweep would delete what the next draws use
+        // and they would create and upload it again, so it keeps the normal age there; only the
+        // critical and allocation passes reclaim the previous frame's images before the flip.
         var profile = SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled;
-        var age = pressured ? 1UL : 16UL;
+        var age = pressured && !midFrame ? 1UL : 16UL;
         if (tick < age)
         {
             return;
