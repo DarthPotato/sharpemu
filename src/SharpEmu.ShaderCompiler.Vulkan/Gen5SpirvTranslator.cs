@@ -4169,9 +4169,6 @@ public static partial class Gen5SpirvTranslator
         private uint Gfx10DeviceFormatSlot(uint scratch, uint index) =>
             _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, scratch, UInt(index));
 
-        private static readonly bool DeviceFormatFunctionInlined =
-            Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_FORMAT_INLINE") == "1";
-
         private void EmitGfx10DeviceFormatFunction()
         {
             if (_gfx10DeviceFormatFunction == 0)
@@ -4185,8 +4182,7 @@ public static partial class Gen5SpirvTranslator
             // 0x50CD2471C58963E1) and 50CD / B3A2 / B21E take 28.7 / 40.9 / 30.0 s to compile on an
             // RTX 5070 instead of 8.8 / 8.1 / 7.3 s. Its result is loaded data, not a descriptor index,
             // so the NVIDIA DontInline miscompile of lookup functions does not apply.
-            // SHARPEMU_DEVICE_FORMAT_INLINE=1 lets the driver inline it.
-            var control = DeviceFormatFunctionInlined ? SpirvFunctionControl.None : SpirvFunctionControl.DontInline;
+            const SpirvFunctionControl control = SpirvFunctionControl.DontInline;
             _module.BeginFunction(_voidType, type, _gfx10DeviceFormatFunction, control);
             _module.AddName(_gfx10DeviceFormatFunction, "loadDeviceFormatElement");
             var baseAddress = _module.AddFunctionParameter(_ulongType);
