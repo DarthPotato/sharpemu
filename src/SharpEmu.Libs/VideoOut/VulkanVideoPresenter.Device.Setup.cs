@@ -586,9 +586,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw new InvalidOperationException("No Vulkan graphics/present queue was found.");
             }
 
-            LoadComputeDeviceLimits();
             _vk.GetPhysicalDeviceProperties(_physicalDevice, out var selected);
             _physicalDeviceVendorId = selected.VendorID;
+            LoadComputeDeviceLimits();
             _maxColorAttachments = selected.Limits.MaxColorAttachments;
             var selectedName = SilkMarshal.PtrToString((nint)selected.DeviceName) ?? "unknown";
             Console.Error.WriteLine(
@@ -659,6 +659,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 floatControls.DenormBehaviorIndependence == ShaderFloatControlsIndependence.IndependenceAll;
             if (pushDescriptorProperties.PNext != null)
             {
+                var ignoreMeshGranularity = _physicalDeviceVendorId == AmdVendorId;
                 _meshShaderLimits = new MeshShaderLimits(
                     meshProperties.MaxMeshWorkGroupInvocations,
                     meshProperties.MaxMeshOutputVertices,
@@ -670,8 +671,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     meshProperties.MaxMeshWorkGroupSize[0],
                     meshProperties.MaxMeshOutputMemorySize,
                     meshProperties.MaxMeshPayloadAndOutputMemorySize,
-                    meshProperties.MeshOutputPerVertexGranularity,
-                    meshProperties.MeshOutputPerPrimitiveGranularity,
+                    ignoreMeshGranularity ? 1u : meshProperties.MeshOutputPerVertexGranularity,
+                    ignoreMeshGranularity ? 1u : meshProperties.MeshOutputPerPrimitiveGranularity,
                     meshProperties.MaxMeshOutputComponents);
             }
             SetNativeSubgroupCapabilities(subgroup.SubgroupSize, subgroup.SupportedStages);

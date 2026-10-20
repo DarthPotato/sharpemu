@@ -544,6 +544,23 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        private static int _unresidentPrtBufferLines;
+
+        private bool IsUnresidentPrtPage(ulong address)
+        {
+            if (_guestMemory.CanRead(address, 1) || !Kernel.KernelRuntimeCompatExports.ContainsPrtRange(address, 1))
+            {
+                return false;
+            }
+
+            if (Interlocked.Exchange(ref _unresidentPrtBufferLines, 1) == 0)
+            {
+                Console.Error.WriteLine($"[GPU][INFO] A buffer starts in an unresident PRT page and binds as a null buffer: address=0x{address:X16}.");
+            }
+
+            return true;
+        }
+
         // The cache buffer each descriptor's range lives in; a null descriptor has none.
         private void FindBuffers(PreparedStageBindings prepared)
         {
@@ -562,7 +579,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var descriptor = BufferDescriptorWords.From(words);
                 var requested = descriptor.Footprint() ?? throw SubmissionScheduler.Fatal(
                     $"A storage buffer descriptor footprint overflows: buffer={index} stride={descriptor.Stride} records={descriptor.RecordCount} hash=0x{program.Hash:X16}.");
-                if (descriptor.Address == 0 || requested == 0)
+                if (descriptor.Address == 0 || requested == 0 || IsUnresidentPrtPage(descriptor.Address))
                 {
                     sources[index] = (descriptor, default);
                     continue;
@@ -693,7 +710,7 @@ internal static unsafe partial class VulkanVideoPresenter
             memoryOffset = 0;
             var address = descriptor.Address;
             var requested = descriptor.Footprint() ?? throw SubmissionScheduler.Fatal($"A storage buffer descriptor footprint overflows: buffer={slot} hash=0x{program.Hash:X16}.");
-            if (address == 0 || requested == 0)
+            if (address == 0 || requested == 0 || IsUnresidentPrtPage(address))
             {
                 return NullStorageBuffer();
             }

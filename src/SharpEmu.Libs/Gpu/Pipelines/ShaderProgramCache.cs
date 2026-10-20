@@ -987,7 +987,7 @@ internal sealed class ShaderProgramCache
                     Mesh = new MeshShaderConfiguration(info.Geometry.OutputVertexCapacity, info.Geometry.OutputPrimitiveCapacity,
                         info.Geometry.ProvokingVertex, info.Geometry.InputPrimitiveCountPerWorkgroup, info.Geometry.InputVertexCountPerWorkgroup,
                         info.Geometry.LocalDataShareDwords, info.Geometry.InputTriangleStrip, info.Execution.DeviceSubgroupLaneCount,
-                        info.Geometry.InputPointList),
+                        info.Geometry.InputPointList, info.Geometry.InputLineList),
                 };
             }
 
@@ -1287,7 +1287,7 @@ internal static class CompiledShaderDump
         var directory = Environment.GetEnvironmentVariable("SHARPEMU_SHADER_SPIRV_DUMP_DIR");
         if (string.IsNullOrWhiteSpace(directory))
         {
-            directory = Path.Combine(AppContext.BaseDirectory, "shader-dumps");
+            directory = Path.Combine(SharpEmuPaths.DataRoot, "shader-dumps");
         }
 
         Directory.CreateDirectory(directory);

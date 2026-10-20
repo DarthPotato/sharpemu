@@ -105,6 +105,7 @@ public static class StageStaticKey
         key.Add(info.Execution.DeviceSubgroupLaneCount);
         key.Add(Bit(info.Geometry.InputTriangleStrip));
         key.Add(Bit(info.Geometry.InputPointList));
+        key.Add(Bit(info.Geometry.InputLineList));
         key.Add(info.Geometry.InputPrimitiveCountPerWorkgroup);
         key.Add(info.Geometry.InputVertexCountPerWorkgroup);
         key.Add(info.Geometry.OutputVertexCapacity);

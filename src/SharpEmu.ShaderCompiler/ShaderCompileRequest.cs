@@ -71,7 +71,8 @@ public readonly record struct MeshShaderConfiguration(
     uint LocalDataShareDwords,
     bool InputTriangleStrip = false,
     uint DeviceSubgroupLaneCount = 0,
-    bool InputPointList = false)
+    bool InputPointList = false,
+    bool InputLineList = false)
 {
     public static uint[] ParameterLocations(Gen5ShaderProgram program, int requiredOutputCount) =>
         program.Instructions.Select(instruction => instruction.Control).OfType<Gen5ExportControl>()

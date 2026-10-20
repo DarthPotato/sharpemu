@@ -294,6 +294,118 @@ public static partial class Gen5SpirvTranslator
 
                     break;
                 }
+                case "VCvtF64F32":
+                {
+                    var converted = _module.AddInstruction(
+                        SpirvOp.FConvert,
+                        DoubleType(),
+                        GetFloatSource(instruction, 0));
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            converted,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VCvtI32F64":
+                case "VCvtU32F64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    result = ConvertDoubleToIntegerSaturated(source, instruction.Opcode == "VCvtI32F64");
+                    break;
+                }
+                case "VTruncF64":
+                case "VCeilF64":
+                case "VRndneF64":
+                case "VFloorF64":
+                case "VFractF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    var rounded = Ext(instruction.Opcode switch
+                    {
+                        "VTruncF64" => 3u,
+                        "VCeilF64" => 9u,
+                        "VRndneF64" => 2u,
+                        "VFloorF64" => 8u,
+                        _ => 10u,
+                    }, DoubleType(), source);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            rounded,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VAddF64":
+                case "VMinF64":
+                case "VMaxF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var left, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 1, out var right, out error))
+                    {
+                        return false;
+                    }
+
+                    var combined = instruction.Opcode switch
+                    {
+                        "VAddF64" => _module.AddInstruction(SpirvOp.FAdd, DoubleType(), left, right),
+                        "VMinF64" => Ext(79, DoubleType(), left, right),
+                        _ => Ext(80, DoubleType(), left, right),
+                    };
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            combined,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VLdexpF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var mantissa, out error))
+                    {
+                        return false;
+                    }
+
+                    var scaled = Ext(53, DoubleType(), mantissa, Bitcast(_intType, GetRawSource(instruction, 1)));
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            scaled,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
                 case "VCvtF32F64":
                 {
                     if (!TryGetDoubleSource(instruction, 0, out var source, out error))
@@ -2445,6 +2557,51 @@ public static partial class Gen5SpirvTranslator
                     ? unordered
                     : _module.AddInstruction(SpirvOp.LogicalNot, _boolType, unordered);
             }
+            else if (opcode.EndsWith("F64", StringComparison.Ordinal))
+            {
+                if (!TryGetDoubleSource(instruction, 0, out var left, out error) ||
+                    !TryGetDoubleSource(instruction, 1, out var right, out error))
+                {
+                    return false;
+                }
+
+                var predicate = opcode.Replace("VCmpx", "VCmp", StringComparison.Ordinal);
+                var unordered = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, left),
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, right));
+                var operation = predicate switch
+                {
+                    "VCmpLtF64" => SpirvOp.FOrdLessThan,
+                    "VCmpEqF64" => SpirvOp.FOrdEqual,
+                    "VCmpLeF64" => SpirvOp.FOrdLessThanEqual,
+                    "VCmpGtF64" => SpirvOp.FOrdGreaterThan,
+                    "VCmpLgF64" => SpirvOp.FOrdNotEqual,
+                    "VCmpGeF64" => SpirvOp.FOrdGreaterThanEqual,
+                    "VCmpNeqF64" => SpirvOp.FUnordNotEqual,
+                    "VCmpNltF64" => SpirvOp.FUnordGreaterThanEqual,
+                    "VCmpNleF64" => SpirvOp.FUnordGreaterThan,
+                    "VCmpNgtF64" => SpirvOp.FUnordLessThanEqual,
+                    "VCmpNgeF64" => SpirvOp.FUnordLessThan,
+                    "VCmpNlgF64" => SpirvOp.FUnordEqual,
+                    _ => SpirvOp.Nop,
+                };
+                condition = predicate switch
+                {
+                    "VCmpFF64" => _module.ConstantBool(false),
+                    "VCmpTruF64" => _module.ConstantBool(true),
+                    "VCmpUF64" => unordered,
+                    "VCmpOF64" => _module.AddInstruction(SpirvOp.LogicalNot, _boolType, unordered),
+                    _ when operation != SpirvOp.Nop => _module.AddInstruction(operation, _boolType, left, right),
+                    _ => 0u,
+                };
+                if (condition == 0)
+                {
+                    error = $"unsupported double compare {opcode}";
+                    return false;
+                }
+            }
             else if (opcode.EndsWith("F16", StringComparison.Ordinal))
             {
                 var left = GetFloat16Source(instruction, 0);
@@ -4534,10 +4691,6 @@ public static partial class Gen5SpirvTranslator
                 DoubleType(),
                 unchecked((ulong)BitConverter.DoubleToInt64Bits(value)));
 
-        // FP64 operands live in a register pair. The gfx10 inline-constant
-        // and literal encodings follow different expansion rules than the
-        // integer 64-bit forms, so refuse them instead of reading the wrong
-        // bits as a double.
         private bool TryGetDoubleSource(
             Gen5ShaderInstruction instruction,
             int sourceIndex,
@@ -4547,14 +4700,19 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             value = 0;
             var operand = instruction.Sources[sourceIndex];
-            if (operand.Kind != Gen5OperandKind.VectorRegister &&
-                operand.Kind != Gen5OperandKind.ScalarRegister)
+            if (operand.Kind is Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister)
             {
-                error = $"FP64 source {sourceIndex} of {instruction.Opcode} is not a register pair";
+                value = Bitcast(DoubleType(), GetRawSource64(instruction, sourceIndex));
+            }
+            else if (TryGetDoubleConstantBits(operand, out var bits))
+            {
+                value = _module.Constant64(DoubleType(), bits);
+            }
+            else
+            {
+                error = $"FP64 source {sourceIndex} of {instruction.Opcode} is not a register pair or a 64-bit constant";
                 return false;
             }
-
-            value = Bitcast(DoubleType(), GetRawSource64(instruction, sourceIndex));
 
             var absoluteMask = 0u;
             var negateMask = 0u;
@@ -4581,6 +4739,54 @@ public static partial class Gen5SpirvTranslator
             }
 
             return true;
+        }
+
+        private static bool TryGetDoubleConstantBits(Gen5Operand operand, out ulong bits)
+        {
+            bits = 0;
+            if (operand.Kind == Gen5OperandKind.LiteralConstant)
+            {
+                bits = (ulong)operand.Value << 32;
+                return true;
+            }
+
+            if (operand.Kind != Gen5OperandKind.EncodedConstant)
+            {
+                return false;
+            }
+
+            double? floating = operand.Value switch
+            {
+                240 => 0.5,
+                241 => -0.5,
+                242 => 1.0,
+                243 => -1.0,
+                244 => 2.0,
+                245 => -2.0,
+                246 => 4.0,
+                247 => -4.0,
+                248 => 0.15915494309189535,
+                _ => null,
+            };
+            if (floating is { } constant)
+            {
+                bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(constant));
+                return true;
+            }
+
+            if (operand.Value is >= 128 and <= 192)
+            {
+                bits = operand.Value - 128;
+                return true;
+            }
+
+            if (operand.Value is >= 193 and <= 208)
+            {
+                bits = unchecked((ulong)-(long)(operand.Value - 192));
+                return true;
+            }
+
+            return false;
         }
 
         // Applies the VOP3 output modifier and clamp to a double result, then
@@ -4746,6 +4952,19 @@ public static partial class Gen5SpirvTranslator
                 UInt(0),
                 converted);
             return _module.AddInstruction(SpirvOp.Select, _uintType, IsNanBits(value), UInt(0), converted);
+        }
+
+        private uint ConvertDoubleToIntegerSaturated(uint value, bool signed)
+        {
+            var type = DoubleType();
+            var clamped = Ext(43, type, value,
+                Double(signed ? int.MinValue : 0.0),
+                Double(signed ? int.MaxValue : uint.MaxValue));
+            var converted = signed
+                ? Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertFToS, _intType, clamped))
+                : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, clamped);
+            return _module.AddInstruction(SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, value), UInt(0), converted);
         }
 
         private uint ConvertFloatToSignedSaturated(uint value)

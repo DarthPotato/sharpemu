@@ -6,6 +6,7 @@ using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Gpu.Vulkan;
+using SharpEmu.Libs.Kernel;
 using Silk.NET.Vulkan;
 
 using SharpEmu.Libs.VideoOut;
@@ -440,6 +441,20 @@ public sealed unsafe partial class GuestImageCache
         var destination = _slots[association.DepthOwner];
         var info = StencilPlaneLayout(destination, association.Description.Data, "upload");
         var fullSliceSize = info.Data.Size / info.Resources.Layers;
+        var rowHeight = info.IsTiled ? DepthBlock(info).BlockHeight : 1u;
+        var rowBytes = (ulong)info.Pitch * rowHeight;
+        var fittingHeight = rowBytes == 0 ? 0 : fullSliceSize / rowBytes * rowHeight;
+        if (fittingHeight == 0)
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The stencil plane is smaller than one row: address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X} pitch={info.Pitch} layers={info.Resources.Layers}.");
+        }
+
+        if (fittingHeight < info.Extent.Height)
+        {
+            info.Extent.Height = (uint)fittingHeight;
+        }
+
         var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
         var linear = new TilerBufferSpan(source.Handle, sourceOffset, source.Size - sourceOffset);
         if (info.IsTiled)
@@ -1032,7 +1047,9 @@ public sealed unsafe partial class GuestImageCache
         {
             download.Invalidate(offset, range.Size);
             GpuWritebackEpoch.Advance();
-            if (!backing.TryWriteBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
+            var published = download.Mapped.Slice((int)offset, (int)range.Size);
+            if (!backing.TryWriteBacking(range.Address, published) &&
+                !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
             {
                 throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
             }

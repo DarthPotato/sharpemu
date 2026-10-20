@@ -900,10 +900,12 @@ public sealed partial class RenderExecutor
     private static bool RequiresMeshExecution(uint stages) =>
         (stages & 0x20u) != 0 || (stages & 0x0200203Fu) == 0x2000u;
 
+    private const uint TessellationStageBits = 0x7u;
+
     private bool UsesMeshExecution(RegisterBanks banks) =>
         _pipelines.MeshShadersSupported && RequiresMeshExecution(banks.Context.ShaderStages) &&
         banks.Shader.Vertex.ExportAddress != 0 &&
-        banks.Shader.Vertex.HullAddress == 0 && banks.Shader.Vertex.LocalAddress == 0;
+        (banks.Context.ShaderStages & TessellationStageBits) == 0;
 
     private void ResolveShaderPrograms(RegisterBanks banks, ref DrawState state, bool indexed = false)
     {

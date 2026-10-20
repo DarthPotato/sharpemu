@@ -52,6 +52,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
 
     // shaderFloat16 is enabled and the device rounds f16 to nearest even and preserves denormals.
     public bool ExactFloat16Conversion { get; private init; }
+    public bool CanRequireComputeSubgroup32 { get; private init; }
     public uint SubgroupSize
     {
         get
@@ -398,6 +399,15 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
 
         vk.GetPhysicalDeviceFeatures(physical, out var baseFeatures);
         var meshShaders = meshFeatures.MeshShader && vulkan13Features.ComputeFullSubgroups && dynamicRendering;
+        var sizeControlProperties = new PhysicalDeviceSubgroupSizeControlProperties
+        {
+            SType = StructureType.PhysicalDeviceSubgroupSizeControlProperties,
+        };
+        var sizeControlQuery = new PhysicalDeviceProperties2 { SType = StructureType.PhysicalDeviceProperties2, PNext = &sizeControlProperties };
+        vk.GetPhysicalDeviceProperties2(physical, &sizeControlQuery);
+        var computeSubgroup32 = vulkan13Features.SubgroupSizeControl &&
+            (sizeControlProperties.RequiredSubgroupSizeStages & ShaderStageFlags.ComputeBit) != 0 &&
+            sizeControlProperties.MinSubgroupSize <= 32 && sizeControlProperties.MaxSubgroupSize >= 32;
         var enabledFeatures = new PhysicalDeviceFeatures
         {
             GeometryShader = baseFeatures.GeometryShader,
@@ -427,6 +437,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             DynamicRendering = dynamicRendering,
             Synchronization2 = true,
             ComputeFullSubgroups = meshShaders,
+            SubgroupSizeControl = computeSubgroup32,
         };
         addressFeatures = new PhysicalDeviceBufferDeviceAddressFeatures
         {
@@ -537,6 +548,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SupportsRuntimeDescriptors = runtimeDescriptors,
             SupportsMeshShaders = meshShaders,
             ExactFloat16Conversion = exactFloat16,
+            CanRequireComputeSubgroup32 = computeSubgroup32,
         };
         if (validation)
         {

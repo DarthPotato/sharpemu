@@ -10,6 +10,8 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 
 internal sealed record ShaderCallLibrary(string Identity, IReadOnlyList<ShaderCallSite> Calls)
 {
+    private const ulong MaxTableBytes = 65536;
+
     public static ShaderCallLibrary Read(Gen5ShaderProgram caller, MemoryAccessTable memory,
         ResourceSnapshot snapshot, GuestWordReader read)
     {
@@ -59,8 +61,10 @@ internal sealed record ShaderCallLibrary(string Identity, IReadOnlyList<ShaderCa
             var address = descriptor[0] | ((ulong)(descriptor[1] & 0xFFFF) << 32);
             var stride = (descriptor[1] >> 16) & 0x3FFF;
             var size = (ulong)descriptor[2] * Math.Max(stride, 1u);
-            if (size == 0 || size > 65536 || (size & 15) != 0 || (descriptor[1] & 0x80000000) != 0)
-                throw new InvalidOperationException("The shader call table extent or layout is not supported.");
+            if (size == 0 || size > MaxTableBytes || (size & 15) != 0 || (descriptor[1] & 0x80000000) != 0)
+                throw new InvalidOperationException(
+                    $"The shader call table extent or layout is not supported: address=0x{address:X} stride={stride} records={descriptor[2]} " +
+                    $"swizzle={descriptor[1] >> 31} dynamic={loadControl.DynamicOffsetRegister.HasValue} offset={loadControl.ImmediateOffsetBytes}.");
             var table = ShaderCallDump.ReadPrefix(address, (int)size, read);
             if ((ulong)table.Length != size) throw new InvalidOperationException("The shader call table is not CPU-readable at this submission.");
             identity.AppendData(table);

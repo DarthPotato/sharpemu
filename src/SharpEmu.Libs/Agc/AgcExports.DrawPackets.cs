@@ -129,6 +129,9 @@ public static partial class AgcExports
         }
 
         NoteDrawModifier("sceAgcDcbDrawIndex", modifier);
+        var drawInitiator = (modifier & (1UL << 32)) != 0
+            ? 0u
+            : ((uint)modifier >> 3) & 0x20u;
 
         if (!TryEmitCommandDwords(ctx, commandBufferAddress, out var baseCommand, Pm4(3, ItIndexBase, 0), (uint)indexAddress, (uint)(indexAddress >> 32), Pm4(2, ItIndexBufferSize, 0), indexCount))
         {
@@ -140,7 +143,7 @@ public static partial class AgcExports
         // former five-dword packet omitted both the real base and the count
         // field, so every call made by Unity looked like a zero-count draw to
         // the submitted-command parser and the complete scene was discarded.
-        if (!TryEmitCommandDwords(ctx, commandBufferAddress, out var drawCommand, Pm4(6, ItDrawIndex2, 0), indexCount, (uint)indexAddress, (uint)(indexAddress >> 32), indexCount, 0))
+        if (!TryEmitCommandDwords(ctx, commandBufferAddress, out var drawCommand, Pm4(6, ItDrawIndex2, 0), indexCount, (uint)indexAddress, (uint)(indexAddress >> 32), indexCount, drawInitiator))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -148,7 +151,7 @@ public static partial class AgcExports
         TraceAgc(
             $"agc.dcb_draw_index buf=0x{commandBufferAddress:X16} " +
             $"base=0x{baseCommand:X16} draw=0x{drawCommand:X16} " +
-            $"count={indexCount} index=0x{indexAddress:X16}");
+            $"count={indexCount} index=0x{indexAddress:X16} modifier=0x{modifier:X}");
 
         return ReturnPointer(ctx, drawCommand);
     }

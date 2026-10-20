@@ -1890,7 +1890,7 @@ public sealed partial class DirectExecutionBackend
 			!expectedPlayGoChunkEnumerationEnd &&
 			!expectedAddcontNotOwned)
 		{
-			return true;
+			return ShouldSampleImportResult(nid, resultValue, out mutexOccurrence);
 		}
 
 		if (!ShouldLogExpectedImportResults())

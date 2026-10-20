@@ -396,6 +396,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
                     ? GuestImageType.Color1D : GuestImageType.Color2D;
                 result = GrowImage(replacement, result);
             }
+            else if (request.View.Type == ImageViewType.Type3D && resolved.Backing.ImageType != ImageType.Type3D)
+            {
+                result = ResourceSlotIdentifier.Invalid;
+                viewMip = -1;
+                viewLayer = -1;
+            }
             else if (request.Role == ImageRole.StorageImage && viewMip < 0 && viewLayer < 0 &&
                      resolved.Description.IsBlock && !request.Description.IsBlock &&
                      (resolved.Backing.Usage & ImageUsageFlags.StorageBit) == 0)
@@ -817,7 +823,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)
     {
-        var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil);
+        var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil, restoreNativeStencil: true);
         if (stencilCompressed || depth.Description.Samples != 1)
         {
             return;

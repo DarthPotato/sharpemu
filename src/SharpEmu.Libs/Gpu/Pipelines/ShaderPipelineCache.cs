@@ -223,7 +223,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             }
 
             dropUnwritten = depthBound ||
-                LeavesSingleDualSourceTarget(context, targetExportMapping, pixelProgram.PixelColorExportMasks);
+                LeavesSingleDualSourceTarget(context, targetExportMapping, pixelProgram.PixelColorExportMasks) ||
+                UnwrittenTargetBoundsRenderArea(context, targetExportMapping, pixelProgram.PixelColorExportMasks);
             pixelOutputs = ResolveBoundTargets(context, targetExportMapping, dropUnwritten ? pixelProgram.PixelColorExportMasks : null,
                 out var outputModes, out var outputMappings);
             pixelInfo = PixelStageInputResolver.Resolve(_context, pixelSource.Registered, shaderInterface, outputModes, outputMappings, inputCount);
@@ -600,6 +601,43 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
 
         return false;
+    }
+
+    private static bool UnwrittenTargetBoundsRenderArea(
+        ContextRegisters context,
+        ReadOnlySpan<ColorComponentMap> mappingBySlot,
+        uint pixelColorExportMasks)
+    {
+        Span<uint> boundSlots = stackalloc uint[(int)ContextRegisters.ColorTargetCount];
+        boundSlots = boundSlots[..BoundColorSlots(context, boundSlots)];
+        if (boundSlots.Length < 2)
+        {
+            return false;
+        }
+
+        uint writtenWidth = 0, writtenHeight = 0;
+        uint unwrittenWidth = uint.MaxValue, unwrittenHeight = uint.MaxValue;
+        foreach (var slot in boundSlots)
+        {
+            if (ColorTargetResolver.Resolve(context, slot, 0, ignoreTargetMask: false, out _) is not { } resolution)
+            {
+                continue;
+            }
+
+            var extent = resolution.Extent;
+            if (RenderExecutor.IsUnwrittenColorTarget(context, slot, mappingBySlot[(int)slot], pixelColorExportMasks))
+            {
+                unwrittenWidth = Math.Min(unwrittenWidth, extent.Width);
+                unwrittenHeight = Math.Min(unwrittenHeight, extent.Height);
+            }
+            else
+            {
+                writtenWidth = Math.Max(writtenWidth, extent.Width);
+                writtenHeight = Math.Max(writtenHeight, extent.Height);
+            }
+        }
+
+        return writtenWidth > unwrittenWidth || writtenHeight > unwrittenHeight;
     }
 
     // The slots ResolveBoundTargets considers bound, before any are dropped as unwritten.

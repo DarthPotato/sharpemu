@@ -267,10 +267,21 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
     public void ColorTarget_RejectsUnsupportedRegisterStates()
     {
         using var fatal = new FatalScope();
-        Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 64, 64, samplesLog2: 1), 0xF, 0, false));
+        Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 64, 64, fragmentsLog2: 1), 0xF, 0, false));
         Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 64, 64, maxMip: 1), 0xF, 0, false));
         Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 64, 64, dimension: 3), 0xF, 0, false));
         Assert.Equal(3, fatal.Messages.Count);
+    }
+
+    [Fact]
+    public void ColorTarget_EqaaUsesTheFragmentCount()
+    {
+        using var fatal = new FatalScope();
+        var resolution = ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 64, 64, GuestTileMode.RenderTarget, samplesLog2: 2, fragmentsLog2: 1), 0xF, 0, false);
+
+        Assert.NotNull(resolution);
+        Assert.Equal(2u, resolution.Value.Samples);
+        Assert.Equal(2u, resolution.Value.Request.Description.Samples);
     }
 
     [Theory]

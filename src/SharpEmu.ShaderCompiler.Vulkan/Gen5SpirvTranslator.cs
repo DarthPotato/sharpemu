@@ -736,7 +736,7 @@ public static partial class Gen5SpirvTranslator
 
         private void DeclareLds()
         {
-            if (!UsesLds())
+            if (!UsesLds() || TryDeclareLaneLdsSlots())
             {
                 return;
             }
@@ -2540,7 +2540,7 @@ public static partial class Gen5SpirvTranslator
                     return TryEmitDataShareBpermute(instruction, control, out error);
             }
 
-            if (_lds == 0 || _ldsElementPointer == 0)
+            if ((_lds == 0 || _ldsElementPointer == 0) && _laneLdsSlotByPc?.ContainsKey(instruction.Pc) != true)
             {
                 error = "invalid LDS instruction";
                 return false;
@@ -2560,6 +2560,12 @@ public static partial class Gen5SpirvTranslator
                     {
                         error = "missing LDS write source";
                         return false;
+                    }
+
+                    if (_laneLdsSlotByPc is { } writeSlots && writeSlots.TryGetValue(instruction.Pc, out var writeSlot))
+                    {
+                        StoreLds(writeSlot, GetRawSource(instruction, 1));
+                        return true;
                     }
 
                     var address = GetRawSource(instruction, 0);
@@ -2731,6 +2737,12 @@ public static partial class Gen5SpirvTranslator
                     {
                         error = "missing LDS read operand";
                         return false;
+                    }
+
+                    if (_laneLdsSlotByPc is { } readSlots && readSlots.TryGetValue(instruction.Pc, out var readSlot))
+                    {
+                        StoreV(instruction.Destinations[0].Value, Load(_uintType, readSlot));
+                        return true;
                     }
 
                     var address = GetRawSource(instruction, 0);

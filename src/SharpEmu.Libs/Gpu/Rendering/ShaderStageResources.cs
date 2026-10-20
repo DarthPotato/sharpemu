@@ -219,6 +219,7 @@ public readonly record struct GuestGeometryConfiguration
     public uint ThreadsPerGroup { get; init; }
     public bool InputTriangleStrip { get; init; }
     public bool InputPointList { get; init; }
+    public bool InputLineList { get; init; }
     public uint InputPrimitiveCountPerWorkgroup { get; init; }
     public uint InputVertexCountPerWorkgroup { get; init; }
     public uint OutputVertexCapacity { get; init; }
