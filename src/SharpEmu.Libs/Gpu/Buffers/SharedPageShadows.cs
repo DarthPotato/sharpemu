@@ -27,6 +27,10 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
         public ulong StagedTick;
     }
 
+    // The owner of a page whose baseline is unproven: no buffer is it, so the next upload into the
+    // page copies it whole and rebases the shadow from the staged bytes.
+    private static readonly object Unsynchronized = new();
+
     private readonly Dictionary<ulong, Shadow> _pages = new();
     private readonly object _gate = new();
     // The narrowed copies of one upload, reused under the gate.
@@ -78,6 +82,31 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
             }
 
             _pages.Add(page, new Shadow(owner, gpuPage.ToArray()) { StagedTick = tick });
+            Volatile.Write(ref _count, _pages.Count);
+            return true;
+        }
+    }
+
+    // Starts shadowing a page whose GPU copy cannot be read, so the bytes both copies agree on are
+    // unknown: guest memory says nothing about bytes the GPU copy never received. The first upload
+    // into the page copies all of it and takes the staged bytes as the baseline (a pull of a readable
+    // GPU copy baselines it from that copy first, like any owner change). False when the capacity
+    // is reached.
+    public bool AdoptUnsynchronized(ulong page)
+    {
+        lock (_gate)
+        {
+            if (_pages.ContainsKey(page))
+            {
+                return true;
+            }
+
+            if (_pages.Count >= capacity)
+            {
+                return false;
+            }
+
+            _pages.Add(page, new Shadow(Unsynchronized, new byte[pageBytes]));
             Volatile.Write(ref _count, _pages.Count);
             return true;
         }

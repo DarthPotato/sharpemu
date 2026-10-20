@@ -888,8 +888,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
+    internal GuestPageTracker Tracker => _tracker;
+
     // Writes downloaded GPU bytes into guest memory; shadows of shared pages take them too.
-    private bool WriteDownloaded(ulong address, ReadOnlySpan<byte> bytes)
+    internal bool WriteDownloaded(ulong address, ReadOnlySpan<byte> bytes)
     {
         if (!_backing.TryWriteBacking(address, bytes))
         {
@@ -901,8 +903,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return true;
     }
 
-    // Downloaded shader-written pages now hold in guest memory what the GPU copy holds (the bytes
-    // outside the download were not GPU-written, so they already agreed): shadow them from there.
+    // Downloaded shader-written pages: the GPU-written bytes are in guest memory now, but guest
+    // memory says nothing about the bytes the owner's GPU copy holds elsewhere on the page. Those may
+    // never have received the guest's CPU writes (they can reach the GPU through the stream ring, or
+    // the owner can be newer than its last full upload), so a shadow taken from guest memory would
+    // filter out every later CPU write that repeats the guest's value and leave the stale GPU bytes.
+    // A readable owner is shadowed from its own GPU copy: the download made the GPU-written bytes
+    // equal in guest memory, and any other difference is a CPU change the next upload must carry.
+    // Otherwise the page has no baseline: its next upload copies all of it into the owner. The
+    // CPU's write to a page marks it dirty, so that upload happens before the GPU reads the CPU's
+    // value; the whole page is guest memory at that point, with the downloaded GPU bytes in it.
     private void AdoptDownloadedPages(ulong address, ulong size)
     {
         if (Volatile.Read(ref _shaderWrittenPageCount) == 0)
@@ -910,7 +920,6 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return;
         }
 
-        Span<byte> guest = stackalloc byte[(int)TrackerLayout.PageBytes];
         var end = address + size;
         for (var page = address & ~(TrackerLayout.PageBytes - 1); page < end; page += TrackerLayout.PageBytes)
         {
@@ -925,8 +934,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 Volatile.Write(ref _shaderWrittenPageCount, _shaderWrittenPages.Count);
             }
 
-            if (_backing.TryReadBacking(page, guest) && !_sharedPages.Adopt(page, owner!, guest) &&
-                Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
+            // A retired owner may be unmapped: only the buffer that holds the page now is read.
+            var adopted = owner!.MappedPointer != null && owner.IsCoherent && ReferenceEquals(FindOwner(page, TrackerLayout.PageBytes), owner)
+                ? _sharedPages.Adopt(page, owner,
+                    new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), (int)TrackerLayout.PageBytes), _scheduler.CurrentTick)
+                : _sharedPages.AdoptUnsynchronized(page);
+            if (!adopted && Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
             {
                 Console.Error.WriteLine("[GPU][WARN] The shared page shadows are full; CPU writes to further shader-written pages may lose shader bytes.");
             }

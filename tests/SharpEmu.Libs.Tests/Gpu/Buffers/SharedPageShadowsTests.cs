@@ -198,6 +198,62 @@ public sealed class SharedPageShadowsTests
         Assert.Equal(0xAA, guest[40]);
     }
 
+    [Fact]
+    public void ABaselineTakenFromGuestMemoryHidesStaleGpuBytes()
+    {
+        // The GPU copy holds 0x81 where guest memory holds 0. A baseline read from guest memory says
+        // the copies agree, so the CPU rewriting 0 is filtered out and the GPU keeps the 0x81.
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.Adopt(Page, owner, Fill(0)));
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        shadows.FilterUpload(copies, owner, Page, Fill(0), tick: 2);
+        Assert.Empty(copies);
+    }
+
+    [Fact]
+    public void AnUnsynchronizedPageUploadsWholeWhenTheCpuRewritesTheGuestValue()
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.AdoptUnsynchronized(Page));
+        Assert.True(shadows.Contains(Page));
+
+        // The guest holds 0 and rewrites 0; the owner's copy may hold anything.
+        var guest = Fill(0);
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        shadows.FilterUpload(copies, owner, Page, guest, tick: 2);
+        Assert.Equal([new BufferCopy(0, 0, PageBytes)], copies);
+
+        // The staged bytes are the baseline from then on: only the CPU's changes upload.
+        guest[7] = 0x33;
+        copies = [new(0, 0, PageBytes)];
+        shadows.FilterUpload(copies, owner, Page, guest, tick: 3);
+        Assert.Equal([new BufferCopy(7, 7, 1)], copies);
+    }
+
+    [Fact]
+    public void AnUnsynchronizedPageStaysUnsynchronizedAcrossABufferCopy()
+    {
+        var old = new object();
+        var replacement = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.AdoptUnsynchronized(Page));
+        shadows.NoteOwnerCopy(old, replacement, tick: 5);
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        shadows.FilterUpload(copies, replacement, Page, Fill(0), tick: 6);
+        Assert.Equal([new BufferCopy(0, 0, PageBytes)], copies);
+    }
+
+    [Fact]
+    public void UnsynchronizedAdoptionStopsAtCapacity()
+    {
+        var shadows = new SharedPageShadows(PageBytes, 1);
+        Assert.True(shadows.AdoptUnsynchronized(Page));
+        Assert.True(shadows.AdoptUnsynchronized(Page));
+        Assert.False(shadows.AdoptUnsynchronized(Page + PageBytes));
+    }
+
     private static byte[] Fill(byte value)
     {
         var bytes = new byte[PageBytes];

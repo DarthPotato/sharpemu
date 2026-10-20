@@ -318,6 +318,43 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void ADownloadedSharedPageKeepsNoBaselineFromGuestBytesTheOwnerNeverReceived()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        const ulong Tracker = TrackerLayout.PageBytes;
+        var (buffer, offset) = harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.FindBuffer(address, 0x10000);
+            var obtained = harness.Cache.ObtainBufferForImage(address, 256);
+            // A shader writes the first dword; the owner also holds 0x81 bytes that guest memory
+            // (zero) never gave it, as when the CPU's bytes reached the GPU through the stream ring.
+            obtained.Buffer.Fill(obtained.Offset, 4, 0xCAFEF00D);
+            obtained.Buffer.Fill(obtained.Offset + 16, 4, 0x81818181);
+            return obtained;
+        });
+        Assert.Equal(0x81818181U, BitConverter.ToUInt32(harness.ReadBack(buffer, offset + 16, 4)));
+        Assert.False(harness.Cache.HasCpuDirtyPages(address, Tracker), "cpu dirty");
+        harness.Worker.Run(() =>
+        {
+            harness.Cache.NoteDeviceAddressWrites(address, Tracker);
+            // The download carried only the shader's dword; the rest of the page was not downloaded.
+            Assert.True(harness.Cache.WriteDownloaded(address, BitConverter.GetBytes(0xCAFEF00DU)));
+            harness.Cache.Tracker.ClearGpuDirtyPages(address, Tracker);
+            // The CPU rewrites the zeros the guest already holds: the page is dirty, its bytes unchanged.
+            harness.Cache.Tracker.MarkCpuDirtyPages(address, Tracker);
+            // The next use of the owner's copy synchronizes the dirty page.
+            _ = harness.Cache.ObtainBufferForImage(address, 256);
+        });
+        var gpu = harness.ReadBack(buffer, offset, 32);
+        Assert.Equal(harness.Read(address, 32), gpu);
+        Assert.Equal(0U, BitConverter.ToUInt32(gpu, 16));
+        Assert.Equal(0xCAFEF00DU, BitConverter.ToUInt32(gpu, 0));
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void MergedAllocationPreservesBothGpuWrittenRanges()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
