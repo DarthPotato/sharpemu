@@ -44,10 +44,12 @@ internal static class StorageBufferViewPlanner
         }
 
         var range = size + adjustment;
-        // The shader indexes a uint[], whose runtime length drops a partial final word, yet a
-        // byte or formatted access may start inside it. Pad the view to whole words when the
-        // cache buffer has the room.
-        if (!dwordAddressed && (range & 3) != 0)
+        // The shader indexes a uint[], whose runtime length drops a partial final word. The
+        // hardware range-checks an access by its first byte, so a dword load or store that
+        // starts inside a range ending mid-word is performed whole, and byte or formatted
+        // accesses may start inside it too. Pad every view to whole words when the cache
+        // buffer has the room; otherwise the exact range is kept.
+        if ((range & 3) != 0)
         {
             var padded = (range + 3) & ~3UL;
             if (padded <= maxRange && alignedOffset + padded <= bufferSize)

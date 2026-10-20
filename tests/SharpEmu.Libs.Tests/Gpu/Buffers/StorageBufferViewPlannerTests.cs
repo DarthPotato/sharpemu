@@ -75,11 +75,32 @@ public sealed class StorageBufferViewPlannerTests
         Assert.Equal(0x103UL, view.Range);
     }
 
-    [Fact]
-    public void DwordAddressedViewsKeepTheirExactRange()
+    // A dword access that starts inside a range ending mid-word is performed whole.
+    [Theory]
+    [InlineData(93UL, 96UL)]
+    [InlineData(94UL, 96UL)]
+    [InlineData(95UL, 96UL)]
+    [InlineData(96UL, 96UL)]
+    public void DwordAddressedViewsArePaddedToWholeWords(ulong size, ulong range)
     {
-        Assert.True(Plan(0x1004, 0x101, dwordAddressed: true, out var view, out var error), error);
-        Assert.Equal(0x105UL, view.Range);
+        Assert.True(Plan(0x1000, size, dwordAddressed: true, out var view, out var error), error);
+        Assert.Equal(range, view.Range);
+
+        Assert.True(Plan(0x1004, size, dwordAddressed: true, out view, out error), error);
+        Assert.Equal(range + 4, view.Range);
+        Assert.Equal(4u, view.MemoryOffset);
+    }
+
+    [Fact]
+    public void ADwordAddressedViewKeepsItsExactRangeWithoutRoom()
+    {
+        // The cache buffer ends 95 bytes after the base: the padded word does not fit.
+        Assert.True(StorageBufferViewPlanner.TryPlan(0x1000, 95, Alignment, MaxRange, 0x1000 + 95, true, out var view, out var error), error);
+        Assert.Equal(95UL, view.Range);
+
+        // The device range limit bounds the padding too.
+        Assert.True(StorageBufferViewPlanner.TryPlan(0x1000, 95, Alignment, 95, BufferSize, true, out view, out error), error);
+        Assert.Equal(95UL, view.Range);
     }
 
     [Fact]
