@@ -918,27 +918,6 @@ internal static unsafe partial class VulkanVideoPresenter
             VideoOutExports.CompleteFlip(requestId);
         }
 
-        // SHARPEMU_FLIP_TRACE=1: once a second, which cached image a flip copies and whether the GPU wrote it.
-        private static readonly bool FlipTraceEnabled = Environment.GetEnvironmentVariable("SHARPEMU_FLIP_TRACE") == "1";
-        private long _lastFlipTraceTicks;
-        private long _flipTraceCount;
-
-        private void TraceFlipSource(ulong address, ulong pixelFormat, ulong width, ulong height, ulong tiling,
-            SharpEmu.Libs.Gpu.Buffers.ResourceSlotIdentifier imageIdentifier, CachedImage source, bool gpuWrittenBeforeRefresh)
-        {
-            if (!FlipTraceEnabled) return;
-            _flipTraceCount++;
-            var now = Environment.TickCount64;
-            if (now - _lastFlipTraceTicks < 1000) return;
-            _lastFlipTraceTicks = now;
-            Console.Error.WriteLine(
-                $"[GPU][FLIP_TRACE] flips={_flipTraceCount} addr=0x{address:X} fmt=0x{pixelFormat:X} {width}x{height} tiling={tiling} " +
-                $"image={imageIdentifier} guest_fmt={source.Description.GuestFormat} host_fmt={source.Backing.Format} " +
-                $"extent={source.Backing.Extent.Width}x{source.Backing.Extent.Height} data=0x{source.Description.Data.Address:X}+0x{source.Description.Data.Size:X} " +
-                $"gpu_written={gpuWrittenBeforeRefresh} gpu_seq={source.GpuWriteSequence} content_seq={source.ContentSequence} " +
-                $"cpu_dirty={source.IsCpuDirty} buffer_modified={source.IsBufferModified}");
-        }
-
         // Copies the display surface through the store; presentation shows the copy once its tick retires.
         internal void CaptureFlip(int handle, int index, ulong requestId, int flipMode, long flipArg)
         {
@@ -983,10 +962,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var imageIdentifier = _imageCache.FindImage(ref request);
                 var source = _imageCache.GetImage(imageIdentifier);
                 source.Uses.VideoOut = true;
-                var gpuWrittenBeforeRefresh = source.IsGpuModified;
                 _imageCache.RefreshImage(imageIdentifier);
-                TraceFlipSource(displayBuffer.Address, displayBuffer.PixelFormat, displayBuffer.Width, displayBuffer.Height,
-                    displayBuffer.TilingMode, imageIdentifier, source, gpuWrittenBeforeRefresh);
                 // The refresh can end the tick; the copy records into the buffer that is current now.
                 var commandBuffer = BeginBatchedGuestCommands();
                 var extent = source.Backing.Extent;

@@ -16,9 +16,7 @@ internal static unsafe partial class VulkanVideoPresenter
 {
     private sealed partial class Presenter
     {
-        // SHARPEMU_PREWARM_LOG_ALL=1 logs every failure, to group the reasons of a title.
-        private static readonly int MaxLoggedPrewarmFailures =
-            Environment.GetEnvironmentVariable("SHARPEMU_PREWARM_LOG_ALL") == "1" ? int.MaxValue : 8;
+        private const int MaxLoggedPrewarmFailures = 8;
         private const int PrewarmProgressBatch = 256;
 
         private sealed record ShaderPrewarmCompletion(string StampPath, string CoverageStamp);
