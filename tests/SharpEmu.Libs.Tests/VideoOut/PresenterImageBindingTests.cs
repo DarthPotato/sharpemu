@@ -157,7 +157,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
 
             // A removed image is not served again: the binding looks the descriptor up afresh.
             var generation = harness.Images.LookupGeneration;
-            typeof(GuestImageCache).GetMethod("DeleteImage", InstanceMembers)!.Invoke(harness.Images, [first, "test", true]);
+            typeof(GuestImageCache).GetMethod("DeleteImage", InstanceMembers)!.Invoke(harness.Images, [first, true]);
             Assert.NotEqual(generation, harness.Images.LookupGeneration);
             var third = (ResourceSlotIdentifier)GetFieldValue(presenter.InvokeMethod("ResolveImageBinding", resource, words, program, 0)!, "ImageIdentifier");
             Assert.True(harness.Images.TryGetImage(third, out var image) && image.Registered);

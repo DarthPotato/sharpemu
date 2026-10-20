@@ -18,11 +18,6 @@ public sealed partial class GuestImageCache
     {
         using var held = _lock.Hold();
         var tick = endsFrame ? _collectionTick++ : _collectionTick;
-        if (endsFrame && ImageChurnTrace.Enabled)
-        {
-            ReportImageChurn(_collectionTick);
-        }
-
         if (endsFrame && SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled && tick % 300 == 0)
             ReportImageMemory("collection", true, tick);
         _allocationCollectionBlocked = false;
@@ -403,7 +398,7 @@ public sealed partial class GuestImageCache
                     ReportImageLifetime(owner, "collect-no-gpu-ownership", deletion: true);
                 }
 
-                deletions -= DeleteImage(imageIdentifier, "collect");
+                deletions -= DeleteImage(imageIdentifier);
                 if (profile) _collectionDeletions++;
                 if (reclaim)
                 {
@@ -593,7 +588,7 @@ public sealed partial class GuestImageCache
     internal void DeleteImageForTest(ResourceSlotIdentifier imageIdentifier)
     {
         using var held = _lock.Hold();
-        DeleteImage(imageIdentifier, "test");
+        DeleteImage(imageIdentifier);
     }
 
     internal void ScheduleReadbackForTest(ResourceSlotIdentifier imageIdentifier)

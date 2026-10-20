@@ -561,7 +561,7 @@ public sealed partial class GuestImageCache
             Console.Error.WriteLine($"[GPU][WARN] An unequal-sample depth overlap copy is not supported: cachedSamples={cached.Backing.Samples} replacementSamples={replacement.Backing.Samples}.");
         }
 
-        ReleaseImage(cachedImageIdentifier, "depth-overlap-replace");
+        ReleaseImage(cachedImageIdentifier);
         return replacementImageIdentifier;
     }
 
@@ -651,7 +651,7 @@ public sealed partial class GuestImageCache
                 if (safeToDelete)
                 {
                     PublishBeforeDrop(cachedImageIdentifier);
-                    ReleaseImage(cachedImageIdentifier, "overlap-layout-change");
+                    ReleaseImage(cachedImageIdentifier);
                 }
 
                 return new OverlapResolution(mergedImageIdentifier);
@@ -715,14 +715,14 @@ public sealed partial class GuestImageCache
             cached.Binding.NeedsRebind |= cached.Binding.IsBound || cached.Binding.IsTarget;
             _slots[mergedImageIdentifier].Binding.IsTarget |= cached.Binding.IsTarget;
             CopyIntoMip(mergedImageIdentifier, cachedImageIdentifier, (uint)containedMip, (uint)containedLayer);
-            ReleaseImage(cachedImageIdentifier, "overlap-merged-into-mip");
+            ReleaseImage(cachedImageIdentifier);
             return new OverlapResolution(mergedImageIdentifier);
         }
 
         if (requested.Data.Address >= cachedInfo.Data.Address && safeToDelete)
         {
             PublishBeforeDrop(cachedImageIdentifier);
-            ReleaseImage(cachedImageIdentifier, "overlap-superseded");
+            ReleaseImage(cachedImageIdentifier);
         }
 
         return new OverlapResolution(mergedImageIdentifier);
@@ -756,7 +756,7 @@ public sealed partial class GuestImageCache
         }
         catch
         {
-            ReleaseImage(expandedImageIdentifier, "grow-copy-failed");
+            ReleaseImage(expandedImageIdentifier);
             throw;
         }
 
@@ -765,7 +765,7 @@ public sealed partial class GuestImageCache
             source.Binding.NeedsRebind = true;
         }
 
-        ReleaseImage(sourceImageIdentifier, "grow-replaced");
+        ReleaseImage(sourceImageIdentifier);
         return expandedImageIdentifier;
     }
 
@@ -797,7 +797,7 @@ public sealed partial class GuestImageCache
         }
 
         CopyWholeImage(replacementImageIdentifier, cachedImageIdentifier);
-        ReleaseImage(cachedImageIdentifier, "compressed-for-storage-replace");
+        ReleaseImage(cachedImageIdentifier);
         return replacementImageIdentifier;
     }
 
