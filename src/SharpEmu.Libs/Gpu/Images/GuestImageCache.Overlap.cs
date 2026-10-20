@@ -615,7 +615,7 @@ public sealed partial class GuestImageCache
             if (cachedInfo.FirstLevel != 0 && !cached.IsGpuModified)
             {
                 cached.Binding.NeedsRebind |= cached.Binding.IsBound || cached.Binding.IsTarget;
-                ReleaseImage(cachedImageIdentifier, "overlap-resident-levels");
+                ReleaseImage(cachedImageIdentifier);
             }
 
             return new OverlapResolution(mergedImageIdentifier);
