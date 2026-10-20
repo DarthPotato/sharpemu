@@ -62,6 +62,29 @@ public sealed unsafe class GuestBufferSharedPageMergeTests(HeadlessVulkanFixture
 
     private static uint Word(byte[] bytes, ulong offset) => BitConverter.ToUInt32(bytes, (int)offset);
 
+    private static void WaitUntilReadsComplete(CacheHarness harness)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!harness.Cache.SharedMergeReadsComplete())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "The shared page readback never completed.");
+            Thread.Sleep(1);
+        }
+    }
+
+    // Sweeps without waiting until the shader's bytes reach guest memory; a sweep that finds the
+    // copy still running leaves it in flight.
+    private static void SweepUntilMerged(CacheHarness harness, ulong address)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (Word(harness.Read(address, 0x100), Elsewhere) != ShaderWord)
+        {
+            Assert.True(DateTime.UtcNow < deadline, "The sweeps never merged the shader's bytes.");
+            harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: false));
+            Thread.Sleep(1);
+        }
+    }
+
     // The CPU dirties the page and writes CpuValue; shaders store through device addresses at
     // CpuValue, Reset and Elsewhere, and the GPU reports the page afterwards.
     private static void CpuWritesThenShadersWrite(CacheHarness harness, ulong address, GpuBuffer buffer, ulong offset)
@@ -187,6 +210,12 @@ public sealed unsafe class GuestBufferSharedPageMergeTests(HeadlessVulkanFixture
 
         harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: false));
 
+        if (asyncReadback)
+        {
+            // The sweep starts the copy and returns; a later sweep merges it once it has completed.
+            SweepUntilMerged(harness, address);
+        }
+
         var shaderBytesReachedGuest = Word(harness.Read(address, 0x100), Elsewhere) == ShaderWord;
         // Without a readback queue the download would drain the scheduler, which a sweep must not do.
         Assert.Equal(asyncReadback || !Deferred(buffer), shaderBytesReachedGuest);
@@ -233,6 +262,148 @@ public sealed unsafe class GuestBufferSharedPageMergeTests(HeadlessVulkanFixture
 
         Assert.NotSame(buffer, replacement);
         Assert.Equal(ShaderWord, Word(harness.Read(address, 0x100), Elsewhere));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void AReadbackIssuedEarlyAndCompletedIsMergedAtSynchronizationWithoutWaiting()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan!);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan!);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var (buffer, offset) = EstablishShadow(harness, address);
+        CpuWritesThenShadersWrite(harness, address, buffer, offset);
+        if (!Deferred(buffer))
+        {
+            Detach(harness);
+            harness.Shutdown();
+            return;
+        }
+
+        // The submitted tick the page waits for is enough: the copy starts at once.
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: false));
+        Assert.Equal(1, harness.Cache.SharedMergesIssued);
+        Assert.Equal(0u, Word(harness.Read(address, 0x100), Elsewhere));
+        WaitUntilReadsComplete(harness);
+
+        // The synchronization that uploads the CPU's write finds the snapshot done and merges it.
+        harness.Worker.Run(() => _ = harness.Cache.ObtainBufferForImage(address, 256));
+
+        Assert.Equal(1, harness.Cache.SharedMergesMergedWithoutWait);
+        Assert.Equal(0, harness.Cache.SharedMergesWaitedInFlight);
+        Assert.Equal(0, harness.Cache.SharedMergesIssuedAndWaited);
+        Assert.Equal(0, harness.Cache.SharedMergesForcedFlush);
+        Assert.Equal(0, harness.Cache.SharedMergesReissued);
+        var guest = harness.Read(address, 0x100);
+        Assert.Equal(CpuWord, Word(guest, CpuValue));
+        Assert.Equal(StaleShaderWord, Word(guest, Reset));
+        Assert.Equal(ShaderWord, Word(guest, Elsewhere));
+        Assert.Equal(guest, harness.ReadBack(buffer, offset, 0x100));
+        Detach(harness);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void ASynchronizationNeedingAPageInFlightWaitsForItsReadbackOnly()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan!);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan!);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var (buffer, offset) = EstablishShadow(harness, address);
+        CpuWritesThenShadersWrite(harness, address, buffer, offset);
+        if (!Deferred(buffer))
+        {
+            Detach(harness);
+            harness.Shutdown();
+            return;
+        }
+
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: false));
+        Assert.Equal(1, harness.Cache.SharedMergesIssued);
+        harness.Worker.Run(() => _ = harness.Cache.ObtainBufferForImage(address, 256));
+
+        // Whether or not the copy had finished by then, it was the only thing waited for.
+        Assert.Equal(1, harness.Cache.SharedMergesMergedWithoutWait + harness.Cache.SharedMergesWaitedInFlight);
+        Assert.Equal(1, harness.Cache.SharedMergesIssued);
+        Assert.Equal(0, harness.Cache.SharedMergesForcedFlush);
+        Assert.Equal(ShaderWord, Word(harness.Read(address, 0x100), Elsewhere));
+        Assert.Equal(harness.Read(address, 0x100), harness.ReadBack(buffer, offset, 0x100));
+        Detach(harness);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void APageWhoseTickIsSubmittedIsReadWithoutSubmittingAnything()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan!);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan!);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var (buffer, offset) = EstablishShadow(harness, address);
+        CpuWritesThenShadersWrite(harness, address, buffer, offset);
+        if (!Deferred(buffer))
+        {
+            Detach(harness);
+            harness.Shutdown();
+            return;
+        }
+
+        var tick = harness.Scheduler.CurrentTick;
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: true));
+
+        Assert.Equal(tick, harness.Scheduler.CurrentTick);
+        Assert.Equal(1, harness.Cache.SharedMergesIssued);
+        Assert.Equal(1, harness.Cache.SharedMergesIssuedAndWaited);
+        Assert.Equal(0, harness.Cache.SharedMergesForcedFlush);
+        Assert.Equal(ShaderWord, Word(harness.Read(address, 0x100), Elsewhere));
+        Detach(harness);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void ASnapshotOlderThanAnUploadStagedAfterItIsReissuedNotMerged()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan!);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan!);
+        var start = harness.MapBacked(0x30000, ReadWrite);
+        var address = start + 0x10000;
+        var (buffer, offset) = EstablishShadow(harness, address);
+        CpuWritesThenShadersWrite(harness, address, buffer, offset);
+        if (!Deferred(buffer))
+        {
+            Detach(harness);
+            harness.Shutdown();
+            return;
+        }
+
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: false));
+        Assert.Equal(1, harness.Cache.SharedMergesIssued);
+        // A replacement buffer copies the old owner into the open command buffer: the page's shadow
+        // now expects bytes the snapshot, taken before that, does not hold.
+        harness.Worker.Run(() => _ = harness.Cache.GetBuffer(harness.Cache.FindBuffer(start, 0x30000)));
+        WaitUntilReadsComplete(harness);
+
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: false));
+
+        Assert.Equal(1, harness.Cache.SharedMergesReissued);
+        Assert.Equal(0, harness.Cache.SharedMergesMergedWithoutWait);
+        Assert.Equal(0u, Word(harness.Read(address, 0x100), Elsewhere));
+
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: true));
+
+        Assert.Equal(2, harness.Cache.SharedMergesIssued);
+        Assert.True(harness.Cache.SharedMergesForcedFlush >= 1);
+        var guest = harness.Read(address, 0x100);
+        Assert.Equal(CpuWord, Word(guest, CpuValue));
+        Assert.Equal(ShaderWord, Word(guest, Elsewhere));
+        Detach(harness);
         harness.Shutdown();
     }
 }

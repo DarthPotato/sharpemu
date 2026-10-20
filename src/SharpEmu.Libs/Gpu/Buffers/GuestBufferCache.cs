@@ -1030,16 +1030,118 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // shadow does not know them, so an upload would filter out any CPU write that repeats the
     // shadow's value and leave the shader's byte in the GPU copy for good.
     // Each page waits here with the completed tick at the report, which the shader's writes precede.
-    // Resolved before an upload reads the page (SynchronizeBuffer), before a synchronized CPU read of
-    // it, and, when its inputs are already complete, after each fault scan. The owner is looked up
-    // again then: a replaced owner holds the same bytes, and a retired one needs no merge.
-    // A CPU write that repeats the shadow's value between the report and the resolve cannot be told
+    // The render thread reads such a page back on the async readback queue as soon as the tick it
+    // depends on (that report and the last upload staged for the page) is submitted, without waiting:
+    // the page is then in flight until the copy completes and its snapshot is merged. Merging happens
+    // before an upload reads the page (SynchronizeBuffer), before a synchronized CPU read of it, and
+    // opportunistically after each batch submission and fault scan. Only a caller that needs a page
+    // whose copy is still in flight waits, for that copy alone. The owner is looked up again at the
+    // merge: a replaced owner holds the same bytes, and a retired one needs no merge.
+    // A CPU write that repeats the shadow's value between the report and the merge cannot be told
     // from no write: the shader's byte wins there, as it would on a coherent owner for a write that
     // came before the report.
     private readonly Dictionary<ulong, ulong> _pendingSharedMerges = new();
+    private readonly Dictionary<ulong, SharedMergeFlight> _inflightSharedMerges = new();
+    private readonly List<SharedMergeBatch> _sharedMergeBatches = new();
     private int _pendingSharedMergeCount;
     private bool _resolvingSharedMerges;
     private const int SharedMergeChunkPages = 256;
+
+    // One readback ticket covering several pages. SnapshotTick is the newest main-queue tick the copy
+    // waits for: every upload staged up to it and every shader write reported by it is in the bytes.
+    private sealed class SharedMergeBatch(VulkanAsyncReadback.Ticket ticket, ulong[] pages, ulong[] reported, GpuBuffer[] owners, ulong snapshotTick)
+    {
+        public VulkanAsyncReadback.Ticket Ticket { get; } = ticket;
+        public ulong[] Pages { get; } = pages;
+        public ulong[] Reported { get; } = reported;
+        public GpuBuffer[] Owners { get; } = owners;
+        public ulong SnapshotTick { get; } = snapshotTick;
+    }
+
+    private readonly record struct SharedMergeFlight(SharedMergeBatch Batch, int Index);
+
+    private readonly record struct SharedMergeCandidate(ulong Page, ulong Reported, GpuBuffer Owner, ulong WaitTick);
+
+    private enum SharedMergeCounter
+    {
+        Issued,
+        MergedWithoutWait,
+        WaitedInFlight,
+        IssuedAndWaited,
+        ForcedFlush,
+        Reissued,
+        Count,
+    }
+
+    // How a batch is consumed: whether its ticket had already completed, was in flight when a caller
+    // needed it, or was issued by that very call.
+    private enum SharedMergeArrival
+    {
+        Completed,
+        WaitedInFlight,
+        IssuedAndWaited,
+    }
+
+    private readonly long[] _sharedMergeCounts = new long[(int)SharedMergeCounter.Count];
+    private static readonly long[] ReportedSharedMergeCounts = new long[(int)SharedMergeCounter.Count];
+
+    private void CountSharedMerge(SharedMergeCounter counter, int pages)
+    {
+        if (pages == 0)
+        {
+            return;
+        }
+
+        Interlocked.Add(ref _sharedMergeCounts[(int)counter], pages);
+        Interlocked.Add(ref ReportedSharedMergeCounts[(int)counter], pages);
+    }
+
+    // Pages handed to the async readback queue (a page issued again counts again).
+    internal long SharedMergesIssued => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.Issued]);
+
+    // Pages merged from a copy that had already completed when it was looked at.
+    internal long SharedMergesMergedWithoutWait => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.MergedWithoutWait]);
+
+    // Pages merged after blocking on a copy that was issued earlier, which waits for that copy only.
+    internal long SharedMergesWaitedInFlight => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.WaitedInFlight]);
+
+    // Pages issued by the call that needed them at once (their tick was already submitted) and waited for.
+    internal long SharedMergesIssuedAndWaited => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.IssuedAndWaited]);
+
+    // Pages whose tick was still in the open command buffer or that found no free readback slot, so
+    // the call submitted the buffer and waited: the blocking path.
+    internal long SharedMergesForcedFlush => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.ForcedFlush]);
+
+    // Pages whose snapshot was dropped because an upload was staged after it was issued.
+    internal long SharedMergesReissued => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.Reissued]);
+
+    // True when every shared page readback in flight has completed, so merging them would not wait.
+    internal bool SharedMergeReadsComplete()
+    {
+        SharedMergeBatch[] batches;
+        lock (_pendingSharedMerges)
+        {
+            batches = _sharedMergeBatches.ToArray();
+        }
+
+        if (AsyncReadback is not { } readback)
+        {
+            return batches.Length == 0;
+        }
+
+        foreach (var batch in batches)
+        {
+            if (!readback.IsComplete(batch.Ticket))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public static string TakeSharedMergeReport() => FormattableString.Invariant(
+        $"[PERF][SHARED_MERGE] issued={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.Issued], 0)} merged_nowait={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.MergedWithoutWait], 0)} waited_inflight={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.WaitedInFlight], 0)} issued_waited={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.IssuedAndWaited], 0)} forced_flush={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.ForcedFlush], 0)} reissued={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.Reissued], 0)}");
 
     private void DeferSharedPageMerge(ulong page) =>
         DeferSharedPageMerge(page, _scheduler.Timeline.CompletedTick);
@@ -1051,9 +1153,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _pendingSharedMerges[page] = _pendingSharedMerges.TryGetValue(page, out var earlier)
                 ? Math.Max(earlier, reportedTick)
                 : reportedTick;
-            Volatile.Write(ref _pendingSharedMergeCount, _pendingSharedMerges.Count);
+            PublishSharedMergeCount();
         }
     }
+
+    // Everything the resolve entry points still have to look at: pending pages, pages in flight and
+    // the batches that hold a readback slot (a batch whose pages were all superseded still does).
+    // Callers hold the _pendingSharedMerges lock.
+    private void PublishSharedMergeCount() =>
+        Volatile.Write(ref _pendingSharedMergeCount,
+            _pendingSharedMerges.Count + _inflightSharedMerges.Count + _sharedMergeBatches.Count);
 
     private bool HasPendingSharedMerges(ulong guestAddress, ulong size)
     {
@@ -1064,8 +1173,42 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         lock (_pendingSharedMerges)
         {
-            return TakePendingSharedMerges(guestAddress, size, null);
+            return TakePendingSharedMerges(guestAddress, size, null) || OverlapsSharedPages(_inflightSharedMerges, guestAddress, size);
         }
+    }
+
+    private static bool OverlapsSharedPages<T>(Dictionary<ulong, T> pages, ulong guestAddress, ulong size)
+    {
+        const ulong pageBytes = TrackerLayout.PageBytes;
+        if (pages.Count == 0)
+        {
+            return false;
+        }
+
+        var first = guestAddress & ~(pageBytes - 1);
+        var end = guestAddress + size;
+        if ((end - first) / pageBytes <= (ulong)pages.Count)
+        {
+            for (var page = first; page < end; page += pageBytes)
+            {
+                if (pages.ContainsKey(page))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        foreach (var page in pages.Keys)
+        {
+            if (page < end && page + pageBytes > guestAddress)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // The pending pages overlapping the range, removed from the table when a list takes them.
@@ -1117,15 +1260,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 _pendingSharedMerges.Remove(pair.Key);
             }
 
-            Volatile.Write(ref _pendingSharedMergeCount, _pendingSharedMerges.Count);
+            PublishSharedMergeCount();
         }
 
         return any;
     }
 
-    // Merges the pending pages in the range. With wait, every one is resolved: the call submits and
-    // waits for the GPU as the download needs. Without it only the pages whose inputs the GPU has
-    // already completed are, and only through the async readback queue; the rest stay pending.
+    // Brings the pending and in-flight pages in the range to guest memory and the shadows. With wait,
+    // every one is: a copy already in flight is waited for on its own, and a page not yet read is
+    // read at once (submitting its tick first when that is still being recorded). Without it, the
+    // call merges the copies that have completed, starts a copy for every page whose tick is
+    // submitted, and leaves the rest pending; it never waits for the GPU.
     // Render thread only, never inside a completion action.
     internal void ResolvePendingSharedMerges(ulong guestAddress, ulong size, bool wait)
     {
@@ -1135,18 +1280,25 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return;
         }
 
-        var pages = new List<KeyValuePair<ulong, ulong>>();
-        lock (_pendingSharedMerges)
-        {
-            if (!TakePendingSharedMerges(guestAddress, size, pages))
-            {
-                return;
-            }
-        }
-
         _resolvingSharedMerges = true;
         try
         {
+            ConsumeSharedMergeBatches(guestAddress, size, wait);
+            List<KeyValuePair<ulong, ulong>> pages;
+            lock (_pendingSharedMerges)
+            {
+                if (_pendingSharedMerges.Count == 0)
+                {
+                    return;
+                }
+
+                pages = new List<KeyValuePair<ulong, ulong>>();
+                if (!TakePendingSharedMerges(guestAddress, size, pages))
+                {
+                    return;
+                }
+            }
+
             ResolveSharedMerges(pages, wait);
         }
         finally
@@ -1157,7 +1309,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void ResolveSharedMerges(List<KeyValuePair<ulong, ulong>> pages, bool wait)
     {
-        var ready = new List<(ulong Page, ulong Reported, GpuBuffer Owner, ulong WaitTick)>(pages.Count);
+        var ready = new List<SharedMergeCandidate>(pages.Count);
         foreach (var (page, reported) in pages)
         {
             // A page without a shadow or an owner has nothing to merge into or from.
@@ -1166,16 +1318,313 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 continue;
             }
 
-            var waitTick = Math.Max(reported, staged);
-            if (!wait && (AsyncReadback is null || !_scheduler.IsTickComplete(waitTick)))
+            ready.Add(new SharedMergeCandidate(page, reported, owner, Math.Max(reported, staged)));
+        }
+
+        if (AsyncReadback is not { } readback)
+        {
+            // Without the readback queue the copy goes through the download ring and drains the scheduler.
+            if (wait)
             {
-                DeferSharedPageMerge(page, reported);
+                CountSharedMerge(SharedMergeCounter.ForcedFlush, ready.Count);
+                MergeSharedPagesSynchronously(ready);
+            }
+            else
+            {
+                foreach (var candidate in ready)
+                {
+                    DeferSharedPageMerge(candidate.Page, candidate.Reported);
+                }
+            }
+
+            return;
+        }
+
+        var unissued = new List<SharedMergeCandidate>();
+        var issued = IssueSharedMergeReads(ready, unissued);
+        if (!wait)
+        {
+            // The pages whose tick is still being recorded are issued after the next submission.
+            foreach (var candidate in unissued)
+            {
+                DeferSharedPageMerge(candidate.Page, candidate.Reported);
+            }
+
+            return;
+        }
+
+        if (unissued.Count != 0)
+        {
+            // The newest tick the pages wait for is still in the open command buffer: submit it, then read.
+            CountSharedMerge(SharedMergeCounter.ForcedFlush, unissued.Count);
+            _scheduler.Flush();
+            var stuck = new List<SharedMergeCandidate>();
+            issued.AddRange(IssueSharedMergeReads(unissued, stuck));
+            // No free readback slot: the synchronous slot or the download ring reads them.
+            MergeSharedPagesSynchronously(stuck);
+        }
+
+        foreach (var batch in issued)
+        {
+            readback.Wait(batch.Ticket);
+            ConsumeSharedMergeBatch(batch, SharedMergeArrival.IssuedAndWaited);
+        }
+    }
+
+    // Starts a copy on the async readback queue for every candidate whose wait tick is already
+    // submitted, in batches that share one ticket; the others go to unissued. Pages leave the pending
+    // table and become in flight. Never waits for the GPU and never submits.
+    private List<SharedMergeBatch> IssueSharedMergeReads(List<SharedMergeCandidate> candidates, List<SharedMergeCandidate> unissued)
+    {
+        const ulong pageBytes = TrackerLayout.PageBytes;
+        var issued = new List<SharedMergeBatch>();
+        var readback = AsyncReadback;
+        var submittedBelow = _scheduler.CurrentTick;
+        var eligible = new List<SharedMergeCandidate>(candidates.Count);
+        foreach (var candidate in candidates)
+        {
+            if (readback is null || candidate.WaitTick >= submittedBelow)
+            {
+                unissued.Add(candidate);
+            }
+            else
+            {
+                eligible.Add(candidate);
+            }
+        }
+
+        for (var first = 0; first < eligible.Count; first += SharedMergeChunkPages)
+        {
+            var count = Math.Min(SharedMergeChunkPages, eligible.Count - first);
+            var pieces = new ReadbackPiece[count];
+            var waitTick = 0UL;
+            for (var index = 0; index < count; index++)
+            {
+                var candidate = eligible[first + index];
+                pieces[index] = new ReadbackPiece(candidate.Owner, candidate.Owner.Offset(candidate.Page), pageBytes);
+                waitTick = Math.Max(waitTick, candidate.WaitTick);
+            }
+
+            VulkanAsyncReadback.Ticket? ticket;
+            using (_device.Slabs.BeginForeignRead())
+            {
+                if (!readback!.TryBegin(pieces, waitTick, out ticket) || ticket is null)
+                {
+                    unissued.AddRange(eligible.GetRange(first, eligible.Count - first));
+                    break;
+                }
+
+                // The owner may be retired while the copy is in flight; its memory stays until the merge.
+                foreach (var piece in pieces)
+                {
+                    piece.Source.RetainForeignRead();
+                }
+            }
+
+            var batchPages = new ulong[count];
+            var batchReported = new ulong[count];
+            var batchOwners = new GpuBuffer[count];
+            for (var index = 0; index < count; index++)
+            {
+                var candidate = eligible[first + index];
+                batchPages[index] = candidate.Page;
+                batchReported[index] = candidate.Reported;
+                batchOwners[index] = candidate.Owner;
+            }
+
+            var batch = new SharedMergeBatch(ticket, batchPages, batchReported, batchOwners, waitTick);
+            lock (_pendingSharedMerges)
+            {
+                for (var index = 0; index < count; index++)
+                {
+                    // A page read again supersedes its earlier copy, which is then only reaped.
+                    _inflightSharedMerges[batchPages[index]] = new SharedMergeFlight(batch, index);
+                }
+
+                _sharedMergeBatches.Add(batch);
+                PublishSharedMergeCount();
+            }
+
+            CountSharedMerge(SharedMergeCounter.Issued, count);
+            issued.Add(batch);
+        }
+
+        return issued;
+    }
+
+    // Merges the batches of in-flight copies that overlap the range and have completed, and, with
+    // wait, waits for the ones a page of the range still depends on. A copy outside the range is
+    // left alone unless the range covers everything.
+    private void ConsumeSharedMergeBatches(ulong guestAddress, ulong size, bool wait)
+    {
+        SharedMergeBatch[] batches;
+        lock (_pendingSharedMerges)
+        {
+            if (_sharedMergeBatches.Count == 0)
+            {
+                return;
+            }
+
+            batches = _sharedMergeBatches.ToArray();
+        }
+
+        if (AsyncReadback is not { } readback)
+        {
+            return;
+        }
+
+        const ulong pageBytes = TrackerLayout.PageBytes;
+        var end = guestAddress + size;
+        foreach (var batch in batches)
+        {
+            var overlaps = false;
+            var needed = false;
+            lock (_pendingSharedMerges)
+            {
+                for (var index = 0; index < batch.Pages.Length; index++)
+                {
+                    var page = batch.Pages[index];
+                    if (page >= end || page + pageBytes <= guestAddress)
+                    {
+                        continue;
+                    }
+
+                    overlaps = true;
+                    if (_inflightSharedMerges.TryGetValue(page, out var flight) && ReferenceEquals(flight.Batch, batch))
+                    {
+                        needed = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!overlaps)
+            {
                 continue;
             }
 
-            ready.Add((page, reported, owner, waitTick));
+            if (readback.IsComplete(batch.Ticket))
+            {
+                ConsumeSharedMergeBatch(batch, SharedMergeArrival.Completed);
+            }
+            else if (wait && needed)
+            {
+                readback.Wait(batch.Ticket);
+                ConsumeSharedMergeBatch(batch, SharedMergeArrival.WaitedInFlight);
+            }
+        }
+    }
+
+    // Merges the snapshot of a completed copy page by page and frees its readback slot. A page that
+    // was read again since is left to its newer copy; one whose shadow got an upload staged after the
+    // copy's tick is not merged from this snapshot and goes back to the pending table.
+    private void ConsumeSharedMergeBatch(SharedMergeBatch batch, SharedMergeArrival arrival)
+    {
+        const int pageBytes = (int)TrackerLayout.PageBytes;
+        var readback = AsyncReadback ?? throw SubmissionScheduler.Fatal("The shared page readback lost its queue.");
+        lock (_pendingSharedMerges)
+        {
+            if (!_sharedMergeBatches.Remove(batch))
+            {
+                return;
+            }
         }
 
+        var snapshot = new byte[batch.Pages.Length * pageBytes];
+        var copied = 0;
+        try
+        {
+            readback.Complete(batch.Ticket, (index, bytes) =>
+            {
+                bytes.CopyTo(snapshot.AsSpan(index * pageBytes, pageBytes));
+                copied++;
+            });
+        }
+        finally
+        {
+            foreach (var owner in batch.Owners)
+            {
+                owner.ReleaseForeignRead();
+            }
+        }
+
+        var current = new bool[batch.Pages.Length];
+        lock (_pendingSharedMerges)
+        {
+            for (var index = 0; index < batch.Pages.Length; index++)
+            {
+                if (_inflightSharedMerges.TryGetValue(batch.Pages[index], out var flight) && ReferenceEquals(flight.Batch, batch))
+                {
+                    current[index] = true;
+                    _inflightSharedMerges.Remove(batch.Pages[index]);
+                }
+            }
+
+            PublishSharedMergeCount();
+        }
+
+        var merged = 0;
+        var stale = 0;
+        for (var index = 0; index < batch.Pages.Length; index++)
+        {
+            if (!current[index])
+            {
+                continue;
+            }
+
+            var page = batch.Pages[index];
+            if (copied != batch.Pages.Length)
+            {
+                // The queue closed before the copy was read: nothing was snapshotted.
+                DeferSharedPageMerge(page, batch.Reported[index]);
+                continue;
+            }
+
+            // The owner may have been replaced meanwhile; its copy of the page holds the same bytes.
+            if (!_sharedPages.TryGetStagedTick(page, out var staged) || FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
+            {
+                continue;
+            }
+
+            if (staged > batch.SnapshotTick)
+            {
+                // An upload or buffer copy was staged after the copy's tick; the snapshot lacks those bytes.
+                DeferSharedPageMerge(page, batch.Reported[index]);
+                stale++;
+                continue;
+            }
+
+            merged++;
+            var slice = snapshot.AsSpan(index * pageBytes, pageBytes);
+            if (MergeSharedPage(page, owner, slice, batch.SnapshotTick))
+            {
+                RequireImageCache().InvalidateMemoryCopiesFromGpu(page, TrackerLayout.PageBytes);
+            }
+
+            // A later report the snapshot already covers needs no copy of its own.
+            lock (_pendingSharedMerges)
+            {
+                if (_pendingSharedMerges.TryGetValue(page, out var pendingTick) && pendingTick <= batch.SnapshotTick)
+                {
+                    _pendingSharedMerges.Remove(page);
+                    PublishSharedMergeCount();
+                }
+            }
+        }
+
+        CountSharedMerge(arrival switch
+        {
+            SharedMergeArrival.Completed => SharedMergeCounter.MergedWithoutWait,
+            SharedMergeArrival.WaitedInFlight => SharedMergeCounter.WaitedInFlight,
+            _ => SharedMergeCounter.IssuedAndWaited,
+        }, merged);
+        CountSharedMerge(SharedMergeCounter.Reissued, stale);
+    }
+
+    // Reads the candidates through the synchronous readback slot, or the download ring without a
+    // readback queue, and merges them. Submits and waits for the GPU as the read needs.
+    private void MergeSharedPagesSynchronously(List<SharedMergeCandidate> ready)
+    {
         for (var first = 0; first < ready.Count; first += SharedMergeChunkPages)
         {
             var count = Math.Min(SharedMergeChunkPages, ready.Count - first);
@@ -1206,10 +1655,38 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
+    // Teardown: waits for the copies in flight and drops them; their pages need no merge any more.
+    private void AbandonSharedMergeBatches()
+    {
+        SharedMergeBatch[] batches;
+        lock (_pendingSharedMerges)
+        {
+            batches = _sharedMergeBatches.ToArray();
+            _sharedMergeBatches.Clear();
+            _inflightSharedMerges.Clear();
+            PublishSharedMergeCount();
+        }
+
+        var readback = AsyncReadback;
+        foreach (var batch in batches)
+        {
+            if (readback is not null)
+            {
+                readback.Wait(batch.Ticket);
+                readback.Complete(batch.Ticket, null);
+            }
+
+            foreach (var owner in batch.Owners)
+            {
+                owner.ReleaseForeignRead();
+            }
+        }
+    }
+
     // Copies each page out of its owner after the ticks it waits for, and returns the newest tick the
     // snapshot is known to include. The async readback queue waits for only those ticks; without it the
     // copy goes through the download ring and the call drains the scheduler.
-    private ulong ReadOwnerPages(List<(ulong Page, ulong Reported, GpuBuffer Owner, ulong WaitTick)> pages, int first, int count, byte[] snapshot)
+    private ulong ReadOwnerPages(List<SharedMergeCandidate> pages, int first, int count, byte[] snapshot)
     {
         const ulong pageBytes = TrackerLayout.PageBytes;
         var waitTick = 0UL;
@@ -1447,9 +1924,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             _faultProcessPending = false;
             ProcessFaultBuffer();
-            // The scan's report ran just now; merge what the GPU has already finished with, without waiting.
-            ResolvePendingSharedMerges(0, ulong.MaxValue, wait: false);
         }
+
+        // The scan's report may have run just now: start the readbacks of the pages it left pending
+        // and merge the copies that finished, without waiting.
+        ResolvePendingSharedMerges(0, ulong.MaxValue, wait: false);
     }
 
     // Called once per guest frame; see GuestPageTracker.DecayCpuWriteHeat.
@@ -1522,6 +2001,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         try
         {
             AbandonEagerReadbacks();
+            AbandonSharedMergeBatches();
             if (_scheduler.Active)
             {
                 _scheduler.Finish();
@@ -1739,6 +2219,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             return;
         }
+
+        // The batch just submitted may hold the tick a pending shared page waits for: start its
+        // readback now, and merge the ones that finished, so a later upload finds them done.
+        ResolvePendingSharedMerges(0, ulong.MaxValue, wait: false);
 
         for (var index = _eagerDownloads.Count - 1; index >= 0; index--)
         {
