@@ -3,7 +3,6 @@
 
 using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
-using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.VideoOut;
 using SharpEmu.ShaderCompiler.Vulkan;
@@ -312,8 +311,6 @@ public sealed partial class RenderExecutor
 
         if (metadataAddress != 0 && _host.IsHtile(metadataAddress) && _host.MarkHtileRewritten(metadataAddress))
         {
-            SyncCostProbe.Add(SyncCostProbe.HtileMarked, 1);
-            SyncCostProbe.MaybeReport();
             if (RenderTrace.Enabled && RenderTrace.MetadataClear())
             {
                 RenderTrace.Write(
