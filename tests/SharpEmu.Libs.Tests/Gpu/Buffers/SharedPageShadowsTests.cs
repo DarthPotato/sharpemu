@@ -254,6 +254,31 @@ public sealed class SharedPageShadowsTests
         Assert.False(shadows.AdoptUnsynchronized(Page + PageBytes));
     }
 
+    [Fact]
+    public void TheStagedTickIsKnownOnlyForShadowedPagesAndFollowsSurvivingUploads()
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.False(shadows.TryGetStagedTick(Page, out _));
+
+        Assert.True(shadows.Adopt(Page, owner, Fill(0x11), tick: 2));
+        Assert.True(shadows.TryGetStagedTick(Page, out var tick));
+        Assert.Equal(2UL, tick);
+
+        // An upload the filter eliminated stages nothing; one that survives does.
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        shadows.FilterUpload(copies, owner, Page, Fill(0x11), tick: 7);
+        Assert.True(shadows.TryGetStagedTick(Page, out tick));
+        Assert.Equal(2UL, tick);
+
+        var staged = Fill(0x11);
+        staged[3] = 0x22;
+        copies = [new(0, 0, PageBytes)];
+        shadows.FilterUpload(copies, owner, Page, staged, tick: 9);
+        Assert.True(shadows.TryGetStagedTick(Page, out tick));
+        Assert.Equal(9UL, tick);
+    }
+
     private static byte[] Fill(byte value)
     {
         var bytes = new byte[PageBytes];

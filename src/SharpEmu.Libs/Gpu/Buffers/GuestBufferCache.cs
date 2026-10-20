@@ -155,9 +155,27 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         TrySynchronizeCpuRead(address, size, GuestMemoryProfile.ReadbackSource.CpuReadSynchronization);
 
     public bool TrySynchronizeCpuRead(ulong address, ulong size, GuestMemoryProfile.ReadbackSource source) =>
-        !_tracker.MayHaveGpuDirtyPages(address, size) ||
-        !_tracker.HasGpuDirtyPages(address, size) ||
-        ReadMemoryOrAwaitShutdown(address, size, isWrite: false, source);
+        ResolveSharedMergesForCpuRead(address, size) &&
+        (!_tracker.MayHaveGpuDirtyPages(address, size) ||
+         !_tracker.HasGpuDirtyPages(address, size) ||
+         ReadMemoryOrAwaitShutdown(address, size, isWrite: false, source));
+
+    // A CPU-dirty page keeps no GPU ownership, so a read of it takes no fault: the callers that
+    // synchronize a read are the only place its pending shader bytes can reach guest memory first.
+    private bool ResolveSharedMergesForCpuRead(ulong address, ulong size)
+    {
+        if (!HasPendingSharedMerges(address, size))
+        {
+            return true;
+        }
+
+        if (!_relay.IsGpuQueueThread && SubmissionScheduler.InDeferredOperation)
+        {
+            return true;
+        }
+
+        return _relay.TryRunOnGpuQueue(() => ResolvePendingSharedMerges(address, size, wait: true)) || AwaitShutdown();
+    }
 
     // Lock-free on the GPU queue thread; see GuestPageTracker.MayHaveGpuDirtyPages.
     public bool MayHaveGpuDirtyPages(ulong address, ulong size) => _tracker.MayHaveGpuDirtyPages(address, size);
@@ -810,7 +828,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (conflicts != 0)
             {
                 // The CPU dirtied the page before the write was reported: the page stays
-                // CPU-owned and the shader's bytes are merged into guest memory instead.
+                // CPU-owned and the shader's bytes are merged into guest memory instead: now when the
+                // owner's copy is mapped, otherwise once the render thread has downloaded the page.
                 if (_sharedPages.Contains(page))
                 {
                     marked |= PullSharedPage(page, owner);
@@ -946,24 +965,40 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
-    // Merges what shaders wrote on a shared page into guest memory; true when bytes were merged.
+    // Merges what shaders wrote on a shared page into guest memory; true when bytes were merged. An
+    // owner the host cannot read through a coherent mapping is merged later, from a download.
     private bool PullSharedPage(ulong page, GpuBuffer owner)
     {
-        if (_sharedPages.Count == 0 || owner.MappedPointer == null || !owner.IsCoherent || !_sharedPages.Contains(page))
+        if (_sharedPages.Count == 0 || !_sharedPages.Contains(page))
         {
+            return false;
+        }
+
+        if (owner.MappedPointer == null || !owner.IsCoherent)
+        {
+            DeferSharedPageMerge(page);
             return false;
         }
 
         // The GPU may still write the page: merge one snapshot of it.
         Span<byte> gpu = stackalloc byte[(int)TrackerLayout.PageBytes];
         new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), gpu.Length).CopyTo(gpu);
+        return MergeSharedPage(page, owner, gpu, _scheduler.Timeline.CompletedTick);
+    }
+
+    // Merges a snapshot of the owner's copy of a shadowed page into guest memory and the shadow: the
+    // bytes shaders changed reach guest memory where the CPU left them alone, and the shadow takes the
+    // GPU state, so a later CPU write is compared with what the GPU holds. completedTick is the newest
+    // tick whose effects the snapshot is known to include. True when bytes were merged.
+    private bool MergeSharedPage(ulong page, GpuBuffer owner, ReadOnlySpan<byte> gpu, ulong completedTick)
+    {
         var guest = new byte[TrackerLayout.PageBytes];
         if (!_backing.TryReadBacking(page, guest))
         {
             return false;
         }
 
-        var count = _sharedPages.PullGpuWrites(page, owner, gpu, guest, _scheduler.Timeline.CompletedTick, (offset, length) =>
+        var count = _sharedPages.PullGpuWrites(page, owner, gpu, guest, completedTick, (offset, length) =>
         {
             GpuWritebackEpoch.Advance();
             if (!_backing.TryWriteBacking(page + (ulong)offset, guest.AsSpan(offset, length)))
@@ -986,6 +1021,244 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (GuestGpuMemoryHook.Traces(page, TrackerLayout.PageBytes))
             GuestGpuMemoryHook.Trace(page, TrackerLayout.PageBytes, $"shared-page-merged bytes={count} submission_tick={_scheduler.CurrentTick}");
         return true;
+    }
+
+    // Shadowed pages whose owner the host cannot read through a coherent mapping (device-local memory
+    // behind a non-coherent or unmapped heap) and that a shader wrote after the CPU dirtied them.
+    // The completion action that reports the write may not wait for the GPU, so it cannot download
+    // the page. Until the render thread does, the shader's bytes exist only in the GPU copy: the
+    // shadow does not know them, so an upload would filter out any CPU write that repeats the
+    // shadow's value and leave the shader's byte in the GPU copy for good.
+    // Each page waits here with the completed tick at the report, which the shader's writes precede.
+    // Resolved before an upload reads the page (SynchronizeBuffer), before a synchronized CPU read of
+    // it, and, when its inputs are already complete, after each fault scan. The owner is looked up
+    // again then: a replaced owner holds the same bytes, and a retired one needs no merge.
+    // A CPU write that repeats the shadow's value between the report and the resolve cannot be told
+    // from no write: the shader's byte wins there, as it would on a coherent owner for a write that
+    // came before the report.
+    private readonly Dictionary<ulong, ulong> _pendingSharedMerges = new();
+    private int _pendingSharedMergeCount;
+    private bool _resolvingSharedMerges;
+    private const int SharedMergeChunkPages = 256;
+
+    private void DeferSharedPageMerge(ulong page) =>
+        DeferSharedPageMerge(page, _scheduler.Timeline.CompletedTick);
+
+    private void DeferSharedPageMerge(ulong page, ulong reportedTick)
+    {
+        lock (_pendingSharedMerges)
+        {
+            _pendingSharedMerges[page] = _pendingSharedMerges.TryGetValue(page, out var earlier)
+                ? Math.Max(earlier, reportedTick)
+                : reportedTick;
+            Volatile.Write(ref _pendingSharedMergeCount, _pendingSharedMerges.Count);
+        }
+    }
+
+    private bool HasPendingSharedMerges(ulong guestAddress, ulong size)
+    {
+        if (Volatile.Read(ref _pendingSharedMergeCount) == 0)
+        {
+            return false;
+        }
+
+        lock (_pendingSharedMerges)
+        {
+            return TakePendingSharedMerges(guestAddress, size, null);
+        }
+    }
+
+    // The pending pages overlapping the range, removed from the table when a list takes them.
+    private bool TakePendingSharedMerges(ulong guestAddress, ulong size, List<KeyValuePair<ulong, ulong>>? taken)
+    {
+        const ulong pageBytes = TrackerLayout.PageBytes;
+        var first = guestAddress & ~(pageBytes - 1);
+        var end = guestAddress + size;
+        var any = false;
+        if ((end - first) / pageBytes <= (ulong)_pendingSharedMerges.Count)
+        {
+            for (var page = first; page < end; page += pageBytes)
+            {
+                if (!_pendingSharedMerges.TryGetValue(page, out var tick))
+                {
+                    continue;
+                }
+
+                any = true;
+                if (taken is null)
+                {
+                    return true;
+                }
+
+                taken.Add(new KeyValuePair<ulong, ulong>(page, tick));
+            }
+        }
+        else
+        {
+            foreach (var pair in _pendingSharedMerges)
+            {
+                if (pair.Key < end && pair.Key + pageBytes > guestAddress)
+                {
+                    any = true;
+                    if (taken is null)
+                    {
+                        return true;
+                    }
+
+                    taken.Add(pair);
+                }
+            }
+        }
+
+        if (taken is not null)
+        {
+            foreach (var pair in taken)
+            {
+                _pendingSharedMerges.Remove(pair.Key);
+            }
+
+            Volatile.Write(ref _pendingSharedMergeCount, _pendingSharedMerges.Count);
+        }
+
+        return any;
+    }
+
+    // Merges the pending pages in the range. With wait, every one is resolved: the call submits and
+    // waits for the GPU as the download needs. Without it only the pages whose inputs the GPU has
+    // already completed are, and only through the async readback queue; the rest stay pending.
+    // Render thread only, never inside a completion action.
+    internal void ResolvePendingSharedMerges(ulong guestAddress, ulong size, bool wait)
+    {
+        if (Volatile.Read(ref _pendingSharedMergeCount) == 0 || _resolvingSharedMerges ||
+            !_scheduler.Active || _scheduler.InsideTickCallback)
+        {
+            return;
+        }
+
+        var pages = new List<KeyValuePair<ulong, ulong>>();
+        lock (_pendingSharedMerges)
+        {
+            if (!TakePendingSharedMerges(guestAddress, size, pages))
+            {
+                return;
+            }
+        }
+
+        _resolvingSharedMerges = true;
+        try
+        {
+            ResolveSharedMerges(pages, wait);
+        }
+        finally
+        {
+            _resolvingSharedMerges = false;
+        }
+    }
+
+    private void ResolveSharedMerges(List<KeyValuePair<ulong, ulong>> pages, bool wait)
+    {
+        var ready = new List<(ulong Page, ulong Reported, GpuBuffer Owner, ulong WaitTick)>(pages.Count);
+        foreach (var (page, reported) in pages)
+        {
+            // A page without a shadow or an owner has nothing to merge into or from.
+            if (!_sharedPages.TryGetStagedTick(page, out var staged) || FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
+            {
+                continue;
+            }
+
+            var waitTick = Math.Max(reported, staged);
+            if (!wait && (AsyncReadback is null || !_scheduler.IsTickComplete(waitTick)))
+            {
+                DeferSharedPageMerge(page, reported);
+                continue;
+            }
+
+            ready.Add((page, reported, owner, waitTick));
+        }
+
+        for (var first = 0; first < ready.Count; first += SharedMergeChunkPages)
+        {
+            var count = Math.Min(SharedMergeChunkPages, ready.Count - first);
+            var snapshot = new byte[count * (int)TrackerLayout.PageBytes];
+            var snapshotTick = ReadOwnerPages(ready, first, count, snapshot);
+            for (var index = 0; index < count; index++)
+            {
+                var (page, reported, _, _) = ready[first + index];
+                // The owner may have been replaced meanwhile; its copy of the page holds the same bytes.
+                if (!_sharedPages.TryGetStagedTick(page, out var staged) || FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
+                {
+                    continue;
+                }
+
+                if (staged > snapshotTick)
+                {
+                    // An upload or buffer copy was staged after the snapshot; it lacks those bytes.
+                    DeferSharedPageMerge(page, reported);
+                    continue;
+                }
+
+                var slice = snapshot.AsSpan(index * (int)TrackerLayout.PageBytes, (int)TrackerLayout.PageBytes);
+                if (MergeSharedPage(page, owner, slice, snapshotTick))
+                {
+                    RequireImageCache().InvalidateMemoryCopiesFromGpu(page, TrackerLayout.PageBytes);
+                }
+            }
+        }
+    }
+
+    // Copies each page out of its owner after the ticks it waits for, and returns the newest tick the
+    // snapshot is known to include. The async readback queue waits for only those ticks; without it the
+    // copy goes through the download ring and the call drains the scheduler.
+    private ulong ReadOwnerPages(List<(ulong Page, ulong Reported, GpuBuffer Owner, ulong WaitTick)> pages, int first, int count, byte[] snapshot)
+    {
+        const ulong pageBytes = TrackerLayout.PageBytes;
+        var waitTick = 0UL;
+        for (var index = 0; index < count; index++)
+        {
+            waitTick = Math.Max(waitTick, pages[first + index].WaitTick);
+        }
+
+        if (AsyncReadback is { } readback)
+        {
+            using var foreignRead = _device.Slabs.BeginForeignRead();
+            // The newest tick may still be recording: the readback queue needs it submitted.
+            if (waitTick >= _scheduler.CurrentTick)
+            {
+                _scheduler.Flush();
+            }
+
+            var pieces = new ReadbackPiece[count];
+            for (var index = 0; index < count; index++)
+            {
+                var (page, _, owner, _) = pages[first + index];
+                pieces[index] = new ReadbackPiece(owner, owner.Offset(page), pageBytes);
+            }
+
+            readback.Read(pieces, waitTick, (index, bytes) => bytes.CopyTo(snapshot.AsSpan((int)((uint)index * pageBytes), (int)pageBytes)));
+            return waitTick;
+        }
+
+        var total = (ulong)count * pageBytes;
+        if (!_download.TryMap(total, out var baseOffset, BufferDownloadBatchPlanner.Alignment))
+        {
+            throw SubmissionScheduler.Fatal("The download ring could not map the shared page snapshot.");
+        }
+
+        for (var index = 0; index < count; index++)
+        {
+            var (page, _, owner, _) = pages[first + index];
+            _download.CopyFrom(
+                _scheduler.Current, owner, owner.Offset(page), baseOffset + (ulong)index * pageBytes, pageBytes,
+                AccessFlags.MemoryWriteBit, AccessFlags.None, AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit, AccessFlags.HostReadBit);
+        }
+
+        _download.Commit();
+        var copyTick = _scheduler.CurrentTick;
+        _scheduler.Finish();
+        _scheduler.WaitForPriorityOperations(copyTick);
+        _download.Invalidate(baseOffset, total);
+        _download.Mapped.Slice((int)baseOffset, (int)total).CopyTo(snapshot);
+        return copyTick;
     }
 
     // Uploads every mapped range before a BDA draw; the fault pass runs at the next collection.
@@ -1174,6 +1447,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             _faultProcessPending = false;
             ProcessFaultBuffer();
+            // The scan's report ran just now; merge what the GPU has already finished with, without waiting.
+            ResolvePendingSharedMerges(0, ulong.MaxValue, wait: false);
         }
     }
 
@@ -2315,6 +2590,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         bool preserveCpuWriteHotPages = true, bool readImageBacking = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySynchronization);
+        // Shader bytes a shared page still owes guest memory and its shadow must land before an upload
+        // is filtered against the shadow, whether or not this call finds more to upload.
+        ResolvePendingSharedMerges(guestAddress, size, wait: true);
         var startedAt = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var nothingToUpload = isWritten
             ? _gpuModifiedRanges.Contains(guestAddress, size)

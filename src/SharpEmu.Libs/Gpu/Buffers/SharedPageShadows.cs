@@ -60,6 +60,28 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
         }
     }
 
+    // The submission tick of the last upload staged for a shadowed page; false when the page has no shadow.
+    // A snapshot of the GPU copy taken once that tick completed holds every byte the shadow expects.
+    public bool TryGetStagedTick(ulong page, out ulong tick)
+    {
+        tick = 0;
+        if (Count == 0)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            if (!_pages.TryGetValue(page, out var shadow))
+            {
+                return false;
+            }
+
+            tick = shadow.StagedTick;
+            return true;
+        }
+    }
+
     // Starts shadowing a page from bytes both copies hold, which uploads staged up to tick may
     // still change. A shader-written page is adopted when the CPU first touches it: that access
     // downloads the page, so guest memory then matches the GPU copy. A page the CPU dirtied before
