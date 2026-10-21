@@ -25,6 +25,8 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     public bool CustomTwoSampleLocationsSupported { get; init; }
     // VK_EXT_sampler_filter_minmax is enabled, so a sampler can reduce with min or max.
     public bool SamplerFilterMinmaxSupported { get; init; }
+    // VK_EXT_conditional_rendering is enabled: indirect-argument buffers also carry the predicate usage.
+    public bool ConditionalRenderingSupported { get; init; }
 
     public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device, bool memoryBudgetEnabled = false)
     {

@@ -1191,6 +1191,27 @@ internal static unsafe partial class VulkanVideoPresenter
             CountDraw();
         }
 
+        // Guest GPUs skip an indirect draw whose vertex or index count (dword 0 of the arguments) is
+        // zero, whatever the other dwords hold; games leave them stale when they cull a draw. Some
+        // hosts still walk the stale instance count (NVIDIA hangs on ~2^31 empty instances), so the
+        // count itself predicates the draw.
+        private bool BeginZeroCountPredicate(CommandBuffer command, BufferBinding arguments)
+        {
+            if (!_supportsConditionalRendering || (arguments.Offset & 3) != 0)
+            {
+                return false;
+            }
+
+            var begin = new ConditionalRenderingBeginInfoEXT
+            {
+                SType = StructureType.ConditionalRenderingBeginInfoExt,
+                Buffer = new VkBuffer(arguments.Handle),
+                Offset = arguments.Offset,
+            };
+            _cmdBeginConditionalRendering(command, &begin);
+            return true;
+        }
+
         void IRenderHost.DrawIndexedIndirect(BufferBinding arguments)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
@@ -1208,7 +1229,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            var predicated = BeginZeroCountPredicate(command, arguments);
             _vk.CmdDrawIndexedIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20);
+            if (predicated)
+            {
+                _cmdEndConditionalRendering(command);
+            }
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
@@ -1233,7 +1259,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            var predicated = BeginZeroCountPredicate(command, arguments);
             _vk.CmdDrawIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 16);
+            if (predicated)
+            {
+                _cmdEndConditionalRendering(command);
+            }
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
                 _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
@@ -1307,7 +1338,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 AccessFlags.ShaderWriteBit,
                 AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit | AccessFlags.VertexAttributeReadBit | AccessFlags.IndexReadBit |
                 AccessFlags.UniformReadBit | AccessFlags.TransferReadBit | AccessFlags.TransferWriteBit |
-                AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit | AccessFlags.IndirectCommandReadBit);
+                AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit | AccessFlags.IndirectCommandReadBit |
+                (_supportsConditionalRendering ? AccessFlags.ConditionalRenderingReadBitExt : AccessFlags.None));
 
         public void ShaderWriteHazardBarrier() =>
             RecordMemoryBarrier(
