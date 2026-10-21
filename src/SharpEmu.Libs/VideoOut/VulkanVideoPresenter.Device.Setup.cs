@@ -806,6 +806,13 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string MemoryBudgetExtensionName = "VK_EXT_memory_budget";
         private bool _memoryBudgetEnabled;
         private const string FillRectangleExtensionName = "VK_NV_fill_rectangle";
+        private const string ConditionalRenderingExtensionName = "VK_EXT_conditional_rendering";
+        // SHARPEMU_CONDITIONAL_INDIRECT=0 draws GPU indirect draws without the zero-count predicate.
+        private static readonly bool ConditionalIndirectRequested =
+            Environment.GetEnvironmentVariable("SHARPEMU_CONDITIONAL_INDIRECT") != "0";
+        private bool _supportsConditionalRendering;
+        private delegate* unmanaged<CommandBuffer, ConditionalRenderingBeginInfoEXT*, void> _cmdBeginConditionalRendering;
+        private delegate* unmanaged<CommandBuffer, void> _cmdEndConditionalRendering;
         private bool _supportsImageViewMinLod;
         private bool _supportsSamplerFilterMinmax;
         private const string MeshShaderExtensionName = "VK_EXT_mesh_shader";
@@ -988,6 +995,21 @@ internal static unsafe partial class VulkanVideoPresenter
                 _supportsImageViewMinLod = imageViewMinLodFeatures.MinLod;
             }
 
+            var conditionalRenderingFeatures = new PhysicalDeviceConditionalRenderingFeaturesEXT
+            {
+                SType = StructureType.PhysicalDeviceConditionalRenderingFeaturesExt,
+            };
+            if (ConditionalIndirectRequested && IsDeviceExtensionAvailable(ConditionalRenderingExtensionName))
+            {
+                var conditionalRenderingQuery = new PhysicalDeviceFeatures2
+                {
+                    SType = StructureType.PhysicalDeviceFeatures2,
+                    PNext = &conditionalRenderingFeatures,
+                };
+                _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &conditionalRenderingQuery);
+                _supportsConditionalRendering = conditionalRenderingFeatures.ConditionalRendering;
+            }
+
             // MoltenVK exposes the barycentric builtins, but SPIRV-Cross rejects PerVertexKHR inputs.
             _supportsPerVertexPixelInputs = _supportsFragmentShaderBarycentric &&
                 !IsDeviceExtensionAvailable(PortabilitySubsetExtensionName);
@@ -1123,12 +1145,13 @@ internal static unsafe partial class VulkanVideoPresenter
             var imageViewMinLodExtension = (byte*)SilkMarshal.StringToPtr(ImageViewMinLodExtensionName);
             var memoryBudgetExtension = (byte*)SilkMarshal.StringToPtr(MemoryBudgetExtensionName);
             _memoryBudgetEnabled = IsDeviceExtensionAvailable(MemoryBudgetExtensionName);
+            var conditionalRenderingExtension = (byte*)SilkMarshal.StringToPtr(ConditionalRenderingExtensionName);
             var fillRectangleExtension = (byte*)SilkMarshal.StringToPtr(FillRectangleExtensionName);
             var samplerFilterMinmaxExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sampler_filter_minmax");
             var meshExtension = (byte*)SilkMarshal.StringToPtr(MeshShaderExtensionName);
             try
             {
-                var extensions = stackalloc byte*[24];
+                var extensions = stackalloc byte*[25];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
@@ -1177,6 +1200,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_memoryBudgetEnabled)
                 {
                     extensions[extensionCount++] = memoryBudgetExtension;
+                }
+
+                if (_supportsConditionalRendering)
+                {
+                    extensions[extensionCount++] = conditionalRenderingExtension;
                 }
 
                 // The extension form is used because the promoted Vulkan12Features struct cannot
@@ -1311,6 +1339,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     renderingChain = &colorWriteEnableFeatures;
                 }
 
+                if (_supportsConditionalRendering)
+                {
+                    conditionalRenderingFeatures = new PhysicalDeviceConditionalRenderingFeaturesEXT
+                    {
+                        SType = StructureType.PhysicalDeviceConditionalRenderingFeaturesExt,
+                        ConditionalRendering = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &conditionalRenderingFeatures;
+                }
+
                 vulkan13Features = new PhysicalDeviceVulkan13Features
                 {
                     SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -1367,10 +1406,21 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)barycentricExtension);
                 SilkMarshal.Free((nint)viewportIndexLayerExtension);
                 SilkMarshal.Free((nint)meshExtension);
+                SilkMarshal.Free((nint)conditionalRenderingExtension);
+            }
+
+            if (_supportsConditionalRendering)
+            {
+                _cmdBeginConditionalRendering = (delegate* unmanaged<CommandBuffer, ConditionalRenderingBeginInfoEXT*, void>)(nint)
+                    _vk.GetDeviceProcAddr(_device, "vkCmdBeginConditionalRenderingEXT");
+                _cmdEndConditionalRendering = (delegate* unmanaged<CommandBuffer, void>)(nint)
+                    _vk.GetDeviceProcAddr(_device, "vkCmdEndConditionalRenderingEXT");
+                _supportsConditionalRendering = _cmdBeginConditionalRendering != null && _cmdEndConditionalRendering != null;
+                Console.Error.WriteLine($"[LOADER][INFO] Vulkan conditional rendering for indirect draws: {(_supportsConditionalRendering ? "on" : "entry points missing")}");
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
-            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled) { ImageViewMinLodSupported = _supportsImageViewMinLod, SamplerFilterMinmaxSupported = _supportsSamplerFilterMinmax };
+            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled) { ImageViewMinLodSupported = _supportsImageViewMinLod, SamplerFilterMinmaxSupported = _supportsSamplerFilterMinmax, ConditionalRenderingSupported = _supportsConditionalRendering };
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
                 _vk.GetDeviceQueue(_device, readbackQueueFamily, 0, out _readbackQueue);

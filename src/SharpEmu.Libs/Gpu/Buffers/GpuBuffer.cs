@@ -47,6 +47,12 @@ public unsafe class GpuBuffer : IDisposable
         CpuAddress = cpuAddress;
         Size = size;
 
+        // Indirect draws read their count dword as a conditional-rendering predicate.
+        if (device.ConditionalRenderingSupported && (flags & BufferUsageFlags.IndirectBufferBit) != 0)
+        {
+            flags |= BufferUsageFlags.ConditionalRenderingBitExt;
+        }
+
         var vk = device.Vk;
         var sharedFamilies = device.SharedQueueFamilies;
         fixed (uint* families = sharedFamilies)

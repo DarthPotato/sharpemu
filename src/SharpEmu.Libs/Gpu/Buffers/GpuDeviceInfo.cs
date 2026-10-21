@@ -28,6 +28,8 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     public bool ImageViewMinLodSupported { get; init; }
     // VK_EXT_sampler_filter_minmax is enabled, so a sampler can reduce with min or max.
     public bool SamplerFilterMinmaxSupported { get; init; }
+    // VK_EXT_conditional_rendering is enabled: indirect-argument buffers also carry the predicate usage.
+    public bool ConditionalRenderingSupported { get; init; }
 
     // `memoryBudgetEnabled`: VK_EXT_memory_budget is enabled on the device, so the driver reports
     // how much device-local memory this process can still use.
