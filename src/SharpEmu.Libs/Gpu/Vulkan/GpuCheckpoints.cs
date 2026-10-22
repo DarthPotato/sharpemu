@@ -57,6 +57,7 @@ internal static unsafe class GpuCheckpoints
     internal const string ExtensionName = "VK_NV_device_diagnostic_checkpoints";
     internal static readonly bool Requested = Environment.GetEnvironmentVariable("SHARPEMU_VK_CHECKPOINTS") == "1";
     internal static bool Enabled { get; private set; }
+    internal static ulong NewestSequence => _ring?.NewestSequence ?? 0;
     private static delegate* unmanaged<CommandBuffer, void*, void> _setCheckpoint;
     private static delegate* unmanaged<Queue, uint*, CheckpointDataNV*, void> _getCheckpointData;
     private static CheckpointRing? _ring;
@@ -161,6 +162,8 @@ internal static unsafe class GpuCheckpoints
                 }
             }
 
+            // SHARPEMU_DIAG_INDIRECT_ARGS records carry the checkpoint sequence they follow.
+            IndirectArgsProbe.DumpOnce();
         }
         catch { }
     }

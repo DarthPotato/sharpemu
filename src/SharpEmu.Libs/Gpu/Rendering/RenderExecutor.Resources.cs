@@ -339,6 +339,11 @@ public sealed partial class RenderExecutor
         }
 
         _host.PrepareGraphicsPipeline(in pipeline);
+        if (emission.IndirectArgumentsAddress != 0 && emission.Indexed && state.Programs.Tessellation is null)
+        {
+            _host.ProbeIndirectArguments(indirectArguments, emission.IndirectArgumentsAddress, draw.Count, vertexProgram.Hash);
+        }
+
         _host.BeginRendering(in state.Rendering);
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (setAutoDebug)

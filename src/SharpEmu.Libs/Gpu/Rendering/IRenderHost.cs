@@ -176,6 +176,11 @@ public interface IRenderHost
 
     void DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance);
 
+    // Diagnostic (SHARPEMU_DIAG_INDIRECT_ARGS): capture the arguments an indexed indirect draw is about to read.
+    void ProbeIndirectArguments(BufferBinding arguments, ulong guestAddress, uint indexRange, ulong vertexHash)
+    {
+    }
+
     // One indexed draw whose counts the GPU reads from the buffer (VkDrawIndexedIndirectCommand layout).
     void DrawIndexedIndirect(BufferBinding arguments) =>
         throw new NotSupportedException("The render host does not draw from indirect arguments.");
