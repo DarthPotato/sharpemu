@@ -1149,10 +1149,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var fillRectangleExtension = (byte*)SilkMarshal.StringToPtr(FillRectangleExtensionName);
             var samplerFilterMinmaxExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sampler_filter_minmax");
             var meshExtension = (byte*)SilkMarshal.StringToPtr(MeshShaderExtensionName);
+            var checkpointsAvailable = Gpu.Vulkan.GpuCheckpoints.Requested && IsDeviceExtensionAvailable(Gpu.Vulkan.GpuCheckpoints.ExtensionName);
+            var checkpointExtension = checkpointsAvailable ? (byte*)SilkMarshal.StringToPtr(Gpu.Vulkan.GpuCheckpoints.ExtensionName) : null;
             try
             {
-                var extensions = stackalloc byte*[25];
+                var extensions = stackalloc byte*[26];
                 var extensionCount = 0u;
+                if (checkpointsAvailable)
+                    extensions[extensionCount++] = checkpointExtension;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
                 if (supportsViewportIndexLayer)
@@ -1407,6 +1411,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)viewportIndexLayerExtension);
                 SilkMarshal.Free((nint)meshExtension);
                 SilkMarshal.Free((nint)conditionalRenderingExtension);
+                if (checkpointExtension != null)
+                    SilkMarshal.Free((nint)checkpointExtension);
             }
 
             if (_supportsConditionalRendering)
@@ -1427,6 +1433,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 _deviceInfo.SharedQueueFamilies = [_queueFamilyIndex, readbackQueueFamily];
                 Console.Error.WriteLine($"[LOADER][INFO] Vulkan async readback queue: family={readbackQueueFamily} (main family={_queueFamilyIndex})");
             }
+            if (Gpu.Vulkan.GpuCheckpoints.Requested)
+                Gpu.Vulkan.GpuCheckpoints.Initialize(_vk, _device, checkpointsAvailable, _queue, _readbackQueue);
             CreateScheduler();
             CreateBufferCache();
             CreateImageCache();

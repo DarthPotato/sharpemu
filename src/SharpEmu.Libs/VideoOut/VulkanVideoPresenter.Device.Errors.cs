@@ -14,6 +14,8 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (result == Result.ErrorDeviceLost)
             {
+                if (Gpu.Vulkan.GpuCheckpoints.Enabled)
+                    Gpu.Vulkan.GpuCheckpoints.DumpOnce();
                 throw new VulkanDeviceLostException(operation);
             }
 
@@ -38,6 +40,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
+            if (Gpu.Vulkan.GpuCheckpoints.Enabled)
+                Gpu.Vulkan.GpuCheckpoints.DumpOnce();
             _deviceLost = true;
             if (!_deviceLostLogged)
             {

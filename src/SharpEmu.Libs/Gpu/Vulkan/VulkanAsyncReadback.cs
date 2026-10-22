@@ -320,6 +320,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 
     private static void Require(Result result, string operation)
     {
+        if (GpuCheckpoints.Enabled && result == Result.ErrorDeviceLost)
+            GpuCheckpoints.DumpOnce();
         if (result != Result.Success)
         {
             throw SubmissionScheduler.Fatal($"{operation} failed: {result}.");

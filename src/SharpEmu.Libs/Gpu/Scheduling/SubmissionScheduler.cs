@@ -548,6 +548,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         if (MeshDrawTrace.Enabled) MeshDrawTrace.Submitted((ulong)buffer, tick, submitted, failure);
         if (!submitted)
         {
+            if (Vulkan.GpuCheckpoints.Enabled && failure.Contains("ErrorDeviceLost", StringComparison.Ordinal))
+                Vulkan.GpuCheckpoints.DumpOnce();
             Console.Error.WriteLine($"[GPU][ERROR] submission history known_completed_tick={_timeline.CompletedTick}");
             foreach (var entry in FormatRecentSubmissions())
                 Console.Error.WriteLine($"[GPU][ERROR] {entry}");

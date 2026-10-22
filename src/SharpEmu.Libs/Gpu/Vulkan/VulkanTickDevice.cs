@@ -363,6 +363,8 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
             if (result == Result.Success)
                 CommandProfile?.MarkSubmitted(buffer);
+            if (GpuCheckpoints.Enabled && result == Result.ErrorDeviceLost)
+                GpuCheckpoints.DumpOnce();
             failure = result.ToString();
             return result == Result.Success;
         }
