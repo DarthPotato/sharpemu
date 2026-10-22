@@ -264,6 +264,11 @@ public sealed partial class RenderExecutor
         }
         var vertexProgram = vertexInput.Stage.Program ?? throw _host.Fatal("The vertex stage has no program.");
         var pixelProgram = pixelBindings is null ? null : pixelInput.Stage.Program ?? throw _host.Fatal("The pixel stage has no program.");
+        if (Vulkan.GpuCheckpoints.Enabled)
+        {
+            Vulkan.GpuCheckpoints.SetDrawShaders(vertexProgram.Hash, pixelProgram?.Hash ?? 0);
+        }
+
         DropUnwrittenColorTargets(context, ref state, pixelProgram);
         state.Rendering = AcquireAttachments(ref state, context);
         // Attachment uploads can submit work. Finish every allocation merge before any

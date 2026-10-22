@@ -844,6 +844,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void CreateDevice()
         {
+            var checkpointsAvailable = GpuCheckpoints.Requested && IsDeviceExtensionAvailable(GpuCheckpoints.ExtensionName);
             var supportedTwoSampleCombination = false;
             if (IsDeviceExtensionAvailable("VK_NV_coverage_reduction_mode"))
             {
@@ -1236,6 +1237,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var depthClipEnableExtension = (byte*)SilkMarshal.StringToPtr(DepthClipEnableExtensionName);
             var barycentricExtension = (byte*)SilkMarshal.StringToPtr(FragmentShaderBarycentricExtensionName);
             var viewportIndexLayerExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_shader_viewport_index_layer");
+            var checkpointExtension = checkpointsAvailable ? (byte*)SilkMarshal.StringToPtr(GpuCheckpoints.ExtensionName) : null;
             var deviceFaultExtension = (byte*)SilkMarshal.StringToPtr(DeviceFaultExtensionName);
             var memoryBudgetExtension = (byte*)SilkMarshal.StringToPtr(MemoryBudgetExtensionName);
             var conditionalRenderingExtension = (byte*)SilkMarshal.StringToPtr(ConditionalRenderingExtensionName);
@@ -1252,8 +1254,10 @@ internal static unsafe partial class VulkanVideoPresenter
             var samplerFilterMinmaxExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sampler_filter_minmax");
             try
             {
-                var extensions = stackalloc byte*[25];
+                var extensions = stackalloc byte*[26];
                 var extensionCount = 0u;
+                if (checkpointsAvailable)
+                    extensions[extensionCount++] = checkpointExtension;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
                 _postDepthCoverageEnabled = IsDeviceExtensionAvailable("VK_EXT_post_depth_coverage");
@@ -1530,6 +1534,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)barycentricExtension);
                 SilkMarshal.Free((nint)viewportIndexLayerExtension);
                 SilkMarshal.Free((nint)deviceFaultExtension);
+                if (checkpointExtension != null)
+                    SilkMarshal.Free((nint)checkpointExtension);
                 SilkMarshal.Free((nint)memoryBudgetExtension);
                 SilkMarshal.Free((nint)conditionalRenderingExtension);
             }
@@ -1553,6 +1559,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 _deviceInfo.SharedQueueFamilies = [_queueFamilyIndex, readbackQueueFamily];
                 Console.Error.WriteLine($"[LOADER][INFO] Vulkan async readback queue: family={readbackQueueFamily} (main family={_queueFamilyIndex})");
             }
+            if (GpuCheckpoints.Requested)
+                GpuCheckpoints.Initialize(_vk, _device, checkpointsAvailable, _queue, _readbackQueue);
             CreateScheduler();
             CreateBufferCache();
             CreateImageCache();

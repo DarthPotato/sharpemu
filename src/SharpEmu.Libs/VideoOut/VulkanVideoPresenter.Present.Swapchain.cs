@@ -737,6 +737,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (result == Result.ErrorDeviceLost)
             {
+                if (Gpu.Vulkan.GpuCheckpoints.Enabled)
+                    Gpu.Vulkan.GpuCheckpoints.DumpOnce();
                 throw new VulkanDeviceLostException(operation);
             }
 

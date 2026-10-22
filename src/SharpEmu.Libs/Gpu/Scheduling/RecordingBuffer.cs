@@ -158,6 +158,11 @@ public sealed class RecordingBuffer
         DebugArg2 = arg2;
         DebugArg3 = arg3;
         DebugArg4 = arg4;
+        if (Vulkan.GpuCheckpoints.Enabled && !IsInvalid && op != (uint)RecordedOperation.Unknown)
+        {
+            _handleWasRequested = true;
+            Vulkan.GpuCheckpoints.Record(Buffer, op, submitId, arg0, arg1, arg2, arg3, arg4);
+        }
     }
 
     public void EndRendering()
