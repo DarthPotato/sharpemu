@@ -1199,6 +1199,19 @@ internal static unsafe partial class VulkanVideoPresenter
             CountDraw();
         }
 
+        void IRenderHost.ProbeIndirectArguments(BufferBinding arguments, ulong guestAddress, uint indexRange, ulong vertexHash)
+        {
+            if (!Gpu.Vulkan.IndirectArgsProbe.Wants(vertexHash))
+            {
+                return;
+            }
+
+            EndRendering();
+            var command = BeginBatchedGuestCommands();
+            Gpu.Vulkan.IndirectArgsProbe.Record(_vk, _deviceInfo, _scheduler, command, new VkBuffer(arguments.Handle), arguments.Offset,
+                guestAddress, indexRange, vertexHash);
+        }
+
         // Guest GPUs skip an indirect draw whose vertex or index count (dword 0 of the arguments) is
         // zero, whatever the other dwords hold; games leave them stale when they cull a draw. Some
         // hosts still walk the stale instance count (NVIDIA hangs on ~2^31 empty instances), so the

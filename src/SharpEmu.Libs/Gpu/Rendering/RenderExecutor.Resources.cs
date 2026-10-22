@@ -449,6 +449,11 @@ public sealed partial class RenderExecutor
 
         var imageSnapshot = _host.BeginImageSnapshot(pixelBindings);
         indirectMesh?.Prepare();
+        if (emission.IndirectArgumentsAddress != 0 && emission.Indexed && state.Programs.Tessellation is null && indirectMesh is null)
+        {
+            _host.ProbeIndirectArguments(indirectArguments, emission.IndirectArgumentsAddress, draw.Count, vertexProgram.Hash);
+        }
+
         _host.BeginRendering(in state.Rendering);
         if (MeshDrawTrace.Active) MeshDrawTrace.Write("rendering", $"width={state.Rendering.Width} height={state.Rendering.Height} layers={state.Rendering.Layers} colors={state.ColorCount}");
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
