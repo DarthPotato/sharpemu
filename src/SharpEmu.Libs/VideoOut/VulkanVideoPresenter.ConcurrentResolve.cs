@@ -48,6 +48,18 @@ internal static unsafe partial class VulkanVideoPresenter
         }
     }
 
+    // Why taken resolutions were stale, for the render profile report (render thread only).
+    private static long _staleByWriteback;
+    private static long _staleByAnswer;
+
+    internal static string TakeStaleReport()
+    {
+        var line = $"[PERF][PROGRAM_PREFETCH_STALE] writeback_epoch={_staleByWriteback} ownership_answer={_staleByAnswer}";
+        _staleByWriteback = 0;
+        _staleByAnswer = 0;
+        return line;
+    }
+
     private sealed partial class Presenter : IConcurrentResolveHost
     {
         // This partial serves the guest readers of program resolution on a thread resolving draws
@@ -76,6 +88,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var assumptions = (ConcurrentAssumptions)assumptionsObject;
             if (assumptions.WritebackEpoch != GpuWritebackEpoch.Value)
             {
+                _staleByWriteback++;
                 return false;
             }
 
@@ -95,6 +108,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 };
                 if (now != answer)
                 {
+                    _staleByAnswer++;
                     return false;
                 }
             }

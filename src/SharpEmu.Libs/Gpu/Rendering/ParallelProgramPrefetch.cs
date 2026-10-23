@@ -151,21 +151,61 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
     {
         programs = null!;
         var job = Current;
-        if (job is null || !ReferenceEquals(job.Banks, banks))
+        if (job is null)
         {
+            _takeOutcomes[(int)TakeOutcome.NoJob]++;
+            return false;
+        }
+
+        if (!ReferenceEquals(job.Banks, banks))
+        {
+            _takeOutcomes[(int)TakeOutcome.OtherBanks]++;
             return false;
         }
 
         Current = null;
         WaitFor(job);
         using var profile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPrefetchValidation);
-        if (job.State != 1 || !job.Inputs.Equals(inputs) || !_concurrent.IsStillCurrent(job.Assumptions!))
+        var outcome = job.State != 1 ? TakeOutcome.NotResolved
+            : !job.Inputs.Equals(inputs) ? TakeOutcome.OtherInputs
+            : !_concurrent.IsStillCurrent(job.Assumptions!) ? TakeOutcome.Stale
+            : TakeOutcome.Taken;
+        _takeOutcomes[(int)outcome]++;
+        if (outcome == TakeOutcome.OtherInputs)
+        {
+            var predicted = job.Inputs;
+            if (predicted.PixelActive != inputs.PixelActive) _inputMismatches[0]++;
+            if (predicted.DepthBound != inputs.DepthBound) _inputMismatches[1]++;
+            if (predicted.Indexed != inputs.Indexed) _inputMismatches[2]++;
+            if (!((ReadOnlySpan<SharpEmu.Libs.Gpu.Images.ColorComponentMap>)predicted.Mapping).SequenceEqual(inputs.Mapping)) _inputMismatches[3]++;
+        }
+
+        if (outcome != TakeOutcome.Taken)
         {
             return false;
         }
 
         programs = job.Programs!;
         return true;
+    }
+
+    // Why the render thread did or did not take a resolution, counted on the render thread for the
+    // render profile report.
+    private enum TakeOutcome { Taken, NoJob, OtherBanks, NotResolved, OtherInputs, Stale, Count }
+
+    private static readonly long[] _takeOutcomes = new long[(int)TakeOutcome.Count];
+
+    // Which predicted input differed: pixel activity, depth binding, indexed mode, color export mapping.
+    private static readonly long[] _inputMismatches = new long[4];
+
+    internal static string TakeReport()
+    {
+        var line = $"[PERF][PROGRAM_PREFETCH] taken={_takeOutcomes[0]} no_job={_takeOutcomes[1]} other_banks={_takeOutcomes[2]} " +
+            $"not_resolved={_takeOutcomes[3]} other_inputs={_takeOutcomes[4]} stale={_takeOutcomes[5]} " +
+            $"input_pixel={_inputMismatches[0]} input_depth={_inputMismatches[1]} input_indexed={_inputMismatches[2]} input_mapping={_inputMismatches[3]}";
+        Array.Clear(_takeOutcomes);
+        Array.Clear(_inputMismatches);
+        return line;
     }
 
     private void WaitFor(Job job)
