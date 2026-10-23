@@ -16,6 +16,84 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // changed since (the shader's bytes in the GPU copy stay), and the bytes the GPU
 // changed since are merged into guest memory where the CPU left them alone. A byte both changed
 // keeps the CPU's value in guest memory, and the next upload carries it to the GPU copy.
+// The changed shared-page segments of one upload, each with its new and previous shadow bytes,
+// for the GPU merge that writes only the bytes that differ. Reused from upload to upload.
+internal sealed class SharedPageMergePlan
+{
+    internal readonly record struct Segment(ulong DestinationOffset, uint Bytes, int NewIndex, int OldIndex);
+
+    private byte[] _data = new byte[64 * 1024];
+
+    public List<Segment> Segments { get; } = new();
+
+    public int DataLength { get; private set; }
+
+    public ReadOnlySpan<byte> Data => _data.AsSpan(0, DataLength);
+
+    public void Clear()
+    {
+        Segments.Clear();
+        DataLength = 0;
+    }
+
+    // The staged bytes of one merge record (TilerShaders.MergeSegmentWords words).
+    public const ulong RecordBytes = SharpEmu.ShaderCompiler.Vulkan.TilerShaders.MergeSegmentWords * sizeof(uint);
+
+    // Sorts the segments by destination and splits them into consecutive chunks that one storage
+    // descriptor of maxBytes can bind on each side: the output span from a chunk's first destination
+    // to its last end, and its staged input (records, then each segment's new and old bytes). A
+    // segment is at most a page, far below the smallest descriptor range a device may have.
+    public List<(int Start, int Count)> Chunks(ulong maxBytes)
+    {
+        Segments.Sort(static (left, right) => left.DestinationOffset.CompareTo(right.DestinationOffset));
+        var chunks = new List<(int Start, int Count)>();
+        var start = 0;
+        var input = 0UL;
+        for (var index = 0; index < Segments.Count; index++)
+        {
+            var segment = Segments[index];
+            var segmentInput = RecordBytes + 2UL * segment.Bytes;
+            var span = segment.DestinationOffset + segment.Bytes - Segments[start].DestinationOffset;
+            if (index > start && (span > maxBytes || input + segmentInput > maxBytes))
+            {
+                chunks.Add((start, index - start));
+                start = index;
+                input = 0;
+            }
+
+            input += segmentInput;
+        }
+
+        if (Segments.Count > start)
+        {
+            chunks.Add((start, Segments.Count - start));
+        }
+
+        return chunks;
+    }
+
+    public void Add(ulong destinationOffset, ReadOnlySpan<byte> newBytes, ReadOnlySpan<byte> oldBytes)
+    {
+        if (newBytes.Length != oldBytes.Length || newBytes.Length == 0)
+        {
+            throw new ArgumentException("A merge segment needs new and old bytes of one nonzero length.");
+        }
+
+        var required = DataLength + 2 * newBytes.Length;
+        if (required > _data.Length)
+        {
+            Array.Resize(ref _data, Math.Max(required, 2 * _data.Length));
+        }
+
+        var newIndex = DataLength;
+        var oldIndex = newIndex + newBytes.Length;
+        newBytes.CopyTo(_data.AsSpan(newIndex));
+        oldBytes.CopyTo(_data.AsSpan(oldIndex));
+        DataLength = required;
+        Segments.Add(new Segment(destinationOffset, (uint)newBytes.Length, newIndex, oldIndex));
+    }
+}
+
 internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
 {
     private sealed class Shadow(object owner, byte[] bytes)
@@ -246,7 +324,14 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
     // staged (indexed by SrcOffset) into a buffer at targetAddress (indexed by DstOffset); copies
     // over shadowed pages are split into the runs that differ from the shadow, which takes them.
     // An upload into a new owner copies everything and shadows the page from it.
-    public void FilterUpload(List<BufferCopy> copies, object target, ulong targetAddress, ReadOnlySpan<byte> staged, ulong tick)
+    //
+    // With merges, a changed segment of a shadowed page whose destination offset and size are
+    // multiples of four leaves the copies whole instead, with its new and previous shadow bytes, for
+    // a GPU pass that writes the differing bytes (GpuTiler.MergeChangedBytes): the result is the
+    // same, but CPU-rewritten data splits into many runs wherever a byte happens to keep its value,
+    // and thousands of copy regions per upload cost far more to record than one merge.
+    public void FilterUpload(List<BufferCopy> copies, object target, ulong targetAddress, ReadOnlySpan<byte> staged, ulong tick,
+        SharedPageMergePlan? merges = null)
     {
         if (Count == 0)
         {
@@ -297,6 +382,22 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
                     {
                         shadow.Owner = target;
                         filtered.Add(Slice(copy, begin, from, to - from));
+                        shadow.StagedTick = Math.Max(shadow.StagedTick, tick);
+                        source.CopyTo(shadowBytes);
+                        continue;
+                    }
+
+                    var destination = copy.DstOffset + (from - begin);
+                    if (merges is not null && destination % 4 == 0 && source.Length % 4 == 0)
+                    {
+                        if (source.CommonPrefixLength(shadowBytes) == source.Length)
+                        {
+                            Interlocked.Add(ref _skippedUploadBytes, source.Length);
+                            continue;
+                        }
+
+                        // The previous shadow bytes go with the merge before the shadow takes the new ones.
+                        merges.Add(destination, source, shadowBytes);
                         shadow.StagedTick = Math.Max(shadow.StagedTick, tick);
                         source.CopyTo(shadowBytes);
                         continue;

@@ -313,4 +313,170 @@ public sealed class SharedPageShadowsTests
         Assert.Equal(4096, SharedPageShadows.DifferingPrefixLength(all, none));
         Assert.Equal(0, SharedPageShadows.DifferingPrefixLength(all, new byte[4096]));
     }
+
+    [Fact]
+    public void AMergePlanTakesAChangedPageWholeWithItsPreviousShadow()
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.Adopt(Page, owner, Fill(0x11)));
+        var staged = Fill(0x11);
+        staged.AsSpan(4, 4).Fill(0xAA);
+        staged[40] = 0xBB;
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        var plan = new SharedPageMergePlan();
+
+        shadows.FilterUpload(copies, owner, Page, staged, tick: 3, plan);
+
+        Assert.Empty(copies);
+        var segment = Assert.Single(plan.Segments);
+        Assert.Equal(0UL, segment.DestinationOffset);
+        Assert.Equal((uint)PageBytes, segment.Bytes);
+        Assert.Equal(staged, plan.Data.Slice(segment.NewIndex, (int)PageBytes).ToArray());
+        Assert.Equal(Fill(0x11), plan.Data.Slice(segment.OldIndex, (int)PageBytes).ToArray());
+
+        // The shadow took the staged bytes: the same bytes again need nothing.
+        var again = new List<BufferCopy> { new(0, 0, PageBytes) };
+        var nextPlan = new SharedPageMergePlan();
+        shadows.FilterUpload(again, owner, Page, staged, tick: 4, nextPlan);
+        Assert.Empty(again);
+        Assert.Empty(nextPlan.Segments);
+    }
+
+    [Fact]
+    public void AMergePlanKeepsCopiesOutsideSharedPagesAndNewOwnersAsCopies()
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.Adopt(Page + PageBytes, owner, Fill(0)));
+        Assert.True(shadows.Adopt(Page + 2 * PageBytes, new object(), Fill(0)));
+        var staged = new byte[3 * PageBytes];
+        staged[PageBytes + 9] = 7;
+        staged[2 * PageBytes + 1] = 5;
+        var copies = new List<BufferCopy> { new(0, 0, 3 * PageBytes) };
+        var plan = new SharedPageMergePlan();
+
+        shadows.FilterUpload(copies, owner, Page, staged, tick: 1, plan);
+
+        // The first page has no shadow and the third a different owner: both stay whole copies.
+        Assert.Equal([new BufferCopy(0, 0, PageBytes), new BufferCopy(2 * PageBytes, 2 * PageBytes, PageBytes)], copies);
+        var segment = Assert.Single(plan.Segments);
+        Assert.Equal(PageBytes, segment.DestinationOffset);
+    }
+
+    [Fact]
+    public void AMergePlanLeavesSegmentsThatAreNotWordAlignedOnRuns()
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.Adopt(Page, owner, Fill(0x11)));
+        var staged = Fill(0x11);
+        staged[40] = 0xBB;
+        // The buffer starts two bytes before the page, so the page lands at buffer offset 2.
+        var copies = new List<BufferCopy> { new(0, 2, PageBytes) };
+        var plan = new SharedPageMergePlan();
+
+        shadows.FilterUpload(copies, owner, Page - 2, staged, tick: 1, plan);
+
+        Assert.Empty(plan.Segments);
+        Assert.Equal([new BufferCopy(40, 42, 1)], copies);
+    }
+
+    [Fact]
+    public void MergeChunksKeepOneChunkWhenEverythingFits()
+    {
+        var plan = new SharedPageMergePlan();
+        plan.Add(128, new byte[64], new byte[64]);
+        plan.Add(0, new byte[64], new byte[64]);
+
+        Assert.Equal([(0, 2)], plan.Chunks(maxBytes: 1 << 20));
+        // Chunks sort the segments by destination.
+        Assert.Equal([0UL, 128UL], plan.Segments.Select(segment => segment.DestinationOffset));
+    }
+
+    [Fact]
+    public void MergeChunksSplitDestinationsFurtherApartThanOneDescriptor()
+    {
+        var plan = new SharedPageMergePlan();
+        plan.Add(0, new byte[64], new byte[64]);
+        plan.Add(64, new byte[64], new byte[64]);
+        plan.Add(4096, new byte[64], new byte[64]);
+
+        // 0..128 fits a 1 KiB span; 4096 starts a new chunk.
+        Assert.Equal([(0, 2), (2, 1)], plan.Chunks(maxBytes: 1024));
+    }
+
+    [Fact]
+    public void MergeChunksSplitWhenTheStagedInputWouldNotFit()
+    {
+        var plan = new SharedPageMergePlan();
+        for (var index = 0; index < 5; index++)
+        {
+            plan.Add((ulong)index * 64, new byte[64], new byte[64]);
+        }
+
+        // Each segment stages a record plus new and old bytes: 16 + 128 = 144 bytes; 300 holds two.
+        var chunks = plan.Chunks(maxBytes: 300);
+        Assert.Equal([(0, 2), (2, 2), (4, 1)], chunks);
+        foreach (var (start, count) in chunks)
+        {
+            var staged = (ulong)count * (SharedPageMergePlan.RecordBytes + 128);
+            Assert.True(staged <= 300);
+            var span = plan.Segments[start + count - 1].DestinationOffset + plan.Segments[start + count - 1].Bytes - plan.Segments[start].DestinationOffset;
+            Assert.True(span <= 300);
+        }
+    }
+
+    // The merge must leave a GPU copy exactly as copying each changed run did, whatever bytes the
+    // shader wrote meanwhile and whichever bytes the CPU happened to rewrite with the same value.
+    [Fact]
+    public void AMergeWritesTheSameBytesAsTheRunCopies()
+    {
+        var random = new System.Random(77);
+        for (var trial = 0; trial < 200; trial++)
+        {
+            var baseline = new byte[PageBytes];
+            random.NextBytes(baseline);
+            var gpu = baseline.ToArray();
+            var staged = baseline.ToArray();
+            for (var index = 0; index < (int)PageBytes; index++)
+            {
+                if (random.Next(6) == 0) gpu[index] = (byte)random.Next(256);
+                if (random.Next(3) == 0) staged[index] = (byte)random.Next(256);
+            }
+
+            var owner = new object();
+            var runShadows = new SharedPageShadows(PageBytes, 4);
+            Assert.True(runShadows.Adopt(Page, owner, baseline));
+            var runCopies = new List<BufferCopy> { new(0, 0, PageBytes) };
+            runShadows.FilterUpload(runCopies, owner, Page, staged, tick: 1);
+            var byRuns = gpu.ToArray();
+            foreach (var copy in runCopies)
+            {
+                staged.AsSpan((int)copy.SrcOffset, (int)copy.Size).CopyTo(byRuns.AsSpan((int)copy.DstOffset));
+            }
+
+            var mergeShadows = new SharedPageShadows(PageBytes, 4);
+            Assert.True(mergeShadows.Adopt(Page, owner, baseline));
+            var mergeCopies = new List<BufferCopy> { new(0, 0, PageBytes) };
+            var plan = new SharedPageMergePlan();
+            mergeShadows.FilterUpload(mergeCopies, owner, Page, staged, tick: 1, plan);
+            Assert.Empty(mergeCopies);
+            var byMerge = gpu.ToArray();
+            foreach (var segment in plan.Segments)
+            {
+                for (var word = 0; word < segment.Bytes / 4; word++)
+                {
+                    var offset = (int)segment.DestinationOffset + word * 4;
+                    var merged = SharpEmu.ShaderCompiler.Vulkan.TilerShaders.MergeChangedBytes(
+                        BitConverter.ToUInt32(byMerge, offset),
+                        BitConverter.ToUInt32(plan.Data.Slice(segment.NewIndex + word * 4, 4)),
+                        BitConverter.ToUInt32(plan.Data.Slice(segment.OldIndex + word * 4, 4)));
+                    BitConverter.TryWriteBytes(byMerge.AsSpan(offset), merged);
+                }
+            }
+
+            Assert.Equal(byRuns, byMerge);
+        }
+    }
 }

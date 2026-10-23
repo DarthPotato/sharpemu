@@ -68,6 +68,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         ConfigureCollectionBudget();
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
+        bufferCache.ChangedByteMerge = _tiler.MergeChangedBytes;
         _backingPool = ImageBackingPool.Enabled ? new ImageBackingPool(device) : null;
         _imageMemoryPool = new OptimalImageMemoryPool(device);
     }
@@ -194,6 +195,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _slots.ForEach((_, image) => image.Dispose());
         _backingPool?.Dispose();
         _imageMemoryPool.ReleaseRetained();
+        _bufferCache.ChangedByteMerge = null;
         _tiler.Dispose();
         _blit.Dispose();
     }

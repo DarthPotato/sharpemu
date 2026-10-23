@@ -91,6 +91,7 @@ public sealed unsafe class GpuTiler : IDisposable
     private Pipeline _d24ToD16;
     private Pipeline _d32ToD16;
     private Pipeline _swapBgra16;
+    private Pipeline _mergeChangedBytes;
 
     public GpuTiler(GpuDeviceInfo device, SubmissionScheduler scheduler, GpuRingBuffer stream)
     {
@@ -146,6 +147,7 @@ public sealed unsafe class GpuTiler : IDisposable
         DestroyPipeline(_d24ToD16);
         DestroyPipeline(_d32ToD16);
         DestroyPipeline(_swapBgra16);
+        DestroyPipeline(_mergeChangedBytes);
         _pools.Dispose();
         lock (_scratchGate)
         {
@@ -847,6 +849,68 @@ public sealed unsafe class GpuTiler : IDisposable
         barriers[1].SrcAccessMask = AccessFlags2.ShaderWriteBit;
         barriers[1].DstAccessMask = AccessFlags2.TransferReadBit;
         VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.TransferBit, 0, 0, null, 1, barriers + 1, 0, null);
+    }
+
+    // A dispatch covers at most this many merge segments (the minimum maxComputeWorkGroupCount[1]).
+    private const uint MaxMergeSegmentsPerDispatch = 65535;
+
+    // Runs the changed-byte merge (TilerShaders.CreateChangedByteMerge): input starts with
+    // segmentCount records, each four words of new, old and destination byte offsets (from the input
+    // and output span starts) and a byte count no larger than maxSegmentBytes, followed by the bytes
+    // they name. Only the output bytes that differ between a segment's new and old bytes change.
+    public void MergeChangedBytes(TilerBufferSpan input, TilerBufferSpan output, uint segmentCount, uint maxSegmentBytes)
+    {
+        if (segmentCount == 0)
+        {
+            return;
+        }
+
+        if (maxSegmentBytes == 0 || maxSegmentBytes % 4 != 0 || input.Size % 4 != 0 || output.Size % 4 != 0)
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The changed-byte merge is not word-sized: maxSegmentBytes={maxSegmentBytes} input={input.Size} output={output.Size}.");
+        }
+
+        if (_mergeChangedBytes.Handle == 0)
+        {
+            _mergeChangedBytes = CreateComputePipeline(TilerShaders.CreateChangedByteMerge(), "changed byte merge");
+        }
+
+        var inputBinding = BindStorage(input, input.Size);
+        var outputBinding = BindStorage(output, output.Size);
+        Span<DescriptorBufferInfo> infos = stackalloc DescriptorBufferInfo[2];
+        infos[0] = inputBinding.Info;
+        infos[1] = outputBinding.Info;
+        var barriers = stackalloc BufferMemoryBarrier2[2];
+        barriers[0] = Barrier(infos[0].Buffer, infos[0].Offset, infos[0].Range, AccessFlags.MemoryWriteBit | AccessFlags.HostWriteBit, AccessFlags.ShaderReadBit);
+        barriers[1] = Barrier(infos[1].Buffer, infos[1].Offset, infos[1].Range, AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
+            AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit);
+        var vk = _device.Vk;
+        _scheduler.EndRendering();
+        var command = new CommandBuffer(_scheduler.Current.Handle);
+        VulkanSynchronization.PipelineBarrier(vk, command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, PipelineStageFlags.ComputeShaderBit,
+            0, 0, null, 2, barriers, 0, null);
+        vk.CmdBindPipeline(command, PipelineBindPoint.Compute, _mergeChangedBytes);
+        Vulkan.NativeBindingEpoch.Advance();
+        BindDescriptorSet(command, WriteDescriptorSet(infos, -1));
+        var groupsX = (maxSegmentBytes / 4 + 63) / 64;
+        for (uint first = 0; first < segmentCount; first += MaxMergeSegmentsPerDispatch)
+        {
+            PushArguments(command, new TileTransferArguments
+            {
+                SourceBase = inputBinding.Base,
+                DestinationBase = outputBinding.Base,
+                Width = segmentCount,
+                Height = first,
+            });
+            vk.CmdDispatch(command, groupsX, Math.Min(segmentCount - first, MaxMergeSegmentsPerDispatch), 1);
+        }
+
+        VulkanCommandProfile.Current?.WriteMarker(command, VulkanCommandProfile.IntervalKind.BufferCopy);
+        barriers[1].SrcAccessMask = AccessFlags2.ShaderWriteBit;
+        barriers[1].DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
+        VulkanSynchronization.PipelineBarrier(vk, command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.AllCommandsBit,
+            0, 0, null, 1, barriers + 1, 0, null);
     }
 
     public TilerBufferSpan SwapBgra16(TilerBufferSpan input)

@@ -530,6 +530,56 @@ public static class TilerShaders
     }
 
     // Swaps the 16-bit blue and red channels of BGRA16 pixels; the width argument counts pixels.
+    // The words of one changed-byte merge segment record: new bytes, old bytes and destination
+    // (byte offsets from the input and output bases), then the segment's byte count. Offsets and
+    // counts are multiples of four.
+    public const uint MergeSegmentWords = 4;
+
+    // Writes the bytes that differ between a segment's new and old copies into the output, leaving
+    // every other output byte as it is. Arguments: 0 input base, 1 output base (bytes, as the
+    // other passes), 2 segment count, 3 first segment index of this dispatch. The segment records
+    // start at the input base. X is the word within a segment, Y the segment (64x1 workgroups).
+    public static byte[] CreateChangedByteMerge()
+    {
+        var (shaderModule, main, x, y) = BeginConversion();
+        var builder = shaderModule.Builder;
+        var segment = shaderModule.Add(y, shaderModule.LoadArgument(3));
+        shaderModule.ReturnWhen(builder.AddInstruction(SpirvOp.UGreaterThanEqual, shaderModule.BooleanType, segment, shaderModule.LoadArgument(2)));
+        var inputBase = shaderModule.ShiftRight(shaderModule.LoadArgument(0), 2);
+        var record = shaderModule.Add(inputBase, shaderModule.Multiply(segment, shaderModule.GetUnsignedConstant(MergeSegmentWords)));
+        var newOffset = shaderModule.LoadWord(shaderModule.InputBufferVariable, record);
+        var oldOffset = shaderModule.LoadWord(shaderModule.InputBufferVariable, shaderModule.Add(record, shaderModule.GetUnsignedConstant(1)));
+        var destinationOffset = shaderModule.LoadWord(shaderModule.InputBufferVariable, shaderModule.Add(record, shaderModule.GetUnsignedConstant(2)));
+        var words = shaderModule.ShiftRight(shaderModule.LoadWord(shaderModule.InputBufferVariable, shaderModule.Add(record, shaderModule.GetUnsignedConstant(3))), 2);
+        shaderModule.ReturnWhen(builder.AddInstruction(SpirvOp.UGreaterThanEqual, shaderModule.BooleanType, x, words));
+        var newWord = shaderModule.LoadWord(shaderModule.InputBufferVariable, shaderModule.Add(shaderModule.Add(inputBase, shaderModule.ShiftRight(newOffset, 2)), x));
+        var oldWord = shaderModule.LoadWord(shaderModule.InputBufferVariable, shaderModule.Add(shaderModule.Add(inputBase, shaderModule.ShiftRight(oldOffset, 2)), x));
+        var difference = shaderModule.Xor(newWord, oldWord);
+        shaderModule.ReturnWhen(builder.AddInstruction(SpirvOp.IEqual, shaderModule.BooleanType, difference, shaderModule.GetUnsignedConstant(0)));
+        // The high bit of each byte of anyBit is set when that byte of the difference is nonzero.
+        var lowBits = shaderModule.Add(shaderModule.And(difference, shaderModule.GetUnsignedConstant(0x7F7F7F7F)), shaderModule.GetUnsignedConstant(0x7F7F7F7F));
+        var anyBit = shaderModule.And(shaderModule.Or(lowBits, difference), shaderModule.GetUnsignedConstant(0x80808080));
+        var byteMask = shaderModule.Multiply(shaderModule.ShiftRight(anyBit, 7), shaderModule.GetUnsignedConstant(0xFF));
+        var outputIndex = shaderModule.Add(shaderModule.Add(shaderModule.ShiftRight(shaderModule.LoadArgument(1), 2), shaderModule.ShiftRight(destinationOffset, 2)), x);
+        var pointer = shaderModule.GetWordPointer(shaderModule.OutputBufferVariable, outputIndex);
+        var current = builder.AddInstruction(SpirvOp.Load, shaderModule.UintType, pointer);
+        var kept = shaderModule.And(current, builder.AddInstruction(SpirvOp.Not, shaderModule.UintType, byteMask));
+        builder.AddStatement(SpirvOp.Store, pointer, shaderModule.Or(kept, shaderModule.And(newWord, byteMask)));
+        builder.AddStatement(SpirvOp.Return);
+        builder.EndFunction();
+        return shaderModule.Finish(main, 64, 1);
+    }
+
+    // The reference the merge shader follows, for tests and CPU fallbacks: the word with the bytes
+    // that differ between newWord and oldWord taken from newWord.
+    public static uint MergeChangedBytes(uint current, uint newWord, uint oldWord)
+    {
+        var difference = newWord ^ oldWord;
+        var anyBit = (((difference & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | difference) & 0x80808080u;
+        var byteMask = (anyBit >> 7) * 0xFFu;
+        return (current & ~byteMask) | (newWord & byteMask);
+    }
+
     public static byte[] CreateBgra16Swap()
     {
         var (shaderModule, main, x, _) = BeginConversion();

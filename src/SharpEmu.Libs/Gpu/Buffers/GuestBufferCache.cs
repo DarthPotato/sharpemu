@@ -876,6 +876,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // Pages shaders write through device addresses; see SharedPageShadows. 64 MiB of shadows at most.
     private const int SharedPageCapacity = 16384;
     private readonly SharedPageShadows _sharedPages = new(TrackerLayout.PageBytes, SharedPageCapacity);
+
+    // The GPU pass that writes the changed bytes of shared-page uploads (GpuTiler.MergeChangedBytes),
+    // set by the image cache that owns it; without it, uploads copy each changed run.
+    internal Action<TilerBufferSpan, TilerBufferSpan, uint, uint>? ChangedByteMerge { get; set; }
+
+    // SHARPEMU_SHARED_PAGE_MERGE=0 keeps copying each changed run of a shared page (for comparison).
+    private static readonly bool SharedPageMergeEnabled =
+        Environment.GetEnvironmentVariable("SHARPEMU_SHARED_PAGE_MERGE") != "0";
     private static long _reportedLateSharedPages;
     private static long _reportedSharedPageMerges;
     private static int _reportedSharedPageCapacity;
@@ -3120,6 +3128,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         private ulong _size;
         private GuestBufferSourceReader? _readSource;
         public readonly List<BufferCopy> Copies = new();
+        public readonly SharedPageMergePlan Merges = new();
         public ulong TotalSize;
         public GpuBuffer? Source;
         public bool InUse;
@@ -3153,6 +3162,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _buffer = null!;
             _readSource = null;
             Copies.Clear();
+            Merges.Clear();
             TotalSize = 0;
             Source = null;
         }
@@ -3171,11 +3181,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         var source = collector.Source;
         var totalSize = collector.TotalSize;
+        var merges = SharedPageMergeEnabled && ChangedByteMerge is not null ? collector.Merges : null;
         if (source != null && _sharedPages.Count != 0)
         {
             using var filterScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferSharedPageFilter);
             // Shared pages copy only the bytes the CPU changed, so shader bytes in the buffer stay.
-            _sharedPages.FilterUpload(copies, buffer, buffer.CpuAddress, source.Mapped, _scheduler.CurrentTick);
+            _sharedPages.FilterUpload(copies, buffer, buffer.CpuAddress, source.Mapped, _scheduler.CurrentTick, merges);
             if (copies.Count == 0)
             {
                 source = null;
@@ -3224,6 +3235,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 0, null, 1, &after, 0, null);
         }
 
+        // Only after the copies above are recorded: staging the merge may wait for staging space, and
+        // a wait may only reclaim upload bytes whose copy is already recorded.
+        if (merges is { Segments.Count: > 0 })
+        {
+            RecordSharedPageMerge(buffer, merges);
+        }
+
         if (BufferUploadProfile.Enabled)
         {
             var elapsedTicks = System.Diagnostics.Stopwatch.GetTimestamp() - startedAt;
@@ -3234,6 +3252,86 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         return isTexelBuffer && !readImageBacking && SynchronizeTexelFromImage(buffer, guestAddress, size);
+    }
+
+    // The bytes a storage binding may add around a span: the descriptor offset rounds down to the
+    // device's storage offset alignment (at most 256) and the range up to a word.
+    private const ulong StorageBindingSlack = 256 + 4;
+
+    // Records the GPU pass that writes the bytes that differ into the buffer, in chunks that one
+    // storage descriptor binds on each side.
+    private void RecordSharedPageMerge(GpuBuffer buffer, SharedPageMergePlan plan)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferUploadRecording);
+        var maxBytes = (ulong)_device.MaxStorageBufferRange - StorageBindingSlack;
+        foreach (var (start, count) in plan.Chunks(maxBytes))
+        {
+            RecordSharedPageMergeChunk(buffer, plan, start, count);
+        }
+    }
+
+    // Stages one chunk's records, then each segment's new and old bytes, in one upload allocation.
+    private void RecordSharedPageMergeChunk(GpuBuffer buffer, SharedPageMergePlan plan, int start, int count)
+    {
+        var segments = plan.Segments;
+        var minimum = segments[start].DestinationOffset;
+        var maximum = 0UL;
+        var largest = 0u;
+        var dataBytes = 0UL;
+        for (var index = start; index < start + count; index++)
+        {
+            var segment = segments[index];
+            maximum = Math.Max(maximum, segment.DestinationOffset + segment.Bytes);
+            largest = Math.Max(largest, segment.Bytes);
+            dataBytes += 2UL * segment.Bytes;
+        }
+
+        var recordBytes = (ulong)count * SharedPageMergePlan.RecordBytes;
+        var total = recordBytes + dataBytes;
+        GpuBuffer input = _staging;
+        var temporary = false;
+        if (!_staging.TryMap(total, out var offset, sizeof(uint)))
+        {
+            input = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Upload, 0, BufferUsageFlags.StorageBufferBit, total);
+            offset = 0;
+            temporary = true;
+        }
+
+        var mapped = input.Mapped.Slice(checked((int)offset), checked((int)total));
+        var records = MemoryMarshal.Cast<byte, uint>(mapped[..(int)recordBytes]);
+        var data = plan.Data;
+        var position = recordBytes;
+        for (var index = 0; index < count; index++)
+        {
+            var segment = segments[start + index];
+            var record = records.Slice(index * (int)SharpEmu.ShaderCompiler.Vulkan.TilerShaders.MergeSegmentWords,
+                (int)SharpEmu.ShaderCompiler.Vulkan.TilerShaders.MergeSegmentWords);
+            var bytes = (int)segment.Bytes;
+            data.Slice(segment.NewIndex, bytes).CopyTo(mapped[(int)position..]);
+            data.Slice(segment.OldIndex, bytes).CopyTo(mapped[(int)(position + (ulong)bytes)..]);
+            record[0] = checked((uint)position);
+            record[1] = checked((uint)(position + (ulong)bytes));
+            record[2] = checked((uint)(segment.DestinationOffset - minimum));
+            record[3] = segment.Bytes;
+            position += 2UL * segment.Bytes;
+            buffer.NoteGpuWrite(segment.DestinationOffset, segment.Bytes);
+        }
+
+        if (temporary)
+        {
+            input.Flush(0, total);
+            _scheduler.QueueCompletionAction(input.Dispose);
+        }
+        else
+        {
+            _staging.Commit();
+        }
+
+        ChangedByteMerge!(
+            new TilerBufferSpan(input.Handle, offset, total),
+            new TilerBufferSpan(buffer.Handle, minimum, maximum - minimum),
+            (uint)count,
+            largest);
     }
 
     private bool SynchronizeTexelFromImage(GpuBuffer buffer, ulong guestAddress, ulong size)
