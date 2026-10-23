@@ -902,6 +902,11 @@ public sealed partial class RenderExecutor
 
     private const uint TessellationStageBits = 0x7u;
 
+    // The indexed mode changes only the primitive type of a draw run as a mesh shader, so a
+    // resolution records it only there: a prefetched resolution then also serves a draw whose
+    // path resolves without the mode (tessellation, targetless writes checks).
+    internal bool IndexedModeAffectsPrograms(RegisterBanks banks) => UsesMeshExecution(banks);
+
     private bool UsesMeshExecution(RegisterBanks banks) =>
         _pipelines.MeshShadersSupported && RequiresMeshExecution(banks.Context.ShaderStages) &&
         banks.Shader.Vertex.ExportAddress != 0 &&
@@ -917,7 +922,7 @@ public sealed partial class RenderExecutor
             targetExportMapping[(int)color.Slot] = color.Resolution.ExportMapping;
         }
 
-        inputs.Indexed = indexed;
+        inputs.Indexed = IndexedModeAffectsPrograms(banks) && indexed;
         inputs.PixelActive = state.PixelActive;
         inputs.DepthBound = state.Depth.HasTarget;
         if (Prefetch is { } prefetch && prefetch.TryTakeGraphics(banks, in inputs, out var prefetched))

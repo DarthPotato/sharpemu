@@ -270,7 +270,8 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         _concurrent.BeginConcurrentResolve();
         try
         {
-            job.Inputs = RenderExecutor.ProgramInputsOf(job.Banks, _host.FormatSupport, _host.Fatal, job.Indexed);
+            job.Inputs = RenderExecutor.ProgramInputsOf(job.Banks, _host.FormatSupport, _host.Fatal,
+                job.Indexed && _executor.IndexedModeAffectsPrograms(job.Banks));
             job.Programs = _executor.ResolveGraphicsPrograms(job.Banks, in job.Inputs);
             job.Assumptions = _concurrent.EndConcurrentResolve();
             job.State = 1;

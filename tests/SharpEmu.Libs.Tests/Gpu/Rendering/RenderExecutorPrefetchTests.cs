@@ -69,7 +69,9 @@ public sealed class RenderExecutorPrefetchTests : IDisposable
         public void Resolve(RegisterBanks banks, bool indexed = false)
         {
             _banks = banks;
-            _inputs = RenderExecutor.ProgramInputsOf(banks, host.FormatSupport, host.Fatal, indexed);
+            // As the worker does: the mode is an input only where it changes the programs.
+            _inputs = RenderExecutor.ProgramInputsOf(banks, host.FormatSupport, host.Fatal,
+                indexed && executor.IndexedModeAffectsPrograms(banks));
             _programs = executor.ResolveGraphicsPrograms(banks, in _inputs);
         }
 
@@ -121,7 +123,9 @@ public sealed class RenderExecutorPrefetchTests : IDisposable
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void IndexedDrawAcceptsOnlyIndexedPrefetch(bool indexed)
+    // Outside mesh execution the index mode does not change the programs, so a draw takes a
+    // resolution made in either mode.
+    public void NonMeshIndexedDrawAcceptsPrefetchOfEitherMode(bool indexed)
     {
         var prefetch = new AheadPrefetch(_executor, _host);
         _executor.Prefetch = prefetch;
@@ -130,6 +134,6 @@ public sealed class RenderExecutorPrefetchTests : IDisposable
 
         _executor.DrawIndexed(1, banks, Indexed(3));
 
-        Assert.Equal(indexed ? (1, 0) : (0, 1), (prefetch.Taken, prefetch.Declined));
+        Assert.Equal((1, 0), (prefetch.Taken, prefetch.Declined));
     }
 }
