@@ -190,7 +190,39 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // Render-state discovery for one shader image; the view is acquired later with the draw.
+        // Most draws bind what the previous draw of their program bound. That case reads the memo through
+        // references: image requests carry a whole mip layout and a trace string, so every request-sized
+        // local of the full lookup below is zeroed on entry, several KB per binding.
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
+        {
+            if (index >= 0 && words.Length >= 4)
+            {
+                ref var memo = ref ImageBindingMemoOf(program, index);
+                if (memo.Matches(words, _imageCache.LookupGeneration))
+                {
+                    var storage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage;
+                    _ = BeginBatchedGuestCommands();
+                    var original = memo.OriginalResolution.Request;
+                    TraceImageLookup(image, words, program, index, original);
+                    CompleteOverlappingPublications(original.Description.Data.Address, original.Description.Data.Size, includeLabels: false);
+                    _imageCache.SynchronizeColorMetadata(original);
+                    _ = BeginBatchedGuestCommands();
+                    if (memo.Matches(words, _imageCache.LookupGeneration) && _imageCache.TryTouchRemembered(memo.Found))
+                    {
+                        if (memo.CompletesLookup)
+                        {
+                            _imageCache.CompleteLookup(memo.Found, memo.Resolution.Request, memo.MetadataBaseLayer);
+                        }
+
+                        return FinishImageBinding(image, words, program, index, storage, memo.Found, memo.Resolution);
+                    }
+                }
+            }
+
+            return ResolveImageBindingFull(image, words, program, index);
+        }
+
+        private TextureResource ResolveImageBindingFull(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
             // A negative index has no slot in the program's memos (a registered runtime image): look it up afresh.
             var unmemoized = default(ImageBindingMemo);
@@ -243,6 +275,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     : default;
             }
 
+            return FinishImageBinding(image, words, program, index, storage, imageIdentifier, resolution);
+        }
+
+        private TextureResource FinishImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index, bool storage,
+            ResourceSlotIdentifier imageIdentifier, in TextureRequestResolution resolution)
+        {
             _imageCache.TraceTextureMetadata(resolution.Request);
             if (Gpu.Images.ImageClearTrace.Enabled)
             {
