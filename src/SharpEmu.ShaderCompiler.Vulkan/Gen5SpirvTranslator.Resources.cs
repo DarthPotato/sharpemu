@@ -146,6 +146,9 @@ public static partial class Gen5SpirvTranslator
         private uint _pendingFaultBits;
         private uint _pendingWrittenWord;
         private uint _pendingWrittenBits;
+        // The written granules of one mask slot, merged and published like the written-page bits.
+        private uint _pendingGranuleSlot;
+        private uint _pendingGranuleBits;
         private bool _deviceWriteNoted;
         private uint _pushDataBlockPointer;
         private uint _wordRuntimeArray;
@@ -358,6 +361,12 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_pendingWrittenBits, "pendingWrittenBits");
                 _interfaces.Add(_pendingWrittenWord);
                 _interfaces.Add(_pendingWrittenBits);
+                _pendingGranuleSlot = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _pendingGranuleBits = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _module.AddName(_pendingGranuleSlot, "pendingGranuleSlot");
+                _module.AddName(_pendingGranuleBits, "pendingGranuleBits");
+                _interfaces.Add(_pendingGranuleSlot);
+                _interfaces.Add(_pendingGranuleBits);
                 if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor))
                 {
                     _deviceBufferWordScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
@@ -735,10 +744,16 @@ public static partial class Gen5SpirvTranslator
             var pageCount = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0);
             var word = IAdd(ShiftRightLogical(pageCount, UInt(5)), ShiftRightLogical(pageIndex, UInt(5)));
             var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
+            // Every reported write is one aligned dword, so it lies in one granule.
+            var slot = IAdd(ShiftRightLogical(pageCount, UInt(4)), BitwiseAnd(pageIndex, UInt(DeviceAddressPaging.WriteGranuleSlots - 1)));
+            var granule = Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, masked, ULong(DeviceAddressPaging.WriteGranuleBits)));
+            var granuleBit = ShiftLeftLogical(UInt(1), BitwiseAnd(granule, UInt(DeviceAddressPaging.WriteGranulesPerPage - 1)));
             if (_stage == Gen5SpirvStage.Pixel)
             {
                 EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
                     _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
+                EmitConditional(IsBlockWordInRange(_faultBuffer, slot), () =>
+                    _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, slot), UInt(1), UInt(0), granuleBit));
                 return;
             }
 
@@ -751,6 +766,16 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, pendingWord), UInt(1), UInt(0), pendingBits));
             Store(_pendingWrittenWord, word);
             Store(_pendingWrittenBits, _module.AddInstruction(SpirvOp.Select, _uintType, keep, BitwiseOr(pendingBits, bit), bit));
+
+            var pendingSlot = Load(_uintType, _pendingGranuleSlot);
+            var pendingGranules = Load(_uintType, _pendingGranuleBits);
+            var keepSlot = _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, pendingGranules, UInt(0)),
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, pendingSlot, slot));
+            EmitConditional(LogicalAnd(LogicalNot(keepSlot), IsBlockWordInRange(_faultBuffer, pendingSlot)), () =>
+                _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, pendingSlot), UInt(1), UInt(0), pendingGranules));
+            Store(_pendingGranuleSlot, slot);
+            Store(_pendingGranuleBits, _module.AddInstruction(SpirvOp.Select, _uintType, keepSlot, BitwiseOr(pendingGranules, granuleBit), granuleBit));
         }
 
         // Publishes the missing pages the invocation met, once, as it ends.
@@ -762,6 +787,10 @@ public static partial class Gen5SpirvTranslator
                 var writtenWord = Load(_uintType, _pendingWrittenWord);
                 EmitConditional(LogicalAnd(_module.AddInstruction(SpirvOp.INotEqual, _boolType, writtenBits, UInt(0)), IsBlockWordInRange(_faultBuffer, writtenWord)), () =>
                     _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, writtenWord), UInt(1), UInt(0), writtenBits));
+                var granuleBits = Load(_uintType, _pendingGranuleBits);
+                var granuleSlot = Load(_uintType, _pendingGranuleSlot);
+                EmitConditional(LogicalAnd(_module.AddInstruction(SpirvOp.INotEqual, _boolType, granuleBits, UInt(0)), IsBlockWordInRange(_faultBuffer, granuleSlot)), () =>
+                    _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, granuleSlot), UInt(1), UInt(0), granuleBits));
             }
 
             if (_pendingFaultBits == 0)

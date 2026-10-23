@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Kernel;
+using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Vulkan;
@@ -31,6 +32,16 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private readonly GpuBuffer _faultBuffer;
     private readonly GpuBuffer _downloadBuffer;
     private readonly GpuBuffer _writtenDownloadBuffer;
+    // The written-granule masks follow both bitmaps; the diagnostic record follows the masks
+    // (DeviceAddressPaging describes the layout the shaders write).
+    private readonly ulong _granuleTableOffset;
+    private readonly ulong _recordOffset;
+    private readonly GpuBuffer _granuleDownloadBuffer;
+    private bool _previousWrittenOverflow;
+
+    // SHARPEMU_DEVICE_WRITE_GRANULES=0 marks every written device page whole again (for comparison).
+    private static readonly bool GranuleMarking =
+        Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_WRITE_GRANULES") != "0";
     private readonly DescriptorSet[] _writtenSets = new DescriptorSet[MaxPendingFaults];
     private readonly GpuBuffer? _traceDownloadBuffer;
     private bool _traceInitialized;
@@ -50,8 +61,12 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         _pageSize = 1UL << pageBits;
         _pageCount = pageCount;
         _faultBufferSize = pageCount / 8;
+        _granuleTableOffset = 2 * _faultBufferSize;
+        _recordOffset = _granuleTableOffset + DeviceAddressPaging.WriteGranuleTableBytes;
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
-            2 * _faultBufferSize + 64UL);
+            _recordOffset + 64UL);
+        _granuleDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags,
+            MaxPendingFaults * DeviceAddressPaging.WriteGranuleTableBytes);
         _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * 256);
         _downloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
         _writtenDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
@@ -186,7 +201,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         {
             if (_traceDownloadBuffer is not null && !_traceInitialized)
             {
-                _faultBuffer.Fill(2 * _faultBufferSize, 64, 0);
+                _faultBuffer.Fill(_recordOffset, 64, 0);
                 _traceInitialized = true;
             }
             return _faultBuffer;
@@ -245,10 +260,16 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         var scanTick = _scheduler.CurrentTick;
         if (_traceDownloadBuffer is not null)
         {
-            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, 2 * _faultBufferSize, area * 256UL, 64,
+            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _recordOffset, area * 256UL, 64,
                 destinationAfter: AccessFlags.HostReadBit);
-            _faultBuffer.Fill(2 * _faultBufferSize, 64, 0);
+            _faultBuffer.Fill(_recordOffset, 64, 0);
         }
+
+        // The masks of the granules written since the last scan: the same writes the written-page scan saw.
+        var granuleOffset = area * DeviceAddressPaging.WriteGranuleTableBytes;
+        _granuleDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _granuleTableOffset, granuleOffset,
+            DeviceAddressPaging.WriteGranuleTableBytes, destinationAfter: AccessFlags.HostReadBit);
+        _faultBuffer.Fill(_granuleTableOffset, DeviceAddressPaging.WriteGranuleTableBytes, 0);
         _scheduler.QueueCompletionAction(() =>
         {
             if (_traceDownloadBuffer is not null)
@@ -304,9 +325,26 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             _writtenDownloadBuffer.Invalidate(offset, PageFaultAreaSize);
             var written = MemoryMarshal.Cast<byte, ulong>(_writtenDownloadBuffer.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
             var writtenCount = Math.Min((uint)written[0], MaxPageFaults - 1);
+            // Pages a full list left in the bitmap lost their masks to this scan's clear: the next
+            // scan reports them without their granules.
+            var overflow = (uint)written[0] > MaxPageFaults - 1;
+            var masksComplete = !_previousWrittenOverflow;
+            _previousWrittenOverflow = overflow;
+            _granuleDownloadBuffer.Invalidate(granuleOffset, DeviceAddressPaging.WriteGranuleTableBytes);
+            var granules = MemoryMarshal.Cast<byte, uint>(
+                _granuleDownloadBuffer.Mapped.Slice((int)granuleOffset, (int)DeviceAddressPaging.WriteGranuleTableBytes));
             for (var index = 1; index <= writtenCount; index++)
             {
-                _cache.NoteDeviceAddressWrites(written[index], _pageSize);
+                var mask = granules[(int)((written[index] >> DeviceAddressPaging.PageBits) & (DeviceAddressPaging.WriteGranuleSlots - 1))];
+                if (Diagnostics.GpuReadTrace.Enabled)
+                {
+                    Diagnostics.GpuReadTrace.NoteWriteMask(written[index], mask, masksComplete, overflow);
+                }
+
+                // A page without a mask, or one whose bits an overflowing scan may have cleared, is
+                // marked whole.
+                _cache.NoteDeviceAddressWrites(written[index], _pageSize,
+                    GranuleMarking && masksComplete && mask != 0 ? mask : uint.MaxValue);
             }
 
             _faultAreas[area] = 0;
@@ -325,6 +363,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         vk.DestroyDescriptorSetLayout(_device.Device, _layout, null);
         _downloadBuffer.Dispose();
         _writtenDownloadBuffer.Dispose();
+        _granuleDownloadBuffer.Dispose();
         _traceDownloadBuffer?.Dispose();
         _faultBuffer.Dispose();
     }

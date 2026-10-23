@@ -12,6 +12,7 @@ using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
 using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Vulkan;
+using DeviceAddressPaging = SharpEmu.ShaderCompiler.Resources.DeviceAddressPaging;
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
@@ -330,6 +331,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 Diagnostics.DccWriterTrace.RecordWrite(guestAddress, size);
             }
 
+            if (Diagnostics.GpuReadTrace.Enabled) Diagnostics.GpuReadTrace.NoteMark(guestAddress, size, device: false);
             if (!_gpuModifiedRanges.Contains(guestAddress, size))
             {
                 _gpuModifiedRanges.Add(guestAddress, size);
@@ -808,17 +810,32 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // atomics) are reported by the GPU after the fact; no binding announced them. They become
     // GPU-owned like any written binding, so CPU reads download them and a CPU write to the page
     // flushes them first instead of a later upload overwriting them with stale guest bytes.
-    internal void NoteDeviceAddressWrites(ulong guestAddress, ulong size)
+    // A device page reported with the mask of the granules it wrote (DeviceAddressPaging) marks
+    // only those: a tracker page without one was not written, and the bytes of a written tracker
+    // page outside them stay guest-owned, so reading them waits for nothing.
+    internal void NoteDeviceAddressWrites(ulong guestAddress, ulong size, uint granuleMask = uint.MaxValue)
     {
         if (!IsValidRange(guestAddress, size))
         {
             return;
         }
 
+        const ulong granuleBytes = 1UL << DeviceAddressPaging.WriteGranuleBits;
+        const int granulesPerTrackerPage = (int)(TrackerLayout.PageBytes / granuleBytes);
+        var byGranule = granuleMask != uint.MaxValue && size == DeviceAddressPaging.PageSize &&
+            (guestAddress & DeviceAddressPaging.PageOffsetMask) == 0;
         var end = guestAddress + size;
         var marked = false;
         for (var page = guestAddress & ~(TrackerLayout.PageBytes - 1); page < end; page += TrackerLayout.PageBytes)
         {
+            var pageGranules = byGranule
+                ? (granuleMask >> (int)((page - guestAddress) / granuleBytes)) & ((1u << granulesPerTrackerPage) - 1)
+                : (1u << granulesPerTrackerPage) - 1;
+            if (pageGranules == 0)
+            {
+                continue;
+            }
+
             if (FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
             {
                 continue;
@@ -855,10 +872,30 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 }
             }
 
-            if (!_gpuModifiedRanges.Contains(page, TrackerLayout.PageBytes))
+            for (var first = 0; first < granulesPerTrackerPage;)
             {
-                _gpuModifiedRanges.Add(page, TrackerLayout.PageBytes);
-                Interlocked.Increment(ref _gpuModifiedVersion);
+                if ((pageGranules & (1u << first)) == 0)
+                {
+                    first++;
+                    continue;
+                }
+
+                var last = first;
+                while (last + 1 < granulesPerTrackerPage && (pageGranules & (1u << (last + 1))) != 0)
+                {
+                    last++;
+                }
+
+                var runAddress = page + (ulong)first * granuleBytes;
+                var runSize = (ulong)(last - first + 1) * granuleBytes;
+                if (Diagnostics.GpuReadTrace.Enabled) Diagnostics.GpuReadTrace.NoteMark(runAddress, runSize, device: true);
+                if (!_gpuModifiedRanges.Contains(runAddress, runSize))
+                {
+                    _gpuModifiedRanges.Add(runAddress, runSize);
+                    Interlocked.Increment(ref _gpuModifiedVersion);
+                }
+
+                first = last + 1;
             }
 
             owner.NoteGpuWrite();
@@ -920,6 +957,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // Writes downloaded GPU bytes into guest memory; shadows of shared pages take them too.
     internal bool WriteDownloaded(ulong address, ReadOnlySpan<byte> bytes)
     {
+        if (Diagnostics.GpuReadTrace.Enabled)
+        {
+            var previous = new byte[bytes.Length];
+            if (_backing.TryReadBacking(address, previous))
+            {
+                Diagnostics.GpuReadTrace.NoteDownload(address, previous, bytes);
+            }
+        }
+
         if (!_backing.TryWriteBacking(address, bytes))
         {
             return false;

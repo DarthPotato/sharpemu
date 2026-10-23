@@ -318,6 +318,60 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void ADeviceAddressWriteWithGranulesMarksOnlyTheWrittenGranules()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        Assert.Equal(0UL, address & (Page - 1));
+        const ulong Tracker = TrackerLayout.PageBytes;
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.FindBuffer(address, 0x10000);
+            var read = harness.Cache.ObtainBufferForImage(address, Page);
+            // Shaders stored a dword in granule 3 (first tracker page) and granule 29 (last one).
+            read.Buffer.Fill(read.Offset + 0x600, 4, 0xCAFEF00D);
+            read.Buffer.Fill(read.Offset + 0x3A00, 4, 0x0BADBEEF);
+            // The owner also holds bytes no reported write produced, in an unwritten granule.
+            read.Buffer.Fill(read.Offset + 0x100, 4, 0x81818181);
+            harness.Cache.NoteDeviceAddressWrites(address, Page, (1u << 3) | (1u << 29));
+            Assert.True(harness.Cache.HasGpuDirtyBytes(address + 0x600, 4), "written granule");
+            Assert.True(harness.Cache.HasGpuDirtyBytes(address + 0x3A00, 4), "second granule");
+            Assert.False(harness.Cache.HasGpuDirtyBytes(address + 0x550, 4), "unwritten granule");
+            Assert.False(harness.Cache.HasGpuDirtyBytes(address + Tracker, 2 * Tracker), "unwritten tracker pages");
+            Assert.True(harness.Cache.HasGpuDirtyPages(address, Tracker), "first tracker page");
+            Assert.False(harness.Cache.HasGpuDirtyPages(address + Tracker, 2 * Tracker), "middle tracker pages");
+            Assert.True(harness.Cache.HasGpuDirtyPages(address + 3 * Tracker, Tracker), "last tracker page");
+        });
+        Assert.True(harness.Store.DownloadToCpu(address, Tracker));
+        Assert.Equal(0xCAFEF00DU, BitConverter.ToUInt32(harness.Read(address + 0x600, 4)));
+        // Only the written granule came back: guest bytes elsewhere on the page stay the guest's.
+        Assert.Equal(0U, BitConverter.ToUInt32(harness.Read(address + 0x100, 4)));
+        Assert.False(harness.Cache.HasGpuDirtyBytes(address, Tracker));
+        Assert.True(harness.Store.DownloadToCpu(address + 3 * Tracker, Tracker));
+        Assert.Equal(0x0BADBEEFU, BitConverter.ToUInt32(harness.Read(address + 0x3A00, 4)));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void ADeviceAddressWriteWithoutGranulesMarksTheWholePage()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.FindBuffer(address, 0x10000);
+            _ = harness.Cache.ObtainBufferForImage(address, Page);
+            harness.Cache.NoteDeviceAddressWrites(address, Page, uint.MaxValue);
+            Assert.True(harness.Cache.HasGpuDirtyPages(address, Page));
+            Assert.True(harness.Cache.Tracker.HasGpuDirtyPages(address + Page - TrackerLayout.PageBytes, TrackerLayout.PageBytes));
+            Assert.True(harness.Cache.HasGpuDirtyBytes(address + 0x550, 4));
+        });
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void ADownloadedSharedPageKeepsNoBaselineFromGuestBytesTheOwnerNeverReceived()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;

@@ -13,4 +13,14 @@ public static class DeviceAddressPaging
 
     // Address handles carry 48 bits; the upper bits are ignored.
     public const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
+
+    // The fault buffer holds, in order: the bitmap of pages a shader needed but found unmapped,
+    // the bitmap of pages a shader wrote through a device address (one bit per page each), the
+    // written-granule masks, and a 64-byte diagnostic record at the end. A written page also sets
+    // the bit of each 512-byte granule it wrote in the mask of slot (page index % slots): pages
+    // that share a slot share their bits, so a page's mask holds at least the granules it wrote.
+    public const int WriteGranuleBits = 9;
+    public const int WriteGranulesPerPage = 1 << (PageBits - WriteGranuleBits);
+    public const uint WriteGranuleSlots = 1u << 16;
+    public const ulong WriteGranuleTableBytes = WriteGranuleSlots * sizeof(uint);
 }
