@@ -3164,11 +3164,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         bool isTexelBuffer, bool preserveCpuWriteHotPages, bool readImageBacking, long startedAt)
     {
         var copies = collector.Copies;
-        _tracker.ForEachUploadRange(guestAddress, size, isWritten, collector.Collect, collector.Upload, preserveCpuWriteHotPages);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferUploadTracking))
+        {
+            _tracker.ForEachUploadRange(guestAddress, size, isWritten, collector.Collect, collector.Upload, preserveCpuWriteHotPages);
+        }
+
         var source = collector.Source;
         var totalSize = collector.TotalSize;
         if (source != null && _sharedPages.Count != 0)
         {
+            using var filterScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferSharedPageFilter);
             // Shared pages copy only the bytes the CPU changed, so shader bytes in the buffer stay.
             _sharedPages.FilterUpload(copies, buffer, buffer.CpuAddress, source.Mapped, _scheduler.CurrentTick);
             if (copies.Count == 0)
@@ -3179,6 +3184,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (source != null)
         {
+            using var recordScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferUploadRecording);
             foreach (var copy in copies)
             {
                 buffer.NoteGpuWrite(copy.DstOffset, copy.Size);

@@ -156,6 +156,12 @@ internal static class RenderPhaseProfile
         ProgramPlanning,
         ProgramLayoutRequest,
         ProgramTranslation,
+        /// <summary>Walking a dirty buffer range's pages for an upload (tracker locks, masks, protection).</summary>
+        BufferUploadTracking,
+        /// <summary>Narrowing an upload to the bytes the CPU changed on shared (shadowed) pages.</summary>
+        BufferSharedPageFilter,
+        /// <summary>Recording an upload's barriers and buffer copy.</summary>
+        BufferUploadRecording,
         Count,
     }
 
