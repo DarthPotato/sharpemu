@@ -59,4 +59,39 @@ public sealed class WriteTickMapTests
         Assert.Equal(2UL, map.MaxTick(0x400, 0x100));
         Assert.Equal(6UL, map.MaxTick(0x100, 0x100));
     }
+
+    // Random overlapping writes against a per-byte model: every range query must see the latest
+    // tick of every byte it covers, whatever splits and merges the assignments caused.
+    [Fact]
+    public void RandomWritesMatchAPerByteModel()
+    {
+        const int Bytes = 512;
+        var random = new System.Random(5);
+        for (var trial = 0; trial < 50; trial++)
+        {
+            var map = new WriteTickMap();
+            var model = new ulong[Bytes];
+            for (var step = 1; step <= 200; step++)
+            {
+                var begin = random.Next(Bytes);
+                var size = 1 + random.Next(Math.Min(64, Bytes - begin));
+                // Ticks repeat sometimes, so neighbours with equal ticks merge.
+                var tick = (ulong)(step / (1 + random.Next(3)));
+                map.Assign((ulong)begin, (ulong)size, tick);
+                Array.Fill(model, tick, begin, size);
+
+                var queryBegin = random.Next(Bytes);
+                var querySize = 1 + random.Next(Bytes - queryBegin);
+                var expected = 0UL;
+                for (var at = queryBegin; at < queryBegin + querySize; at++)
+                {
+                    expected = Math.Max(expected, model[at]);
+                }
+
+                Assert.Equal(expected, map.MaxTick((ulong)queryBegin, (ulong)querySize));
+            }
+
+            Assert.True(map.Count <= Bytes);
+        }
+    }
 }

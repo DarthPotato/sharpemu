@@ -29,36 +29,47 @@ public sealed class WriteTickMap
             removed++;
         }
 
-        Entry? left = null;
-        Entry? right = null;
+        // The removed entries give way to the kept piece before the range, the range itself and the
+        // kept piece after it. Overwriting in place and inserting or removing only the difference
+        // keeps the common rewrite of an existing range from shifting the rest of the list.
+        Span<Entry> replacement = stackalloc Entry[3];
+        var count = 0;
         if (removed != 0)
         {
             var first = _entries[index];
             if (first.Begin < begin)
             {
-                left = first with { End = begin };
+                replacement[count++] = first with { End = begin };
             }
+        }
 
+        var middle = index + count;
+        replacement[count++] = new Entry(begin, end, tick);
+        if (removed != 0)
+        {
             var last = _entries[index + removed - 1];
             if (last.End > end)
             {
-                right = last with { Begin = end };
+                replacement[count++] = last with { Begin = end };
             }
-
-            _entries.RemoveRange(index, removed);
         }
 
-        var insert = index;
-        if (left is { } leftPiece)
+        var shared = Math.Min(count, removed);
+        for (var offset = 0; offset < shared; offset++)
         {
-            _entries.Insert(insert++, leftPiece);
+            _entries[index + offset] = replacement[offset];
         }
 
-        _entries.Insert(insert, new Entry(begin, end, tick));
-        var middle = insert++;
-        if (right is { } rightPiece)
+        if (count > removed)
         {
-            _entries.Insert(insert, rightPiece);
+            for (var offset = removed; offset < count; offset++)
+            {
+                _entries.Insert(index + offset, replacement[offset]);
+            }
+        }
+        else if (removed > count)
+        {
+            _entries.RemoveRange(index + count, removed - count);
         }
 
         if (middle + 1 < _entries.Count)
