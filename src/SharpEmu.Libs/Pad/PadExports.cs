@@ -951,6 +951,8 @@ public static class PadExports
             buttons |= 0x4000;
         }
 
+        ApplyAutoStick(ref leftX, ref leftY, ref rightX, ref rightY);
+
         if (LogPadState)
         {
             var signature = ((ulong)buttons << 8) | ((ulong)(acceptsKeyboardInput ? 1 : 0) << 4) | (uint)gamepadCount;
@@ -1040,6 +1042,114 @@ public static class PadExports
     }
 
     private static readonly int[] AutoCrossSampled = new int[AutoCrossTimes.Length];
+
+    // One window of SHARPEMU_AUTO_STICK: each axis is -1, 0 (untouched) or +1 while it is open.
+    internal readonly record struct AutoStickWindow(double Start, double End, int LeftX, int LeftY, int RightX, int RightY);
+
+    private static readonly AutoStickWindow[] AutoStickWindows = ParseAutoStick(Environment.GetEnvironmentVariable("SHARPEMU_AUTO_STICK"));
+
+    // SHARPEMU_AUTO_STICK="400-460=up;470-500=up+right;505-507=look-left": holds the sticks fully in
+    // those directions between the second offsets from process start. up/down/left/right move the left
+    // stick, look-up/look-down/look-left/look-right the right stick; overlapping windows combine.
+    // Debug aid for unattended runs, like SHARPEMU_AUTO_CROSS.
+    internal static AutoStickWindow[] ParseAutoStick(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return [];
+        }
+
+        var windows = new List<AutoStickWindow>();
+        foreach (var entry in raw.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parts = entry.Split('=', 2, StringSplitOptions.TrimEntries);
+            var range = parts[0].Split('-', 2, StringSplitOptions.TrimEntries);
+            if (parts.Length != 2 || range.Length != 2 ||
+                !double.TryParse(range[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var start) ||
+                !double.TryParse(range[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var end) ||
+                end <= start)
+            {
+                Console.Error.WriteLine($"[LOADER][WARN] SHARPEMU_AUTO_STICK: ignoring '{entry}' (expected start-end=direction[+direction])");
+                continue;
+            }
+
+            int leftX = 0, leftY = 0, rightX = 0, rightY = 0;
+            var valid = true;
+            foreach (var direction in parts[1].Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                switch (direction.ToLowerInvariant())
+                {
+                    case "up": leftY = -1; break;
+                    case "down": leftY = 1; break;
+                    case "left": leftX = -1; break;
+                    case "right": leftX = 1; break;
+                    case "look-up": rightY = -1; break;
+                    case "look-down": rightY = 1; break;
+                    case "look-left": rightX = -1; break;
+                    case "look-right": rightX = 1; break;
+                    default: valid = false; break;
+                }
+            }
+
+            if (!valid)
+            {
+                Console.Error.WriteLine($"[LOADER][WARN] SHARPEMU_AUTO_STICK: ignoring '{entry}' (unknown direction)");
+                continue;
+            }
+
+            windows.Add(new AutoStickWindow(start, end, leftX, leftY, rightX, rightY));
+        }
+
+        if (windows.Count != 0)
+        {
+            Console.Error.WriteLine($"[LOADER][INFO] SHARPEMU_AUTO_STICK: {windows.Count} window(s)");
+        }
+
+        return windows.ToArray();
+    }
+
+    // The stick values of the windows open at the given time; axes no window moves keep their value.
+    internal static void ApplyAutoStick(ReadOnlySpan<AutoStickWindow> windows, double elapsed,
+        ref byte leftX, ref byte leftY, ref byte rightX, ref byte rightY)
+    {
+        int lx = 0, ly = 0, rx = 0, ry = 0;
+        foreach (var window in windows)
+        {
+            if (elapsed < window.Start || elapsed >= window.End)
+            {
+                continue;
+            }
+
+            lx += window.LeftX;
+            ly += window.LeftY;
+            rx += window.RightX;
+            ry += window.RightY;
+        }
+
+        static void Set(ref byte axis, int direction)
+        {
+            if (direction != 0)
+            {
+                axis = direction < 0 ? (byte)0 : (byte)255;
+            }
+        }
+
+        Set(ref leftX, lx);
+        Set(ref leftY, ly);
+        Set(ref rightX, rx);
+        Set(ref rightY, ry);
+    }
+
+    private static void ApplyAutoStick(ref byte leftX, ref byte leftY, ref byte rightX, ref byte rightY)
+    {
+        if (AutoStickWindows.Length == 0)
+        {
+            return;
+        }
+
+        var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
+        ApplyAutoStick(AutoStickWindows, elapsed, ref leftX, ref leftY, ref rightX, ref rightY);
+    }
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>
     private static uint ToOrbisButtons(HostGamepadButtons buttons)
