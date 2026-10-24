@@ -22,6 +22,15 @@ public sealed class RegionLock
     private long _protectionAtEnter;
     private GpuMemoryAccessProfile.Operation _holdOperation;
 
+    // Backoff rounds of 1, 2, 4 ... 64 pause iterations (a few microseconds) before yielding.
+    private const int SpinRounds = 7;
+
+    // SHARPEMU_REGION_LOCK_YIELD=0 restores the pure spin.
+    private static readonly bool YieldWhileWaiting = Environment.GetEnvironmentVariable("SHARPEMU_REGION_LOCK_YIELD") != "0";
+
+    // Runs the static initializer before any fault handler can be the first to read the setting.
+    internal static void InitializeSettings() => _ = YieldWhileWaiting;
+
     public RegionLock(Category category = Category.MemoryTracker) => _category = category;
 
     private static bool Timed => GpuMemoryAccessProfile.Enabled || RegionLockTrace.Enabled;
@@ -54,11 +63,18 @@ public sealed class RegionLock
         if (Interlocked.CompareExchange(ref _held, 1, 0) != 0)
         {
             var waitStarted = Timed ? Stopwatch.GetTimestamp() : 0;
-            do
+            if (YieldWhileWaiting)
             {
-                Thread.SpinWait(1);
+                WaitYielding();
             }
-            while (Interlocked.CompareExchange(ref _held, 1, 0) != 0);
+            else
+            {
+                do
+                {
+                    Thread.SpinWait(1);
+                }
+                while (Interlocked.CompareExchange(ref _held, 1, 0) != 0);
+            }
 
             if (Timed)
             {
@@ -77,6 +93,32 @@ public sealed class RegionLock
             _protectionAtEnter = GpuMemoryAccessProfile.ProtectionTicks;
             GpuMemoryAccessProfile.RegionLocksHeld++;
             _holdStarted = Stopwatch.GetTimestamp();
+        }
+    }
+
+    // A holder that lost its CPU mid-section keeps every waiter spinning, and spinning waiters keep the
+    // CPUs it needs to finish. Spin briefly on a plain read, then give the CPU away between checks.
+    // Thread.Yield is SwitchToThread or sched_yield: no allocation and no wait on any object, so it
+    // is as safe in a fault handler as the host protection call that handler already makes.
+    private void WaitYielding()
+    {
+        var spins = 0;
+        while (true)
+        {
+            if (Volatile.Read(ref _held) == 0 && Interlocked.CompareExchange(ref _held, 1, 0) == 0)
+            {
+                return;
+            }
+
+            if (spins < SpinRounds)
+            {
+                Thread.SpinWait(1 << spins);
+                spins++;
+            }
+            else
+            {
+                Thread.Yield();
+            }
         }
     }
 

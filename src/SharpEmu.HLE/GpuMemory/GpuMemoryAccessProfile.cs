@@ -90,11 +90,12 @@ public static class GpuMemoryAccessProfile
     private static bool TracksFaults => Enabled || RegionLockTrace.Enabled;
 
     // Initialize before protected pages can fault, not from the fault handler.
-    // The region lock trace reads its setting in a static initializer, which allocates.
+    // The region lock reads its settings in static initializers, which allocate.
     internal static void Initialize()
     {
         _ = Counters;
         _ = RegionLockTrace.Enabled;
+        RegionLock.InitializeSettings();
     }
 
     // Host protection time this thread spent so far, for the region lock trace.
