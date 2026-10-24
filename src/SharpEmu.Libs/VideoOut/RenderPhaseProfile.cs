@@ -491,6 +491,7 @@ internal static class RenderPhaseProfile
             string.Join(" ", parts.Select(part => $"{part.Phase}={part.Milliseconds:F2}ms/n{part.Entries}")));
 
         GpuWaitSiteProfile.Report();
+        GpuBacklogProfile.Report();
         ComputeCompileProfile.Report();
         SharpEmu.ShaderCompiler.Vulkan.ShaderTranslationProfile.Report();
         ReportImageUploads();

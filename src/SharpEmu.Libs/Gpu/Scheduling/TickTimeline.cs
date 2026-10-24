@@ -50,10 +50,13 @@ public sealed class TickTimeline
             return;
         }
 
+        var backlog = VideoOut.GpuBacklogProfile.Begin(tick, CompletedTick);
         if (!_device.TryWaitTimeline(tick, out var failure))
         {
             throw SubmissionScheduler.Fatal($"vkWaitSemaphores failed: {failure}, tick={tick}");
         }
+
+        VideoOut.GpuBacklogProfile.End(backlog);
 
         RefreshCompletedTick();
     }

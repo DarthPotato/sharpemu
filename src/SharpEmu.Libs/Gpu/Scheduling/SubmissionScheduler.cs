@@ -477,6 +477,13 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     // Uses the last completed tick read from the device; it does not query the device.
     internal bool IsTickKnownComplete(ulong tick) => _timeline.IsTickComplete(tick);
 
+    // Refreshes and returns the last completed tick (profiling).
+    internal ulong RefreshCompletedTick()
+    {
+        _timeline.RefreshCompletedTick();
+        return _timeline.CompletedTick;
+    }
+
     public bool IsTickComplete(ulong tick)
     {
         if (_timeline.IsTickComplete(tick))
@@ -525,6 +532,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         _command.End();
         var buffer = _command.Buffer;
+        var completedBefore = VideoOut.GpuBacklogProfile.Enabled ? RefreshCompletedTick() : 0;
         bool submitted;
         string failure;
         ulong tick;
@@ -562,6 +570,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3, _command.DebugArg4);
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
         _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
+        if (VideoOut.GpuBacklogProfile.Enabled) VideoOut.GpuBacklogProfile.NoteSubmit(tick, completedBefore);
         _command.Buffer = 0;
         _submitted?.Invoke(tick);
         return tick;

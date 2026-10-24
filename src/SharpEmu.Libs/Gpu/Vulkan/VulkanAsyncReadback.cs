@@ -37,9 +37,11 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         public bool Busy;
     }
 
-    internal sealed class Ticket(Slot slot, ulong value, ulong[] offsets, ulong[] sizes)
+    internal sealed class Ticket(Slot slot, ulong value, ulong[] offsets, ulong[] sizes, ulong mainTick)
     {
         public Slot Slot { get; } = slot;
+        // The main-queue tick the copy waits for.
+        public ulong MainTick { get; } = mainTick;
         public ulong Value { get; } = value;
         public ulong[] Offsets { get; } = offsets;
         public ulong[] Sizes { get; } = sizes;
@@ -151,6 +153,9 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             _waiters++;
         }
 
+        var backlog = VideoOut.GpuBacklogProfile.Enabled && ticket.MainTick != 0
+            ? VideoOut.GpuBacklogProfile.Begin(ticket.MainTick, _scheduler.RefreshCompletedTick())
+            : default;
         try
         {
             var vk = _device.Vk;
@@ -182,6 +187,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         }
         finally
         {
+            VideoOut.GpuBacklogProfile.End(backlog);
             lock (_gate)
             {
                 _waiters--;
@@ -298,7 +304,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         };
         Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
         slot.Busy = true;
-        return new Ticket(slot, signalValue, offsets, sizes);
+        return new Ticket(slot, signalValue, offsets, sizes, waitTick);
     }
 
     public delegate void ReadbackConsumer(int index, ReadOnlySpan<byte> bytes);
