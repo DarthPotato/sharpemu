@@ -5448,6 +5448,10 @@ public static partial class Gen5SpirvTranslator
                 var broadcast = BroadcastWaveLane(sourceValue, selectedLane);
                 StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, broadcast));
             }
+            else if (_subgroupInvocationIdInput != 0 && ReadsGraphicsLanes)
+            {
+                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, ReadPresentGraphicsLane(sourceValue, selectedLane)));
+            }
             else
             {
                 // Fallback: no subgroup ops, read current lane's value, or the
@@ -5456,6 +5460,43 @@ public static partial class Gen5SpirvTranslator
             }
 
             return true;
+        }
+
+        // A pixel or vertex wave runs as one 32-lane host subgroup. V_READLANE gives every lane the
+        // same scalar: reading the lane's own value instead made each invocation see a different
+        // "scalar", and a wave-wide reduction loop (DPP min, then readlane 31/63, then retire the
+        // lanes equal to the minimum) never emptied its lane mask and ran until the step guard.
+        // SHARPEMU_GRAPHICS_READLANE=0 restores the per-invocation read.
+        private static readonly bool GraphicsReadlaneEnabled =
+            Environment.GetEnvironmentVariable("SHARPEMU_GRAPHICS_READLANE") != "0";
+
+        private bool ReadsGraphicsLanes =>
+            GraphicsReadlaneEnabled && !_pairedLanes &&
+            _stage is Gen5SpirvStage.Pixel or Gen5SpirvStage.Vertex &&
+            _waveLowering is NativeWave32Lowering;
+
+        // The selected lane's value, or, when no host invocation sits in that lane (a fragment
+        // subgroup whose quads were never launched), the value of the highest present lane below
+        // it: a lane prefix (DPP row shifts) gathers toward the highest present lane. The choice
+        // depends only on the subgroup ballot, so every invocation reads the same lane.
+        private uint ReadPresentGraphicsLane(uint value, uint selectedLane)
+        {
+            var present = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _uintType,
+                _module.AddInstruction(SpirvOp.GroupNonUniformBallot, _uvec4Type, UInt(3), _module.ConstantBool(true)),
+                0);
+            var lane = BitwiseAnd(selectedLane, UInt(31));
+            var atOrBelow = BitwiseAnd(
+                present,
+                ShiftRightLogical(UInt(uint.MaxValue), _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(31), lane)));
+            var source = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                IsNotZero(atOrBelow),
+                Ext(75, _uintType, atOrBelow),
+                Ext(73, _uintType, present));
+            return ShuffleLane(value, source);
         }
 
         private bool TryGetFixedLane(Gen5Operand operand, out uint lane)

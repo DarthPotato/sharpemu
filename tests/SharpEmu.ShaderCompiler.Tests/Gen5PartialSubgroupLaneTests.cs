@@ -79,6 +79,20 @@ public sealed class Gen5PartialSubgroupLaneTests
         Assert.Equal(1, Count(CompilePixel(new Gen5Dpp8Control(0x053977, true)), GroupNonUniformShuffle));
     }
 
+    [Theory]
+    [InlineData(31u)]
+    [InlineData(63u)]
+    public void PixelReadlane_ReadsOneLaneForTheWholeSubgroup(uint lane)
+    {
+        // Each invocation used to read its own value, so a "scalar" differed per lane and a
+        // reduction loop over the wave never retired its lanes. The lane comes from a ballot of
+        // the present invocations, so an absent lane falls back to one that exists.
+        var words = CompilePixel(ResourceTestProgram.ReadLane(0, 20, 3, lane));
+        // The old per-invocation read shuffled nothing.
+        Assert.Equal(1, Count(words, GroupNonUniformShuffle));
+        Assert.True(Count(words, GroupNonUniformBallot) >= 1);
+    }
+
     [Fact]
     public void PixelPermlane_WithoutFetchInactive_JudgesThePartnerWithAnExecBallot()
     {
