@@ -5575,6 +5575,31 @@ public static partial class Gen5SpirvTranslator
             }
 
             var sourceActive = IsGuestLaneExecActive(targetLane);
+            if (PermlaneAbsentLaneReadsOwnValue && _stage is Gen5SpirvStage.Pixel or Gen5SpirvStage.Vertex &&
+                FeedsIdempotentCombine(instruction, out var permuted))
+            {
+                // A wave reduction first enables every lane and pads the unused ones with the
+                // operation's identity, so on the console the partner always exists. A partly
+                // launched host subgroup has no invocation there: zero then became the minimum
+                // of a waterfall loop that no lane matched, and the loop ran to the step guard.
+                // For the reduction step right after this permute only, a missing partner reads
+                // as the lane's own source, the identity of an idempotent combine. The register
+                // itself keeps zero for every other reader.
+                if (_permuteIdentity == 0)
+                {
+                    _permuteIdentity = _module.AddGlobalVariable(
+                        _privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, 0));
+                    _interfaces.Add(_permuteIdentity);
+                    _module.AddName(_permuteIdentity, "permuteIdentity");
+                }
+
+                var identity = _module.AddInstruction(
+                    SpirvOp.Select, _uintType, IsGuestLanePresent(targetLane), UInt(0), value);
+                Store(_permuteIdentity, _module.AddInstruction(SpirvOp.Select, _uintType, sourceActive, shuffled, identity));
+                _permuteIdentityIndex = _emittingIndex + 1;
+                _permuteIdentityRegister = permuted;
+            }
+
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -5582,6 +5607,46 @@ public static partial class Gen5SpirvTranslator
                 shuffled,
                 UInt(0));
         }
+
+        private static readonly HashSet<string> IdempotentCombines =
+        [
+            "VMinU32", "VMinI32", "VMinF32", "VMaxU32", "VMaxI32", "VMaxF32", "VAndB32", "VOrB32",
+        ];
+
+        // True for an in-place reduction step: the instruction after this permute combines the
+        // permuted value with the permute's own source through min, max, and or or, writes the
+        // result back to that source, and has no modifier that would make the combine other
+        // than idempotent. Then the source is the identity for a missing partner.
+        // The next instruction must be in the same block, so no other path reaches it without
+        // this permute.
+        private bool FeedsIdempotentCombine(Gen5ShaderInstruction instruction, out uint permuted)
+        {
+            permuted = 0;
+            var instructions = _request.Program.Instructions;
+            if (instruction.Destinations.Count == 0 || instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                instruction.Sources.Count == 0 || instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister ||
+                _emittingIndex < 0 || _emittingIndex + 1 >= _emittingBlockEnd ||
+                !ReferenceEquals(instructions[_emittingIndex], instruction))
+                return false;
+            permuted = instruction.Destinations[0].Value;
+            var source = instruction.Sources[0].Value;
+            // A permute in place leaves no copy of the source to combine with.
+            if (permuted == source)
+                return false;
+            var next = instructions[_emittingIndex + 1];
+            var plain = next.Control is null ||
+                next.Control is Gen5Vop3Control { AbsoluteMask: 0, NegateMask: 0, OutputModifier: 0, OperandSelect: 0 };
+            var target = permuted;
+            return plain && IdempotentCombines.Contains(next.Opcode) &&
+                next.Sources.Count == 2 && next.Destinations.Count == 1 &&
+                next.Destinations[0] is { Kind: Gen5OperandKind.VectorRegister } written && written.Value == source &&
+                next.Sources.All(operand => operand.Kind == Gen5OperandKind.VectorRegister) &&
+                next.Sources.Any(operand => operand.Value == source) && next.Sources.Any(operand => operand.Value == target);
+        }
+
+        // SHARPEMU_PERMLANE_ABSENT_SELF=0 restores zero for a permute partner absent from the host subgroup.
+        private static readonly bool PermlaneAbsentLaneReadsOwnValue =
+            Environment.GetEnvironmentVariable("SHARPEMU_PERMLANE_ABSENT_SELF") != "0";
 
         private uint GetInt16Source(Gen5ShaderInstruction instruction, int sourceIndex, bool signed)
         {

@@ -1712,6 +1712,9 @@ public static partial class Gen5SpirvTranslator
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
                 var instruction = _request.Program.Instructions[index];
+                _emittingIndex = index;
+                _emittingBlockEnd = block.EndIndex;
+                if (_permuteIdentityIndex != index) _permuteIdentityIndex = -1;
                 if (_stage != Gen5SpirvStage.Mesh) _waveLowering.BeforeInstruction(instruction);
                 if (IsBranch(instruction.Opcode) || instruction.Opcode == "SEndpgm")
                 {
@@ -9136,7 +9139,20 @@ public static partial class Gen5SpirvTranslator
                 ? value
                 : Load(_uintType, ScalarPointer(register));
 
-        private uint LoadV(uint register) => Load(_uintType, VectorPointer(register));
+        private uint LoadV(uint register) =>
+            _permuteIdentityIndex == _emittingIndex && register == _permuteIdentityRegister
+                ? Load(_uintType, _permuteIdentity)
+                : Load(_uintType, VectorPointer(register));
+
+        // The instruction being emitted by the block loop, and the end of its block.
+        private int _emittingIndex = -1;
+        private int _emittingBlockEnd = -1;
+
+        // A reduction step's permute leaves, for the combine right after it only, the value its
+        // register would hold if a missing partner read as the reduction's identity.
+        private int _permuteIdentityIndex = -1;
+        private uint _permuteIdentityRegister;
+        private uint _permuteIdentity;
 
         private void StoreS(uint register, uint value)
         {
@@ -9526,15 +9542,17 @@ public static partial class Gen5SpirvTranslator
         // graphics subgroup (fragment quads never launched) reads as inactive instead of
         // the undefined result of shuffling from a lane that is not there. The lane is
         // masked the same way ShuffleLane masks it, so both address the same invocation.
-        private uint IsGuestLaneExecActive(uint lane)
-        {
-            if (_subgroupInvocationIdInput == 0)
-            {
-                return Load(_boolType, _exec);
-            }
+        private uint IsGuestLaneExecActive(uint lane) =>
+            _subgroupInvocationIdInput == 0 ? Load(_boolType, _exec) : IsGuestLaneInBallot(lane, Load(_boolType, _exec));
 
+        // True when a host invocation sits behind the guest lane at all, active or not.
+        private uint IsGuestLanePresent(uint lane) =>
+            _subgroupInvocationIdInput == 0 ? _module.ConstantBool(true) : IsGuestLaneInBallot(lane, _module.ConstantBool(true));
+
+        private uint IsGuestLaneInBallot(uint lane, uint condition)
+        {
             var ballot = _module.AddInstruction(
-                SpirvOp.GroupNonUniformBallot, _uvec4Type, UInt(3), Load(_boolType, _exec));
+                SpirvOp.GroupNonUniformBallot, _uvec4Type, UInt(3), condition);
             uint word;
             if (_waveLowering is NativeWave64Lowering)
             {

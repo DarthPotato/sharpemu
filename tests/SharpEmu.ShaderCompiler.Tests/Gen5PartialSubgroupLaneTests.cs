@@ -18,9 +18,15 @@ public sealed class Gen5PartialSubgroupLaneTests
     private const uint GroupNonUniformBallot = 339;
     private const uint GroupNonUniformShuffle = 345;
 
-    private static uint[] CompilePixel(Gen5ShaderInstruction instruction)
+    private static uint[] CompilePixel(Gen5ShaderInstruction instruction) =>
+        CompilePixel([instruction]);
+
+    // The body's instructions are placed one after another (each is 8 bytes), then s_endpgm.
+    private static uint[] CompilePixel(Gen5ShaderInstruction[] body)
     {
-        var program = ResourceTestProgram.Program(instruction, ResourceTestProgram.EndProgram(8));
+        var instructions = body.Select((instruction, index) => instruction with { Pc = (uint)index * 8 })
+            .Append(ResourceTestProgram.EndProgram((uint)body.Length * 8)).ToArray();
+        var program = ResourceTestProgram.Program(instructions);
         var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
@@ -91,6 +97,21 @@ public sealed class Gen5PartialSubgroupLaneTests
         // The old per-invocation read shuffled nothing.
         Assert.Equal(1, Count(words, GroupNonUniformShuffle));
         Assert.True(Count(words, GroupNonUniformBallot) >= 1);
+    }
+
+    [Fact]
+    public void PixelPermlane_AbsentPartner_ReadsOwnValueOnlyBeforeAnIdempotentCombine()
+    {
+        // Before a min, an absent partner (one more ballot, of every present invocation) gives the
+        // lane's own value, the identity of the reduction. Before an add it stays zero.
+        var permute = ResourceTestProgram.Vop3(0, "VPermlanex16B32", 4,
+            Gen5Operand.Vector(3), ResourceTestProgram.Operand(uint.MaxValue), ResourceTestProgram.Operand(uint.MaxValue));
+        var reduce = CompilePixel([permute, ResourceTestProgram.Vop3(0, "VMinU32", 3, Gen5Operand.Vector(3), Gen5Operand.Vector(4))]);
+        var sum = CompilePixel([permute, ResourceTestProgram.Vop3(0, "VAddU32", 3, Gen5Operand.Vector(3), Gen5Operand.Vector(4))]);
+        // A min of the permuted value with something other than its source is no reduction step.
+        var unrelated = CompilePixel([permute, ResourceTestProgram.Vop3(0, "VMinU32", 5, Gen5Operand.Vector(6), Gen5Operand.Vector(4))]);
+        Assert.Equal(1, Count(reduce, GroupNonUniformBallot) - Count(sum, GroupNonUniformBallot));
+        Assert.Equal(Count(sum, GroupNonUniformBallot), Count(unrelated, GroupNonUniformBallot));
     }
 
     [Fact]
