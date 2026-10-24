@@ -18,9 +18,13 @@ public sealed class RegionLock
     private int _held;
     private int _owner;
     private long _holdStarted;
+    private long _pendingWaitTicks;
+    private long _protectionAtEnter;
     private GpuMemoryAccessProfile.Operation _holdOperation;
 
     public RegionLock(Category category = Category.MemoryTracker) => _category = category;
+
+    private static bool Timed => GpuMemoryAccessProfile.Enabled || RegionLockTrace.Enabled;
 
     public readonly ref struct Held
     {
@@ -46,22 +50,32 @@ public sealed class RegionLock
             return;
         }
 
+        long waited = 0;
         if (Interlocked.CompareExchange(ref _held, 1, 0) != 0)
         {
-            var waitStarted = GpuMemoryAccessProfile.Enabled ? Stopwatch.GetTimestamp() : 0;
+            var waitStarted = Timed ? Stopwatch.GetTimestamp() : 0;
             do
             {
                 Thread.SpinWait(1);
             }
             while (Interlocked.CompareExchange(ref _held, 1, 0) != 0);
-            if (GpuMemoryAccessProfile.Enabled)
-                GpuMemoryAccessProfile.RecordLockWait(_category, Stopwatch.GetTimestamp() - waitStarted);
+
+            if (Timed)
+            {
+                waited = Stopwatch.GetTimestamp() - waitStarted;
+                if (GpuMemoryAccessProfile.Enabled)
+                    GpuMemoryAccessProfile.RecordLockWait(_category, waited);
+            }
         }
 
         Volatile.Write(ref _owner, thread);
-        if (GpuMemoryAccessProfile.Enabled)
+        if (Timed)
         {
             _holdOperation = GpuMemoryAccessProfile.GetLockOperation(_category, hold: true);
+            // Recorded after release: the trace allocates outside fault handlers.
+            _pendingWaitTicks = waited;
+            _protectionAtEnter = GpuMemoryAccessProfile.ProtectionTicks;
+            GpuMemoryAccessProfile.RegionLocksHeld++;
             _holdStarted = Stopwatch.GetTimestamp();
         }
     }
@@ -76,10 +90,19 @@ public sealed class RegionLock
 
         // Copy measurements before release; the next owner can then replace the lock's fields.
         var holdOperation = _holdOperation;
-        var holdTicks = GpuMemoryAccessProfile.Enabled ? Stopwatch.GetTimestamp() - _holdStarted : 0;
+        var holdTicks = Timed ? Stopwatch.GetTimestamp() - _holdStarted : 0;
+        var waitTicks = _pendingWaitTicks;
+        var protectionTicks = Timed ? GpuMemoryAccessProfile.ProtectionTicks - _protectionAtEnter : 0;
         Volatile.Write(ref _owner, 0);
         Volatile.Write(ref _held, 0);
         if (GpuMemoryAccessProfile.Enabled)
             GpuMemoryAccessProfile.RecordLockHold(holdOperation, holdTicks);
+        if (Timed)
+            GpuMemoryAccessProfile.RegionLocksHeld--;
+        if (RegionLockTrace.Enabled)
+        {
+            RegionLockTrace.Record(hold: false, waitTicks);
+            RegionLockTrace.Record(hold: true, holdTicks, protectionTicks);
+        }
     }
 }

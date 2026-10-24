@@ -84,13 +84,42 @@ public static class GpuMemoryAccessProfile
     private static readonly Measurements Counters = new();
     [ThreadStatic] private static int _faultDepth;
 
+    // Fault depth is counted only while either profile that needs it is on.
+    internal static bool InFault => _faultDepth != 0;
+
+    private static bool TracksFaults => Enabled || RegionLockTrace.Enabled;
+
     // Initialize before protected pages can fault, not from the fault handler.
-    internal static void Initialize() => _ = Counters;
+    // The region lock trace reads its setting in a static initializer, which allocates.
+    internal static void Initialize()
+    {
+        _ = Counters;
+        _ = RegionLockTrace.Enabled;
+    }
+
+    // Host protection time this thread spent so far, for the region lock trace.
+    [ThreadStatic] private static long _protectionTicks;
+
+    internal static long ProtectionTicks => _protectionTicks;
+
+    internal static void AddProtectionTicks(long ticks) => _protectionTicks += ticks;
+
+    // Region locks this thread holds while the region lock trace is on.
+    [ThreadStatic] private static int _regionLocksHeld;
+
+    internal static int RegionLocksHeld
+    {
+        get => _regionLocksHeld;
+        set => _regionLocksHeld = value;
+    }
 
     // Prepare thread-local storage before guest code can cause a memory fault.
     internal static void InitializeCurrentThread()
     {
-        if (Enabled) Volatile.Write(ref _faultDepth, _faultDepth);
+        if (!TracksFaults) return;
+        Volatile.Write(ref _faultDepth, _faultDepth);
+        Volatile.Write(ref _protectionTicks, _protectionTicks);
+        Volatile.Write(ref _regionLocksHeld, _regionLocksHeld);
     }
 
     internal static Measurement[] Snapshot() => Counters.Snapshot();
@@ -152,7 +181,7 @@ public static class GpuMemoryAccessProfile
             if (!_active) return;
             var elapsed = Stopwatch.GetTimestamp() - _started;
             if (_fault) _faultDepth--;
-            Counters.Record(_operation, elapsed, _bytes);
+            if (Enabled) Counters.Record(_operation, elapsed, _bytes);
         }
     }
 
@@ -171,7 +200,7 @@ public static class GpuMemoryAccessProfile
     internal static Scope MeasureAccess(Operation regular, Operation fault, ulong bytes = 0) =>
         Enabled ? new Scope(_faultDepth == 0 ? regular : fault, bytes, false) : default;
 
-    internal static Scope MeasureFault(FaultKind kind) => Enabled
+    internal static Scope MeasureFault(FaultKind kind) => TracksFaults
         ? new Scope(kind switch
         {
             FaultKind.Write => Operation.WriteFault,
