@@ -1165,7 +1165,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdDraw(command, count, instanceCount, firstVertex, firstInstance);
             _occlusionQueries?.TraceDraw();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
-                _boundGraphicsPipeline?.Id ?? 0, count, instanceCount);
+                _boundGraphicsPipeline?.Id ?? 0, count, instanceCount, 0,
+                _profileMeshDrawState with { Width = _renderingState.Width, Height = _renderingState.Height });
             CountDraw();
         }
 
@@ -1195,7 +1196,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdDrawIndexed(command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
             _occlusionQueries?.TraceDraw(indexCount);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
-                _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount);
+                _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount, 0,
+                _profileMeshDrawState with { Width = _renderingState.Width, Height = _renderingState.Height });
             CountDraw();
         }
 

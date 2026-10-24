@@ -275,10 +275,11 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
             foreach (var (key, total) in _totals.OrderByDescending(pair => pair.Value.Milliseconds).Take(ReportedKeys))
             {
                 _write($"[PERF][GPU_INTERVAL] kind={key.Kind} pipeline={key.Pipeline} count={total.Count} total_ms={total.Milliseconds:F3} avg_ms={total.Milliseconds / total.Count:F3} max_ms={total.MaximumMilliseconds:F3} max_args={total.MaximumMarker.First},{total.MaximumMarker.Second},{total.MaximumMarker.Third} mesh_groups={total.MeshGroups:F0}");
-                if (key.Kind == IntervalKind.MeshDraw)
+                if (key.Kind is IntervalKind.MeshDraw or IntervalKind.Draw or IntervalKind.DrawIndexed)
                 {
                     var state = total.MaximumMarker.MeshState;
-                    _write($"[PERF][GPU_MESH_MAX] pipeline={key.Pipeline} target={state.Width}x{state.Height} " +
+                    var label = key.Kind == IntervalKind.MeshDraw ? "GPU_MESH_MAX" : "GPU_DRAW_MAX";
+                    _write($"[PERF][{label}] pipeline={key.Pipeline} target={state.Width}x{state.Height} " +
                         $"viewport={state.ViewportWidth}x{state.ViewportHeight} scissor={state.ScissorWidth}x{state.ScissorHeight} " +
                         $"depth_test={state.DepthTest} depth_write={state.DepthWrite}");
                 }
