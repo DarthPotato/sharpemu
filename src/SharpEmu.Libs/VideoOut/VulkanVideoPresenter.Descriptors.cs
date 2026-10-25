@@ -222,11 +222,28 @@ internal static unsafe partial class VulkanVideoPresenter
             return ResolveImageBindingFull(image, words, program, index);
         }
 
-        private TextureResource ResolveImageBindingFull(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
+        // Its inlinees leave a frame of many request-sized temporaries; none holds a reference, and
+        // every one is written before it is read, so the frame is not zeroed on entry.
+        private TextureResource ResolveImageBindingFull(ImageResource image, uint[] words, ShaderProgramInfo program, int index) =>
+            index >= 0
+                ? ResolveImageBindingFull(image, words, program, index, ref ImageBindingMemoOf(program, index))
+                : ResolveUnmemoizedImageBinding(image, words, program, index);
+
+        // A negative index has no slot in the program's memos (a registered runtime image): look it up
+        // afresh. Kept apart so the memo-sized local, which holds a reference, stays out of the hot frame.
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private TextureResource ResolveUnmemoizedImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
-            // A negative index has no slot in the program's memos (a registered runtime image): look it up afresh.
             var unmemoized = default(ImageBindingMemo);
-            ref var memo = ref (index >= 0 ? ref ImageBindingMemoOf(program, index) : ref unmemoized);
+            return ResolveImageBindingFull(image, words, program, index, ref unmemoized);
+        }
+
+        // Its inlinees leave a frame of many request-sized temporaries; none holds a reference, and
+        // every one is written before it is read, so the frame is not zeroed on entry.
+        [System.Runtime.CompilerServices.SkipLocalsInit]
+        private TextureResource ResolveImageBindingFull(ImageResource image, uint[] words, ShaderProgramInfo program, int index,
+            ref ImageBindingMemo memo)
+        {
             if (words.Length < 4)
             {
                 throw SubmissionScheduler.Fatal($"An image descriptor is too short: image={index} words={words.Length} hash=0x{program.Hash:X16}.");
@@ -260,19 +277,20 @@ internal static unsafe partial class VulkanVideoPresenter
                 var metadataBaseLayer = request.View.BaseLayer;
                 imageIdentifier = _imageCache.FindImage(ref request, resolution.ExactFormat);
                 resolution = resolution with { Request = request };
-                memo = !ImageDescription.IsEmptyRange(request.Description.Data)
-                    ? new ImageBindingMemo
-                    {
-                        Words = (uint[])words.Clone(),
-                        Generation = _imageCache.LookupGeneration,
-                        Resolution = resolution,
-                        OriginalResolution = originalResolution,
-                        Found = imageIdentifier,
-                        MetadataBaseLayer = metadataBaseLayer,
-                        CompletesLookup = request.Description.Metadata.Kind == MetadataKind.Dcc ||
-                            _imageCache.GetImage(imageIdentifier).Description.DccSliceSize != 0,
-                    }
-                    : default;
+                // Written field by field: a memo-sized temporary is zeroed on every miss. The words go
+                // last, so a memo left half written by an exception never matches.
+                memo.Words = null;
+                if (!ImageDescription.IsEmptyRange(request.Description.Data))
+                {
+                    memo.Generation = _imageCache.LookupGeneration;
+                    memo.Resolution = resolution;
+                    memo.OriginalResolution = originalResolution;
+                    memo.Found = imageIdentifier;
+                    memo.MetadataBaseLayer = metadataBaseLayer;
+                    memo.CompletesLookup = request.Description.Metadata.Kind == MetadataKind.Dcc ||
+                        _imageCache.GetImage(imageIdentifier).Description.DccSliceSize != 0;
+                    memo.Words = (uint[])words.Clone();
+                }
             }
 
             return FinishImageBinding(image, words, program, index, storage, imageIdentifier, resolution);
