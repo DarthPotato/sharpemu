@@ -36,7 +36,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (OnCommandThread)
             {
                 if (!_guestPublications.HasOverlap(address, size, includeLabels, skipGpuSlots)) return;
-                _commandThread!.Run(() => CompleteOverlappingPublications(address, size, includeLabels, skipGpuSlots));
+                CompleteOverlappingPublicationsOnRenderThread(address, size, includeLabels, skipGpuSlots);
                 return;
             }
             var tick = _guestPublications.OverlapTick(address, size, includeLabels, skipGpuSlots);
@@ -44,6 +44,11 @@ internal static unsafe partial class VulkanVideoPresenter
             _scheduler.Wait(tick);
             _scheduler.RunCompletedOperations();
         }
+        // The callback captures the arguments; built here, its closure is allocated only when the
+        // command thread hands the wait over, not on every call (texture bindings make thousands a frame).
+        private void CompleteOverlappingPublicationsOnRenderThread(ulong address, ulong size, bool includeLabels, bool skipGpuSlots) =>
+            _commandThread!.Run(() => CompleteOverlappingPublications(address, size, includeLabels, skipGpuSlots));
+
         public bool TryReadOcclusionCounter(int queueId, out ulong value)
         {
             if (OnCommandThread)
