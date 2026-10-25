@@ -513,6 +513,7 @@ internal static class RenderPhaseProfile
         SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.WriteReport();
         SharpEmu.HLE.GpuMemory.GpuMemoryAccessProfile.WriteReport();
         SharpEmu.HLE.GpuMemory.RegionLockTrace.WriteReport();
+        Diagnostics.ShaderSyncProfile.Report();
         WindowPollProfile.Report();
         SharpEmu.HLE.GuestMemory.GuestMemoryProfile.WriteReport();
         var commandReads = new List<string>();

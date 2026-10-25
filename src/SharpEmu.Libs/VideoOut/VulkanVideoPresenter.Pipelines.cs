@@ -188,8 +188,11 @@ internal static unsafe partial class VulkanVideoPresenter
                         Diagnostics.GpuReadTrace.Record(address, ResourceMaterializationCache.ReadingTable);
                     }
 
-                    if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
-                            SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
+                    var syncStarted = Diagnostics.ShaderSyncProfile.Start();
+                    var readable = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
+                        SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
+                    Diagnostics.ShaderSyncProfile.Record(syncStarted);
+                    if (!readable)
                     {
                         return false;
                     }
