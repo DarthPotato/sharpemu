@@ -23,28 +23,113 @@ internal static class GpuWritebackEpoch
         Volatile.Read(ref _activeWriters) == 0 && Volatile.Read(ref _value) == recorded;
 
     // Wraps one store of GPU data into guest memory; may run on any thread.
-    public static WriteScope BeginWrite()
+    public static WriteScope BeginWrite(ulong address, ulong size)
     {
         Interlocked.Increment(ref _activeWriters);
-        Interlocked.Increment(ref _value);
-        return new WriteScope(true);
+        if (!RecordsHistory)
+        {
+            return new WriteScope(Interlocked.Increment(ref _value));
+        }
+
+        // Counted and recorded together, so the floor never misses a store and the history stays in
+        // count order.
+        lock (HistoryGate)
+        {
+            var epoch = Interlocked.Increment(ref _value);
+            History[_historyCount % HistoryCapacity] = (epoch, address, size);
+            _historyCount++;
+            ActiveBegins.Add(epoch);
+            return new WriteScope(epoch);
+        }
+    }
+
+    // With the render profile, the ranges of recent stores are kept to tell whether a stale
+    // resolution read what a store wrote, or was rejected for a store elsewhere.
+    public static readonly bool RecordsHistory = VideoOut.RenderPhaseProfile.Enabled;
+    private const int HistoryCapacity = 4096;
+    private static readonly (long Epoch, ulong Address, ulong Size)[] History = new (long, ulong, ulong)[HistoryCapacity];
+    private static readonly List<long> ActiveBegins = new();
+    private static readonly object HistoryGate = new();
+    private static long _historyCount;
+
+    // Taken where work records Value: the start count of the oldest store still writing then, or
+    // Value itself. Every store that can overlap the work started at or after it.
+    public static long HistoryFloor()
+    {
+        if (!RecordsHistory)
+        {
+            return Value;
+        }
+
+        lock (HistoryGate)
+        {
+            var floor = Value;
+            foreach (var begin in ActiveBegins)
+            {
+                floor = Math.Min(floor, begin);
+            }
+
+            return floor;
+        }
+    }
+
+    public enum StaleCause
+    {
+        // A store since the floor overlapped a range the resolution read.
+        Overlapping,
+        // Every store since the floor was elsewhere.
+        Disjoint,
+        // The history no longer reaches back to the floor.
+        Unknown,
+    }
+
+    public static StaleCause ClassifyStores(long floor, Func<ulong, ulong, bool> wasRead)
+    {
+        lock (HistoryGate)
+        {
+            var oldest = Math.Max(0, _historyCount - HistoryCapacity);
+            for (var index = _historyCount - 1; index >= oldest; index--)
+            {
+                var (epoch, address, size) = History[index % HistoryCapacity];
+                if (epoch < floor)
+                {
+                    return StaleCause.Disjoint;
+                }
+
+                if (wasRead(address, size))
+                {
+                    return StaleCause.Overlapping;
+                }
+            }
+
+            return oldest == 0 ? StaleCause.Disjoint : StaleCause.Unknown;
+        }
     }
 
     public readonly ref struct WriteScope
     {
-        private readonly bool _active;
+        // The store's start count; 0 for a scope that is not a store.
+        private readonly long _begin;
 
-        internal WriteScope(bool active) => _active = active;
+        internal WriteScope(long begin) => _begin = begin;
 
         public void Dispose()
         {
-            if (!_active)
+            if (_begin == 0)
             {
                 return;
             }
 
             // Counted before the writer leaves: a reader that sees no writer also sees the count move.
             Interlocked.Increment(ref _value);
+            if (RecordsHistory)
+            {
+                lock (HistoryGate)
+                {
+                    ActiveBegins.Remove(_begin);
+                }
+            }
+
             Interlocked.Decrement(ref _activeWriters);
         }
     }

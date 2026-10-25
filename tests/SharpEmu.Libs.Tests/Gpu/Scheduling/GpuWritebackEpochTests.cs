@@ -14,7 +14,7 @@ public sealed class GpuWritebackEpochTests
     public void WorkBeforeAStoreIsStale()
     {
         var recorded = GpuWritebackEpoch.Value;
-        using (GpuWritebackEpoch.BeginWrite())
+        using (GpuWritebackEpoch.BeginWrite(0x1000, 4))
         {
         }
 
@@ -24,7 +24,7 @@ public sealed class GpuWritebackEpochTests
     [Fact]
     public void WorkStartedDuringAStoreIsStaleDuringAndAfterIt()
     {
-        var scope = GpuWritebackEpoch.BeginWrite();
+        var scope = GpuWritebackEpoch.BeginWrite(0x1000, 4);
         var recorded = GpuWritebackEpoch.Value;
         Assert.False(GpuWritebackEpoch.Unchanged(recorded));
         scope.Dispose();

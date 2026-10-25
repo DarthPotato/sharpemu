@@ -22,6 +22,8 @@ internal static unsafe partial class VulkanVideoPresenter
         public readonly long WritebackEpoch = writebackEpoch;
         public readonly List<(ConcurrentQuery Query, ulong Address, ulong Size, bool Answer)> Answers = new();
         public bool ReadsImageOwnership;
+        // GpuWritebackEpoch.HistoryFloor at the start (render profile diagnostics only).
+        public long HistoryFloor;
 
         public void Record(ConcurrentQuery query, ulong address, ulong size, bool answer)
         {
@@ -52,11 +54,17 @@ internal static unsafe partial class VulkanVideoPresenter
     private static long _staleByWriteback;
     private static long _staleByAnswer;
 
+    // Writeback-stale resolutions by whether a store overlapped a range they read through the recorded
+    // readers (other reads, such as shader code, are not recorded): overlapping, disjoint, unknown.
+    private static readonly long[] _staleWritebackCauses = new long[3];
+
     internal static string TakeStaleReport()
     {
-        var line = $"[PERF][PROGRAM_PREFETCH_STALE] writeback_epoch={_staleByWriteback} ownership_answer={_staleByAnswer}";
+        var line = $"[PERF][PROGRAM_PREFETCH_STALE] writeback_epoch={_staleByWriteback} ownership_answer={_staleByAnswer} " +
+            $"writeback_overlapping={_staleWritebackCauses[0]} writeback_disjoint={_staleWritebackCauses[1]} writeback_unknown={_staleWritebackCauses[2]}";
         _staleByWriteback = 0;
         _staleByAnswer = 0;
+        Array.Clear(_staleWritebackCauses);
         return line;
     }
 
@@ -71,8 +79,15 @@ internal static unsafe partial class VulkanVideoPresenter
         [ThreadStatic]
         private static ConcurrentAssumptions? _concurrentAssumptions;
 
-        void IConcurrentResolveHost.BeginConcurrentResolve() =>
-            _concurrentAssumptions = new ConcurrentAssumptions(_bufferCache.GpuModifiedVersion, GpuWritebackEpoch.Value);
+        void IConcurrentResolveHost.BeginConcurrentResolve()
+        {
+            // The floor first: a store still writing when the epoch is read started at or after it.
+            var historyFloor = GpuWritebackEpoch.HistoryFloor();
+            _concurrentAssumptions = new ConcurrentAssumptions(_bufferCache.GpuModifiedVersion, GpuWritebackEpoch.Value)
+            {
+                HistoryFloor = historyFloor,
+            };
+        }
 
         object IConcurrentResolveHost.EndConcurrentResolve()
         {
@@ -89,6 +104,21 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!GpuWritebackEpoch.Unchanged(assumptions.WritebackEpoch))
             {
                 _staleByWriteback++;
+                if (GpuWritebackEpoch.RecordsHistory)
+                {
+                    var cause = GpuWritebackEpoch.ClassifyStores(assumptions.HistoryFloor, (address, size) =>
+                    {
+                        foreach (var answer in assumptions.Answers)
+                        {
+                            if (address < answer.Address + answer.Size && answer.Address < address + size)
+                                return true;
+                        }
+
+                        return false;
+                    });
+                    _staleWritebackCauses[(int)cause]++;
+                }
+
                 return false;
             }
 
