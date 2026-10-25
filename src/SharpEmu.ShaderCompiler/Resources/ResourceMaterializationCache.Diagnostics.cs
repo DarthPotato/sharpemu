@@ -265,12 +265,74 @@ public sealed partial class ResourceMaterializationCache
         }
     }
 
+    // Which used user data words differ from the previous key miss of the same draw key, and how the
+    // address rebase treats them: names the per-draw words that keep a shader from ever hitting.
+    private static readonly Dictionary<(ulong Hash, ShaderStage Stage, int Index, string Class), long> KeyChanges = new();
+    private static readonly Dictionary<(ulong Hash, ShaderStage Stage, int Changed), long> KeyChangeCounts = new();
+    private readonly Dictionary<ulong, uint[]> _lastMissUserData = new();
+
+    private void RecordKeyChange(ShaderResourcePlan plan, ulong drawKey, IReadOnlyList<uint> userData, ulong[]? learned,
+        AddressRebase rebase)
+    {
+        if (!MissDiagnosticsEnabled) return;
+        lock (MissReportLock)
+        {
+            var current = userData.ToArray();
+            if (!_lastMissUserData.TryGetValue(drawKey, out var previous) || previous.Length != current.Length)
+            {
+                if (_lastMissUserData.Count < 65536) _lastMissUserData[drawKey] = current;
+                return;
+            }
+
+            _lastMissUserData[drawKey] = current;
+            var changed = 0;
+            for (var index = 0; index < current.Length; index++)
+            {
+                if (learned is null || !IsUsed(learned, index) || current[index] == previous[index])
+                    continue;
+                changed++;
+                var key = (plan.Hash, plan.Stage, index, rebase.Describe(index));
+                if (KeyChanges.Count < MaximumProfileKeys * 8 || KeyChanges.ContainsKey(key))
+                    KeyChanges[key] = KeyChanges.GetValueOrDefault(key) + 1;
+            }
+
+            var countKey = (plan.Hash, plan.Stage, changed);
+            if (KeyChangeCounts.Count < MaximumProfileKeys * 4 || KeyChangeCounts.ContainsKey(countKey))
+                KeyChangeCounts[countKey] = KeyChangeCounts.GetValueOrDefault(countKey) + 1;
+        }
+    }
+
+    // Why the address rebase rejected user data words, with one difference sample per shader and reason.
+    private static readonly Dictionary<(ulong Hash, ShaderStage Stage, string Words, string Reason), (long Count, string? Sample)> RebaseRejections = new();
+
+    private static void RecordRebaseRejection(ShaderResourcePlan plan, List<int> words, string reason, string? difference)
+    {
+        if (!MissDiagnosticsEnabled) return;
+        lock (MissReportLock)
+        {
+            var key = (plan.Hash, plan.Stage, string.Join(',', words), reason);
+            if (RebaseRejections.Count >= MaximumProfileKeys * 4 && !RebaseRejections.ContainsKey(key))
+                return;
+            var entry = RebaseRejections.GetValueOrDefault(key);
+            RebaseRejections[key] = (entry.Count + 1, entry.Sample ?? difference);
+        }
+    }
+
     private static string TakeMissReport()
     {
         if (!MissDiagnosticsEnabled) return string.Empty;
         lock (MissReportLock)
         {
             var result = new System.Text.StringBuilder();
+            // Rejections are rare and final: kept for the whole run.
+            foreach (var (key, value) in RebaseRejections)
+                result.Append($"\n[PERF][RESOURCE_REBASE_REJECTED] hash={key.Hash:X16} stage={key.Stage} user_data={key.Words} reason={key.Reason} count={value.Count} sample={value.Sample?.Replace('\n', ' ')}");
+            foreach (var (key, count) in KeyChanges.OrderByDescending(pair => pair.Value).Take(40))
+                result.Append($"\n[PERF][RESOURCE_KEY_CHANGE] hash={key.Hash:X16} stage={key.Stage} user_data={key.Index} rebase={key.Class} misses={count}");
+            foreach (var (key, count) in KeyChangeCounts.OrderByDescending(pair => pair.Value).Take(20))
+                result.Append($"\n[PERF][RESOURCE_KEY_CHANGE_COUNT] hash={key.Hash:X16} stage={key.Stage} changed_words={key.Changed} misses={count}");
+            KeyChanges.Clear();
+            KeyChangeCounts.Clear();
             foreach (var (key, reason) in TransactionBuilds)
                 result.Append($"\n[PERF][RESOURCE_TRANSACTION_REJECTED] hash={key.Hash:X16} stage={key.Stage} table_only={key.TableOnly} reason={reason}");
             TransactionBuilds.Clear();

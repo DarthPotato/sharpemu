@@ -445,6 +445,12 @@ public sealed partial class ResourceMaterializationCache
         // The rebased words; replaced, never mutated, so a caller can compare references.
         public ulong[] Active { get; private set; } = [];
 
+        // For the miss diagnostics: how the rebase treats a user data word.
+        public string Describe(int index) =>
+            IsUsed(Active, index) ? "rebased" :
+            IsUsed(_rejected, index) ? "rejected" :
+            IsUsed(_candidateMask, index) ? "candidate" : "not_candidate";
+
         // Every rebased base dword of the entry equals the word it came from.
         public bool AppliesTo(Entry entry)
         {
@@ -534,7 +540,8 @@ public sealed partial class ResourceMaterializationCache
                 if (predict?.Invoke(previous, Or(Active, MaskOf(differing))) is not { } prediction)
                     return;
 
-                var agrees = Difference(prediction.Snapshot, previous.Specialization, built.Snapshot, built.Specialization) is null;
+                var difference = Difference(prediction.Snapshot, previous.Specialization, built.Snapshot, built.Specialization);
+                var agrees = difference is null;
                 if (prediction.Patches is { } patches)
                 {
                     // A wrong prediction that moved bases blames those bases, not the words.
@@ -544,6 +551,7 @@ public sealed partial class ResourceMaterializationCache
                 }
                 else if (!agrees)
                 {
+                    RecordRebaseRejection(_plan, differing, "prediction_differs", difference);
                     _rejected = Or(_rejected, MaskOf(differing));
                     if (Overlaps(Active, _rejected))
                         Active = AndNot(Active, _rejected);
@@ -557,6 +565,11 @@ public sealed partial class ResourceMaterializationCache
             if (reads == ReadComparison.Mismatch ||
                 !SameExceptBases(previous, built, differing, compareTable: reads == ReadComparison.SameBytes))
             {
+                if (MissDiagnosticsEnabled)
+                    RecordRebaseRejection(_plan, differing, reads == ReadComparison.Mismatch ? "reads_mismatch" : $"materialization_differs_{reads}",
+                        reads == ReadComparison.Mismatch
+                            ? DescribeMovedReadMismatch(this, previous, built, differing)
+                            : Difference(previous.Snapshot, previous.Specialization, built.Snapshot, built.Specialization));
                 _rejected = Or(_rejected, MaskOf(differing));
                 if (Overlaps(Active, _rejected))
                     Active = AndNot(Active, _rejected);
@@ -648,6 +661,39 @@ public sealed partial class ResourceMaterializationCache
             SameBytes,
             // Only words the flattened table alone reads changed: per-draw constants.
             TableBytesDiffer,
+        }
+
+        // For the miss diagnostics: the first recorded read that did not land where the moved words
+        // put it, with the user data words and candidate windows involved.
+        private static string DescribeMovedReadMismatch(AddressRebase rebase, Entry previous, Entry built, List<int> differing)
+        {
+            var text = new System.Text.StringBuilder();
+            text.Append($"ranges={previous.RangeAddresses.Length}/{built.RangeAddresses.Length}");
+            foreach (var index in differing)
+                text.Append($" ud{index}=0x{previous.UserData[index]:X8}->0x{built.UserData[index]:X8}");
+            foreach (var candidate in rebase._candidates)
+            {
+                if (!differing.Contains(candidate.UserData))
+                    continue;
+                text.Append(rebase.TryWindow(previous, candidate, out var start, out var size, out var addressBase)
+                    ? $" window[ud{candidate.UserData} buf={candidate.Buffer}]=0x{start:X}+0x{size:X} base=0x{addressBase:X}"
+                    : $" window[ud{candidate.UserData} buf={candidate.Buffer}]=none");
+            }
+
+            var common = Math.Min(previous.RangeAddresses.Length, built.RangeAddresses.Length);
+            for (var range = 0; range < common; range++)
+            {
+                var length = previous.RangeLengths[range];
+                var moved = rebase.Move(previous, built.UserData, previous.RangeAddresses[range], length, differing);
+                if (moved == built.RangeAddresses[range] && length == built.RangeLengths[range] &&
+                    previous.RangeClean[range] == built.RangeClean[range])
+                    continue;
+                text.Append($" first_bad_range={range} prev=0x{previous.RangeAddresses[range]:X}+{length} moved=0x{moved:X} " +
+                    $"built=0x{built.RangeAddresses[range]:X}+{built.RangeLengths[range]} clean={previous.RangeClean[range]}/{built.RangeClean[range]}");
+                break;
+            }
+
+            return text.ToString();
         }
 
         private static ReadComparison CompareMovedReads(AddressRebase rebase, Entry previous, Entry built, List<int> differing)
@@ -1113,6 +1159,8 @@ public sealed partial class ResourceMaterializationCache
         timing.ChangePhase(MaterializationPhase.Materialization);
         Misses++;
         RecordMiss(plan, key, found);
+        if (!found)
+            RecordKeyChange(plan, drawKey, inputs.UserData, learned, rebase);
         Interlocked.Increment(ref _totalMisses);
         var recorder = TakeRecorder();
         try
