@@ -40,6 +40,22 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <TieredPGO>true</TieredPGO>
   </PropertyGroup>
 
+  <!-- On Windows the emulator allocates ~180 MB/s across many threads, and a
+       workstation GC (one thread collecting while every other thread waits)
+       stopped the process for ~9% of wall time. Server GC collects on several
+       threads and far less often: ~2% of wall time and +13% frames per second
+       in Ghost of Yotei on a 6-core / 12-thread host, though each pause is
+       longer (40-150 ms instead of 4-9 ms). The heap count is capped so the
+       per-heap reservations stay small whatever the core count (see above).
+       DOTNET_gcServer=0 restores the workstation GC. -->
+  <PropertyGroup Condition="$([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win'))">
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup Condition="$([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win'))">
+    <RuntimeHostConfigurationOption Include="System.GC.HeapCount" Value="6" />
+  </ItemGroup>
+
   <!-- Background GC's write-watch revisit calls FlushProcessWriteBuffers,
        which on macOS uses thread_get_register_pointer_values; under Rosetta 2
        that Mach call can stall indefinitely on threads executing translated
