@@ -449,7 +449,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("The host DMA write range is invalid.");
         }
 
-        GpuWritebackEpoch.Advance();
+        using var writebackScope = GpuWritebackEpoch.BeginWrite();
         if (!_backing.TryWriteBacking(guestAddress, data))
         {
             throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{data.Length:X16}");
@@ -626,7 +626,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             for (ulong offset = 0; offset < size;)
             {
                 var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
-                GpuWritebackEpoch.Advance();
+                using var writebackScope = GpuWritebackEpoch.BeginWrite();
                 if (!_backing.TryWriteBacking(guestAddress + offset, bytes[..chunk]))
                 {
                     return false;
@@ -1054,7 +1054,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         var count = _sharedPages.PullGpuWrites(page, owner, gpu, guest, completedTick, (offset, length) =>
         {
-            GpuWritebackEpoch.Advance();
+            using var writebackScope = GpuWritebackEpoch.BeginWrite();
             if (!_backing.TryWriteBacking(page + (ulong)offset, guest.AsSpan(offset, length)))
             {
                 throw SubmissionScheduler.Fatal($"Could not merge shader writes into guest memory: addr=0x{page + (ulong)offset:X16} size=0x{length:X}");
@@ -2576,7 +2576,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     return;
                 }
 
-                GpuWritebackEpoch.Advance();
+                using var writebackScope = GpuWritebackEpoch.BeginWrite();
                 if (!WriteDownloaded(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
@@ -2978,7 +2978,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
-            GpuWritebackEpoch.Advance();
+            using var writebackScope = GpuWritebackEpoch.BeginWrite();
             if (!WriteDownloaded(copies[index].Address, bytes))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
@@ -3011,7 +3011,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var placement = copy.Placement;
             var offset = baseOffset + placement.DataOffset;
             _download.Invalidate(offset, placement.DataSize);
-            GpuWritebackEpoch.Advance();
+            using var writebackScope = GpuWritebackEpoch.BeginWrite();
             if (GpuCommands.VisibilityResultTrace.Enabled)
                 GpuCommands.VisibilityResultTrace.Download(copy.Address,
                     _download.Mapped.Slice((int)offset, (int)placement.DataSize), _backing.TryReadBacking);

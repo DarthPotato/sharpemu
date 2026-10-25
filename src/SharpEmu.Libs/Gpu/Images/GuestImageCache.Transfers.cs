@@ -384,7 +384,7 @@ public sealed unsafe partial class GuestImageCache
             try
             {
                 download.Invalidate(offset, plane.Size);
-                GpuWritebackEpoch.Advance();
+                using var writebackScope = GpuWritebackEpoch.BeginWrite();
                 if (!backing.TryWriteBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
                 {
                     throw SubmissionScheduler.Fatal($"The stencil plane could not be written to guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
@@ -1091,7 +1091,7 @@ public sealed unsafe partial class GuestImageCache
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             download.Invalidate(offset, range.Size);
-            GpuWritebackEpoch.Advance();
+            using var writebackScope = GpuWritebackEpoch.BeginWrite();
             var published = download.Mapped.Slice((int)offset, (int)range.Size);
             if (!backing.TryWriteBacking(range.Address, published) &&
                 !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))

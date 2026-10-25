@@ -86,7 +86,7 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IConcurrentResolveHost.IsStillCurrent(object assumptionsObject)
         {
             var assumptions = (ConcurrentAssumptions)assumptionsObject;
-            if (assumptions.WritebackEpoch != GpuWritebackEpoch.Value)
+            if (!GpuWritebackEpoch.Unchanged(assumptions.WritebackEpoch))
             {
                 _staleByWriteback++;
                 return false;
