@@ -72,6 +72,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _batchOpen = true;
                 _batchDrawCount = 0;
+                _nextIdleFlushCheck = 0;
             }
         }
 
@@ -88,6 +89,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using var profile = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueueSubmit);
             var tick = _scheduler.Flush();
+            _lastBatchSubmit = System.Diagnostics.Stopwatch.GetTimestamp();
             _bufferCache?.OnBatchSubmitted();
             return tick;
         }

@@ -32,6 +32,20 @@ internal static unsafe partial class VulkanVideoPresenter
     // restarted Demon's Souls' 1440p G-buffer pass (five targets + depth) every 64 draws.
     // The pass still ends at this cap so a long pass cannot hold the batch forever.
     private const int DrawsPerBatchInRenderPass = 512;
+    // A batch is otherwise submitted only when full or when something needs its results, so
+    // the GPU can sit idle while a batch is recorded and the CPU then waits for all of it. Once
+    // the main queue has finished every submitted tick, a batch of at least this many draws is
+    // submitted at the next preparation. Only outside an open render pass by default: splitting
+    // passes costs attachment stores/loads (see above). SHARPEMU_IDLE_FLUSH_DRAWS=0 turns it off;
+    // SHARPEMU_IDLE_FLUSH_DRAWS_IN_PASS (default 0 = never) allows it inside a pass.
+    private static readonly int IdleFlushDraws = ReadIdleFlushDraws("SHARPEMU_IDLE_FLUSH_DRAWS", 8);
+    private static readonly int IdleFlushDrawsInRenderPass = ReadIdleFlushDraws("SHARPEMU_IDLE_FLUSH_DRAWS_IN_PASS", 0);
+    // The main-queue test ignores the readback queue, so idle submissions also keep this gap.
+    private static readonly long IdleFlushMinimumGapTicks = System.Diagnostics.Stopwatch.Frequency / 1000;
+    private const int IdleFlushCheckInterval = 4;
+
+    private static int ReadIdleFlushDraws(string name, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out var draws) && draws >= 0 ? draws : fallback;
     private const uint SingleRectangleVertexCount = 4;
 
     private static void RequireRenderingFeature(bool supported, string feature, string deviceName)
@@ -481,11 +495,37 @@ internal static unsafe partial class VulkanVideoPresenter
                 EndRendering();
                 FlushBatchedGuestCommands();
             }
+            else if (ShouldSubmitForIdleGpu())
+            {
+                if (GpuSyncProfile.Enabled)
+                {
+                    GpuSyncProfile.CountIdleFlush();
+                }
+
+                EndRendering();
+                FlushBatchedGuestCommands();
+            }
 
             EnsureGuestSubmissionCapacity();
             _ = BeginBatchedGuestCommands();
             _preparation = new RenderPreparation(this, _bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream).RetainUpcomingAllocations());
             return _preparation;
+        }
+
+        private int _nextIdleFlushCheck;
+        private long _lastBatchSubmit;
+
+        private bool ShouldSubmitForIdleGpu()
+        {
+            var threshold = _renderingActive ? IdleFlushDrawsInRenderPass : IdleFlushDraws;
+            if (!_batchOpen || threshold == 0 || _batchDrawCount < Math.Max(threshold, _nextIdleFlushCheck))
+            {
+                return false;
+            }
+
+            _nextIdleFlushCheck = _batchDrawCount + IdleFlushCheckInterval;
+            return System.Diagnostics.Stopwatch.GetTimestamp() - _lastBatchSubmit >= IdleFlushMinimumGapTicks &&
+                _scheduler.IsTickComplete(_scheduler.CurrentTick - 1);
         }
 
         private RenderPreparation RequirePreparation() =>

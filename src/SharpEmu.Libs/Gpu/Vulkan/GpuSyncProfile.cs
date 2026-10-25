@@ -27,6 +27,7 @@ internal static class GpuSyncProfile
     private static long _mergedRequests;
     private static long _renderingScopes;
     private static long _batchFlushes;
+    private static long _idleFlushes;
 
     public static bool Enabled => VideoOut.RenderPhaseProfile.Enabled;
 
@@ -48,6 +49,8 @@ internal static class GpuSyncProfile
     public static void CountRenderingScope() => Interlocked.Increment(ref _renderingScopes);
 
     public static void CountBatchFlush() => Interlocked.Increment(ref _batchFlushes);
+
+    public static void CountIdleFlush() => Interlocked.Increment(ref _idleFlushes);
 
     public static void CountNativeState(NativeStateKind kind, bool reused)
     {
@@ -75,5 +78,5 @@ internal static class GpuSyncProfile
     }
 
     public static string TakeReport() => FormattableString.Invariant(
-        $"[PERF][GPU_SYNC] barriers={Interlocked.Exchange(ref _barriers, 0)} draining={Interlocked.Exchange(ref _drainingBarriers, 0)} memory={Interlocked.Exchange(ref _memoryBarriers, 0)} buffer={Interlocked.Exchange(ref _bufferBarriers, 0)} image={Interlocked.Exchange(ref _imageBarriers, 0)} merged_requests={Interlocked.Exchange(ref _mergedRequests, 0)} rendering_scopes={Interlocked.Exchange(ref _renderingScopes, 0)} draw_count_flushes={Interlocked.Exchange(ref _batchFlushes, 0)} reused {TakeNativeStateReport()}");
+        $"[PERF][GPU_SYNC] barriers={Interlocked.Exchange(ref _barriers, 0)} draining={Interlocked.Exchange(ref _drainingBarriers, 0)} memory={Interlocked.Exchange(ref _memoryBarriers, 0)} buffer={Interlocked.Exchange(ref _bufferBarriers, 0)} image={Interlocked.Exchange(ref _imageBarriers, 0)} merged_requests={Interlocked.Exchange(ref _mergedRequests, 0)} rendering_scopes={Interlocked.Exchange(ref _renderingScopes, 0)} draw_count_flushes={Interlocked.Exchange(ref _batchFlushes, 0)} idle_flushes={Interlocked.Exchange(ref _idleFlushes, 0)} reused {TakeNativeStateReport()}");
 }
