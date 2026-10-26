@@ -305,7 +305,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 presenter.CompleteOverlappingPublications(virtualAddress, (ulong)source.Length);
                 if (presenter.OnCommandThread)
                 {
-                    presenter._commandThread!.PostWrite(virtualAddress, source);
+                    presenter._commandThread!.PostWrite(virtualAddress, source, presenter._postingQueueId);
                     return true;
                 }
 
@@ -457,10 +457,14 @@ internal static unsafe partial class VulkanVideoPresenter
             _relay.RunPendingCommands();
         }
 
+        // The guest queue the command stream thread is interpreting, for the label latency profile.
+        private int _postingQueueId;
+
         public void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots)
         {
             if (OnCommandThread)
             {
+                _postingQueueId = queueId;
                 // The translation state belongs to this thread; the queue context to the render thread.
                 _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
                 _commandThread!.Post(() => BeginSubmissionContext(queueId, submissionId));

@@ -103,6 +103,9 @@ public sealed class CommandSubmission
 
     internal ulong AdmissionOrdinal { get; set; }
 
+    // When the queue accepted it, for the label latency profile; zero when the profile is off.
+    internal long AcceptedAt { get; set; }
+
     // Snapshots captured at submit time; the processor never reads them.
     public object? GeometrySnapshots { get; }
 

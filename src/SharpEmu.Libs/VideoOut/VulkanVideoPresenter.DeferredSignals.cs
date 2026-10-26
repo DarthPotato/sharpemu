@@ -197,10 +197,11 @@ internal static unsafe partial class VulkanVideoPresenter
             var entry = _guestPublications.AddAfterPending(queueId, write.Destination, size, write.Value);
             if (entry is null) return false;
             var captured = write;
+            var deferredAt = Diagnostics.LabelLatencyProfile.Start();
             try
             {
-                if (OnCommandThread) _commandThread!.Post(() => RecordDeferredSignal(entry, captured));
-                else RecordDeferredSignal(entry, captured);
+                if (OnCommandThread) _commandThread!.Post(() => RecordDeferredSignal(entry, captured, deferredAt));
+                else RecordDeferredSignal(entry, captured, deferredAt);
             }
             catch (Exception exception)
             {
@@ -210,7 +211,7 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
-        private void RecordDeferredSignal(PendingGuestPublications.Entry entry, EndOfPipeWrite write)
+        private void RecordDeferredSignal(PendingGuestPublications.Entry entry, EndOfPipeWrite write, long deferredAt)
         {
             try
             {
@@ -238,6 +239,9 @@ internal static unsafe partial class VulkanVideoPresenter
                             BinaryPrimitives.WriteUInt64LittleEndian(bytes, write.Value);
                             if (!_guestMemory.TryWrite(write.Destination, bytes[..(int)entry.Size]))
                                 throw SubmissionScheduler.Fatal("Cannot publish a deferred end-of-pipe label.");
+                            Diagnostics.LabelLatencyProfile.Record(entry.Queue == 0
+                                ? Diagnostics.LabelLatencyProfile.Path.DeferredGraphics
+                                : Diagnostics.LabelLatencyProfile.Path.DeferredCompute, deferredAt);
                         }
                         if (hasSignal) _endOfPipe.CompleteDeferred(in write);
                         if (write.FlipRequestId != 0)

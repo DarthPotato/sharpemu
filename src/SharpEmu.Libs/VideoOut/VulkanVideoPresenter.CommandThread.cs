@@ -40,6 +40,10 @@ internal static partial class VulkanVideoPresenter
             public byte[]? Data;
             // The guest range a queued fill or copy writes; zero for other items.
             public ulong RangeSize;
+            // When a store was posted, for the label latency profile; zero when it is off.
+            public long PostedAt;
+            public int PostedQueue;
+            public int PostedAhead;
             // Resolution jobs submitted before this non-draw item; they finish before it runs.
             public long JobsBefore;
             public bool Sync;
@@ -125,9 +129,10 @@ internal static partial class VulkanVideoPresenter
             return result;
         }
 
-        public void PostWrite(ulong address, ReadOnlySpan<byte> data)
+        public void PostWrite(ulong address, ReadOnlySpan<byte> data, int queueId = 0)
         {
-            var item = new Item { Kind = Kind.Write, Address = address, Data = data.ToArray() };
+            var item = new Item { Kind = Kind.Write, Address = address, Data = data.ToArray(), PostedAt = Diagnostics.LabelLatencyProfile.Start(),
+                PostedQueue = queueId, PostedAhead = Volatile.Read(ref _outstanding) };
             lock (_writeLock)
             {
                 _pendingWrites.Enqueue(item);
@@ -424,6 +429,9 @@ internal static partial class VulkanVideoPresenter
                 }
 
                 _pendingWrites.Dequeue();
+                Diagnostics.LabelLatencyProfile.Record(item.PostedQueue == 0
+                    ? Diagnostics.LabelLatencyProfile.Path.StoreGraphics
+                    : Diagnostics.LabelLatencyProfile.Path.StoreCompute, item.PostedAt, item.PostedAhead);
                 _pendingWriteCount = _pendingWrites.Count;
                 if (!written)
                 {

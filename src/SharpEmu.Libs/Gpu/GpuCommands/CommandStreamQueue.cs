@@ -205,6 +205,7 @@ public sealed class CommandStreamQueue
         }
 
         submission.AdmissionOrdinal = ++_admissionOrdinal;
+        submission.AcceptedAt = Diagnostics.LabelLatencyProfile.Start();
         _queues[submission.QueueId].AddLast(submission);
         _submissionCount++;
         if (submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
@@ -564,6 +565,9 @@ public sealed class CommandStreamQueue
         if (firstSlice)
         {
             submission.Started = true;
+            Diagnostics.LabelLatencyProfile.Record(submission.QueueId == 0
+                ? Diagnostics.LabelLatencyProfile.Path.AdmitGraphics
+                : Diagnostics.LabelLatencyProfile.Path.AdmitCompute, submission.AcceptedAt);
             processor.SubmitId = ++_submitId;
             processor.ResetCounters();
             processor.SetFlip(default);
