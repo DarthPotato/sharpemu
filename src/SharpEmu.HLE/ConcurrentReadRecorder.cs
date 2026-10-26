@@ -21,20 +21,67 @@ public sealed class ConcurrentReadRecorder
     public IReadOnlyList<(ulong Address, ulong Size)> Ranges => _ranges;
 
     // Too many separate ranges were read to keep them.
-    public bool Overflowed { get; private set; }
+    public bool Overflowed { get; internal set; }
+
+    // The writeback history floor of the resolution the recorder belongs to (GPU side), so work
+    // inside the resolution checks stores from its start.
+    public long Floor { get; set; }
+
+    // The guest view generation when the resolution began (GuestRangeCanonicalizer): views that change
+    // during it may give its addresses other bytes without any store.
+    public long ViewGeneration { get; set; }
 
     public static void Open(ConcurrentReadRecorder recorder) => _current = recorder;
 
     public static void Close() => _current = null;
 
-    // Called at the entry of every base-memory read, before any early return.
-    public static void Note(ulong address, ulong size)
+    // The recorder open on this thread, if any (for a nested recording that hands its ranges on).
+    public static ConcurrentReadRecorder? Current => _current;
+
+    // Records into `nested` instead until the returned recorder (the previous one) is restored with
+    // EndNested, which also adds what `nested` recorded to it.
+    public static ConcurrentReadRecorder? BeginNested(ConcurrentReadRecorder nested)
     {
-        if (_current is { } recorder)
+        var previous = _current;
+        _current = nested;
+        return previous;
+    }
+
+    public static void EndNested(ConcurrentReadRecorder nested, ConcurrentReadRecorder? previous)
+    {
+        _current = previous;
+        if (previous is null)
         {
-            recorder.Add(address, size);
+            return;
+        }
+
+        if (nested.Overflowed)
+        {
+            previous.Overflowed = true;
+            return;
+        }
+
+        foreach (var (address, size) in nested._ranges)
+        {
+            previous.Add(address, size);
         }
     }
+
+    // Called at the entry of every base-memory read, before any early return. The range is kept in
+    // canonical pieces (GuestRangeCanonicalizer), as stores are, so views of one backing compare.
+    public static void Note(ulong address, ulong size)
+    {
+        if (_current is not null)
+        {
+            GuestMemory.GuestRangeCanonicalizer.ForEach(address, size, AddToCurrent);
+        }
+    }
+
+    private static readonly Action<ulong, ulong> AddToCurrent = static (address, size) => _current!.Add(address, size);
+
+    // A guest range the resolution read some other way (the presenter's readers): in canonical pieces.
+    public void AddCanonical(ulong address, ulong size) =>
+        GuestMemory.GuestRangeCanonicalizer.ForEach(address, size, (pieceAddress, pieceSize) => Add(pieceAddress, pieceSize));
 
     public bool Overlaps(ulong address, ulong size)
     {

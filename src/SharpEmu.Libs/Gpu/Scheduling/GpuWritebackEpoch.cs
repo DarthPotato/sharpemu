@@ -23,32 +23,81 @@ internal static class GpuWritebackEpoch
         Volatile.Read(ref _activeWriters) == 0 && Volatile.Read(ref _value) == recorded;
 
     // Wraps one store of GPU data into guest memory; may run on any thread.
-    public static WriteScope BeginWrite(ulong address, ulong size)
+    public static WriteScope BeginWrite(ulong address, ulong size) => new(BeginStore(address, size));
+
+    // The same as a token: the store's start count, for EndStore.
+    public static long BeginStore(ulong address, ulong size)
     {
         Interlocked.Increment(ref _activeWriters);
         if (!RecordsHistory)
         {
-            return new WriteScope(Interlocked.Increment(ref _value));
+            return Interlocked.Increment(ref _value);
         }
 
+        // The store's canonical pieces, so a store through one view of a backing overlaps a read
+        // through another (HLE GuestRangeCanonicalizer).
+        var pieces = _pieces ??= new List<(ulong, ulong)>();
+        pieces.Clear();
+        SharpEmu.HLE.GuestMemory.GuestRangeCanonicalizer.ForEach(address, size, AddPiece);
         // Counted and recorded together, so the floor never misses a store and the history stays in
         // count order.
         lock (HistoryGate)
         {
             var epoch = Interlocked.Increment(ref _value);
-            History[_historyCount % HistoryCapacity] = (epoch, address, size);
-            _historyCount++;
+            foreach (var (pieceAddress, pieceSize) in pieces)
+            {
+                History[_historyCount % HistoryCapacity] = (epoch, pieceAddress, pieceSize);
+                _historyCount++;
+            }
+
             ActiveBegins.Add(epoch);
-            return new WriteScope(epoch);
+            return epoch;
         }
     }
+
+    public static void EndStore(long begin)
+    {
+        if (begin == 0)
+        {
+            return;
+        }
+
+        // Counted before the writer leaves: a reader that sees no writer also sees the count move.
+        Interlocked.Increment(ref _value);
+        if (RecordsHistory)
+        {
+            lock (HistoryGate)
+            {
+                ActiveBegins.Remove(begin);
+            }
+        }
+
+        Interlocked.Decrement(ref _activeWriters);
+    }
+
+    // With the prefetch ungated (SHARPEMU_PREFETCH_UNGATE=1), every guest write the stream threads
+    // make for a stream item is a store too (HLE StreamStoreHook): work resolved ahead of the stream
+    // read guest memory before those items ran.
+    public static void AttachStreamStores()
+    {
+        if (Rendering.ParallelProgramPrefetch.Ungated)
+        {
+            SharpEmu.HLE.GuestMemory.StreamStoreHook.Attach(BeginStore, EndStore);
+        }
+    }
+
+    [ThreadStatic]
+    private static List<(ulong, ulong)>? _pieces;
+
+    private static readonly Action<ulong, ulong> AddPiece = static (address, size) => _pieces!.Add((address, size));
 
     // The ranges of recent stores are kept so a resolution whose epoch moved is still taken when every
     // store since its start was elsewhere. Opt-in (SHARPEMU_PREFETCH_RANGE_AWARE=1) until reads and
     // stores are compared through backing identities: two guest views of one backing make an
     // overlapping store look disjoint. Off, any store rejects (the render profile still keeps the
     // history to report why).
-    public static readonly bool RangeAware = Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_RANGE_AWARE") == "1";
+    public static readonly bool RangeAware = Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_RANGE_AWARE") == "1" ||
+        Rendering.ParallelProgramPrefetch.Ungated;
     public static readonly bool RecordsHistory = RangeAware || VideoOut.RenderPhaseProfile.Enabled;
 
     public static bool HasActiveWriters => Volatile.Read(ref _activeWriters) != 0;
@@ -119,24 +168,6 @@ internal static class GpuWritebackEpoch
 
         internal WriteScope(long begin) => _begin = begin;
 
-        public void Dispose()
-        {
-            if (_begin == 0)
-            {
-                return;
-            }
-
-            // Counted before the writer leaves: a reader that sees no writer also sees the count move.
-            Interlocked.Increment(ref _value);
-            if (RecordsHistory)
-            {
-                lock (HistoryGate)
-                {
-                    ActiveBegins.Remove(_begin);
-                }
-            }
-
-            Interlocked.Decrement(ref _activeWriters);
-        }
+        public void Dispose() => EndStore(_begin);
     }
 }

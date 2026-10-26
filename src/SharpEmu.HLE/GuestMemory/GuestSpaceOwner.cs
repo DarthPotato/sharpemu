@@ -60,6 +60,11 @@ public sealed class GuestSpaceOwner : IDisposable
 
     public ulong AliasBase => _views.AliasBase;
 
+    public void ForEachCanonicalRange(ulong address, ulong size, Action<ulong, ulong> visit) =>
+        _views.ForEachCanonicalRange(address, size, visit);
+
+    public long ViewGeneration => _views.ViewGeneration;
+
     public ulong BackingSize => _views.Size;
 
     public bool TryClearBacking(ulong offset, ulong size) => _views.Clear(offset, size);

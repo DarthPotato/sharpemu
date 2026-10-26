@@ -49,6 +49,19 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
 
     public bool Clear(ulong offset, ulong size)
     {
+        var store = StreamStoreHook.Begin(AliasBase + offset, size);
+        try
+        {
+            return ClearCore(offset, size);
+        }
+        finally
+        {
+            StreamStoreHook.End(store);
+        }
+    }
+
+    private bool ClearCore(ulong offset, ulong size)
+    {
         lock (_lock)
         {
             WaitForCopies();
@@ -63,6 +76,19 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
     }
 
     public bool TryWriteBacking(ulong address, ReadOnlySpan<byte> data)
+    {
+        var store = StreamStoreHook.Begin(address, (ulong)data.Length);
+        try
+        {
+            return TryWriteBackingCore(address, data);
+        }
+        finally
+        {
+            StreamStoreHook.End(store);
+        }
+    }
+
+    private bool TryWriteBackingCore(ulong address, ReadOnlySpan<byte> data)
     {
         if (TryAccessSingleView(address, (ulong)data.Length, out var target))
         {
@@ -129,6 +155,19 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
 
     public bool TryWriteSingleView(ulong address, ReadOnlySpan<byte> data)
     {
+        var store = StreamStoreHook.Begin(address, (ulong)data.Length);
+        try
+        {
+            return TryWriteSingleViewCore(address, data);
+        }
+        finally
+        {
+            StreamStoreHook.End(store);
+        }
+    }
+
+    private bool TryWriteSingleViewCore(ulong address, ReadOnlySpan<byte> data)
+    {
         if (!TryAccessSingleView(address, (ulong)data.Length, out var target))
         {
             return false;
@@ -194,6 +233,19 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
 
     // Use temporary storage if a copy segment can overwrite another segment's source.
     public bool TryCopyBacking(ulong destination, ulong source, ulong size)
+    {
+        var store = StreamStoreHook.Begin(destination, size);
+        try
+        {
+            return TryCopyBackingCore(destination, source, size);
+        }
+        finally
+        {
+            StreamStoreHook.End(store);
+        }
+    }
+
+    private bool TryCopyBackingCore(ulong destination, ulong source, ulong size)
     {
         if (size >= ConcurrentCopyMinimumBytes && size <= int.MaxValue &&
             TryReserveCopy(destination, source, size, out var reservation))
@@ -663,6 +715,45 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
     private void PublishSnapshot()
     {
         Volatile.Write(ref _snapshot, _views.Snapshot);
+        Interlocked.Increment(ref _viewGeneration);
+    }
+
+    private long _viewGeneration;
+
+    // Moves with every change to the views: canonical ranges taken before it may name other bytes.
+    public long ViewGeneration => Volatile.Read(ref _viewGeneration);
+
+    // Splits a guest range into canonical pieces, so that ranges reached through two views of one
+    // backing compare equal: a piece inside a view becomes its alias range (AliasBase + backing
+    // offset); a piece outside every view keeps its guest address. Lock-free on the published views.
+    public void ForEachCanonicalRange(ulong address, ulong size, Action<ulong, ulong> visit)
+    {
+        if (size == 0)
+        {
+            return;
+        }
+
+        var end = ulong.MaxValue - address < size ? ulong.MaxValue : address + size;
+        var snapshot = Volatile.Read(ref _snapshot);
+        var aliasBase = AliasBase;
+        var current = address;
+        while (current < end)
+        {
+            var record = ViewRecordTree.FindAtOrBelow(snapshot, current);
+            if (record.Size != 0 && current < record.Address + record.Size && aliasBase != 0)
+            {
+                var bytes = Math.Min(end, record.Address + record.Size) - current;
+                visit(aliasBase + record.Offset + (current - record.Address), bytes);
+                current += bytes;
+                continue;
+            }
+
+            // Not in a view: up to the next view, if any starts before the end.
+            var next = ViewRecordTree.FindAtOrAbove(snapshot, current + 1);
+            var gapEnd = next.Size != 0 && next.Address < end ? next.Address : end;
+            visit(current, gapEnd - current);
+            current = gapEnd;
+        }
     }
 
     // Resolves an access that lies inside one view to its alias address and registers

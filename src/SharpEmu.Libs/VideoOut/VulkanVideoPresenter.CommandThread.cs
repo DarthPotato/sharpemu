@@ -48,6 +48,8 @@ internal static partial class VulkanVideoPresenter
             public long JobsBefore;
             // The item submitted its own prefetch job just before it: not one of the jobs it waits for.
             public bool OwnJob;
+            // Not a prefetch gate (ParallelProgramPrefetch.Ungated): neither waits for earlier jobs nor holds later ones.
+            public bool Ungated;
             public bool Sync;
             public volatile bool Done;
             public Exception? Failure;
@@ -223,7 +225,10 @@ internal static partial class VulkanVideoPresenter
         private void Enqueue(Item item)
         {
             ThrowIfFailed();
-            if (!item.IsDraw)
+            // Ungated, a store or a dispatch is not a gate: the prefetch resolves past it and each
+            // resolution is checked, when taken, against the stores the item made (range-aware).
+            item.Ungated = !item.IsDraw && ParallelProgramPrefetch.Ungated && item.Kind is Kind.Write or Kind.Deferred;
+            if (!item.IsDraw && !item.Ungated)
             {
                 item.JobsBefore = (_prefetch?.Submitted ?? 0) - (item.OwnJob ? 1 : 0);
                 _enqueuedNonDraw++;
@@ -375,7 +380,10 @@ internal static partial class VulkanVideoPresenter
                 return;
             }
 
-            _prefetch?.WaitFinished(item.JobsBefore);
+            if (!item.Ungated)
+            {
+                _prefetch?.WaitFinished(item.JobsBefore);
+            }
             try
             {
                 switch (item.Kind)
@@ -402,7 +410,11 @@ internal static partial class VulkanVideoPresenter
             }
             finally
             {
-                _executedNonDraw++;
+                if (!item.Ungated)
+                {
+                    _executedNonDraw++;
+                }
+
                 if (item.RangeSize != 0)
                 {
                     lock (_writeLock)
@@ -469,6 +481,7 @@ internal static partial class VulkanVideoPresenter
 
         private void Run()
         {
+            SharpEmu.HLE.GuestMemory.StreamStoreHook.MarkStreamThread();
             try
             {
                 var lastProgress = Stopwatch.GetTimestamp();

@@ -215,21 +215,77 @@ internal sealed class ShaderProgramCache
         return bridge;
     }
 
+    // Set by Decode when the program it returned may be torn by a concurrent store: whatever is
+    // built from it is not cached (GetOrCompileCore).
+    [ThreadStatic]
+    private static bool _decodeNotCached;
+
     // The decoded instructions of a program, shared by every static variant of the same code.
     public Gen5ShaderProgram Decode(ShaderSource source)
     {
         var key = (source.Hash, source.CodeSize, source.ContinuationAddressOffset);
         if (_decoded.TryGetValue(key, out var program))
         {
+            // A resolution ahead of the stream that reuses the program depends on this code too: every
+            // range of it (a fused shader's continuation can lie elsewhere).
+            if (ConcurrentReadRecorder.Current is not null)
+            {
+                foreach (var (address, size) in source.Registered.CodeRanges)
+                {
+                    ConcurrentReadRecorder.Note(address, size);
+                }
+            }
+
             return program;
         }
 
         using var decodeScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramDecode);
         var recording = _host.ShaderPrewarm is not null ? new RecordingCpuMemory(_context.Memory) : null;
         var context = recording is null ? _context : new CpuContext(recording, _context.TargetGeneration);
-        if (!Gen5ShaderTranslator.TryDecodeProgram(context, source.Address, out program, out var error))
+        // With stores checked by range, the code the decode read (linked code included) is recorded,
+        // and a decode that a store may have torn is returned to its resolution, which is then
+        // rejected, but not kept for later ones.
+        var codeReads = GpuWritebackEpoch.RangeAware ? new ConcurrentReadRecorder() : null;
+        var outerReads = codeReads is null ? null : ConcurrentReadRecorder.BeginNested(codeReads);
+        // Stores are checked from the start of the resolution, which read the shader's identity (its
+        // hash, the cache key) before the decode began.
+        var floor = codeReads is null ? 0 : outerReads?.Floor ?? GpuWritebackEpoch.HistoryFloor();
+        bool decoded;
+        string? error;
+        try
+        {
+            decoded = Gen5ShaderTranslator.TryDecodeProgram(context, source.Address, out program, out error);
+        }
+        finally
+        {
+            if (codeReads is not null)
+            {
+                ConcurrentReadRecorder.EndNested(codeReads, outerReads);
+            }
+        }
+
+        if (!decoded)
         {
             throw SubmissionScheduler.Fatal($"The shader program cannot be decoded: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
+        }
+
+        // Views that changed since the resolution began can have given the code addresses other bytes.
+        var viewsChanged = outerReads is not null &&
+            outerReads.ViewGeneration != SharpEmu.HLE.GuestMemory.GuestRangeCanonicalizer.ViewGeneration;
+        if (codeReads is not null &&
+            (viewsChanged || GpuWritebackEpoch.ClassifyStores(floor, codeReads.Overlaps) != GpuWritebackEpoch.StaleCause.Disjoint))
+        {
+            // Ahead of the stream (a resolution's recorder is open), the render thread resolves the
+            // work itself instead. On the stream's own thread (another thread's download overlapped)
+            // the program is used once: neither it nor the program built from it is kept.
+            if (outerReads is not null)
+            {
+                throw new SubmissionScheduler.AbandonedWorkException(
+                    $"A store overlapped the shader code being decoded: hash=0x{source.Hash:X16} shader=0x{source.Address:X16}.");
+            }
+
+            _decodeNotCached = true;
+            return program;
         }
 
         _decoded.Add(key, program);
@@ -326,9 +382,16 @@ internal sealed class ShaderProgramCache
         };
         if (entry is null)
         {
+            _decodeNotCached = false;
             entry = CreateEntry(source, options);
             key = BuildProgramKey(source);
-            _programs.Add(key, entry);
+            // Built from a decode a concurrent store overlapped: used for this draw only.
+            if (!_decodeNotCached)
+            {
+                _programs.Add(key, entry);
+            }
+
+            _decodeNotCached = false;
             ShaderCacheCounters.CountProgram();
         }
 

@@ -55,12 +55,20 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         }
     }
 
+    // SHARPEMU_PREFETCH_UNGATE=1: command-processor stores and dispatches stop gating the jobs after
+    // them, so the worker resolves ahead of them. A resolution is then checked, when taken, against
+    // every store since it began by range (range-aware staleness), including the guest writes the
+    // stream threads make for those items (GpuWritebackEpoch.AttachStreamStores); compute jobs are on.
+    // (Declared before ComputeEnabled, which reads it: static fields initialize in text order.)
+    public static bool Ungated { get; internal set; } =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_UNGATE"), "1", StringComparison.Ordinal);
+
     // SHARPEMU_PREFETCH_COMPUTE=1 resolves dispatches' compute programs on the worker too. Off by
     // default: while every dispatch gates the jobs after it, the worker reaches a dispatch's job only
     // once the item before it ran, so most jobs are cancelled and the rest are waited for (Ghost of
     // Yotei: 3.65 vs 3.82 fps). It pays off once dispatches stop gating the prefetch.
     public static readonly bool ComputeEnabled =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_COMPUTE"), "1", StringComparison.Ordinal);
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_COMPUTE"), "1", StringComparison.Ordinal) || Ungated;
 
     private readonly RenderExecutor _executor;
     private readonly IRenderHost _host;
@@ -213,6 +221,14 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         }
 
         Current = null;
+        // Ungated, the worker resolves dispatches too and can fall behind: a draw whose job it has not
+        // started resolves its own programs rather than waiting for the worker to reach it.
+        if (Ungated && job.State == 0 && TryCancel(job))
+        {
+            _takeOutcomes[(int)TakeOutcome.NotStarted]++;
+            return false;
+        }
+
         WaitFor(job);
         using var profile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPrefetchValidation);
         var outcome = job.State != 1 ? TakeOutcome.NotResolved
@@ -300,7 +316,7 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
 
     // Why the render thread did or did not take a resolution, counted on the render thread for the
     // render profile report.
-    private enum TakeOutcome { Taken, NoJob, OtherBanks, NotResolved, OtherInputs, Stale, Count }
+    private enum TakeOutcome { Taken, NoJob, OtherBanks, NotResolved, OtherInputs, Stale, NotStarted, Count }
 
     private static readonly long[] _takeOutcomes = new long[(int)TakeOutcome.Count];
 
@@ -310,7 +326,7 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
     internal static string TakeReport()
     {
         var line = $"[PERF][PROGRAM_PREFETCH] taken={_takeOutcomes[0]} no_job={_takeOutcomes[1]} other_banks={_takeOutcomes[2]} " +
-            $"not_resolved={_takeOutcomes[3]} other_inputs={_takeOutcomes[4]} stale={_takeOutcomes[5]} " +
+            $"not_resolved={_takeOutcomes[3]} other_inputs={_takeOutcomes[4]} stale={_takeOutcomes[5]} not_started={_takeOutcomes[6]} " +
             $"input_pixel={_inputMismatches[0]} input_depth={_inputMismatches[1]} input_indexed={_inputMismatches[2]} input_mapping={_inputMismatches[3]} " +
             $"graphics_refused={_graphicsTakenWithRefusals} " +
             $"compute_taken={_computeOutcomes[0]} compute_no_job={_computeOutcomes[1]} compute_other_inputs={_computeOutcomes[2]} " +

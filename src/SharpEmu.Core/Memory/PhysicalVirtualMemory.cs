@@ -161,6 +161,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 ? new HostAddressRange(WindowsGuestAddressReservation.DataStart, WindowsGuestAddressReservation.DataSize)
                 : null;
             _backedSpace = new GuestSpaceOwner(viewHost, backingBytes, preReserveGuestAddressSpace, startupReservation);
+            SharpEmu.HLE.GuestMemory.GuestRangeCanonicalizer.Attach(_backedSpace);
             RunBackingSelfTest();
         }
     }
@@ -2285,7 +2286,22 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    // A write by a thread executing the GPU command stream is reported as a store for the work
+    // resolved ahead of the stream (StreamStoreHook).
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
+    {
+        var store = StreamStoreHook.Begin(virtualAddress, (ulong)source.Length);
+        try
+        {
+            return TryWriteCore(virtualAddress, source);
+        }
+        finally
+        {
+            StreamStoreHook.End(store);
+        }
+    }
+
+    private bool TryWriteCore(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
         // A managed write into a page the guest-image write tracker has
         // protected surfaces as a fatal AccessViolation — the runtime turns
@@ -2387,6 +2403,19 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     }
 
     public bool TryCopy(ulong destinationAddress, ulong sourceAddress, ulong length)
+    {
+        var store = StreamStoreHook.Begin(destinationAddress, length);
+        try
+        {
+            return TryCopyCore(destinationAddress, sourceAddress, length);
+        }
+        finally
+        {
+            StreamStoreHook.End(store);
+        }
+    }
+
+    private bool TryCopyCore(ulong destinationAddress, ulong sourceAddress, ulong length)
     {
         if (length == 0)
         {
@@ -3002,6 +3031,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         if (!_disposed)
         {
             Clear();
+            if (_backedSpace is { } backed)
+                SharpEmu.HLE.GuestMemory.GuestRangeCanonicalizer.Detach(backed);
             _backedSpace?.Dispose();
             _backedSpace = null;
             if (_ownsStartupAddressReservations && !_hostMemory.Free(WindowsGuestAddressReservation.ImageStart))

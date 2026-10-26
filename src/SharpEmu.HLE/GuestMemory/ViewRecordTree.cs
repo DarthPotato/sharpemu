@@ -56,9 +56,11 @@ internal sealed class ViewRecordTree : IEnumerable<ViewRecord>
         return result;
     }
 
-    public ViewRecord FindAtOrAbove(ulong address)
+    public ViewRecord FindAtOrAbove(ulong address) => FindAtOrAbove(_root, address);
+
+    internal static ViewRecord FindAtOrAbove(Node? root, ulong address)
     {
-        var current = _root;
+        var current = root;
         var result = default(ViewRecord);
         while (current is not null)
         {

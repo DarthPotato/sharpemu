@@ -28,21 +28,28 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool Refused;
         // GpuWritebackEpoch.HistoryFloor at the start.
         public long HistoryFloor;
-        // The ranges read through guest memory directly (headers, code, input tables).
+        // The ranges read through guest memory directly (headers, code, input tables), canonical.
         public readonly ConcurrentReadRecorder DirectReads = new();
+        // The views the ranges were canonicalized against (GuestRangeCanonicalizer).
+        public readonly long ViewGeneration = SharpEmu.HLE.GuestMemory.GuestRangeCanonicalizer.ViewGeneration;
+        // The presenter readers' ranges in canonical pieces, made on the first comparison.
+        private ConcurrentReadRecorder? _answerRanges;
 
-        // Whether a store into this range could have changed what the resolution read.
+        // Whether a store (a canonical range from the history) could have changed what the resolution read.
         public bool MayHaveRead(ulong address, ulong size)
         {
             if (DirectReads.Overlaps(address, size))
                 return true;
-            foreach (var answer in Answers)
+            if (_answerRanges is null)
             {
-                if (address < answer.Address + answer.Size && answer.Address < address + size)
-                    return true;
+                _answerRanges = new ConcurrentReadRecorder();
+                foreach (var answer in Answers)
+                {
+                    _answerRanges.AddCanonical(answer.Address, answer.Size);
+                }
             }
 
-            return false;
+            return _answerRanges.Overlaps(address, size);
         }
 
         public void Record(ConcurrentQuery query, ulong address, ulong size, bool answer)
@@ -114,6 +121,8 @@ internal static unsafe partial class VulkanVideoPresenter
             };
             if (GpuWritebackEpoch.RangeAware)
             {
+                _concurrentAssumptions.DirectReads.Floor = historyFloor;
+                _concurrentAssumptions.DirectReads.ViewGeneration = _concurrentAssumptions.ViewGeneration;
                 ConcurrentReadRecorder.Open(_concurrentAssumptions.DirectReads);
             }
         }
@@ -133,12 +142,25 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IConcurrentResolveHost.IsStillCurrent(object assumptionsObject)
         {
             var assumptions = (ConcurrentAssumptions)assumptionsObject;
+            // Views that changed since the start may map what it read (canonicalized against the old
+            // views) to other bytes, with or without a store.
+            if (GpuWritebackEpoch.RangeAware &&
+                assumptions.ViewGeneration != SharpEmu.HLE.GuestMemory.GuestRangeCanonicalizer.ViewGeneration)
+            {
+                _staleByWriteback++;
+                _staleWritebackCauses[(int)GpuWritebackEpoch.StaleCause.Unknown]++;
+                return false;
+            }
+
             if (!GpuWritebackEpoch.Unchanged(assumptions.WritebackEpoch))
             {
                 // A store still writing, or one since the start that touched a range the resolution read
                 // (or a history that no longer reaches back), makes it stale. Stores only elsewhere do not.
+                // Views that changed since the start may map the canonical ranges to other bytes.
                 var cause = GpuWritebackEpoch.HasActiveWriters
                     ? GpuWritebackEpoch.StaleCause.Overlapping
+                    : assumptions.ViewGeneration != SharpEmu.HLE.GuestMemory.GuestRangeCanonicalizer.ViewGeneration
+                        ? GpuWritebackEpoch.StaleCause.Unknown
                     : GpuWritebackEpoch.RecordsHistory
                         ? GpuWritebackEpoch.ClassifyStores(assumptions.HistoryFloor, assumptions.MayHaveRead)
                         : GpuWritebackEpoch.StaleCause.Unknown;

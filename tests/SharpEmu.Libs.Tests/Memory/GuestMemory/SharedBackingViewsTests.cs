@@ -130,6 +130,57 @@ public sealed class SharedBackingViewsTests
         Assert.True(host.FreeHole(second, hole));
     }
 
+    // Ranges reached through two views of one backing offset have the same canonical pieces; a range
+    // running past a view keeps its guest address there; view changes move the generation.
+    [Fact]
+    public void TwoViewsOfOneOffset_HaveTheSameCanonicalRanges()
+    {
+        if (!Supported)
+        {
+            return;
+        }
+
+        var host = HostViewMemory.Create();
+        using var store = new SharedBackingViews(host, BackingSize);
+        var hole = HoleSize(host);
+        var first = ReserveFreeHole(host, hole);
+        var second = ReserveFreeHole(host, hole);
+        Assert.True(host.SplitHole(first, Segment));
+        Assert.True(host.SplitHole(second, Segment));
+        var before = store.ViewGeneration;
+        Assert.True(store.TryMapReservedRange(first, Segment, Segment, HostPageProtection.ReadWrite, out _));
+        Assert.True(store.TryMapReservedRange(second, Segment, Segment, HostPageProtection.ReadWrite, out _));
+        Assert.True(store.ViewGeneration > before);
+        try
+        {
+            List<(ulong, ulong)> Pieces(ulong address, ulong size)
+            {
+                var pieces = new List<(ulong, ulong)>();
+                store.ForEachCanonicalRange(address, size, (pieceAddress, pieceSize) => pieces.Add((pieceAddress, pieceSize)));
+                return pieces;
+            }
+
+            Assert.Equal(Pieces(first + 0x100, 0x40), Pieces(second + 0x100, 0x40));
+            Assert.Equal([(store.AliasBase + Segment + 0x100, 0x40UL)], Pieces(first + 0x100, 0x40));
+            // Past the end of the view: the canonical part, then the guest address beyond it.
+            Assert.Equal([(store.AliasBase + Segment + Segment - 0x10, 0x10UL), (first + Segment, 0x10UL)],
+                Pieces(first + Segment - 0x10, 0x20));
+            var mapped = store.ViewGeneration;
+            Assert.True(store.Unmap(first, Segment, out _));
+            Assert.True(store.ViewGeneration > mapped);
+            Assert.Equal([(first + 0x100, 0x40UL)], Pieces(first + 0x100, 0x40));
+        }
+        finally
+        {
+            _ = store.Unmap(first, Segment, out _);
+            Assert.True(store.Unmap(second, Segment, out _));
+            Assert.True(host.JoinHoles(first, hole));
+            Assert.True(host.JoinHoles(second, hole));
+            Assert.True(host.FreeHole(first, hole));
+            Assert.True(host.FreeHole(second, hole));
+        }
+    }
+
     // Single-view transfers run without the lock against a snapshot of the views; they
     // must stay exact on a stable view and fail or succeed cleanly on a view that is
     // being unmapped and remapped at the same time.

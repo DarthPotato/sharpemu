@@ -151,6 +151,47 @@ public sealed class RenderExecutorComputePrefetchTests : IDisposable
         Assert.Contains("dispatch 4 1 1", _host.Calls);
     }
 
+    // Ungated, a draw whose job the worker has not started resolves its own programs; gated, it
+    // waits for the worker as before.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void AnUngatedDrawWhoseJobHasNotStartedResolvesItsOwnPrograms(bool ungated)
+    {
+        var previous = ParallelProgramPrefetch.Ungated;
+        ParallelProgramPrefetch.Ungated = ungated;
+        try
+        {
+            using var prefetch = new ParallelProgramPrefetch(_executor, _host, new ConcurrentHost(current: true));
+            _executor.Prefetch = prefetch;
+            var banks = Banks();
+            // Gated on an item that has not run: the worker cannot start it.
+            prefetch.Current = prefetch.Submit(banks, 1);
+            if (ungated)
+            {
+                _executor.DrawAuto(1, banks, Auto(3));
+                prefetch.AdvanceGate(1);
+                prefetch.WaitIdle();
+                // Resolved once, by the draw; the worker skipped its cancelled job.
+                Assert.Equal(1, _pipelines.Calls.Count(call => call.StartsWith("get_graphics_programs", StringComparison.Ordinal)));
+            }
+            else
+            {
+                var draw = Task.Run(() => _executor.DrawAuto(1, banks, Auto(3)));
+                Assert.False(draw.Wait(100));
+                prefetch.AdvanceGate(1);
+                draw.Wait();
+                Assert.Equal(1, _pipelines.Calls.Count(call => call.StartsWith("get_graphics_programs", StringComparison.Ordinal)));
+            }
+
+            Assert.Contains(_host.Calls, call => call.StartsWith("draw ", StringComparison.Ordinal));
+        }
+        finally
+        {
+            ParallelProgramPrefetch.Ungated = previous;
+        }
+    }
+
     // A graphics job is not taken as a dispatch's, and the reverse.
     [Fact]
     public void ADrawJobIsNotTakenByADispatch()
