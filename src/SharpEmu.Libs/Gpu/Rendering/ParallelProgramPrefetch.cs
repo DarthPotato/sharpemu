@@ -235,10 +235,11 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         }
 
         // A clean word read the worker refused, where the render thread would have synchronized
-        // the image first and read it: counted for now (graphics behaviour unchanged).
+        // the image first and read it: the programs it resolved can differ from the render thread's.
         if (_concurrent.RefusedReads(job.Assumptions!))
         {
             _graphicsTakenWithRefusals++;
+            return false;
         }
 
         programs = job.Programs!;
@@ -311,7 +312,7 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         var line = $"[PERF][PROGRAM_PREFETCH] taken={_takeOutcomes[0]} no_job={_takeOutcomes[1]} other_banks={_takeOutcomes[2]} " +
             $"not_resolved={_takeOutcomes[3]} other_inputs={_takeOutcomes[4]} stale={_takeOutcomes[5]} " +
             $"input_pixel={_inputMismatches[0]} input_depth={_inputMismatches[1]} input_indexed={_inputMismatches[2]} input_mapping={_inputMismatches[3]} " +
-            $"graphics_taken_with_refusals={_graphicsTakenWithRefusals} " +
+            $"graphics_refused={_graphicsTakenWithRefusals} " +
             $"compute_taken={_computeOutcomes[0]} compute_no_job={_computeOutcomes[1]} compute_other_inputs={_computeOutcomes[2]} " +
             $"compute_not_resolved={_computeOutcomes[3]} compute_unavailable={_computeOutcomes[4]} compute_refused={_computeOutcomes[5]} " +
             $"compute_stale={_computeOutcomes[6]} compute_not_started={_computeOutcomes[7]}";
