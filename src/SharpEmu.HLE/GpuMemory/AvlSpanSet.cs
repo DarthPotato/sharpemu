@@ -3,12 +3,17 @@
 
 namespace SharpEmu.HLE.GpuMemory;
 
-// Every operation holds the set's own lock: the program prefetch worker asks whether bytes are
-// GPU-modified while the render thread and completion callbacks change the set, and a rotation seen
-// half done can send a reader around a cycle. The tree does not change range ownership.
+// The program prefetch worker asks whether bytes are GPU-modified while the render thread and
+// completion callbacks change the set. Changes hold the set's own lock and make the version odd
+// while they run. Contains and Overlaps read without the lock: a read that saw the version change,
+// or walked further than a balanced tree is deep (a rotation seen half done), is repeated under the
+// lock. The tree does not change range ownership.
 public sealed class AvlSpanSet
 {
     private readonly object _gate = new();
+    private int _version;
+    // Deeper than any balanced tree of 2^64 spans (height <= 1.44 log2 n).
+    private const int MaxReadSteps = 128;
 
     private sealed class Node(ulong start, ulong end)
     {
@@ -20,16 +25,115 @@ public sealed class AvlSpanSet
     }
 
     private Node? _root;
-    public bool IsEmpty { get { lock (_gate) return _root is null; } }
-    public void Clear() { lock (_gate) _root = null; }
+    public bool IsEmpty => Volatile.Read(ref _root) is null;
 
-    public void Add(ulong address, ulong size) { lock (_gate) AddCore(address, size); }
+    public void Clear()
+    {
+        lock (_gate)
+        {
+            BeginChange();
+            _root = null;
+            EndChange();
+        }
+    }
 
-    public void Remove(ulong address, ulong size) { lock (_gate) RemoveCore(address, size); }
+    public void Add(ulong address, ulong size)
+    {
+        lock (_gate)
+        {
+            BeginChange();
+            try
+            {
+                AddCore(address, size);
+            }
+            finally
+            {
+                EndChange();
+            }
+        }
+    }
 
-    public bool Contains(ulong address, ulong size) { lock (_gate) return ContainsCore(address, size); }
+    public void Remove(ulong address, ulong size)
+    {
+        lock (_gate)
+        {
+            BeginChange();
+            try
+            {
+                RemoveCore(address, size);
+            }
+            finally
+            {
+                EndChange();
+            }
+        }
+    }
 
-    public bool Overlaps(ulong address, ulong size) { lock (_gate) return OverlapsCore(address, size); }
+    // Odd while a change runs; the increments are full fences, so a reader that sees the same even
+    // version before and after its walk saw no part of a change.
+    private void BeginChange() => Interlocked.Increment(ref _version);
+
+    private void EndChange() => Interlocked.Increment(ref _version);
+
+    public bool Contains(ulong address, ulong size)
+    {
+        ValidateRange(address, size);
+        var version = Volatile.Read(ref _version);
+        if ((version & 1) == 0 && TryFindAtOrBelowUnlocked(address, out var node))
+        {
+            var contains = node is not null && node.End >= address + size;
+            Interlocked.MemoryBarrier();
+            if (Volatile.Read(ref _version) == version) return contains;
+        }
+
+        lock (_gate) return ContainsCore(address, size);
+    }
+
+    public bool Overlaps(ulong address, ulong size)
+    {
+        ValidateRange(address, size);
+        var version = Volatile.Read(ref _version);
+        if ((version & 1) == 0 && TryOverlapsUnlocked(address, address + size, out var overlaps))
+        {
+            Interlocked.MemoryBarrier();
+            if (Volatile.Read(ref _version) == version) return overlaps;
+        }
+
+        lock (_gate) return OverlapsCore(address, size);
+    }
+
+    private bool TryFindAtOrBelowUnlocked(ulong address, out Node? result)
+    {
+        result = null;
+        var steps = 0;
+        for (var node = Volatile.Read(ref _root); node is not null; steps++)
+        {
+            if (steps == MaxReadSteps) return false;
+            if (node.Start <= address) { result = node; node = node.Right; }
+            else node = node.Left;
+        }
+
+        return true;
+    }
+
+    private bool TryOverlapsUnlocked(ulong address, ulong end, out bool overlaps)
+    {
+        overlaps = false;
+        var steps = 0;
+        for (var node = Volatile.Read(ref _root); node is not null; steps++)
+        {
+            if (steps == MaxReadSteps) return false;
+            if (node.Start >= end) node = node.Left;
+            else if (node.End <= address) node = node.Right;
+            else
+            {
+                overlaps = true;
+                return true;
+            }
+        }
+
+        return true;
+    }
 
     public List<GuestSpan> GetOverlappingRanges(ulong address, ulong size) { lock (_gate) return GetOverlappingRangesCore(address, size); }
 

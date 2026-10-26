@@ -63,4 +63,48 @@ public sealed class AvlSpanSetTests
         Assert.False(set.Overlaps(ulong.MaxValue - 50, 50));
         Assert.Equal(new[] { new GuestSpan(ulong.MaxValue - 100, 50) }, set.GetOverlappingRanges(ulong.MaxValue - 100, 100));
     }
+
+    // Readers walk the tree without its lock while a writer merges and splits spans elsewhere: they
+    // always finish, and spans the writer never touches always read the same.
+    [Fact]
+    public void ReadsWithoutTheLockStayCorrectDuringConcurrentChanges()
+    {
+        var set = new AvlSpanSet();
+        const ulong kept = 0x10_0000;
+        set.Add(kept, 0x1000);
+        var readersDone = 0;
+        var failures = 0;
+        // Dedicated threads: a busy thread pool would leave a reader unstarted.
+        var writer = new Thread(() =>
+        {
+            var random = new System.Random(7);
+            while (Volatile.Read(ref readersDone) < 3)
+            {
+                // Churn below and above the kept span, never over it or the absent one.
+                var low = random.Next(2) == 0;
+                var address = low ? (ulong)random.Next(0, 0xF_0000) : 0x20_0000 + (ulong)random.Next(0, 0xF_0000);
+                var size = (ulong)random.Next(1, 0x1000);
+                if (random.Next(2) == 0) set.Add(address, size);
+                else set.Remove(address, size);
+            }
+        });
+        var readers = Enumerable.Range(0, 3).Select(_ => new Thread(() =>
+        {
+            for (var read = 0; read < 200_000; read++)
+            {
+                if (!set.Overlaps(kept + 0x800, 8) || !set.Contains(kept, 0x1000) ||
+                    set.Overlaps(0x18_0000, 0x1000) || set.Contains(0x18_0000, 8))
+                {
+                    Interlocked.Increment(ref failures);
+                }
+            }
+
+            Interlocked.Increment(ref readersDone);
+        })).ToArray();
+        writer.Start();
+        foreach (var reader in readers) reader.Start();
+        foreach (var reader in readers) Assert.True(reader.Join(TimeSpan.FromSeconds(60)));
+        Assert.True(writer.Join(TimeSpan.FromSeconds(60)));
+        Assert.Equal(0, failures);
+    }
 }
