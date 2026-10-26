@@ -4,6 +4,7 @@
 namespace SharpEmu.Libs.VideoOut;
 
 using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.HLE;
 using SharpEmu.Libs.Gpu.Scheduling;
 
 internal static unsafe partial class VulkanVideoPresenter
@@ -25,8 +26,24 @@ internal static unsafe partial class VulkanVideoPresenter
         // A clean word read was refused because the GPU owns it: the render thread synchronizes
         // such a word and reads it, so a result resolved without it can differ.
         public bool Refused;
-        // GpuWritebackEpoch.HistoryFloor at the start (render profile diagnostics only).
+        // GpuWritebackEpoch.HistoryFloor at the start.
         public long HistoryFloor;
+        // The ranges read through guest memory directly (headers, code, input tables).
+        public readonly ConcurrentReadRecorder DirectReads = new();
+
+        // Whether a store into this range could have changed what the resolution read.
+        public bool MayHaveRead(ulong address, ulong size)
+        {
+            if (DirectReads.Overlaps(address, size))
+                return true;
+            foreach (var answer in Answers)
+            {
+                if (address < answer.Address + answer.Size && answer.Address < address + size)
+                    return true;
+            }
+
+            return false;
+        }
 
         public void Record(ConcurrentQuery query, ulong address, ulong size, bool answer)
         {
@@ -61,12 +78,17 @@ internal static unsafe partial class VulkanVideoPresenter
     // readers (other reads, such as shader code, are not recorded): overlapping, disjoint, unknown.
     private static readonly long[] _staleWritebackCauses = new long[3];
 
+    // Resolutions taken although the epoch moved, every store since their start being elsewhere.
+    private static long _keptAcrossWriteback;
+
     internal static string TakeStaleReport()
     {
         var line = $"[PERF][PROGRAM_PREFETCH_STALE] writeback_epoch={_staleByWriteback} ownership_answer={_staleByAnswer} " +
-            $"writeback_overlapping={_staleWritebackCauses[0]} writeback_disjoint={_staleWritebackCauses[1]} writeback_unknown={_staleWritebackCauses[2]}";
+            $"writeback_overlapping={_staleWritebackCauses[0]} writeback_disjoint={_staleWritebackCauses[1]} writeback_unknown={_staleWritebackCauses[2]} " +
+            $"kept_across_writeback={_keptAcrossWriteback}";
         _staleByWriteback = 0;
         _staleByAnswer = 0;
+        _keptAcrossWriteback = 0;
         Array.Clear(_staleWritebackCauses);
         return line;
     }
@@ -90,11 +112,16 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 HistoryFloor = historyFloor,
             };
+            if (GpuWritebackEpoch.RangeAware)
+            {
+                ConcurrentReadRecorder.Open(_concurrentAssumptions.DirectReads);
+            }
         }
 
         object IConcurrentResolveHost.EndConcurrentResolve()
         {
             var assumptions = _concurrentAssumptions ?? throw new InvalidOperationException("No concurrent resolution is open.");
+            ConcurrentReadRecorder.Close();
             _concurrentAssumptions = null;
             return assumptions;
         }
@@ -108,23 +135,21 @@ internal static unsafe partial class VulkanVideoPresenter
             var assumptions = (ConcurrentAssumptions)assumptionsObject;
             if (!GpuWritebackEpoch.Unchanged(assumptions.WritebackEpoch))
             {
-                _staleByWriteback++;
-                if (GpuWritebackEpoch.RecordsHistory)
+                // A store still writing, or one since the start that touched a range the resolution read
+                // (or a history that no longer reaches back), makes it stale. Stores only elsewhere do not.
+                var cause = GpuWritebackEpoch.HasActiveWriters
+                    ? GpuWritebackEpoch.StaleCause.Overlapping
+                    : GpuWritebackEpoch.RecordsHistory
+                        ? GpuWritebackEpoch.ClassifyStores(assumptions.HistoryFloor, assumptions.MayHaveRead)
+                        : GpuWritebackEpoch.StaleCause.Unknown;
+                _staleWritebackCauses[(int)cause]++;
+                if (!GpuWritebackEpoch.RangeAware || cause != GpuWritebackEpoch.StaleCause.Disjoint)
                 {
-                    var cause = GpuWritebackEpoch.ClassifyStores(assumptions.HistoryFloor, (address, size) =>
-                    {
-                        foreach (var answer in assumptions.Answers)
-                        {
-                            if (address < answer.Address + answer.Size && answer.Address < address + size)
-                                return true;
-                        }
-
-                        return false;
-                    });
-                    _staleWritebackCauses[(int)cause]++;
+                    _staleByWriteback++;
+                    return false;
                 }
 
-                return false;
+                _keptAcrossWriteback++;
             }
 
             if (assumptions.BufferVersion == _bufferCache.GpuModifiedVersion && !assumptions.ReadsImageOwnership)

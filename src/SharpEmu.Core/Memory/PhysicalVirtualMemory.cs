@@ -2054,6 +2054,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public bool TryRead(ulong virtualAddress, Span<byte> destination)
     {
+        ConcurrentReadRecorder.Note(virtualAddress, (ulong)destination.Length);
         // Backed guest memory is the shared backing itself, and the backing's view table
         // is readable without a lock; only other memory needs _gate to find its region.
         // Descriptor evaluation alone reads guest words ~40 at a time per draw here.
@@ -2132,6 +2133,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public bool TryScanCString(ulong address, byte needle, bool findLast, ulong maxLength, out ulong match)
     {
+        ConcurrentReadRecorder.Note(address, maxLength);
         match = 0;
         _gate.EnterReadLock();
         try
@@ -2217,6 +2219,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         ReadOnlySpan<byte> expected,
         out bool equal)
     {
+        ConcurrentReadRecorder.Note(virtualAddress, (ulong)expected.Length);
         equal = false;
         _gate.EnterReadLock();
         try

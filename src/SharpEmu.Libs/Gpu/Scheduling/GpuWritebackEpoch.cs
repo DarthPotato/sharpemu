@@ -43,9 +43,15 @@ internal static class GpuWritebackEpoch
         }
     }
 
-    // With the render profile, the ranges of recent stores are kept to tell whether a stale
-    // resolution read what a store wrote, or was rejected for a store elsewhere.
-    public static readonly bool RecordsHistory = VideoOut.RenderPhaseProfile.Enabled;
+    // The ranges of recent stores are kept so a resolution whose epoch moved is still taken when every
+    // store since its start was elsewhere. Opt-in (SHARPEMU_PREFETCH_RANGE_AWARE=1) until reads and
+    // stores are compared through backing identities: two guest views of one backing make an
+    // overlapping store look disjoint. Off, any store rejects (the render profile still keeps the
+    // history to report why).
+    public static readonly bool RangeAware = Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_RANGE_AWARE") == "1";
+    public static readonly bool RecordsHistory = RangeAware || VideoOut.RenderPhaseProfile.Enabled;
+
+    public static bool HasActiveWriters => Volatile.Read(ref _activeWriters) != 0;
     private const int HistoryCapacity = 4096;
     private static readonly (long Epoch, ulong Address, ulong Size)[] History = new (long, ulong, ulong)[HistoryCapacity];
     private static readonly List<long> ActiveBegins = new();
