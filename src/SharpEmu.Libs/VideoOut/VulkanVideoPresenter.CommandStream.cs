@@ -467,7 +467,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _postingQueueId = queueId;
                 // The translation state belongs to this thread; the queue context to the render thread.
                 _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
-                _commandThread!.Post(() => BeginSubmissionContext(queueId, submissionId));
+                _commandThread!.PostNonGating(() => BeginSubmissionContext(queueId, submissionId));
                 return;
             }
 
@@ -492,7 +492,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.Post(Flush);
+                _commandThread!.PostNonGating(Flush);
                 return;
             }
 
@@ -548,7 +548,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.Post(RunGarbageCollector);
+                _commandThread!.PostNonGating(RunGarbageCollector);
                 return;
             }
 
@@ -609,7 +609,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.PostRange(() => FillBuffer(address, size, value, isGds), address, isGds ? 0 : size);
+                _commandThread!.PostRange(() => FillBuffer(address, size, value, isGds), address, isGds ? 0 : size, nonGating: true);
                 return;
             }
 
@@ -625,7 +625,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.PostRange(() => CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds), destination, destinationIsGds ? 0 : size);
+                _commandThread!.PostRange(() => CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds), destination, destinationIsGds ? 0 : size, nonGating: true);
                 return;
             }
 
@@ -665,7 +665,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (OnCommandThread)
             {
                 var queued = write;
-                _commandThread!.Post(() => RecordEndOfPipe(in queued));
+                _commandThread!.PostNonGating(() => RecordEndOfPipe(in queued));
                 return;
             }
 

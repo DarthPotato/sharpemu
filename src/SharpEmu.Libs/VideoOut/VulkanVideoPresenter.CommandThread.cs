@@ -123,8 +123,10 @@ internal static partial class VulkanVideoPresenter
 
         public void Post(Action action) => Enqueue(new Item { Kind = Kind.Call, Action = action, Origin = OriginOf(action) });
 
-        // A call that changes neither guest memory nor what a resolution reads (a barrier): with
-        // ungating on, it does not gate the prefetch, like a store or a dispatch.
+        // A call that does not gate the prefetch with ungating on, like a store or a dispatch: whatever
+        // it changes that a resolution reads (guest bytes in write scopes, GPU ownership answers, views)
+        // is checked when the resolution is taken, and the structures the worker reads are locked
+        // (local/reports/codex-gate-audit.md lists what each call changes).
         public void PostNonGating(Action action) =>
             Enqueue(new Item { Kind = Kind.Call, Action = action, Origin = OriginOf(action), NonGating = true });
 
@@ -175,9 +177,10 @@ internal static partial class VulkanVideoPresenter
         }
 
         // A fill or copy the render thread runs in order; reads of its destination wait for it.
-        public void PostRange(Action action, ulong address, ulong size)
+        // nonGating: as PostNonGating; the pending range still makes reads of the destination wait.
+        public void PostRange(Action action, ulong address, ulong size, bool nonGating = false)
         {
-            var item = new Item { Kind = Kind.Call, Action = action, Address = address, RangeSize = size, Origin = OriginOf(action) };
+            var item = new Item { Kind = Kind.Call, Action = action, Address = address, RangeSize = size, Origin = OriginOf(action), NonGating = nonGating };
             if (size != 0)
             {
                 lock (_writeLock)
