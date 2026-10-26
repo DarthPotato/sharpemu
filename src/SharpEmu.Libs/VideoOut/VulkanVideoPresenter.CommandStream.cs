@@ -560,7 +560,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.Post(EmitGlobalBarrier);
+                _commandThread!.PostNonGating(EmitGlobalBarrier);
                 return;
             }
 

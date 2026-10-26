@@ -52,6 +52,8 @@ internal static partial class VulkanVideoPresenter
             public bool Ungated;
             // What posted a call, with the render profile on: its delegate's method.
             public string? Origin;
+            // Posted with PostNonGating.
+            public bool NonGating;
             public bool Sync;
             public volatile bool Done;
             public Exception? Failure;
@@ -120,6 +122,11 @@ internal static partial class VulkanVideoPresenter
             Enqueue(new Item { Kind = Kind.Deferred, Work = work, IsDraw = isDraw, OwnJob = ownJob });
 
         public void Post(Action action) => Enqueue(new Item { Kind = Kind.Call, Action = action, Origin = OriginOf(action) });
+
+        // A call that changes neither guest memory nor what a resolution reads (a barrier): with
+        // ungating on, it does not gate the prefetch, like a store or a dispatch.
+        public void PostNonGating(Action action) =>
+            Enqueue(new Item { Kind = Kind.Call, Action = action, Origin = OriginOf(action), NonGating = true });
 
         public void Run(Action action)
         {
@@ -248,7 +255,7 @@ internal static partial class VulkanVideoPresenter
             ThrowIfFailed();
             // Ungated, a store or a dispatch is not a gate: the prefetch resolves past it and each
             // resolution is checked, when taken, against the stores the item made (range-aware).
-            item.Ungated = !item.IsDraw && ParallelProgramPrefetch.Ungated && item.Kind is Kind.Write or Kind.Deferred;
+            item.Ungated = !item.IsDraw && ParallelProgramPrefetch.Ungated && (item.Kind is Kind.Write or Kind.Deferred || item.NonGating);
             if (!item.IsDraw && !item.Ungated)
             {
                 item.JobsBefore = (_prefetch?.Submitted ?? 0) - (item.OwnJob ? 1 : 0);
