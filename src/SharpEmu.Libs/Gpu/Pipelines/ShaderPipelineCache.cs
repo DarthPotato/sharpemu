@@ -23,7 +23,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly CpuContext _context;
     private readonly IShaderPipelineHost _host;
     private readonly ShaderHeaderRegistry _registry;
-    private readonly ShaderProgramCache _programs;
+    // Draws and dispatches resolve their programs in separate caches, each under its own gate, so a
+    // draw's resolution and a dispatch's can run at the same time (program entries are per stage).
+    private readonly ShaderProgramCache _graphicsPrograms;
+    private readonly ShaderProgramCache _computePrograms;
     private readonly Dictionary<GraphicsPipelineKey, PipelineHandle> _graphicsPipelines = new();
     private readonly Dictionary<ComputePipelineKey, PipelineHandle> _computePipelines = new();
     private readonly Dictionary<Gen5ShaderProgram, bool> _rayTracingComputePrograms = new();
@@ -41,10 +44,14 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         _context = context;
         _host = host;
         _registry = registry;
-        _programs = new ShaderProgramCache(context, compiler, host);
+        var programIds = new ProgramIdSource();
+        _graphicsPrograms = new ShaderProgramCache(context, compiler, host, programIds);
+        _computePrograms = new ShaderProgramCache(context, compiler, host, programIds);
     }
 
-    public ShaderProgramCache Programs => _programs;
+    public ShaderProgramCache Programs => _graphicsPrograms;
+
+    public ShaderProgramCache ComputePrograms => _computePrograms;
 
     public bool MeshShadersSupported => _host.MeshShadersSupported;
 
@@ -89,10 +96,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return new ShaderSource(registered, hash, userData, includeGeometryPointer ? 0 : userDataBase, stage);
     }
 
-    // Program resolution runs on the render thread and on a thread resolving draws ahead of it;
-    // the program, decode and materialization caches it updates are used under this lock only.
-    // A pipeline lookup takes _pipelineGate instead, so it does not wait for a resolution.
-    private readonly object _resolveGate = new();
+    // Program resolution runs on the render thread and on threads resolving work ahead of it; each
+    // domain's program, decode and materialization caches are used under its gate only. Neither
+    // gate is taken while _gate is held. A pipeline lookup takes _pipelineGate, so it does not wait
+    // for a resolution.
+    private readonly object _graphicsResolveGate = new();
+    private readonly object _computeResolveGate = new();
 
     public GraphicsPrograms GetGraphicsPrograms(
         VertexStageRegisters vertex,
@@ -159,7 +168,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         // resolution then uses exactly these and touches only their cache entries.
         var sources = PrepareGraphicsSources(vertex, pixel, shaderInterface, context, pixelActive, mesh);
         using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GraphicsResolveLockWait);
-        lock (_resolveGate)
+        lock (_graphicsResolveGate)
         {
             using var workScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
             return ResolveGraphicsProgramsCore(sources, vertex, pixel, shaderInterface, context, targetExportMapping, pixelActive, depthBound, mesh);
@@ -239,7 +248,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 RenderTrace.Write($"PixelDrawState shader=0x{pixelSource.Address:X16} hash=0x{pixelSource.Hash:X16} " +
                     $"user_data=[{string.Join(",", pixelSource.UserData.Select(word => $"{word:X8}"))}]");
             using var pixelProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PixelInputResolution);
-            var pixelProgram = _programs.Decode(pixelSource);
+            var pixelProgram = _graphicsPrograms.Decode(pixelSource);
             var attributes = GetPixelAttributes(pixelProgram);
             attributeCount = attributes.Length == 0 ? 0 : attributes[^1] + 1;
             var inputCount = shaderInterface.PixelInputControl & 0x3Fu;
@@ -269,14 +278,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgramHandle = default;
         ShaderStageResources vertexStage;
         ShaderStageResources pixelStage = default;
-        profileScope.SwitchPhase(RenderPhaseProfile.Phase.ProgramSharedGateWait);
-        lock (_gate)
         {
-            profileScope.SwitchPhase(RenderPhaseProfile.Phase.ProgramPreparation);
             var pushDataCursor = 0u;
             if (pixelSource is not null)
             {
                 if (!TryPrepareProgram(
+                    _graphicsPrograms,
                     pixelSource,
                     new StageCompileOptions
                     {
@@ -292,6 +299,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             }
 
             if (!TryPrepareProgram(
+                _graphicsPrograms,
                 vertexSource,
                 mesh is null
                     ? new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount, Tessellation = tessellation }
@@ -315,27 +323,24 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         TessellationDrawPrograms? tessellationPrograms = null;
         if (tessellated)
         {
-            lock (_gate)
+            tessellationPrograms = PrepareTessellationHull(sources.Hull!, vertex, shaderInterface, tessellation!.Value);
+            var bridge = _graphicsPrograms.GetTessellationBridge(vertexStage.Program!.Bindings!, tessellation.Value.Domain);
+            vertexInfo = new VertexInputInfo
             {
-                tessellationPrograms = PrepareTessellationHull(sources.Hull!, vertex, shaderInterface, tessellation!.Value);
-                var bridge = _programs.GetTessellationBridge(vertexStage.Program!.Bindings!, tessellation.Value.Domain);
-                vertexInfo = new VertexInputInfo
-                {
-                    PositionExportControl = vertexInfo.PositionExportControl,
-                    IeeeMode = vertexInfo.IeeeMode,
-                    Stage = vertexStage,
-                    Tessellation = new(bridge.Control, vertexProgram, tessellationPrograms.HullConfiguration.InputControlPoints),
-                };
-                vertexProgram = bridge.Vertex;
-            }
+                PositionExportControl = vertexInfo.PositionExportControl,
+                IeeeMode = vertexInfo.IeeeMode,
+                Stage = vertexStage,
+                Tessellation = new(bridge.Control, vertexProgram, tessellationPrograms.HullConfiguration.InputControlPoints),
+            };
+            vertexProgram = bridge.Vertex;
         }
 
         SolidColorClear? solidClear = null;
         var disableBlending = false;
         if (mesh is null && pixelInfo is not null && !tessellated)
         {
-            var vertexProgramWords = _programs.Decode(vertexSource);
-            var pixelProgramWords = _programs.Decode(pixelSource!);
+            var vertexProgramWords = _graphicsPrograms.Decode(vertexSource);
+            var pixelProgramWords = _graphicsPrograms.Decode(pixelSource!);
             if (IsProceduralFullscreenClearPair(vertexProgramWords, vertexInfo, vertexStage, pixelProgramWords, pixelStage))
             {
                 var color = DecodeSolidClearColor(pixelStage.Resources.UserData);
@@ -726,7 +731,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     {
         var source = PrepareComputeSource(compute);
         using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ComputeResolveLockWait);
-        lock (_resolveGate)
+        lock (_computeResolveGate)
         {
             using var workScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
             return GetComputeProgramCore(source, compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: false)!;
@@ -744,7 +749,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         uint dimensionZ)
     {
         var source = PrepareComputeSource(compute);
-        lock (_resolveGate)
+        lock (_computeResolveGate)
         {
             return GetComputeProgramCore(source, compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: true);
         }
@@ -764,7 +769,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         bool ahead)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
-        var program = _programs.Decode(source);
+        var program = _computePrograms.Decode(source);
         if (_skipRayTracing)
         {
             profileScope.SwitchPhase(RenderPhaseProfile.Phase.ProgramSharedGateWait);
@@ -801,35 +806,33 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             return new ComputeProgram { Consumed = true };
         }
 
-        ShaderProgram handle;
-        ShaderStageResources stage;
-        profileScope.SwitchPhase(RenderPhaseProfile.Phase.ProgramSharedGateWait);
-        lock (_gate)
+        var pushDataCursor = 0u;
+        if (!TryPrepareProgram(
+            _computePrograms,
+            source,
+            new StageCompileOptions { ComputeInfo = input, ComputeSystemRegisters = systemRegisters },
+            ref pushDataCursor,
+            out var handle,
+            out var stage))
         {
-            profileScope.SwitchPhase(RenderPhaseProfile.Phase.ProgramPreparation);
-            var pushDataCursor = 0u;
-            if (!TryPrepareProgram(
-                source,
-                new StageCompileOptions { ComputeInfo = input, ComputeSystemRegisters = systemRegisters },
-                ref pushDataCursor,
-                out handle,
-                out stage))
-            {
-                return new ComputeProgram { Available = false };
-            }
+            return new ComputeProgram { Available = false };
         }
 
         input.Stage = stage;
         return new ComputeProgram { Program = handle, Input = input };
     }
 
-    private bool TryPrepareProgram(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
+    // Under the domain's resolve gate only: the program caches belong to the domain, and the
+    // presenter publishes the modules under its own lock.
+    private bool TryPrepareProgram(ShaderProgramCache programs, ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
         out ShaderProgram program, out ShaderStageResources stage)
     {
-        if (_programs.TryGetProgram(source, options, _strictShaders, ref pushDataCursor, out program, out stage, out var rejection))
+        if (programs.TryGetProgram(source, options, _strictShaders, ref pushDataCursor, out program, out stage, out var rejection))
             return true;
 
-        if (_reportedShaderSkips.Add((source.Stage, source.Hash, source.CodeSize)))
+        bool firstSkip;
+        lock (_gate) firstSkip = _reportedShaderSkips.Add((source.Stage, source.Hash, source.CodeSize));
+        if (firstSkip)
         {
             var tag = source.Stage == ShaderStage.Compute ? "COMPUTE_SKIPPED" : "DRAW_SKIPPED";
             Console.Error.WriteLine($"[GPU][WARN][{tag}] {rejection} " +

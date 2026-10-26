@@ -167,7 +167,8 @@ internal sealed class ShaderProgramCache
     // SHARPEMU_RESOURCE_CACHE=0 materializes every draw, for A/B comparisons.
     private readonly ResourceMaterializationCache? _materializations =
         Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_CACHE") == "0" ? null : new();
-    private ulong _nextProgramId;
+    // Shared by the caches of one pipeline cache: pipeline keys and the presenter's modules use the ids.
+    private readonly ProgramIdSource _programIds;
 
     public ResourceMaterializationCache? Materializations => _materializations;
 
@@ -182,11 +183,12 @@ internal sealed class ShaderProgramCache
 
     private static readonly bool PrefetchEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_PREFETCH") != "0";
 
-    public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host)
+    public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host, ProgramIdSource? programIds = null)
     {
         _context = context;
         _compiler = compiler;
         _host = host;
+        _programIds = programIds ?? new ProgramIdSource();
         _readGuestWord = host.TryReadGuestWord;
         _readCleanGuestWord = host.TryReadCleanGuestWord;
         _readResidentGuestBytes = host.TryReadResidentGuestBytes;
@@ -206,7 +208,7 @@ internal sealed class ShaderProgramCache
         var shaders = _compiler.CompileTessellationBridge(layout, domain);
         ShaderProgram Create(IGuestCompiledShader shader, ShaderStage stage)
         {
-            var id = ++_nextProgramId;
+            var id = _programIds.Next();
             return new(id, _host.CreateShaderModule(shader, stage, 0, id));
         }
 
@@ -842,7 +844,7 @@ internal sealed class ShaderProgramCache
         }
         var permutationDump = ShaderPermutationDump.WriteInputs(
             source, key, sourceWasCached, _programs.Keys, entry.Permutations,
-            specialization, request, pushDataCursor, _nextProgramId + 1);
+            specialization, request, pushDataCursor, _programIds.Last + 1);
         IGuestCompiledShader? compiled;
         string error;
         bool translated;
@@ -923,7 +925,7 @@ internal sealed class ShaderProgramCache
         _compiler.CountShaderCompilation();
         ShaderPermutationDump.WriteModule(permutationDump, compiled.Payload, compiled.PayloadFileExtension);
         CompiledShaderDump.Write(source.Label, source.Address, source.Hash, compiled, program);
-        var id = ++_nextProgramId;
+        var id = _programIds.Next();
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
         var info = CreateProgramInfo(source, entry, resources, layout, request, compiled.InputLocationMask);
         if (source.Stage == ShaderStage.Compute && options.TessellationHull is null &&

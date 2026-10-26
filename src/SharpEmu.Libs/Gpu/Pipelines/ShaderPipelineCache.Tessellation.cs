@@ -87,7 +87,7 @@ internal sealed partial class ShaderPipelineCache
         if (hullSource.Error is { } hullError) throw SubmissionScheduler.Fatal(hullError);
         var source = hullSource.Source!;
         var registered = hullSource.Registered!;
-        var decoded = _programs.Decode(source);
+        var decoded = _graphicsPrograms.Decode(source);
         if (decoded.FusedContinuationPc is not { } entry ||
             !Gen5TessellationHullInfo.TryDecode(shaderInterface.LocalHullConfiguration, entry + 8, out var hull, out var error))
             throw SubmissionScheduler.Fatal("The merged hull has an invalid continuation or workgroup configuration.");
@@ -99,7 +99,7 @@ internal sealed partial class ShaderPipelineCache
             ScratchDwords = registered.ScratchDwords, NeedsLocalDataShareBarriers = true,
         };
         var cursor = 0u;
-        var handle = _programs.GetOrCompile(source, new StageCompileOptions
+        var handle = _graphicsPrograms.GetOrCompile(source, new StageCompileOptions
             { ComputeInfo = input, TessellationHull = hull }, ref cursor, out var stage);
         input.Stage = stage;
         return new(tessellation, hull, new ComputeProgram { Program = handle, Input = input });
