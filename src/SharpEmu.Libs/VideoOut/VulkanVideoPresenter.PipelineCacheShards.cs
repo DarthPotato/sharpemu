@@ -27,14 +27,15 @@ internal static unsafe partial class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_VK_PIPELINE_CACHE_LEGACY_SHARDS") == "1";
 
         private string ComputeCacheKey(ulong guestHash, ulong module) =>
-            !LegacyShaderGroups && _shaderModuleCacheIdentities.TryGetValue(module, out var identity)
+            !LegacyShaderGroups && TryGetShaderModuleCacheIdentity(module, out var identity)
                 ? $"c2-{identity}" : $"c-{guestHash:X16}";
 
         private string GraphicsCacheKey(ulong vertexHash, ulong pixelHash, ulong vertexModule, ulong pixelModule)
         {
-            if (!LegacyShaderGroups && _shaderModuleCacheIdentities.TryGetValue(vertexModule, out var vertex) &&
-                (pixelModule == 0 || _shaderModuleCacheIdentities.ContainsKey(pixelModule)))
-                return $"g2-{vertex}-{(pixelModule == 0 ? "none" : _shaderModuleCacheIdentities[pixelModule])}";
+            string? pixel = null;
+            if (!LegacyShaderGroups && TryGetShaderModuleCacheIdentity(vertexModule, out var vertex) &&
+                (pixelModule == 0 || TryGetShaderModuleCacheIdentity(pixelModule, out pixel)))
+                return $"g2-{vertex}-{(pixelModule == 0 ? "none" : pixel)}";
             return $"g-{vertexHash:X16}-{pixelHash:X16}";
         }
 

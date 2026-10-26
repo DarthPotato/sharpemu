@@ -61,6 +61,10 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly Dictionary<ulong, int> _shaderModuleSpirvBytes = new();
         private readonly Dictionary<ulong, byte[]> _rectangleStageCode = new();
         private readonly Dictionary<ulong, string> _shaderModuleCacheIdentities = new();
+        // The four module dictionaries above: program resolution publishes modules on the prefetch
+        // worker while the render thread reads them for pipelines; every access holds this lock, and
+        // nothing native runs under it.
+        private readonly object _shaderModuleLock = new();
         private long _pipelineCreationMilliseconds;
         private KhrPushDescriptor _pushDescriptorApi = null!;
         private uint _maxPushDescriptors;
@@ -395,12 +399,16 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCompile);
             var module = CreateShaderModule(shader.Payload);
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
-            _shaderModules.Add(programId, module);
-            _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
-            if (stage is ShaderStage.Vertex or ShaderStage.Pixel)
-                _rectangleStageCode[module.Handle] = shader.Payload;
             var identity = VulkanPipelineCacheStorage.CompiledShaderIdentity(shader.Payload);
-            _shaderModuleCacheIdentities[module.Handle] = identity;
+            lock (_shaderModuleLock)
+            {
+                _shaderModules.Add(programId, module);
+                _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
+                if (stage is ShaderStage.Vertex or ShaderStage.Pixel)
+                    _rectangleStageCode[module.Handle] = shader.Payload;
+                _shaderModuleCacheIdentities[module.Handle] = identity;
+            }
+
             if (stage == ShaderStage.Compute)
             {
                 NoteRuntimeComputeModule(identity);
@@ -414,8 +422,29 @@ internal static unsafe partial class VulkanVideoPresenter
         // the SPIR-V size that produced it.
         private const long SlowPipelineCreationMilliseconds = 250;
 
-        private int SpirvBytesOf(ulong moduleHandle) =>
-            _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+        private int SpirvBytesOf(ulong moduleHandle)
+        {
+            lock (_shaderModuleLock)
+            {
+                return _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+            }
+        }
+
+        private byte[] RectangleStageCodeOf(ulong moduleHandle)
+        {
+            lock (_shaderModuleLock)
+            {
+                return _rectangleStageCode[moduleHandle];
+            }
+        }
+
+        private bool TryGetShaderModuleCacheIdentity(ulong moduleHandle, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? identity)
+        {
+            lock (_shaderModuleLock)
+            {
+                return _shaderModuleCacheIdentities.TryGetValue(moduleHandle, out identity);
+            }
+        }
 
         private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
         {
@@ -902,8 +931,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (expandRectangles)
                 {
-                    var geometryCode = RectangleGeometryShader.Create(_rectangleStageCode[vertexModule.Handle],
-                        pixelModule.Handle == 0 ? null : _rectangleStageCode[pixelModule.Handle], out var vertexCode, out var pixelCode);
+                    var geometryCode = RectangleGeometryShader.Create(RectangleStageCodeOf(vertexModule.Handle),
+                        pixelModule.Handle == 0 ? null : RectangleStageCodeOf(pixelModule.Handle), out var vertexCode, out var pixelCode);
                     rectangleModule = CreateShaderModule(geometryCode);
                     rectangleVertexModule = CreateShaderModule(vertexCode);
                     if (pixelCode is not null) rectanglePixelModule = CreateShaderModule(pixelCode);
@@ -1290,7 +1319,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private ComputePipelineContentKey? CreateComputeContentKey(ComputePipelineDescription description, List<DescriptorSetLayoutBinding> bindings)
         {
-            if (!_shaderModuleCacheIdentities.TryGetValue(description.Program.Module, out var identity))
+            if (!TryGetShaderModuleCacheIdentity(description.Program.Module, out var identity))
             {
                 return null;
             }
@@ -1599,14 +1628,20 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _pipelineEntries.Clear();
-            foreach (var module in _shaderModules.Values)
+            ShaderModule[] modules;
+            lock (_shaderModuleLock)
+            {
+                modules = [.. _shaderModules.Values];
+                _shaderModules.Clear();
+                _shaderModuleSpirvBytes.Clear();
+                _rectangleStageCode.Clear();
+                _shaderModuleCacheIdentities.Clear();
+            }
+
+            foreach (var module in modules)
             {
                 _vk.DestroyShaderModule(_device, module, null);
             }
-
-            _shaderModules.Clear();
-            _rectangleStageCode.Clear();
-            _shaderModuleCacheIdentities.Clear();
         }
     }
 }
