@@ -3,9 +3,13 @@
 
 namespace SharpEmu.HLE.GpuMemory;
 
-// Callers serialize access. The tree does not change range ownership or locking.
+// Every operation holds the set's own lock: the program prefetch worker asks whether bytes are
+// GPU-modified while the render thread and completion callbacks change the set, and a rotation seen
+// half done can send a reader around a cycle. The tree does not change range ownership.
 public sealed class AvlSpanSet
 {
+    private readonly object _gate = new();
+
     private sealed class Node(ulong start, ulong end)
     {
         public ulong Start = start;
@@ -16,10 +20,20 @@ public sealed class AvlSpanSet
     }
 
     private Node? _root;
-    public bool IsEmpty => _root is null;
-    public void Clear() => _root = null;
+    public bool IsEmpty { get { lock (_gate) return _root is null; } }
+    public void Clear() { lock (_gate) _root = null; }
 
-    public void Add(ulong address, ulong size)
+    public void Add(ulong address, ulong size) { lock (_gate) AddCore(address, size); }
+
+    public void Remove(ulong address, ulong size) { lock (_gate) RemoveCore(address, size); }
+
+    public bool Contains(ulong address, ulong size) { lock (_gate) return ContainsCore(address, size); }
+
+    public bool Overlaps(ulong address, ulong size) { lock (_gate) return OverlapsCore(address, size); }
+
+    public List<GuestSpan> GetOverlappingRanges(ulong address, ulong size) { lock (_gate) return GetOverlappingRangesCore(address, size); }
+
+    private void AddCore(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var start = address;
@@ -39,7 +53,7 @@ public sealed class AvlSpanSet
         _root = Insert(_root, start, end);
     }
 
-    public void Remove(ulong address, ulong size)
+    private void RemoveCore(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var end = address + size;
@@ -60,14 +74,14 @@ public sealed class AvlSpanSet
         }
     }
 
-    public bool Contains(ulong address, ulong size)
+    private bool ContainsCore(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var node = FindAtOrBelow(address);
         return node is not null && node.End >= address + size;
     }
 
-    public bool Overlaps(ulong address, ulong size)
+    private bool OverlapsCore(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var end = address + size;
@@ -81,7 +95,7 @@ public sealed class AvlSpanSet
         return false;
     }
 
-    public List<GuestSpan> GetOverlappingRanges(ulong address, ulong size)
+    private List<GuestSpan> GetOverlappingRangesCore(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var result = new List<GuestSpan>();
