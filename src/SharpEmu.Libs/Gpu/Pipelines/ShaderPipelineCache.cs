@@ -155,25 +155,34 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         bool depthBound,
         MeshDrawConfiguration? mesh)
     {
+        // The sources (shader identities) first, from the registers and guest headers only: the
+        // resolution then uses exactly these and touches only their cache entries.
+        var sources = PrepareGraphicsSources(vertex, pixel, shaderInterface, context, pixelActive, mesh);
         using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GraphicsResolveLockWait);
         lock (_resolveGate)
         {
             using var workScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
-            return ResolveGraphicsProgramsCore(vertex, pixel, shaderInterface, context, targetExportMapping, pixelActive, depthBound, mesh);
+            return ResolveGraphicsProgramsCore(sources, vertex, pixel, shaderInterface, context, targetExportMapping, pixelActive, depthBound, mesh);
         }
     }
 
-    private GraphicsPrograms ResolveGraphicsProgramsCore(
+    // The sources of a draw's stages, read before any cache is touched: the vertex (or domain/mesh)
+    // stage, the pixel stage when it runs, and the merged local/hull program of a tessellated draw.
+    private sealed record GraphicsSources(
+        ShaderSource Vertex,
+        ShaderSource? Pixel,
+        bool Tessellated,
+        Gen5TessellationInfo? Tessellation,
+        HullSource? Hull);
+
+    private GraphicsSources PrepareGraphicsSources(
         VertexStageRegisters vertex,
         PixelStageRegisters pixel,
         ShaderInterfaceRegisters shaderInterface,
         ContextRegisters context,
-        ReadOnlySpan<ColorComponentMap> targetExportMapping,
         bool pixelActive,
-        bool depthBound,
         MeshDrawConfiguration? mesh)
     {
-        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
         var tessellated = mesh is null && IsMergedTessellationMask(context.ShaderStages);
         Gen5TessellationInfo? tessellation = null;
         if (tessellated)
@@ -190,6 +199,30 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             vertex.ExportAddress, tessellated ? ShaderStage.TessellationEvaluation : mesh is null ? ShaderStage.Vertex : ShaderStage.Mesh,
             tessellated ? "domain" : mesh is null ? "vertex" : "mesh", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
             probeWrittenRegisters: true, VertexUserDataBase, vertex.GeometryUserDataAddress);
+        var pixelSource = pixelActive
+            ? PrepareSource(
+                pixel.Address, ShaderStage.Pixel, "pixel", pixel.UserScalars, pixel.Resource2.UserScalarCount,
+                probeWrittenRegisters: true, userDataBase: 0)
+            : null;
+        return new GraphicsSources(vertexSource, pixelSource, tessellated, tessellation,
+            tessellated ? PrepareHullSource(vertex) : null);
+    }
+
+    private GraphicsPrograms ResolveGraphicsProgramsCore(
+        GraphicsSources sources,
+        VertexStageRegisters vertex,
+        PixelStageRegisters pixel,
+        ShaderInterfaceRegisters shaderInterface,
+        ContextRegisters context,
+        ReadOnlySpan<ColorComponentMap> targetExportMapping,
+        bool pixelActive,
+        bool depthBound,
+        MeshDrawConfiguration? mesh)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        var tessellated = sources.Tessellated;
+        var tessellation = sources.Tessellation;
+        var vertexSource = sources.Vertex;
         // A domain stage reads its control points from the guest rings, so it has no vertex input to resolve.
         var vertexInfo = tessellated ? new VertexInputInfo { PositionExportControl = shaderInterface.VertexOutputControl }
             : mesh is null ? PrepareVertexInput(vertexSource, shaderInterface, context) : new VertexInputInfo();
@@ -201,9 +234,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var attributeCount = 0u;
         if (pixelActive)
         {
-            pixelSource = PrepareSource(
-                pixel.Address, ShaderStage.Pixel, "pixel", pixel.UserScalars, pixel.Resource2.UserScalarCount,
-                probeWrittenRegisters: true, userDataBase: 0);
+            pixelSource = sources.Pixel!;
             if (RenderTrace.Enabled)
                 RenderTrace.Write($"PixelDrawState shader=0x{pixelSource.Address:X16} hash=0x{pixelSource.Hash:X16} " +
                     $"user_data=[{string.Join(",", pixelSource.UserData.Select(word => $"{word:X8}"))}]");
@@ -286,7 +317,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         {
             lock (_gate)
             {
-                tessellationPrograms = PrepareTessellationHull(vertex, shaderInterface, tessellation!.Value);
+                tessellationPrograms = PrepareTessellationHull(sources.Hull!, vertex, shaderInterface, tessellation!.Value);
                 var bridge = _programs.GetTessellationBridge(vertexStage.Program!.Bindings!, tessellation.Value.Domain);
                 vertexInfo = new VertexInputInfo
                 {
@@ -693,11 +724,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         uint dimensionY,
         uint dimensionZ)
     {
+        var source = PrepareComputeSource(compute);
         using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ComputeResolveLockWait);
         lock (_resolveGate)
         {
             using var workScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
-            return GetComputeProgramCore(compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: false)!;
+            return GetComputeProgramCore(source, compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: false)!;
         }
     }
 
@@ -711,13 +743,18 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         uint dimensionY,
         uint dimensionZ)
     {
+        var source = PrepareComputeSource(compute);
         lock (_resolveGate)
         {
-            return GetComputeProgramCore(compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: true);
+            return GetComputeProgramCore(source, compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: true);
         }
     }
 
+    private ShaderSource PrepareComputeSource(ComputeStageRegisters compute)
+        => PrepareSource(compute.Address, ShaderStage.Compute, "compute", compute.UserScalars, compute.UserScalarCount, probeWrittenRegisters: false, userDataBase: 0);
+
     private ComputeProgram? GetComputeProgramCore(
+        ShaderSource source,
         ComputeStageRegisters compute,
         ShaderInterfaceRegisters shaderInterface,
         uint dispatchInitiator,
@@ -727,7 +764,6 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         bool ahead)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
-        var source = PrepareSource(compute.Address, ShaderStage.Compute, "compute", compute.UserScalars, compute.UserScalarCount, probeWrittenRegisters: false, userDataBase: 0);
         var program = _programs.Decode(source);
         if (_skipRayTracing)
         {

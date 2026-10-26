@@ -31,31 +31,62 @@ internal sealed partial class ShaderPipelineCache
         return (stages & ~((1u << 22) | (1u << 23))) == mask;
     }
 
-    private TessellationDrawPrograms PrepareTessellationHull(VertexStageRegisters vertex,
-        ShaderInterfaceRegisters shaderInterface, Gen5TessellationInfo tessellation)
+    // The merged local/hull program of a tessellated draw, read from its registers and guest headers
+    // before any cache is touched. A header it cannot read is kept as Error and raised only when the
+    // hull is resolved, as before: a draw whose other stages are unavailable never reaches it.
+    private sealed record HullSource(ShaderSource? Source, RegisteredShader? Registered, string? Error);
+
+    private HullSource PrepareHullSource(VertexStageRegisters vertex)
+    {
+        var outer = SubmissionScheduler.ThrowOnFatal;
+        SubmissionScheduler.ThrowOnFatal = true;
+        try
+        {
+            return PrepareHullSourceCore(vertex);
+        }
+        catch (SubmissionScheduler.AbandonedWorkException error)
+        {
+            return new HullSource(null, null, error.Message);
+        }
+        finally
+        {
+            SubmissionScheduler.ThrowOnFatal = outer;
+        }
+    }
+
+    private HullSource PrepareHullSourceCore(VertexStageRegisters vertex)
     {
         var address = vertex.LocalAddress != 0 ? vertex.LocalAddress : vertex.HullAddress;
         var registered = _registry.Require(address, "merged-hull");
         if (!registered.IsFused)
-            throw SubmissionScheduler.Fatal("The tessellation path requires a registered merged local/hull program.");
+            return new HullSource(null, null, "The tessellation path requires a registered merged local/hull program.");
         var count = vertex.HullResource2.UserScalarCount;
         // A merged front may consume more user data than the back's RSRC2.
         // Reading its own declared count preserves the guest's AGC header.
         if (!Gen5ShaderTranslator.TryGetFusedProgramParts(_context, address, out var frontHeader, out _, out _) ||
             !_context.TryReadUInt64(frontHeader + 0x20, out var shRegisters) ||
             !_context.TryReadUInt32(frontHeader + 0x5C, out var shCount))
-            throw SubmissionScheduler.Fatal("The merged hull front has an unreadable register header.");
+            return new HullSource(null, null, "The merged hull front has an unreadable register header.");
         for (uint index = 0; index < (shCount & 0xFF); index++)
         {
             if (!_context.TryReadUInt32(shRegisters + index * 8, out var offset) ||
                 !_context.TryReadUInt32(shRegisters + index * 8 + 4, out var value))
-                throw SubmissionScheduler.Fatal("The merged hull front has an unreadable register entry.");
+                return new HullSource(null, null, "The merged hull front has an unreadable register entry.");
             if (offset == ShaderRegisterOffset.SpiShaderPgmRsrc2Hs)
                 count = Math.Max(count, HullResource2.Decode(value).UserScalarCount);
         }
         var source = PrepareSource(address, ShaderStage.Compute, "merged-hull", vertex.HullUserScalars,
             count, false, VertexUserDataBase);
-        source = source with { UserData = MergedHullUserData(vertex.HullUserScalars, count, vertex.HullUserDataAddress) };
+        return new HullSource(source with { UserData = MergedHullUserData(vertex.HullUserScalars, count, vertex.HullUserDataAddress) },
+            registered, null);
+    }
+
+    private TessellationDrawPrograms PrepareTessellationHull(HullSource hullSource, VertexStageRegisters vertex,
+        ShaderInterfaceRegisters shaderInterface, Gen5TessellationInfo tessellation)
+    {
+        if (hullSource.Error is { } hullError) throw SubmissionScheduler.Fatal(hullError);
+        var source = hullSource.Source!;
+        var registered = hullSource.Registered!;
         var decoded = _programs.Decode(source);
         if (decoded.FusedContinuationPc is not { } entry ||
             !Gen5TessellationHullInfo.TryDecode(shaderInterface.LocalHullConfiguration, entry + 8, out var hull, out var error))
