@@ -61,6 +61,10 @@ public interface IConcurrentResolveHost
 
     // On the render thread.
     bool IsStillCurrent(object assumptions);
+
+    // Whether the resolution had a read refused that the render thread would have served (a clean
+    // word the GPU still owns in an image): its result can differ from the render thread's own.
+    bool RefusedReads(object assumptions) => false;
 }
 
 // Program resolutions computed ahead of their draws. A draw takes one only when it was resolved
@@ -68,6 +72,13 @@ public interface IConcurrentResolveHost
 public interface IProgramPrefetch
 {
     bool TryTakeGraphics(RegisterBanks banks, in GraphicsProgramInputs inputs, out GraphicsPrograms programs);
+
+    bool TryTakeCompute(RegisterBanks banks, uint dispatchInitiator, uint dimensionX, uint dimensionY, uint dimensionZ,
+        out ComputeProgram program)
+    {
+        program = null!;
+        return false;
+    }
 }
 
 public sealed partial class RenderExecutor

@@ -46,6 +46,8 @@ internal static partial class VulkanVideoPresenter
             public int PostedAhead;
             // Resolution jobs submitted before this non-draw item; they finish before it runs.
             public long JobsBefore;
+            // The item submitted its own prefetch job just before it: not one of the jobs it waits for.
+            public bool OwnJob;
             public bool Sync;
             public volatile bool Done;
             public Exception? Failure;
@@ -110,8 +112,8 @@ internal static partial class VulkanVideoPresenter
 
         // The producer side, on the command stream thread.
 
-        public void EnqueueDeferred(AgcExports.DeferredWork work, bool isDraw) =>
-            Enqueue(new Item { Kind = Kind.Deferred, Work = work, IsDraw = isDraw });
+        public void EnqueueDeferred(AgcExports.DeferredWork work, bool isDraw, bool ownJob = false) =>
+            Enqueue(new Item { Kind = Kind.Deferred, Work = work, IsDraw = isDraw, OwnJob = ownJob });
 
         public void Post(Action action) => Enqueue(new Item { Kind = Kind.Call, Action = action });
 
@@ -223,7 +225,7 @@ internal static partial class VulkanVideoPresenter
             ThrowIfFailed();
             if (!item.IsDraw)
             {
-                item.JobsBefore = _prefetch?.Submitted ?? 0;
+                item.JobsBefore = (_prefetch?.Submitted ?? 0) - (item.OwnJob ? 1 : 0);
                 _enqueuedNonDraw++;
             }
 

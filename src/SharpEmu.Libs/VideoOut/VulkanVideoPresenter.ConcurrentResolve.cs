@@ -22,6 +22,9 @@ internal static unsafe partial class VulkanVideoPresenter
         public readonly long WritebackEpoch = writebackEpoch;
         public readonly List<(ConcurrentQuery Query, ulong Address, ulong Size, bool Answer)> Answers = new();
         public bool ReadsImageOwnership;
+        // A clean word read was refused because the GPU owns it: the render thread synchronizes
+        // such a word and reads it, so a result resolved without it can differ.
+        public bool Refused;
         // GpuWritebackEpoch.HistoryFloor at the start (render profile diagnostics only).
         public long HistoryFloor;
 
@@ -95,6 +98,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _concurrentAssumptions = null;
             return assumptions;
         }
+
+        bool IConcurrentResolveHost.RefusedReads(object assumptions) => ((ConcurrentAssumptions)assumptions).Refused;
 
         // GPU data stored into guest memory since the resolution may have changed what it read;
         // otherwise the answers stand while the ownership they came from has not changed.

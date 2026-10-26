@@ -108,6 +108,17 @@ public interface IShaderPipelineProvider
         uint dimensionY,
         uint dimensionZ);
 
+    // The same resolution on a thread ahead of the dispatch, which must have no side effects: null
+    // when only the dispatch itself can resolve it (a kernel the provider would run in place) or
+    // when the provider does not resolve ahead.
+    ComputeProgram? ResolveComputeProgramAhead(
+        ComputeStageRegisters compute,
+        ShaderInterfaceRegisters shaderInterface,
+        uint dispatchInitiator,
+        uint dimensionX,
+        uint dimensionY,
+        uint dimensionZ) => null;
+
     PipelineHandle CreateComputePipeline(ComputeInputInfo input, ShaderProgram program);
 
     Task? GetComputePipelineCompletion(ShaderProgram program) => null;

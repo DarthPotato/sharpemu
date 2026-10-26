@@ -697,17 +697,34 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         lock (_resolveGate)
         {
             using var workScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
-            return GetComputeProgramCore(compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ);
+            return GetComputeProgramCore(compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: false)!;
         }
     }
 
-    private ComputeProgram GetComputeProgramCore(
+    // On the prefetch worker: the masked dword copy kernel writes guest memory when it is resolved,
+    // so a dispatch of its shape is left to the render thread, which resolves it in stream order.
+    public ComputeProgram? ResolveComputeProgramAhead(
         ComputeStageRegisters compute,
         ShaderInterfaceRegisters shaderInterface,
         uint dispatchInitiator,
         uint dimensionX,
         uint dimensionY,
         uint dimensionZ)
+    {
+        lock (_resolveGate)
+        {
+            return GetComputeProgramCore(compute, shaderInterface, dispatchInitiator, dimensionX, dimensionY, dimensionZ, ahead: true);
+        }
+    }
+
+    private ComputeProgram? GetComputeProgramCore(
+        ComputeStageRegisters compute,
+        ShaderInterfaceRegisters shaderInterface,
+        uint dispatchInitiator,
+        uint dimensionX,
+        uint dimensionY,
+        uint dimensionZ,
+        bool ahead)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
         var source = PrepareSource(compute.Address, ShaderStage.Compute, "compute", compute.UserScalars, compute.UserScalarCount, probeWrittenRegisters: false, userDataBase: 0);
@@ -733,7 +750,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         var systemRegisters = DecodeComputeSystemRegisters(compute);
-        if (TrySubmitMaskedDwordCopyKernel(program, source, systemRegisters, input, out var description))
+        if (ahead && IsMaskedDwordCopyShape(program))
+        {
+            return null;
+        }
+
+        if (!ahead && TrySubmitMaskedDwordCopyKernel(program, source, systemRegisters, input, out var description))
         {
             if (RenderTrace.Enabled)
             {

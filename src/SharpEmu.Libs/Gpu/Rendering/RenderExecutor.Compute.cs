@@ -25,6 +25,17 @@ public sealed partial class RenderExecutor
     private const uint ImageClearStride = 16;
     private const uint ImageClearUserDataCount = 8;
 
+    // Whether Dispatch would ask for a program: a shader and work to run (Dispatch's early returns).
+    // The indirect argument address is not known here; an indirect dispatch's zero counts are not
+    // a reason to skip, so this errs towards resolving one the render thread then skips.
+    internal static bool ResolvesComputeAhead(RegisterBanks banks, uint dispatchInitiator, uint groupsX, uint groupsY, uint groupsZ) =>
+        banks.Shader.Compute.Address != 0;
+
+    // The dispatch's compute program resolved on the prefetch worker, or null when only the
+    // render thread can resolve it.
+    internal ComputeProgram? ResolveComputeProgramAhead(RegisterBanks banks, uint dispatchInitiator, uint groupsX, uint groupsY, uint groupsZ) =>
+        _pipelines.ResolveComputeProgramAhead(banks.Shader.Compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+
     public void Dispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
     {
         if (!_host.IsRecording)
@@ -86,7 +97,11 @@ public sealed partial class RenderExecutor
             }
         }
 
-        var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+        if (Prefetch is not { } prefetch ||
+            !prefetch.TryTakeCompute(banks, dispatchInitiator, groupsX, groupsY, groupsZ, out var computeProgram))
+        {
+            computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+        }
         if (computeProgram.Consumed)
         {
             return;

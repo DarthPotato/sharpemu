@@ -24,7 +24,43 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         internal object? Assumptions;
         // 0 queued, 1 resolved, 2 abandoned.
         internal volatile int State;
+
+        // A dispatch's job resolves its compute program instead.
+        internal bool IsCompute;
+        internal uint DispatchInitiator;
+        internal uint DimensionX;
+        internal uint DimensionY;
+        internal uint DimensionZ;
+        internal ComputeProgram? ComputeProgram;
+        // Set under the lock before the worker took the job: the worker skips it.
+        internal bool Cancelled;
     }
+
+    // The job the worker took off the queue and is resolving, under _lock.
+    private Job? _runningJob;
+
+    // A job the worker has not started yet will not be: its dispatch resolves its own program
+    // instead of waiting for the worker to reach it.
+    private bool TryCancel(Job job)
+    {
+        lock (_lock)
+        {
+            if (job.State != 0 || ReferenceEquals(_runningJob, job))
+            {
+                return false;
+            }
+
+            job.Cancelled = true;
+            return true;
+        }
+    }
+
+    // SHARPEMU_PREFETCH_COMPUTE=1 resolves dispatches' compute programs on the worker too. Off by
+    // default: while every dispatch gates the jobs after it, the worker reaches a dispatch's job only
+    // once the item before it ran, so most jobs are cancelled and the rest are waited for (Ghost of
+    // Yotei: 3.65 vs 3.82 fps). It pays off once dispatches stop gating the prefetch.
+    public static readonly bool ComputeEnabled =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_COMPUTE"), "1", StringComparison.Ordinal);
 
     private readonly RenderExecutor _executor;
     private readonly IRenderHost _host;
@@ -57,9 +93,22 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
 
     // A gate above zero holds the job until AdvanceGate reaches it: with the command stream on its own
     // thread, draws are submitted ahead of the work before them, which may change what they read.
-    public Job Submit(RegisterBanks banks, long gate = 0, bool indexed = false)
+    public Job Submit(RegisterBanks banks, long gate = 0, bool indexed = false) => Enqueue(new Job(banks, gate, indexed));
+
+    // A dispatch's compute program, resolved like a draw's programs: after the stream items before
+    // the dispatch ran (the gate), and taken only when nothing it assumed changed.
+    public Job SubmitCompute(RegisterBanks banks, long gate, uint dispatchInitiator, uint dimensionX, uint dimensionY, uint dimensionZ) =>
+        Enqueue(new Job(banks, gate)
+        {
+            IsCompute = true,
+            DispatchInitiator = dispatchInitiator,
+            DimensionX = dimensionX,
+            DimensionY = dimensionY,
+            DimensionZ = dimensionZ,
+        });
+
+    private Job Enqueue(Job job)
     {
-        var job = new Job(banks, gate, indexed);
         lock (_lock)
         {
             _queue.Enqueue(job);
@@ -185,9 +234,68 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
             return false;
         }
 
+        // A clean word read the worker refused, where the render thread would have synchronized
+        // the image first and read it: counted for now (graphics behaviour unchanged).
+        if (_concurrent.RefusedReads(job.Assumptions!))
+        {
+            _graphicsTakenWithRefusals++;
+        }
+
         programs = job.Programs!;
         return true;
     }
+
+    // The compute program of the dispatch the render thread runs now. Only a resolved, available
+    // program that read nothing the worker refused and whose assumptions still hold is taken: an
+    // unavailable result or a refused read may differ from what the render thread would resolve.
+    public bool TryTakeCompute(RegisterBanks banks, uint dispatchInitiator, uint dimensionX, uint dimensionY, uint dimensionZ,
+        out ComputeProgram program)
+    {
+        program = null!;
+        var job = Current;
+        if (job is null || !job.IsCompute)
+        {
+            _computeOutcomes[(int)ComputeOutcome.NoJob]++;
+            return false;
+        }
+
+        Current = null;
+        if (!ReferenceEquals(job.Banks, banks) || job.DispatchInitiator != dispatchInitiator || job.DimensionX != dimensionX ||
+            job.DimensionY != dimensionY || job.DimensionZ != dimensionZ)
+        {
+            _computeOutcomes[(int)ComputeOutcome.OtherInputs]++;
+            return false;
+        }
+
+        // The worker reaches a dispatch's job only after the item before it ran, usually just before
+        // the dispatch itself: waiting for it then costs more than resolving here.
+        if (job.State == 0 && TryCancel(job))
+        {
+            _computeOutcomes[(int)ComputeOutcome.NotStarted]++;
+            return false;
+        }
+
+        WaitFor(job);
+        using var profile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPrefetchValidation);
+        var outcome = job.State != 1 || job.ComputeProgram is null ? ComputeOutcome.NotResolved
+            : !job.ComputeProgram.Available || job.ComputeProgram.Consumed ? ComputeOutcome.Unavailable
+            : _concurrent.RefusedReads(job.Assumptions!) ? ComputeOutcome.Refused
+            : !_concurrent.IsStillCurrent(job.Assumptions!) ? ComputeOutcome.Stale
+            : ComputeOutcome.Taken;
+        _computeOutcomes[(int)outcome]++;
+        if (outcome != ComputeOutcome.Taken)
+        {
+            return false;
+        }
+
+        program = job.ComputeProgram!;
+        return true;
+    }
+
+    private enum ComputeOutcome { Taken, NoJob, OtherInputs, NotResolved, Unavailable, Refused, Stale, NotStarted, Count }
+
+    private static readonly long[] _computeOutcomes = new long[(int)ComputeOutcome.Count];
+    private static long _graphicsTakenWithRefusals;
 
     // Why the render thread did or did not take a resolution, counted on the render thread for the
     // render profile report.
@@ -202,9 +310,15 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
     {
         var line = $"[PERF][PROGRAM_PREFETCH] taken={_takeOutcomes[0]} no_job={_takeOutcomes[1]} other_banks={_takeOutcomes[2]} " +
             $"not_resolved={_takeOutcomes[3]} other_inputs={_takeOutcomes[4]} stale={_takeOutcomes[5]} " +
-            $"input_pixel={_inputMismatches[0]} input_depth={_inputMismatches[1]} input_indexed={_inputMismatches[2]} input_mapping={_inputMismatches[3]}";
+            $"input_pixel={_inputMismatches[0]} input_depth={_inputMismatches[1]} input_indexed={_inputMismatches[2]} input_mapping={_inputMismatches[3]} " +
+            $"graphics_taken_with_refusals={_graphicsTakenWithRefusals} " +
+            $"compute_taken={_computeOutcomes[0]} compute_no_job={_computeOutcomes[1]} compute_other_inputs={_computeOutcomes[2]} " +
+            $"compute_not_resolved={_computeOutcomes[3]} compute_unavailable={_computeOutcomes[4]} compute_refused={_computeOutcomes[5]} " +
+            $"compute_stale={_computeOutcomes[6]} compute_not_started={_computeOutcomes[7]}";
         Array.Clear(_takeOutcomes);
         Array.Clear(_inputMismatches);
+        Array.Clear(_computeOutcomes);
+        _graphicsTakenWithRefusals = 0;
         return line;
     }
 
@@ -292,14 +406,24 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
 
                 _queue.Dequeue();
                 _running = true;
+                _runningJob = job;
             }
 
-            Resolve(job);
+            if (job.Cancelled)
+            {
+                job.State = 2;
+            }
+            else
+            {
+                Resolve(job);
+            }
+
             lock (_lock)
             {
                 _outstanding--;
                 _finished++;
                 _running = false;
+                _runningJob = null;
                 Monitor.PulseAll(_lock);
             }
         }
@@ -307,9 +431,25 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
 
     private void Resolve(Job job)
     {
+        if (job.IsCompute && !RenderExecutor.ResolvesComputeAhead(job.Banks, job.DispatchInitiator, job.DimensionX, job.DimensionY, job.DimensionZ))
+        {
+            // The dispatch runs no program (no shader, no work): nothing to resolve.
+            job.State = 2;
+            return;
+        }
+
         _concurrent.BeginConcurrentResolve();
         try
         {
+            if (job.IsCompute)
+            {
+                job.ComputeProgram = _executor.ResolveComputeProgramAhead(job.Banks, job.DispatchInitiator,
+                    job.DimensionX, job.DimensionY, job.DimensionZ);
+                job.Assumptions = _concurrent.EndConcurrentResolve();
+                job.State = job.ComputeProgram is null ? 2 : 1;
+                return;
+            }
+
             job.Inputs = RenderExecutor.ProgramInputsOf(job.Banks, _host.FormatSupport, _host.Fatal,
                 job.Indexed && _executor.IndexedModeAffectsPrograms(job.Banks));
             job.Programs = _executor.ResolveGraphicsPrograms(job.Banks, in job.Inputs);

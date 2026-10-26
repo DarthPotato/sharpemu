@@ -252,6 +252,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (owned)
             {
+                // The render thread would have synchronized this image and read the word.
+                if (_concurrentAssumptions is { } concurrent && _scheduler.Active && _imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
+                    concurrent.Refused = true;
                 return false;
             }
 

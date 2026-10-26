@@ -142,6 +142,27 @@ internal sealed partial class ShaderPipelineCache
         return true;
     }
 
+    // The opcode sequence TrySubmitMaskedDwordCopyKernel starts from: a program of another shape is
+    // never replaced, so its resolution has no side effect.
+    private static bool IsMaskedDwordCopyShape(Gen5ShaderProgram program)
+    {
+        var instructions = program.Instructions;
+        if (instructions.Count != MaskedCopyOpcodes.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < MaskedCopyOpcodes.Length; index++)
+        {
+            if (instructions[index].Opcode != MaskedCopyOpcodes[index])
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Replaces only the exact masked-copy kernel shape; its writes land in command order over the guest range.
     private bool TrySubmitMaskedDwordCopyKernel(
         Gen5ShaderProgram program,

@@ -35,7 +35,9 @@ public static partial class AgcExports
         // The non-draw items handed over so far; a draw's resolution waits until they ran.
         long Gate { get; }
 
-        void EnqueueDeferred(DeferredWork work, bool isDraw);
+        // ownJob: a non-draw item that submitted its own prefetch job just before; it waits only for
+        // the jobs before that one, and takes or cancels its own when it runs.
+        void EnqueueDeferred(DeferredWork work, bool isDraw, bool ownJob = false);
     }
 
     // The snapshots the submit-time prepass captured for one submission.
@@ -239,7 +241,8 @@ public static partial class AgcExports
             uint GroupsY,
             uint GroupsZ,
             uint DispatchInitiator,
-            ulong IndirectArgumentsAddress) : DeferredWork;
+            ulong IndirectArgumentsAddress,
+            ParallelProgramPrefetch.Job? Job = null) : DeferredWork;
 
         // With the command stream on its own thread, its draws and dispatches reach the render
         // thread through the sink, which runs them with RunDeferred in stream order.
@@ -287,6 +290,11 @@ public static partial class AgcExports
                     using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DeferredDispatchTranslation);
                     var executing = _executing;
                     _executing = dispatch.State;
+                    if (_parallel is not null)
+                    {
+                        _parallel.Current = dispatch.Job;
+                    }
+
                     try
                     {
                         ExecuteDispatch(_executor!, dispatch.SubmitId, dispatch.Banks, dispatch.GroupsX, dispatch.GroupsY, dispatch.GroupsZ,
@@ -295,6 +303,10 @@ public static partial class AgcExports
                     finally
                     {
                         _executing = executing;
+                        if (_parallel is not null)
+                        {
+                            _parallel.Current = null;
+                        }
                     }
 
                     break;
@@ -571,8 +583,14 @@ public static partial class AgcExports
                 if (Producing)
                 {
                     var snapshot = banks.Snapshot();
-                    Sink!.EnqueueDeferred(new PendingDispatch(submitId, state, snapshot, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress),
-                        isDraw: false);
+                    // The job is submitted with the gate before the dispatch, then the dispatch is
+                    // enqueued: it waits for the jobs before its own, raises the gate for the work
+                    // after it, and takes or cancels its own job when it runs.
+                    var job = ParallelProgramPrefetch.ComputeEnabled
+                        ? _parallel?.SubmitCompute(snapshot, Sink!.Gate, dispatchInitiator, endX, endY, endZ)
+                        : null;
+                    Sink!.EnqueueDeferred(new PendingDispatch(submitId, state, snapshot, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress, job),
+                        isDraw: false, ownJob: job is not null);
                     return;
                 }
 

@@ -608,6 +608,27 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
 
     public (uint X, uint Y, uint Z) LastDispatchDimensions { get; private set; }
 
+    // Off by default, as for a provider that does not resolve ahead. On, it returns Ahead, which
+    // may be null (a dispatch only the render thread can resolve).
+    public bool ResolvesAhead { get; set; }
+
+    public ComputeProgram? Ahead { get; set; }
+
+    public ComputeProgram? ResolveComputeProgramAhead(ComputeStageRegisters compute, ShaderInterfaceRegisters shaderInterface, uint dispatchInitiator, uint dimensionX, uint dimensionY, uint dimensionZ)
+    {
+        if (!ResolvesAhead)
+        {
+            return null;
+        }
+
+        lock (Calls)
+        {
+            Calls.Add($"resolve_compute_ahead {dimensionX} {dimensionY} {dimensionZ}");
+        }
+
+        return Ahead;
+    }
+
     public ComputeProgram GetComputeProgram(ComputeStageRegisters compute, ShaderInterfaceRegisters shaderInterface, uint dispatchInitiator, uint dimensionX, uint dimensionY, uint dimensionZ)
     {
         var dispatchThreadDimensions = (dispatchInitiator & (1u << 5)) != 0;
