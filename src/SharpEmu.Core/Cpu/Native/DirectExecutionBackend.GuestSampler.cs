@@ -41,6 +41,14 @@ public sealed partial class DirectExecutionBackend
 			? report
 			: 15;
 
+	// Write each report as it is made instead of only at process exit (a run killed at a
+	// timeout otherwise loses them all).
+	private static readonly bool _profileGuestRipFlush =
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GUEST_RIP_FLUSH"),
+			"1",
+			StringComparison.Ordinal);
+
 	private static readonly string? _profileGuestRipThreadFilter =
 		Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GUEST_RIP_THREAD");
 
@@ -215,6 +223,8 @@ public sealed partial class DirectExecutionBackend
 				ReportGuestRipSamples(samples - lastReportSamples, (elapsedMs - lastReportMs) / 1000.0);
 				lastReportMs = elapsedMs;
 				lastReportSamples = samples;
+				if (_profileGuestRipFlush)
+					FlushGuestSamplerReports();
 			}
 			catch (Exception exception)
 			{
@@ -371,6 +381,21 @@ public sealed partial class DirectExecutionBackend
 		Interlocked.Exchange(ref _guestWaitTotalSamples, 0);
 	}
 
+
+	// Writes the buffered reports now. Only the sampler thread calls it, between captures, so no
+	// thread it suspended can be holding the output stream; a run that ends in a hard kill keeps
+	// every report written so far.
+	private void FlushGuestSamplerReports()
+	{
+		string[] reports;
+		lock (_guestSamplerReportGate)
+		{
+			if (_guestSamplerReportsClosed) return;
+			reports = _guestSamplerReports.ToArray();
+			_guestSamplerReports.Clear();
+		}
+		foreach (var report in reports) Console.Error.WriteLine(report);
+	}
 
 	private void BufferGuestSamplerReport(string message)
 	{
