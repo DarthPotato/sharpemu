@@ -5835,21 +5835,40 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return LegacyGuestPriorities ? ThreadPriority.Normal : ThreadPriority.BelowNormal;
 	}
 
+	// The host mask this thread was last given: a guest thread is run again after every block,
+	// and setting an unchanged mask is a system call each time (~3% of a busy audio worker).
+	// Only ApplyGuestThreadAffinity sets the affinity of a thread that runs guest code.
+	[ThreadStatic]
+	private static ulong _appliedHostAffinityMask;
+
 	private void ApplyGuestThreadAffinity(ulong guestAffinityMask)
 	{
 		var hostAffinityMask = MapGuestThreadAffinity(guestAffinityMask);
 		if (hostAffinityMask == 0)
 		{
+			var guestLanes = SharpEmu.HLE.Host.HostLaneReservation.Active
+				? SharpEmu.HLE.Host.HostLaneReservation.GuestMask
+				: 0;
+			if (guestLanes == 0 || guestLanes == _appliedHostAffinityMask)
+				return;
 			SharpEmu.HLE.Host.HostLaneReservation.ApplyToGuestThread();
+			_appliedHostAffinityMask = guestLanes;
 			return;
 		}
 
-		if (SetThreadAffinityMask(GetCurrentThread(), (nuint)hostAffinityMask) == 0 && _logGuestThreads)
+		if (hostAffinityMask == _appliedHostAffinityMask)
+			return;
+		if (SetThreadAffinityMask(GetCurrentThread(), (nuint)hostAffinityMask) == 0)
 		{
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] Failed to set guest thread affinity guest=0x{guestAffinityMask:X} " +
-				$"host=0x{hostAffinityMask:X} error={Marshal.GetLastWin32Error()}");
+			_appliedHostAffinityMask = 0;
+			if (_logGuestThreads)
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] Failed to set guest thread affinity guest=0x{guestAffinityMask:X} " +
+					$"host=0x{hostAffinityMask:X} error={Marshal.GetLastWin32Error()}");
+			return;
 		}
+
+		_appliedHostAffinityMask = hostAffinityMask;
 	}
 
 	private static ulong MapGuestThreadAffinity(ulong guestAffinityMask)
@@ -6192,16 +6211,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			out reason);
 	}
 
+	// Read once: the trace sits on the path every blocked guest thread takes to resume.
+	private static readonly bool _traceFocusedContinuation = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FOCUSED_CONTINUATION"),
+		"1",
+		StringComparison.Ordinal);
+
 	private static void TraceFocusedContinuation(
 		string operation,
 		ulong threadHandle,
 		GuestCpuContinuation continuation,
 		string detail)
 	{
-		if (!string.Equals(
-				Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FOCUSED_CONTINUATION"),
-				"1",
-				StringComparison.Ordinal) ||
+		if (!_traceFocusedContinuation ||
 			continuation.Rsp < 0x00006FFFAC000000UL ||
 			continuation.Rsp >= 0x00006FFFAC200000UL)
 		{

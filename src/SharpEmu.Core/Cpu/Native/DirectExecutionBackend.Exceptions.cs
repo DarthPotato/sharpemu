@@ -677,15 +677,18 @@ public sealed partial class DirectExecutionBackend
 			&& GuestGpuMemoryHook.TryResolveFault(kind, exceptionRecord->ExceptionInformation[1]);
 	}
 
+	// Read once: the check runs inside the vectored handler, on every guest fault.
+	private static readonly bool _disableGuestAllocatorHoleRecovery = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_ALLOCATOR_HOLE_RECOVERY"),
+		"1",
+		StringComparison.Ordinal);
+
 	private unsafe static bool TryRecoverGuestAllocatorHole(
 		EXCEPTION_RECORD* exceptionRecord,
 		void* contextRecord,
 		ulong rip)
 	{
-		if (string.Equals(
-				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_ALLOCATOR_HOLE_RECOVERY"),
-				"1",
-				StringComparison.Ordinal) ||
+		if (_disableGuestAllocatorHoleRecovery ||
 			exceptionRecord->NumberParameters < 2 ||
 			exceptionRecord->ExceptionInformation[0] != 0 ||
 			exceptionRecord->ExceptionInformation[1] != 8 ||
