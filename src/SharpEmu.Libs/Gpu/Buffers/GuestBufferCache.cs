@@ -274,6 +274,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         CompleteGuestPublications?.Invoke(guestAddress, size, isWritten ? PublicationAccess.Write : PublicationAccess.OverlaidRead);
         if (isWritten && ImageClearTrace.Enabled) ImageCache?.TraceGuestWrite("shader-buffer-write", guestAddress, size, shaderHash: traceShaderHash);
         if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-obtain", guestAddress, size, $"written={isWritten} texel={isTexelBuffer} hash=0x{traceShaderHash:X16}", remember: true);
+        // A written binding makes its whole range GPU-owned once uploaded; name the shader that did.
+        if (isWritten && GuestGpuMemoryHook.Traces(guestAddress, size))
+            GuestGpuMemoryHook.Trace(guestAddress, size,
+                $"written-binding base=0x{guestAddress:X} size=0x{size:X} texel={isTexelBuffer} device_address={requiresDeviceAddress} hash=0x{traceShaderHash:X16} submission_tick={_scheduler.CurrentTick}");
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferAcquisitionChecks);
         var command = _scheduler.Current;
         if (command.IsInvalid || !IsValidRange(guestAddress, size))
