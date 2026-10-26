@@ -50,6 +50,8 @@ internal static partial class VulkanVideoPresenter
             public bool OwnJob;
             // Not a prefetch gate (ParallelProgramPrefetch.Ungated): neither waits for earlier jobs nor holds later ones.
             public bool Ungated;
+            // What posted a call, with the render profile on: its delegate's method.
+            public string? Origin;
             public bool Sync;
             public volatile bool Done;
             public Exception? Failure;
@@ -117,11 +119,11 @@ internal static partial class VulkanVideoPresenter
         public void EnqueueDeferred(AgcExports.DeferredWork work, bool isDraw, bool ownJob = false) =>
             Enqueue(new Item { Kind = Kind.Deferred, Work = work, IsDraw = isDraw, OwnJob = ownJob });
 
-        public void Post(Action action) => Enqueue(new Item { Kind = Kind.Call, Action = action });
+        public void Post(Action action) => Enqueue(new Item { Kind = Kind.Call, Action = action, Origin = OriginOf(action) });
 
         public void Run(Action action)
         {
-            var item = new Item { Kind = Kind.Call, Action = action, Sync = true };
+            var item = new Item { Kind = Kind.Call, Action = action, Sync = true, Origin = _runOrigin ?? OriginOf(action) };
             Enqueue(item);
             WaitFor(item);
         }
@@ -129,8 +131,27 @@ internal static partial class VulkanVideoPresenter
         public T Run<T>(Func<T> function)
         {
             T result = default!;
+            _runOrigin = RenderPhaseProfile.Enabled ? function.Method.Name : null;
             Run(() => { result = function(); });
+            _runOrigin = null;
             return result;
+        }
+
+        // The producer's origin for the Run<T> wrapper's call.
+        private string? _runOrigin;
+
+        private static string? OriginOf(Delegate action) => RenderPhaseProfile.Enabled ? action.Method.Name : null;
+
+        // Prefetch gates (non-draw items the prefetch waits for) by what posted them, for the render profile.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> GateOrigins = new();
+
+        internal static string? TakeGateReport()
+        {
+            if (GateOrigins.IsEmpty) return null;
+            var top = GateOrigins.ToArray().OrderByDescending(pair => pair.Value).Take(12)
+                .Select(pair => $"{pair.Key}={pair.Value}");
+            GateOrigins.Clear();
+            return "[PERF][PREFETCH_GATES] " + string.Join(' ', top);
         }
 
         public void PostWrite(ulong address, ReadOnlySpan<byte> data, int queueId = 0)
@@ -149,7 +170,7 @@ internal static partial class VulkanVideoPresenter
         // A fill or copy the render thread runs in order; reads of its destination wait for it.
         public void PostRange(Action action, ulong address, ulong size)
         {
-            var item = new Item { Kind = Kind.Call, Action = action, Address = address, RangeSize = size };
+            var item = new Item { Kind = Kind.Call, Action = action, Address = address, RangeSize = size, Origin = OriginOf(action) };
             if (size != 0)
             {
                 lock (_writeLock)
@@ -232,6 +253,11 @@ internal static partial class VulkanVideoPresenter
             {
                 item.JobsBefore = (_prefetch?.Submitted ?? 0) - (item.OwnJob ? 1 : 0);
                 _enqueuedNonDraw++;
+                if (RenderPhaseProfile.Enabled && _prefetch is not null)
+                {
+                    var origin = item.Kind == Kind.Call ? item.Origin ?? "call" : item.Kind.ToString();
+                    GateOrigins.AddOrUpdate(origin, 1, static (_, count) => count + 1);
+                }
             }
 
             if (Volatile.Read(ref _outstanding) >= MaxOutstanding)

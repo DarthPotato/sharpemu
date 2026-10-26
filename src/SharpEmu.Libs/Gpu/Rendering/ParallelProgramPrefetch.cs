@@ -34,6 +34,8 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         internal ComputeProgram? ComputeProgram;
         // Set under the lock before the worker took the job: the worker skips it.
         internal bool Cancelled;
+        // Stopwatch timestamp of the submission, with the render profile on.
+        internal long SubmittedAt;
     }
 
     // The job the worker took off the queue and is resolving, under _lock.
@@ -117,6 +119,7 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
 
     private Job Enqueue(Job job)
     {
+        if (RenderPhaseProfile.Enabled) job.SubmittedAt = System.Diagnostics.Stopwatch.GetTimestamp();
         lock (_lock)
         {
             _queue.Enqueue(job);
@@ -336,6 +339,20 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         Array.Clear(_inputMismatches);
         Array.Clear(_computeOutcomes);
         _graphicsTakenWithRefusals = 0;
+        static string Ms(long ticks) => $"{ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}ms";
+        var waits = _waitCount.Sum();
+        line += $"\n[PERF][PREFETCH_WAIT] running={_waitCount[0]}/{Ms(_waitTicks[0])} behind={_waitCount[1]}/{Ms(_waitTicks[1])} " +
+            $"gated={_waitCount[2]}/{Ms(_waitTicks[2])} paused={_waitCount[3]}/{Ms(_waitTicks[3])} " +
+            $"mean_jobs_ahead={(waits == 0 ? 0 : (double)_waitJobsAhead / waits):F1} " +
+            $"mean_job_age={(waits == 0 ? "0" : Ms(_waitJobAgeTicks / waits))} submitted_under_100us={_waitSubmittedLate} " +
+            $"worker_empty={Ms(Interlocked.Exchange(ref _workerEmptyTicks, 0))} worker_gate={Ms(Interlocked.Exchange(ref _workerGateTicks, 0))} " +
+            $"worker_paused={Ms(Interlocked.Exchange(ref _workerPausedTicks, 0))} worker_resolve={Ms(Interlocked.Exchange(ref _workerResolveTicks, 0))} " +
+            $"worker_jobs={Interlocked.Exchange(ref _workerJobs, 0)}";
+        Array.Clear(_waitCount);
+        Array.Clear(_waitTicks);
+        _waitJobsAhead = 0;
+        _waitJobAgeTicks = 0;
+        _waitSubmittedLate = 0;
         return line;
     }
 
@@ -346,6 +363,74 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
             return;
         }
 
+        if (RenderPhaseProfile.Enabled)
+        {
+            WaitForMeasured(job);
+            return;
+        }
+
+        WaitForCore(job);
+    }
+
+    // Why the render thread waited for the worker: its job was being resolved, or still queued
+    // behind other jobs (how many), behind a closed gate, or while the worker was paused.
+    private enum WaitCause { Running, Behind, Gated, Paused, Count }
+
+    private static readonly long[] _waitCount = new long[(int)WaitCause.Count];
+    private static readonly long[] _waitTicks = new long[(int)WaitCause.Count];
+    private static long _waitJobsAhead;
+    private static long _waitSubmittedLate;
+    // Worker time: waiting for a job, on a closed gate, paused, and resolving.
+    private static long _workerEmptyTicks;
+    private static long _workerGateTicks;
+    private static long _workerPausedTicks;
+    private static long _workerResolveTicks;
+    private static long _workerJobs;
+    // The job a waiting render thread found was submitted this recently (ticks), summed.
+    private static long _waitJobAgeTicks;
+
+    private void WaitForMeasured(Job job)
+    {
+        WaitCause cause;
+        long ahead;
+        lock (_lock)
+        {
+            ahead = 0;
+            var gated = false;
+            var queuedJob = false;
+            foreach (var queued in _queue)
+            {
+                if (ReferenceEquals(queued, job))
+                {
+                    queuedJob = true;
+                    break;
+                }
+
+                ahead++;
+            }
+
+            if (queuedJob)
+            {
+                gated = _queue.Peek().Gate > Volatile.Read(ref _executedGate);
+            }
+
+            cause = !queuedJob ? WaitCause.Running : _paused ? WaitCause.Paused : gated ? WaitCause.Gated : WaitCause.Behind;
+        }
+
+        var age = System.Diagnostics.Stopwatch.GetTimestamp() - job.SubmittedAt;
+        var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        WaitForCore(job);
+        var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+        _waitCount[(int)cause]++;
+        _waitTicks[(int)cause] += elapsed;
+        _waitJobsAhead += ahead;
+        _waitJobAgeTicks += age;
+        // Submitted less than 100 us before the render thread needed it.
+        if (age < System.Diagnostics.Stopwatch.Frequency / 10_000) _waitSubmittedLate++;
+    }
+
+    private void WaitForCore(Job job)
+    {
         using var profile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPrefetchWait);
         var spinner = new SpinWait();
         for (var spin = 0; spin < 64 && job.State == 0; spin++)
@@ -373,6 +458,8 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         while (true)
         {
             Job job;
+            var measured = RenderPhaseProfile.Enabled;
+            var waitStart = measured ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             lock (_lock)
             {
                 while (_queue.Count == 0 && !_stopping)
@@ -383,6 +470,15 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
                 if (_stopping)
                 {
                     return;
+                }
+
+                long gateStart = 0;
+                var pausedAtGate = false;
+                if (measured)
+                {
+                    gateStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    Interlocked.Add(ref _workerEmptyTicks, gateStart - waitStart);
+                    pausedAtGate = _paused;
                 }
 
                 job = _queue.Peek();
@@ -424,8 +520,15 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
                 _queue.Dequeue();
                 _running = true;
                 _runningJob = job;
+                if (measured)
+                {
+                    var gated = System.Diagnostics.Stopwatch.GetTimestamp() - gateStart;
+                    if (pausedAtGate) Interlocked.Add(ref _workerPausedTicks, gated);
+                    else Interlocked.Add(ref _workerGateTicks, gated);
+                }
             }
 
+            var resolveStart = measured ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             if (job.Cancelled)
             {
                 job.State = 2;
@@ -433,6 +536,12 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
             else
             {
                 Resolve(job);
+            }
+
+            if (measured)
+            {
+                Interlocked.Add(ref _workerResolveTicks, System.Diagnostics.Stopwatch.GetTimestamp() - resolveStart);
+                Interlocked.Increment(ref _workerJobs);
             }
 
             lock (_lock)

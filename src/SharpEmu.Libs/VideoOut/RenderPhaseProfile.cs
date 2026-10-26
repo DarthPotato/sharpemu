@@ -507,6 +507,7 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeLookupReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Rendering.ParallelProgramPrefetch.TakeReport());
         Console.Error.WriteLine(VulkanVideoPresenter.TakeStaleReport());
+        if (VulkanVideoPresenter.TakeGateReport() is { } gateReport) Console.Error.WriteLine(gateReport);
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccReport());
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();
         DescriptorStallProfile.WriteReport();

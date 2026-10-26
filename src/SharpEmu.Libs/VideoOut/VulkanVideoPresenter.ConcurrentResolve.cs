@@ -88,6 +88,8 @@ internal static unsafe partial class VulkanVideoPresenter
     // Resolutions taken although the epoch moved, every store since their start being elsewhere.
     private static long _keptAcrossWriteback;
 
+    internal static string? TakeGateReport() => CommandThread.TakeGateReport();
+
     internal static string TakeStaleReport()
     {
         var line = $"[PERF][PROGRAM_PREFETCH_STALE] writeback_epoch={_staleByWriteback} ownership_answer={_staleByAnswer} " +
