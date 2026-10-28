@@ -389,17 +389,30 @@ public sealed class GpuCommandInterpreterLabelTests
         Assert.Equal(SubmissionProgress.Blocked, progress);
         Assert.Equal(new[] { "flush", "flip_done? 3 1" }, runner.Host.Calls);
 
+        Assert.Equal(0, runner.Host.VisibilityBoundaries);
         runner.Host.FlipDone = true;
         Assert.Equal(SubmissionProgress.Complete, runner.Run());
         Assert.Equal(5u, runner.Interpreter.InstanceCount);
+        Assert.Equal(1, runner.Host.VisibilityBoundaries);
+    }
+
+    [Theory]
+    [InlineData(0x100u)]
+    [InlineData(0x8000u)]
+    public void ReleaseMemory_InvalidationAndUnknownGcrMarkVisibility(uint gcrControl)
+    {
+        var runner = new StreamRunner();
+        runner.Interpreter.ReleaseMemory(0, 0x28, 0, gcrControl, 0, 0, 0, 0, 0, 0);
+        Assert.Equal(1, runner.Host.VisibilityBoundaries);
     }
 
     [Fact]
-    public void AcquireMemory_IsANoOp()
+    public void AcquireMemory_MarksVisibilityForBothPacketForms()
     {
         var runner = new StreamRunner();
 
         runner.Run(StreamRunner.CustomPacket(Nop, PacketCustomCode.AcquireMemory, 0, 0, 0, 0, 0, 0, 0), StreamRunner.Packet(PacketOpcode.AcquireMemory, 0, 0, 0, 0, 0, 0));
+        Assert.Equal(2, runner.Host.VisibilityBoundaries);
 
         Assert.Empty(runner.Host.Calls);
     }

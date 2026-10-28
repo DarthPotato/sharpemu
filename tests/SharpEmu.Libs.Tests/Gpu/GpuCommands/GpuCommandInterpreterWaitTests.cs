@@ -64,6 +64,7 @@ public sealed class GpuCommandInterpreterWaitTests
 
         Assert.Equal(satisfied ? SubmissionProgress.Complete : SubmissionProgress.Blocked, progress);
         Assert.Equal(satisfied ? 2u : 1u, runner.Interpreter.InstanceCount);
+        Assert.Equal(satisfied ? 1 : 0, runner.Host.VisibilityBoundaries);
     }
 
     [Fact]
@@ -73,9 +74,11 @@ public sealed class GpuCommandInterpreterWaitTests
         runner.Host.WriteQword(Label, 1);
 
         Assert.Equal(SubmissionProgress.Blocked, runner.Run(Wait64(5, Label, 0x1_0000_0000, ulong.MaxValue), CreateInstanceCountPacket(3)));
+        Assert.Equal(0, runner.Host.VisibilityBoundaries);
         runner.Host.WriteQword(Label, 0x1_0000_0000);
         Assert.Equal(SubmissionProgress.Complete, runner.Run());
         Assert.Equal(3u, runner.Interpreter.InstanceCount);
+        Assert.Equal(1, runner.Host.VisibilityBoundaries);
     }
 
     [Fact]
@@ -134,12 +137,15 @@ public sealed class GpuCommandInterpreterWaitTests
         var wait64 = StreamRunner.CustomPacket(Nop, PacketCustomCode.WaitMemory64, StreamRunner.Low(Label), StreamRunner.High(Label), 0xFFFF_FFFF, 0xFFFF_FFFF, 5, 2, 0x13, 0);
         Assert.Equal(SubmissionProgress.Complete, runner.Run(legacy, wait32, wait64, CreateInstanceCountPacket(4)));
         Assert.Equal(4u, runner.Interpreter.InstanceCount);
+        Assert.Equal(3, runner.Host.VisibilityBoundaries);
 
         var unmet = StreamRunner.CustomPacket(Nop, PacketCustomCode.WaitMemory32, StreamRunner.Low(Label), StreamRunner.High(Label), 0xF, 6, 0x13, 0);
         Assert.Equal(SubmissionProgress.Blocked, runner.Run(unmet));
+        Assert.Equal(3, runner.Host.VisibilityBoundaries);
 
         var maskless = StreamRunner.CustomPacket(Nop, PacketCustomCode.WaitMemory32, StreamRunner.Low(Label), StreamRunner.High(Label), 0, 6, 0x13, 0);
         Assert.Equal(SubmissionProgress.Complete, runner.Run(maskless));
+        Assert.Equal(3, runner.Host.VisibilityBoundaries);
     }
 
     [Fact]
@@ -283,14 +289,18 @@ public sealed class GpuCommandInterpreterWaitTests
         runner.Run(Semaphore(Data, 6, writeSignal: true));
         Assert.Equal(1UL, runner.Host.ReadQword(Data));
 
+        Assert.Equal(0, runner.Host.VisibilityBoundaries);
         Assert.Equal(SubmissionProgress.Complete, runner.Run(Semaphore(Data, 7)));
+        Assert.Equal(1, runner.Host.VisibilityBoundaries);
         Assert.Equal(0UL, runner.Host.ReadQword(Data));
 
         Assert.Equal(SubmissionProgress.Blocked, runner.Run(Semaphore(Data, 7), CreateInstanceCountPacket(3)));
+        Assert.Equal(1, runner.Host.VisibilityBoundaries);
         runner.Host.WriteQword(Data, 1);
         Assert.Equal(SubmissionProgress.Complete, runner.Run());
         Assert.Equal(0UL, runner.Host.ReadQword(Data));
         Assert.Equal(3u, runner.Interpreter.InstanceCount);
+        Assert.Equal(2, runner.Host.VisibilityBoundaries);
         Assert.Contains("semaphore packet is not supported", runner.RunExpectingFatal(Semaphore(Data, 5)).Message);
     }
 }

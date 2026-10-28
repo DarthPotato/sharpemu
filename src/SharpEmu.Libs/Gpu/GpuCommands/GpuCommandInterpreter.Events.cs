@@ -139,11 +139,13 @@ public sealed partial class GpuCommandInterpreter
     {
         if (packet.Header == PacketHeader.Make(8, PacketOpcode.Nop, PacketCustomCode.AcquireMemory))
         {
+            _host.CpuGpuVisibilityBoundary();
             return 7;
         }
 
         if (packet.Header == PacketHeader.Make(7, PacketOpcode.AcquireMemory))
         {
+            _host.CpuGpuVisibilityBoundary();
             return 6;
         }
 

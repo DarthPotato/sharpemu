@@ -101,6 +101,10 @@ public sealed partial class GpuCommandInterpreter
         {
             Suspend();
         }
+        else
+        {
+            _host.CpuGpuVisibilityBoundary();
+        }
 
         return 3;
     }

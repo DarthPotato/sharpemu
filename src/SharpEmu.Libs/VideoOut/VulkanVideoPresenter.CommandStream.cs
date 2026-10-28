@@ -6,6 +6,7 @@ namespace SharpEmu.Libs.VideoOut;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Gpu;
+using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.GpuCommands;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -460,10 +461,25 @@ internal static unsafe partial class VulkanVideoPresenter
         // The guest queue the command stream thread is interpreting, for the label latency profile.
         private int _postingQueueId;
 
+        public void CpuGpuVisibilityBoundary()
+        {
+            if (!GuestBufferCache.BdaVisibilitySweepEnabled) return;
+            if (OnCommandThread)
+            {
+                _translation.DrainPendingDraws();
+                _commandThread!.PostNonGating(CpuGpuVisibilityBoundary);
+                return;
+            }
+
+            DrainDraws();
+            _bufferCache.NoteCpuGpuVisibilityBoundary();
+        }
+
         public void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots)
         {
             if (OnCommandThread)
             {
+                if (GuestBufferCache.BdaVisibilitySweepEnabled) _translation.DrainPendingDraws();
                 _postingQueueId = queueId;
                 // The translation state belongs to this thread; the queue context to the render thread.
                 _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
@@ -478,6 +494,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void BeginSubmissionContext(int queueId, ulong submissionId)
         {
+            CpuGpuVisibilityBoundary();
             if (_occlusionQueueId != queueId)
                 EndRendering();
             _occlusionQueueId = queueId;
@@ -795,12 +812,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void PrepareCpuFlip(int handle, int index, ulong requestId)
         {
+            CpuGpuVisibilityBoundary();
             if (OnCommandThread)
             {
-                _commandThread!.Run(() => PrepareCpuFlip(handle, index, requestId));
+                _commandThread!.Run(() => CaptureCpuFlip(handle, index, requestId));
                 return;
             }
 
+            CaptureCpuFlip(handle, index, requestId);
+        }
+
+        private void CaptureCpuFlip(int handle, int index, ulong requestId)
+        {
             DrainDraws();
             CaptureFlip(handle, index, requestId, flipMode: 0, flipArg: 0);
         }

@@ -59,6 +59,9 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
         return ReadOcclusionSamples is not null;
     }
 
+    public int VisibilityBoundaries { get; private set; }
+    public void CpuGpuVisibilityBoundary() => VisibilityBoundaries++;
+
     public List<string> Calls { get; } = new();
 
     public List<(string Operation, ulong Address, ulong Size, byte[] Bytes)> TracedWrites { get; } = new();

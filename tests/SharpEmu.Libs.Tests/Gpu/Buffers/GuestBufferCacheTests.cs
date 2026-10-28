@@ -943,6 +943,53 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         harness.Shutdown();
     }
 
+    [Theory]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(true, false, true)]
+    [InlineData(false, false, false)]
+    public void BdaSweepRequiresVisibilityUnlessMappingChanges(bool enabled, bool boundary, bool mappingChanged)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var previous = GuestBufferCache.BdaVisibilitySweepEnabled;
+        GuestBufferCache.BdaVisibilitySweepEnabled = enabled;
+        try
+        {
+            using var harness = new CacheHarness(_vulkan!);
+            var address = harness.MapBacked(0x20000, ReadWrite);
+            const ulong size = 0x8000;
+            var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, false));
+            harness.Worker.Run(() => harness.Cache.PrepareBda([new GuestSpan(address, size)]));
+            var before = harness.ReadBack(buffer, offset, size);
+            Assert.True(harness.Store.MarkCpuWrite(address, size));
+            var expected = Pattern((int)size, 17);
+            harness.Write(address, expected);
+            harness.Worker.Run(() =>
+            {
+                if (boundary) harness.Cache.NoteCpuGpuVisibilityBoundary();
+                harness.Cache.PrepareBda([new GuestSpan(address, mappingChanged ? size + Page : size)]);
+            });
+            var uploaded = !enabled || boundary || mappingChanged;
+            Assert.Equal(!uploaded, harness.Cache.HasCpuDirtyPages(address, size));
+            Assert.Equal(uploaded ? expected : before, harness.ReadBack(buffer, offset, size));
+            if (!uploaded)
+            {
+                harness.Worker.Run(() =>
+                {
+                    harness.Cache.NoteCpuGpuVisibilityBoundary();
+                    harness.Cache.PrepareBda([new GuestSpan(address, size)]);
+                });
+                Assert.Equal(expected, harness.ReadBack(buffer, offset, size));
+                Assert.False(harness.Cache.HasCpuDirtyPages(address, size));
+            }
+            harness.Shutdown();
+        }
+        finally
+        {
+            GuestBufferCache.BdaVisibilitySweepEnabled = previous;
+        }
+    }
+
     [Fact]
     public void SynchronizeBuffersInRange_UploadsDirtyPagesOfEveryBufferInTheRange()
     {

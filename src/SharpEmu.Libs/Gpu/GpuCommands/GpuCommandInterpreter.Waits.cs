@@ -49,6 +49,10 @@ public sealed partial class GpuCommandInterpreter
         {
             Suspend();
         }
+        else
+        {
+            _host.CpuGpuVisibilityBoundary();
+        }
     }
 
     // The wait bit is PredicationZPassWaitOp: 0 (kWaitForQueryResults) stalls the command
@@ -157,6 +161,10 @@ public sealed partial class GpuCommandInterpreter
         if (!valid)
         {
             Suspend();
+        }
+        else
+        {
+            _host.CpuGpuVisibilityBoundary();
         }
     }
 

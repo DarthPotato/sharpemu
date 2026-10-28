@@ -335,6 +335,9 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal($"The release-memory data selection is not supported: selection={dataSelection} address=0x{destination:X16}.");
         }
 
+        // Invalidation can accompany a CPU publication even in a release packet.
+        if ((gcrControl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate | GcrGl2Invalidate | ~GcrKnownMask)) != 0)
+            _host.CpuGpuVisibilityBoundary();
         WarnUnknownReleaseMemGcr(gcrControl);
         var gl2WriteBack = (gcrControl & GcrGl2Writeback) != 0;
 
@@ -590,6 +593,10 @@ public sealed partial class GpuCommandInterpreter
         if (!_host.IsFlipDone((int)videoOutHandle, (int)displayBufferIndex))
         {
             Suspend();
+        }
+        else
+        {
+            _host.CpuGpuVisibilityBoundary();
         }
     }
 }

@@ -206,6 +206,7 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal($"The indirect buffer nesting is too deep: depth={execution.Depth} address=0x{address:X16} dwords={dwordCount}.");
         }
 
+        _host.CpuGpuVisibilityBoundary();
         var stopDepth = execution.Depth;
         execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address));
         RunPackets(execution, stopDepth);
@@ -217,6 +218,7 @@ public sealed partial class GpuCommandInterpreter
         var execution = RequireExecution();
         execution.Pop();
         execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address, followedChunkAdvance));
+        _host.CpuGpuVisibilityBoundary();
         _chainRequested = true;
     }
 

@@ -1875,6 +1875,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public void PrepareBda(IReadOnlyCollection<GuestSpan> mapped, ulong mapping)
     {
         var traceAddress = GuestGpuMemoryHook.TraceAddress;
+        if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaPrepares);
         var traceCovered = false;
         if (traceAddress != 0)
         {
@@ -1899,12 +1900,20 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             }
 
             var epoch = _tracker.CpuDirtyEpoch;
-            if (epoch != _bdaSweepEpoch || mapping != _bdaSweepMapping)
+            var mappingChanged = mapping != _bdaSweepMapping || _bdaSweepEpoch == -1;
+            var dirty = epoch != _bdaSweepEpoch || mappingChanged;
+            if (dirty && (mappingChanged || !BdaVisibilitySweepEnabled || _bdaVisibilityPending))
             {
                 foreach (var span in spans)
                     _tracker.ForEachPossiblyCpuDirtyRange(span.Address, span.Size, _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange);
                 _bdaSweepEpoch = epoch;
                 _bdaSweepMapping = mapping;
+                _bdaVisibilityPending = false;
+                if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaSweeps);
+            }
+            else if (dirty && VideoOut.RenderPhaseProfile.Enabled)
+            {
+                Interlocked.Increment(ref _bdaSkippedNoBoundary);
             }
         }
 
@@ -1916,6 +1925,23 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private Action<ulong, ulong>? _uploadDirtyBuffersInRange;
     private Action<ulong, ulong>? _touchBuffersInRange;
+    internal static bool BdaVisibilitySweepEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPEMU_BDA_VISIBILITY_SWEEP") == "1";
+
+    // Render-thread owned; only a completed sweep consumes the pending boundary.
+    private bool _bdaVisibilityPending;
+
+    public void NoteCpuGpuVisibilityBoundary()
+    {
+        _bdaVisibilityPending = true;
+        if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaBoundaryMarkers);
+    }
+
+    private static long _bdaPrepares, _bdaSweeps, _bdaBoundaryMarkers, _bdaSkippedNoBoundary;
+
+    public static string TakeBdaReport() => FormattableString.Invariant(
+        $"[PERF][BDA_SWEEP] prepares={Interlocked.Exchange(ref _bdaPrepares, 0)} sweeps={Interlocked.Exchange(ref _bdaSweeps, 0)} boundary_markers={Interlocked.Exchange(ref _bdaBoundaryMarkers, 0)} skipped_no_boundary={Interlocked.Exchange(ref _bdaSkippedNoBoundary, 0)}");
+
     private long _bdaSweepEpoch = -1;
     private ulong _bdaSweepMapping;
 

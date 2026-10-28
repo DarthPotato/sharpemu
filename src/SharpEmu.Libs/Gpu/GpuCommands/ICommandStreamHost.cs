@@ -119,6 +119,9 @@ public interface ICommandStreamHost
     // Starts a slice of a submission; the geometry snapshots were captured when it was submitted.
     void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots);
 
+    // Ordered between the render work preceding and following this acquisition.
+    void CpuGpuVisibilityBoundary() { }
+
     void Flush();
 
     // A frame boundary: submits what the frame recorded. The submitter resumes once it returns, so a
