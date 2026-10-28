@@ -19,6 +19,29 @@ public sealed class GuestPageTrackerTests : IDisposable
     private const GuestPageProtection Read = GuestPageProtection.Read;
     private const GuestPageProtection ReadWrite = GuestPageProtection.Read | GuestPageProtection.Write;
 
+    [NativePageProtectionFact]
+    public void GpuDirtyPrecheckPreservesStreamingOwnershipDecisionAcrossRegions()
+    {
+        var address = AllocateAligned(Region * 2, Region);
+        var start = address + Region - Page;
+        bool HasGpuOwnership() => _tracker.MayHaveGpuDirtyPages(start, Page * 2) &&
+            _tracker.HasGpuDirtyPages(start, Page * 2);
+
+        Assert.False(HasGpuOwnership()); // Absent tracker regions are GPU-clean.
+        _tracker.ForEachUploadRange(start, Page * 2, false, NoRange, NoUpload);
+        Assert.False(HasGpuOwnership());
+        _tracker.MarkGpuDirtyPages(start + Page, Page);
+        Assert.True(HasGpuOwnership());
+        _tracker.ClearGpuDirtyPages(start + Page, Page);
+        Assert.False(HasGpuOwnership());
+        _tracker.MarkGpuDirtyPages(start, Page);
+        Assert.True(HasGpuOwnership());
+        _tracker.ClearGpuDirtyPages(start, Page);
+        Assert.False(HasGpuOwnership());
+        _tracker.UntrackMemory(address, Region * 2);
+        Release(address, Region * 2);
+    }
+
     private sealed class TrackerFatalException(string message) : Exception(message);
 
     // Forwards to the real address space and records every protection call.

@@ -294,7 +294,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         // A caller that needs a physical address cannot take the transient stream copy.
         if (!requiresDeviceAddress && !isWritten &&
-            !_tracker.HasGpuDirtyPages(guestAddress, size) &&
+            // Only this queue thread sets GPU ownership; a clear lock-free probe
+            // is exact here. Concurrent clears can only require the locked fallback.
+            (!_tracker.MayHaveGpuDirtyPages(guestAddress, size) || !_tracker.HasGpuDirtyPages(guestAddress, size)) &&
             _tracker.HasCpuDirtyPages(guestAddress, size) &&
             (size <= CachingPageSize || (!isTexelBuffer && _tracker.IsCpuWriteHotRange(guestAddress, size))))
         {
