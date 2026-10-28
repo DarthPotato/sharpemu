@@ -16,7 +16,17 @@ public sealed class CpuDirtySummary
 
     public long Epoch => Volatile.Read(ref _epoch);
 
-    public void NoteDirtied() => Interlocked.Increment(ref _epoch);
+    private PendingCpuDirtyBlocks? _bdaPending;
+
+    public PendingCpuDirtyBlocks EnableBdaPending() =>
+        LazyInitializer.EnsureInitialized(ref _bdaPending, static () => new PendingCpuDirtyBlocks());
+
+    public void NoteDirtied(ulong block)
+    {
+        // Publish the candidate before the epoch observed by the BDA consumer.
+        Volatile.Read(ref _bdaPending)?.Publish(block);
+        Interlocked.Increment(ref _epoch);
+    }
 
     public void Set(ulong block, bool dirty)
     {

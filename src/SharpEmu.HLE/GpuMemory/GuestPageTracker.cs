@@ -74,6 +74,49 @@ public sealed class GuestPageTracker
 
     public long CpuDirtyEpoch => _cpuDirtySummary.Epoch;
 
+    // Returns whether this was a full sweep. Mapping changes rescan even dirtiness
+    // discarded outside the old mapping. Only BDA drains this notification record.
+    public bool ForEachBdaDirtyRange(IReadOnlyCollection<GuestSpan> mapped, bool full, Action<ulong, ulong> visit)
+    {
+        var pending = _cpuDirtySummary.EnableBdaPending();
+        var batch = pending.Drain();
+        full |= batch.Overflow;
+        try
+        {
+            if (full)
+            {
+                foreach (var span in mapped)
+                    ForEachPossiblyCpuDirtyRange(span.Address, span.Size, visit);
+            }
+            else
+            {
+                foreach (var (word, bits) in batch.Words)
+                {
+                    var remaining = bits;
+                    while (remaining != 0)
+                    {
+                        var block = (ulong)word * 64 + (ulong)System.Numerics.BitOperations.TrailingZeroCount(remaining);
+                        remaining &= remaining - 1;
+                        if (!_cpuDirtySummary.IsDirty(block)) continue;
+                        var address = block * BlockBytes;
+                        foreach (var span in mapped)
+                        {
+                            var start = Math.Max(address, span.Address);
+                            var end = Math.Min(address + BlockBytes, span.End);
+                            if (start < end) visit(start, end - start);
+                        }
+                    }
+                }
+            }
+            return full;
+        }
+        catch
+        {
+            pending.Restore(batch);
+            throw;
+        }
+    }
+
     public bool HasGpuDirtyPages(ulong vaddr, ulong size)
     {
         RejectUploadCallbackReentry();

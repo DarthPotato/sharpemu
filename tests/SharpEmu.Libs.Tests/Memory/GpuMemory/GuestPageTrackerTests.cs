@@ -87,6 +87,112 @@ public sealed class GuestPageTrackerTests : IDisposable
     }
 
     [NativePageProtectionFact]
+    public void BdaIncrementalVisitsOnlyNewlyDirtyBlocksAndNewRegions()
+    {
+        var address = AllocateAligned(Region * 3, Region);
+        _tracker.ForEachUploadRange(address, Region * 2, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+        GuestSpan[] mapped = [new(address, Region * 3)];
+        _tracker.ForEachBdaDirtyRange(mapped, true, (_, _) => { });
+        _tracker.MarkCpuDirtyPages(address + Page, Page);
+        var visits = new List<GuestSpan>();
+        Assert.False(_tracker.ForEachBdaDirtyRange(mapped, false, (a, s) => visits.Add(new(a, s))));
+        Assert.Equal([new GuestSpan(address, Region)], visits);
+        _tracker.ForEachUploadRange(address, Region, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+        visits.Clear();
+        _tracker.MarkCpuDirtyPages(address + Region * 2, Page);
+        _tracker.ForEachBdaDirtyRange(mapped, false, (a, s) => visits.Add(new(a, s)));
+        Assert.Equal([new GuestSpan(address + Region * 2, Region)], visits);
+        _tracker.UntrackMemory(address, Region * 3);
+        Release(address, Region * 3);
+    }
+
+    [NativePageProtectionFact]
+    public void BdaSweepPreservesConcurrentNotificationsAndFailedCandidates()
+    {
+        var address = AllocateAligned(Region * 3, Region);
+        GuestSpan[] mapped = [new(address, Region * 2)];
+        _tracker.ForEachUploadRange(address, Region * 2, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+        _tracker.ForEachBdaDirtyRange(mapped, true, (_, _) => { });
+        _tracker.MarkCpuDirtyPages(address, Page);
+        _tracker.ForEachBdaDirtyRange(mapped, false, (_, _) =>
+        {
+            RunConcurrentDirty(() => _tracker.MarkCpuDirtyPages(address + Region, Page));
+        });
+        Assert.Throws<InvalidOperationException>(() => _tracker.ForEachBdaDirtyRange(mapped, false, (_, _) => throw new InvalidOperationException()));
+        var visits = new List<GuestSpan>();
+        _tracker.ForEachBdaDirtyRange(mapped, false, (a, s) => visits.Add(new(a, s)));
+        Assert.Equal([new GuestSpan(address + Region, Region)], visits);
+        _tracker.UntrackMemory(address, Region * 3);
+        Release(address, Region * 3);
+    }
+
+    [NativePageProtectionFact]
+    public void BdaMappingRescanFindsPreviouslyUnmappedDirtiness()
+    {
+        var address = AllocateAligned(Region * 3, Region);
+        _tracker.ForEachUploadRange(address, Region * 2, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+        GuestSpan[] first = [new(address, Region)];
+        _tracker.ForEachBdaDirtyRange(first, true, (_, _) => { });
+        _tracker.MarkCpuDirtyPages(address + Region, Page);
+        _tracker.ForEachBdaDirtyRange(first, false, (_, _) => Assert.Fail("Unmapped block visited"));
+        var visits = new List<GuestSpan>();
+        Assert.True(_tracker.ForEachBdaDirtyRange([new(address, Region * 2)], true, (a, s) => visits.Add(new(a, s))));
+        Assert.Equal([new GuestSpan(address + Region, Region)], visits);
+        _tracker.UntrackMemory(address, Region * 3);
+        Release(address, Region * 3);
+    }
+
+    [Fact]
+    public void BdaPendingOverflowForcesFullRescanAndRestoresOnFailure()
+    {
+        var pending = new PendingCpuDirtyBlocks();
+        for (ulong word = 0; word < 257; word++) pending.Publish(word * 64);
+        var batch = pending.Drain();
+        Assert.True(batch.Overflow);
+        pending.Restore(batch);
+        Assert.True(pending.Drain().Overflow);
+        Assert.False(pending.Drain().Overflow);
+    }
+
+    [NativePageProtectionFact]
+    public void BdaOtherUploadDoesNotConsumePendingRecordAndCleanCandidatesAreSkipped()
+    {
+        var address = AllocateAligned(Region, Region);
+        GuestSpan[] mapped = [new(address, Region)];
+        _tracker.ForEachUploadRange(address, Region, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+        _tracker.ForEachBdaDirtyRange(mapped, true, (_, _) => { });
+        _tracker.MarkCpuDirtyPages(address, Page * 2);
+        _tracker.ForEachUploadRange(address, Page, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+        var visits = 0;
+        _tracker.ForEachBdaDirtyRange(mapped, false, (a, s) =>
+        {
+            visits++;
+            _tracker.ForEachUploadRange(a, s, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+            // Republish the very same block while its old candidate is in flight.
+            RunConcurrentDirty(() => _tracker.MarkCpuDirtyPages(address, Page));
+        });
+        Assert.Equal(1, visits);
+        _tracker.ForEachUploadRange(address, Region, false, (_, _) => { }, () => { }, preserveCpuWriteHotPages: false);
+        _tracker.ForEachBdaDirtyRange(mapped, false, (_, _) => Assert.Fail("Clean candidate visited"));
+        _tracker.ForEachBdaDirtyRange(mapped, false, (_, _) => Assert.Fail("Drained candidate visited twice"));
+        _tracker.UntrackMemory(address, Region);
+        Release(address, Region);
+    }
+
+    private static void RunConcurrentDirty(Action dirty)
+    {
+        Exception? failure = null;
+        var writer = new Thread(() =>
+        {
+            try { dirty(); }
+            catch (Exception error) { failure = error; }
+        }) { IsBackground = true };
+        writer.Start();
+        Assert.True(writer.Join(TimeSpan.FromSeconds(10)), "Concurrent dirty notification timed out");
+        Assert.Null(failure);
+    }
+
+    [NativePageProtectionFact]
     public void QueriesDoNotRequireMappedOwnership()
     {
         const ulong address = 0x2_0300_0000;

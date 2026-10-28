@@ -991,6 +991,38 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void BdaIncrementalSweepUploadsNewlyRegisteredRegion()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var previous = GuestBufferCache.BdaVisibilitySweepEnabled;
+        GuestBufferCache.BdaVisibilitySweepEnabled = true;
+        try
+        {
+            using var harness = new CacheHarness(_vulkan!);
+            var address = harness.MapBacked(0x20000, ReadWrite);
+            GuestSpan[] mapped = [new(address, 0x20000)];
+            harness.Worker.Run(() => harness.Cache.PrepareBda(mapped));
+            var expected = Pattern(0x8000, 23);
+            harness.Write(address, expected);
+            var buffer = harness.Worker.Run(() => harness.Cache.GetBuffer(harness.Cache.FindBuffer(address, 0x8000)));
+            Assert.False(harness.Cache.Tracker.HasRegion(address, 0x8000));
+            var offset = address - buffer.CpuAddress;
+            harness.Worker.Run(() =>
+            {
+                harness.Cache.NoteCpuGpuVisibilityBoundary();
+                harness.Cache.PrepareBda(mapped);
+            });
+            Assert.Equal(expected, harness.ReadBack(buffer, offset, 0x8000));
+            Assert.False(harness.Cache.HasCpuDirtyPages(address, 0x8000));
+            harness.Shutdown();
+        }
+        finally
+        {
+            GuestBufferCache.BdaVisibilitySweepEnabled = previous;
+        }
+    }
+
+    [Fact]
     public void SynchronizeBuffersInRange_UploadsDirtyPagesOfEveryBufferInTheRange()
     {
         if (_vulkan is null) return;

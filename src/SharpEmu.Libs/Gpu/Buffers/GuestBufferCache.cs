@@ -1904,12 +1904,22 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var dirty = epoch != _bdaSweepEpoch || mappingChanged;
             if (dirty && (mappingChanged || !BdaVisibilitySweepEnabled || _bdaVisibilityPending))
             {
-                foreach (var span in spans)
-                    _tracker.ForEachPossiblyCpuDirtyRange(span.Address, span.Size, _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange);
+                var visit = _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange;
+                var full = true;
+                if (BdaVisibilitySweepEnabled)
+                    full = _tracker.ForEachBdaDirtyRange(spans, mappingChanged, visit);
+                else
+                    foreach (var span in spans)
+                        _tracker.ForEachPossiblyCpuDirtyRange(span.Address, span.Size, visit);
                 _bdaSweepEpoch = epoch;
                 _bdaSweepMapping = mapping;
                 _bdaVisibilityPending = false;
-                if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaSweeps);
+                if (VideoOut.RenderPhaseProfile.Enabled)
+                {
+                    Interlocked.Increment(ref _bdaSweeps);
+                    if (full) Interlocked.Increment(ref _bdaFullSweeps);
+                    else Interlocked.Increment(ref _bdaIncrementalSweeps);
+                }
             }
             else if (dirty && VideoOut.RenderPhaseProfile.Enabled)
             {
@@ -1938,10 +1948,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private static long _bdaPrepares, _bdaSweeps, _bdaBoundaryMarkers, _bdaSkippedNoBoundary;
+    private static long _bdaVisits, _bdaSynchronizedBuffers, _bdaFullSweeps, _bdaIncrementalSweeps;
 
-    public static string TakeBdaReport() => FormattableString.Invariant(
-        $"[PERF][BDA_SWEEP] prepares={Interlocked.Exchange(ref _bdaPrepares, 0)} sweeps={Interlocked.Exchange(ref _bdaSweeps, 0)} boundary_markers={Interlocked.Exchange(ref _bdaBoundaryMarkers, 0)} skipped_no_boundary={Interlocked.Exchange(ref _bdaSkippedNoBoundary, 0)}");
-
+    public static string TakeBdaReport()
+    {
+        var sweeps = Interlocked.Exchange(ref _bdaSweeps, 0);
+        var visits = Interlocked.Exchange(ref _bdaVisits, 0);
+        return FormattableString.Invariant(
+            $"[PERF][BDA_SWEEP] prepares={Interlocked.Exchange(ref _bdaPrepares, 0)} sweeps={sweeps} boundary_markers={Interlocked.Exchange(ref _bdaBoundaryMarkers, 0)} skipped_no_boundary={Interlocked.Exchange(ref _bdaSkippedNoBoundary, 0)} visits={visits} visits_per_sweep={(sweeps == 0 ? 0 : (double)visits / sweeps):F2} synchronized_buffers={Interlocked.Exchange(ref _bdaSynchronizedBuffers, 0)} full_sweeps={Interlocked.Exchange(ref _bdaFullSweeps, 0)} incremental_sweeps={Interlocked.Exchange(ref _bdaIncrementalSweeps, 0)}");
+    }
     private long _bdaSweepEpoch = -1;
     private ulong _bdaSweepMapping;
 
@@ -1956,6 +1971,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // The upload half of SynchronizeBuffersInRange, for a range that may hold CPU-dirty pages.
     private void UploadDirtyBuffersInRange(ulong guestAddress, ulong size)
     {
+        if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaVisits);
         var end = guestAddress + size;
         var index = _registry.FindFirstOverlappingIndex(guestAddress);
         for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
@@ -1964,7 +1980,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var start = Math.Max(buffer.CpuAddress, guestAddress);
             var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
             if (start < finish && _tracker.MayHaveCpuDirtyPages(start, finish - start))
+            {
+                if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaSynchronizedBuffers);
                 _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: false);
+            }
         }
     }
 
@@ -2803,6 +2822,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 $"device-address-registration insert={insert} buffer={bufferIdentifier} submission_tick={_scheduler.CurrentTick} collection_tick={_retirementPolicy.CurrentTick}");
         if (insert)
         {
+            // Registration can expose untracked allocation padding to BDA. It has
+            // no dirty notification yet, so the next opt-in sweep must rescan.
+            if (BdaVisibilitySweepEnabled) _bdaSweepEpoch = -1;
             _registry.RegisterBuffer(bufferIdentifier, _retirementPolicy.CurrentTick);
             var addresses = new ulong[sizePages];
             for (ulong page = 0; page < sizePages; page++)
