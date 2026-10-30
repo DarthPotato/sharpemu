@@ -543,7 +543,7 @@ public sealed class CommandStreamQueue
         {
             SlicesRun++;
             _host.PrepareCpuFlip(submission.FlipHandle, submission.FlipIndex, submission.FlipRequestId);
-            _host.Flush();
+            _host.Flush(SharpEmu.Libs.Gpu.Scheduling.SubmitReason.CpuFlip);
             return true;
         }
 
@@ -586,7 +586,7 @@ public sealed class CommandStreamQueue
                 _host.RunGarbageCollector();
             }
 
-            _host.Flush();
+            _host.CompleteSlice(complete);
         }
         else if (complete)
         {

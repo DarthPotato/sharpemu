@@ -541,7 +541,7 @@ public sealed partial class GpuCommandInterpreter
         var write = new EndOfPipeWrite(
             EndOfPipeWriteKind.Flip, SubmitId, FlipHandle: flip.Handle, FlipIndex: flip.Index, FlipMode: flip.FlipMode, FlipArgument: flip.FlipArgument, FlipRequestId: requestId);
         if (!_host.TryDeferEndOfPipe(QueueId, in write)) _host.RecordEndOfPipe(in write);
-        _host.Flush();
+        _host.Flush(SharpEmu.Libs.Gpu.Scheduling.SubmitReason.FlipPacketOrWait);
     }
 
     internal void SubmitFlipWithLabel(ulong destination, uint value)
@@ -560,7 +560,7 @@ public sealed partial class GpuCommandInterpreter
             FlipHandle: flip.Handle, FlipIndex: flip.Index, FlipMode: flip.FlipMode, FlipArgument: flip.FlipArgument, FlipRequestId: requestId);
         if (deferred) PublishLabel(in write, false);
         else _host.RecordEndOfPipe(in write);
-        _host.Flush();
+        _host.Flush(SharpEmu.Libs.Gpu.Scheduling.SubmitReason.FlipPacketOrWait);
     }
 
     internal void SubmitFlipWithInterrupt(uint eopEventType, uint cacheAction, ulong destination, uint value)
@@ -584,12 +584,12 @@ public sealed partial class GpuCommandInterpreter
             FlipHandle: flip.Handle, FlipIndex: flip.Index, FlipMode: flip.FlipMode, FlipArgument: flip.FlipArgument, FlipRequestId: requestId);
         if (deferred) PublishLabel(in write, false);
         else _host.RecordEndOfPipe(in write);
-        _host.Flush();
+        _host.Flush(SharpEmu.Libs.Gpu.Scheduling.SubmitReason.FlipPacketOrWait);
     }
 
     internal void WaitForFlip(uint videoOutHandle, uint displayBufferIndex)
     {
-        _host.Flush();
+        _host.Flush(SharpEmu.Libs.Gpu.Scheduling.SubmitReason.FlipPacketOrWait);
         if (!_host.IsFlipDone((int)videoOutHandle, (int)displayBufferIndex))
         {
             Suspend();

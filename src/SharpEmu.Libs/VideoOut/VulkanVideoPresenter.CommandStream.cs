@@ -505,17 +505,19 @@ internal static unsafe partial class VulkanVideoPresenter
             _ = CurrentRecordingBuffer();
         }
 
-        public void Flush()
+        public void Flush() => Flush(SubmitReason.Other);
+
+        public void Flush(SubmitReason reason)
         {
             if (OnCommandThread)
             {
-                _commandThread!.PostNonGating(Flush);
+                _commandThread!.PostNonGating(() => Flush(reason));
                 return;
             }
 
             DrainDraws();
             using var flushScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.Flush);
-            FlushBatchedGuestCommands();
+            FlushGuestCommandsForReason(reason);
         }
 
         // The guest reuses the frame's memory (descriptor tables, rings) once the boundary returns,
@@ -524,11 +526,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (OnCommandThread)
             {
-                _commandThread!.Run(Flush);
+                _commandThread!.Run(() => Flush(SubmitReason.FrameBoundary));
                 return;
             }
 
-            Flush();
+            Flush(SubmitReason.FrameBoundary);
         }
 
         public void FlushAndWait()
@@ -997,7 +999,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            FlushBatchedGuestCommands();
+            FlushGuestCommandsForReason(SubmitReason.FlipSnapshot);
             RunGuestCacheCollection(endsFrame: true);
             EnsureGuestSubmissionCapacity(collectNow: true);
             long version;
@@ -1064,7 +1066,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 // The tick of this flush, not the shared field: the presenter thread also
                 // writes _submitTimeline, so reading it here can name an older tick that is
                 // already complete and let the blit run before the copy above.
-                var captureTick = FlushBatchedGuestCommands();
+                var captureTick = FlushGuestCommandsForReason(SubmitReason.FlipSnapshot);
                 submitted = true;
                 _guestImageVersions.Add(version, snapshot);
 

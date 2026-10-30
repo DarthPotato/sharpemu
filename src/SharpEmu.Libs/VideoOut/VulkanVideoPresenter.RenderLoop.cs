@@ -171,7 +171,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Flush))
             {
-                FlushBatchedGuestCommands();
+                FlushGuestCommandsForReason(System.Diagnostics.Stopwatch.GetTimestamp() >= renderWorkDeadline
+                    ? Gpu.Scheduling.SubmitReason.RenderLoopDeadline : Gpu.Scheduling.SubmitReason.RenderLoopDrain);
             }
 
             PerfOverlay.SetGuestCacheStatistics(
@@ -382,7 +383,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             using var presentScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Present);
-            FlushBatchedGuestCommands();
+            FlushGuestCommandsForReason(Gpu.Scheduling.SubmitReason.Presentation);
             _commandBuffer = CurrentRecordingBuffer();
 
             PipelineStageFlags waitStage;

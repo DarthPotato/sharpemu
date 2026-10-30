@@ -495,7 +495,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 EndRendering();
-                FlushBatchedGuestCommands();
+                FlushGuestCommandsForReason(SubmitReason.DrawCap);
             }
             else if (ShouldSubmitForIdleGpu())
             {
@@ -505,7 +505,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 EndRendering();
-                FlushBatchedGuestCommands();
+                FlushGuestCommandsForReason(SubmitReason.IdleKick);
             }
 
             EnsureGuestSubmissionCapacity();

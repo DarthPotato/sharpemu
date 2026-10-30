@@ -219,7 +219,7 @@ internal static unsafe partial class VulkanVideoPresenter
             bundle.AddSignal(renderFinished.Handle, 1);
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueueSubmit))
             {
-                return _scheduler.Flush(bundle);
+                return _scheduler.Flush(bundle, SubmitReason.Presentation);
             }
         }
     }

@@ -490,6 +490,7 @@ internal static class RenderPhaseProfile
             $"[PERF][RENDER_MS] window_s={seconds:F1} frames={frames} " +
             string.Join(" ", parts.Select(part => $"{part.Phase}={part.Milliseconds:F2}ms/n{part.Entries}")));
 
+        SharpEmu.Libs.Gpu.Scheduling.SubmitReasonProfile.Report();
         GpuWaitSiteProfile.Report();
         GpuBacklogProfile.Report();
         ComputeCompileProfile.Report();

@@ -247,16 +247,18 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public ulong Flush() => Flush(new SubmitBundle());
 
-    public ulong Flush(SubmitBundle bundle)
+    public ulong Flush(SubmitReason reason) => Flush(new SubmitBundle(), reason);
+
+    public ulong Flush(SubmitBundle bundle, SubmitReason reason = SubmitReason.Other)
     {
-        var tick = Submit(bundle);
+        var tick = Submit(bundle, reason);
         BeginNextCommandBuffer();
         return tick;
     }
 
     public void FlushAndWait()
     {
-        var tick = Submit();
+        var tick = Submit(reason: SubmitReason.FlushAndWait);
         _timeline.Wait(tick);
         BeginNextCommandBuffer();
     }
@@ -266,7 +268,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         RequireActiveScheduler();
         if (!_command.IsInvalid)
         {
-            Submit();
+            Submit(reason: SubmitReason.Finish);
         }
 
         _timeline.Wait(CurrentTick - 1);
@@ -310,7 +312,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         if (tick == CurrentTick)
         {
             RequireActiveScheduler();
-            var submitted = Submit();
+            var submitted = Submit(reason: SubmitReason.WaitCurrentTick);
             if (submitted != tick)
             {
                 throw Fatal($"The submitted tick {submitted} does not match the requested tick {tick}.");
@@ -516,7 +518,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     }
 
     // Add the timeline signal to a copy. Keep the caller's submission bundle unchanged.
-    public ulong Submit(SubmitBundle? bundle = null)
+    public ulong Submit(SubmitBundle? bundle = null, SubmitReason reason = SubmitReason.Other)
     {
         var submit = bundle == null ? new SubmitBundle() : new SubmitBundle(bundle);
         if (_command.IsInvalid)
@@ -530,6 +532,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             throw Fatal($"The submission exceeds its capacity: waits={submit.WaitCount} signals={submit.SignalCount}.");
         }
 
+        var nonempty = _command.HasPendingCommands || submit.WaitCount != 0 || submit.SignalCount != 0;
         _command.End();
         var buffer = _command.Buffer;
         var completedBefore = VideoOut.GpuBacklogProfile.Enabled ? RefreshCompletedTick() : 0;
@@ -571,6 +574,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
         _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
         if (VideoOut.GpuBacklogProfile.Enabled) VideoOut.GpuBacklogProfile.NoteSubmit(tick, completedBefore);
+        if (nonempty) SubmitReasonProfile.Count(reason);
         _command.Buffer = 0;
         _submitted?.Invoke(tick);
         return tick;

@@ -1417,7 +1417,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             // The newest tick the pages wait for is still in the open command buffer: submit it, then read.
             CountSharedMerge(SharedMergeCounter.ForcedFlush, unissued.Count);
-            _scheduler.Flush();
+            _scheduler.Flush(SubmitReason.Readback);
             var stuck = new List<SharedMergeCandidate>();
             issued.AddRange(IssueSharedMergeReads(unissued, stuck));
             // No free readback slot: the synchronous slot or the download ring reads them.
@@ -1761,7 +1761,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             // The newest tick may still be recording: the readback queue needs it submitted.
             if (waitTick >= _scheduler.CurrentTick)
             {
-                _scheduler.Flush();
+                _scheduler.Flush(SubmitReason.Readback);
             }
 
             var pieces = new ReadbackPiece[count];
@@ -2969,7 +2969,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (waitTick >= _scheduler.CurrentTick)
         {
-            _scheduler.Flush();
+            _scheduler.Flush(SubmitReason.Readback);
         }
 
         var pieces = new ReadbackPiece[copies.Count];
@@ -3021,7 +3021,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         // waiting) so the readback queue has a signal to wait for.
         if (waitTick >= _scheduler.CurrentTick)
         {
-            _scheduler.Flush();
+            _scheduler.Flush(SubmitReason.Readback);
         }
 
         var pieces = new ReadbackPiece[copies.Count];

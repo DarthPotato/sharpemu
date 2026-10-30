@@ -80,7 +80,9 @@ internal static unsafe partial class VulkanVideoPresenter
         // Returns the timeline tick that contains the commands this call submitted, so a
         // caller that must wait for its own recording does not read the shared
         // _submitTimeline field, which the presenter thread also writes.
-        private ulong FlushBatchedGuestCommands()
+        private ulong FlushBatchedGuestCommands() => FlushGuestCommandsForReason(SubmitReason.Other);
+
+        private ulong FlushGuestCommandsForReason(SubmitReason reason)
         {
             if (!_batchOpen)
             {
@@ -88,7 +90,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             using var profile = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueueSubmit);
-            var tick = _scheduler.Flush();
+            var tick = _scheduler.Flush(reason);
             _lastBatchSubmit = System.Diagnostics.Stopwatch.GetTimestamp();
             _bufferCache?.OnBatchSubmitted();
             return tick;
