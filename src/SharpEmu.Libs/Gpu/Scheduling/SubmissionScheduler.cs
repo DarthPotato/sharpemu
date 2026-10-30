@@ -556,6 +556,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 tick = _timeline.ReserveTick();
                 submit.AddSignal(_timeline.Handle, tick);
                 submitted = _device.TrySubmit(buffer, submit, out failure);
+                if (submitted && VideoOut.FrameTimeline.Enabled)
+                    VideoOut.FrameTimeline.Note(VideoOut.FrameTimelineAccumulator.Event.GpuSubmit, tick, _timeline);
             }
 
             if (submitted && _completed is { } completed)

@@ -289,6 +289,7 @@ internal static partial class VulkanVideoPresenter
 
         private void WaitForSpace()
         {
+            using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Space);
             lock (_lock)
             {
                 // The flag is set before the check: the render thread reads it after it changes what is checked.
@@ -312,6 +313,7 @@ internal static partial class VulkanVideoPresenter
 
         private void WaitFor(Item item)
         {
+            using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Sync);
             var spinner = new SpinWait();
             for (var spin = 0; spin < 100 && !item.Done; spin++)
             {
@@ -410,6 +412,7 @@ internal static partial class VulkanVideoPresenter
 
         private void Execute(Item item)
         {
+            using var timelineItem = FrameTimeline.RenderItem();
             if (item.IsDraw)
             {
                 _runDeferred(item.Work!);
@@ -527,7 +530,8 @@ internal static partial class VulkanVideoPresenter
                     switch (result)
                     {
                         case SliceResult.NoWork:
-                            _ = _queue.WaitForWork(8);
+                            using (FrameTimeline.Measure(FrameTimelineAccumulator.Metric.CommandIdle))
+                                _ = _queue.WaitForWork(8);
                             break;
                         case SliceResult.AllBlocked:
                             WaitBlocked(ref lastProgress);
@@ -564,7 +568,8 @@ internal static partial class VulkanVideoPresenter
                 return;
             }
 
-            _ = _queue.WaitForRetryInterval((int)Math.Max(1, remaining * 1000 / Stopwatch.Frequency));
+            using (FrameTimeline.Measure(FrameTimelineAccumulator.Metric.CommandBlocked))
+                _ = _queue.WaitForRetryInterval((int)Math.Max(1, remaining * 1000 / Stopwatch.Frequency));
         }
     }
 }

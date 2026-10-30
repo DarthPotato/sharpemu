@@ -686,6 +686,7 @@ public static partial class VideoOutExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
                 }
 
+                using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait);
                 Monitor.Wait(
                     _stateGate,
                     timeoutAddress == 0
@@ -701,6 +702,7 @@ public static partial class VideoOutExports
             {
                 if (remainingUsec > 0)
                 {
+                    using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait);
                     Thread.Sleep(TimeSpan.FromMicroseconds(remainingUsec));
                 }
 
@@ -712,7 +714,8 @@ public static partial class VideoOutExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
             }
 
-            Thread.Sleep(TimeSpan.FromMicroseconds(extraUsec));
+            using (FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait))
+                Thread.Sleep(TimeSpan.FromMicroseconds(extraUsec));
         }
 
         if (timeoutAddress != 0)
@@ -807,7 +810,8 @@ public static partial class VideoOutExports
             port.DisplayClock.Advance(Stopwatch.GetTimestamp(), port.RefreshRate);
             target = port.DisplayClock.NextTimestamp(port.RefreshRate);
         }
-        HostTiming.SleepUntil(target);
+        using (FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait))
+            HostTiming.SleepUntil(target);
         lock (_stateGate)
         {
             if (!_ports.TryGetValue(handle, out var port)) return OrbisVideoOutErrorInvalidHandle;
@@ -1766,7 +1770,8 @@ public static partial class VideoOutExports
                     return true;
                 }
             }
-            HostTiming.SleepUntil(target);
+            using (FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait))
+                HostTiming.SleepUntil(target);
         }
     }
 

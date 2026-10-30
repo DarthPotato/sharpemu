@@ -24,6 +24,7 @@ public sealed class TickTimeline
     public void RefreshCompletedTick()
     {
         var counter = _device.ReadTimeline();
+        if (VideoOut.FrameTimeline.Enabled) VideoOut.FrameTimeline.Complete(this, counter);
         var known = Volatile.Read(ref _gpuTick);
         while (known < counter)
         {

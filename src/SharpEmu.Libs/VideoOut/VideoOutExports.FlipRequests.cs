@@ -150,6 +150,7 @@ public static partial class VideoOutExports
         }
 
         requestId = request.RequestId;
+        if (FrameTimeline.Enabled) FrameTimeline.Note(FrameTimelineAccumulator.Event.FlipRequest);
         return 0;
     }
 
@@ -205,6 +206,7 @@ public static partial class VideoOutExports
             }
 
             request.State = FlipRequestState.Completed;
+            if (FrameTimeline.Enabled) FrameTimeline.Flip(requestId);
             if (_ports.TryGetValue(request.Handle, out var port))
             {
                 port.FlipCount++;
@@ -255,7 +257,11 @@ public static partial class VideoOutExports
     }
 
     // The presenter showed the frame.
-    internal static void MarkFlipPresented(ulong requestId) => SetFlipOutcome(requestId, FlipOutcome.Presented);
+    internal static void MarkFlipPresented(ulong requestId)
+    {
+        if (FrameTimeline.Enabled) FrameTimeline.Note(FrameTimelineAccumulator.Event.Present);
+        SetFlipOutcome(requestId, FlipOutcome.Presented);
+    }
 
     // The presenter will never show the frame (dropped, trimmed, device lost, window gone).
     internal static void DiscardFlip(ulong requestId)

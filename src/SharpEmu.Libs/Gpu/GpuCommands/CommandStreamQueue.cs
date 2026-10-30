@@ -205,6 +205,8 @@ public sealed class CommandStreamQueue
         }
 
         submission.AdmissionOrdinal = ++_admissionOrdinal;
+        if (FrameTimeline.Enabled && submission.Kind is CommandSubmissionKind.Graphics or CommandSubmissionKind.Compute)
+            FrameTimeline.Note(FrameTimelineAccumulator.Event.Admission);
         submission.AcceptedAt = Diagnostics.LabelLatencyProfile.Start();
         _queues[submission.QueueId].AddLast(submission);
         _submissionCount++;
@@ -257,6 +259,7 @@ public sealed class CommandStreamQueue
                 // Shutdown: no slice will run a queued boundary, so drain as before.
                 while (_outcome == IdleOutcome.Completed && (_processing || _submissionCount != 0))
                 {
+                    using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait);
                     Monitor.Wait(_gate);
                 }
 
@@ -268,6 +271,7 @@ public sealed class CommandStreamQueue
             EnqueueLocked(new CommandSubmission(CommandSubmissionKind.FrameBoundary, 0, 0, 0, 0, null));
             while (_outcome == IdleOutcome.Completed && _pendingBoundaries > _boundariesInFlight)
             {
+                using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait);
                 Monitor.Wait(_gate);
             }
 
@@ -283,6 +287,7 @@ public sealed class CommandStreamQueue
             while (_outcome == IdleOutcome.Completed &&
                    (_processing || _submissionCount != 0 || _controlBarriers.Count != 0))
             {
+                using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait);
                 Monitor.Wait(_gate);
             }
 
@@ -454,6 +459,8 @@ public sealed class CommandStreamQueue
         {
             try
             {
+                using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Command, FrameTimelineAccumulator.Event.CommandEnd);
+                if (FrameTimeline.Enabled) FrameTimeline.Note(FrameTimelineAccumulator.Event.CommandItem);
                 control.Work();
             }
             catch (Exception exception)
@@ -482,6 +489,8 @@ public sealed class CommandStreamQueue
         bool complete;
         try
         {
+            using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Command, FrameTimelineAccumulator.Event.CommandEnd);
+            if (FrameTimeline.Enabled) FrameTimeline.Note(FrameTimelineAccumulator.Event.CommandItem);
             complete = RunSlice(submission!);
         }
         catch (Exception exception)

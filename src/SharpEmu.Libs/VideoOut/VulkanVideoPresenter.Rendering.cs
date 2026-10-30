@@ -1183,6 +1183,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
         {
+            if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             var count = vertexCount;
@@ -1220,6 +1221,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance)
         {
+            if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
@@ -1279,6 +1281,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawIndexedIndirect(BufferBinding arguments)
         {
+            if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
@@ -1308,6 +1311,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawIndirect(BufferBinding arguments)
         {
+            if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             // The executor sends rectangle lists here only when the device fills them natively.
@@ -1331,6 +1335,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawMeshTasks(uint groupCountX, uint groupCountY, uint groupCountZ)
         {
+            if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
             if (_cmdDrawMeshTasks is null)
             {
                 throw SubmissionScheduler.Fatal("The Vulkan device has no mesh shader draw command.");
@@ -1350,6 +1355,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void Dispatch(uint groupsX, uint groupsY, uint groupsZ)
         {
+            if (FrameTimeline.Enabled) FrameTimeline.Draw(true);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
@@ -1361,6 +1367,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryDispatchIndirect(ulong argumentsAddress)
         {
+            if (FrameTimeline.Enabled) FrameTimeline.Draw(true);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var (buffer, offset) = _bufferCache.ObtainBuffer(argumentsAddress, 3u * sizeof(uint), false);
             var command = BeginBatchedGuestCommands();

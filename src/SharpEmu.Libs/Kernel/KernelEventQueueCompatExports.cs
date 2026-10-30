@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Network;
+using SharpEmu.Libs.VideoOut;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
@@ -15,6 +16,7 @@ public static class KernelEventQueueCompatExports
     private const int KernelEventSize = 0x20;
     public const short KernelEventFilterRead = -1;
     public const short KernelEventFilterGraphics = -14;
+    private const short KernelEventFilterVideoOut = -13;
     public const short KernelEventFilterHrTimer = -15;
     public const short KernelEventFilterUser = -11;
     public const short KernelEventFilterAmpr = -25;
@@ -215,6 +217,14 @@ public static class KernelEventQueueCompatExports
         private readonly object _completionLock = new();
         private int _reservedCount;
         private WaitCompletion _completion;
+        internal FrameTimeline.Scope Timeline;
+        private int _timelineEnded;
+
+        internal void EndTimeline()
+        {
+            if (FrameTimeline.Enabled && Interlocked.Exchange(ref _timelineEnded, 1) == 0)
+                Timeline.Dispose();
+        }
 
         public required CpuContext Ctx { get; init; }
         public required EventQueueState State { get; init; }
@@ -225,6 +235,7 @@ public static class KernelEventQueueCompatExports
 
         public int Resume()
         {
+            EndTimeline();
             KernelQueuedEvent[]? reservedEvents;
             int reservedCount;
             WaitCompletion completion;
@@ -854,20 +865,45 @@ public static class KernelEventQueueCompatExports
             ? 0
             : GuestThreadExecution.ComputeDeadlineTimestamp(
                 TimeSpan.FromMicroseconds(timeoutUsec));
-        var requestedBlock = GuestThreadExecution.RequestCurrentThreadBlock(
-            ctx,
-            "sceKernelWaitEqueue",
-            state.WakeKey,
-            new EqueueWaiter
+        var gpuWait = false;
+        if (FrameTimeline.Enabled)
+        {
+            lock (_eventQueueGate)
             {
-                Ctx = ctx,
-                State = state,
-                EventsAddress = eventsAddress,
-                EventCapacity = eventCapacity,
-                OutCountAddress = outCountAddress,
-                WaiterId = waiterId,
-            },
-            blockDeadlineTimestamp);
+                if (_registeredEvents.TryGetValue(handle, out var registrations))
+                    foreach (var registration in registrations.Values)
+                        if (registration.Filter is KernelEventFilterGraphics or KernelEventFilterVideoOut)
+                        {
+                            gpuWait = true;
+                            break;
+                        }
+            }
+        }
+        var waiter = new EqueueWaiter
+        {
+            Ctx = ctx,
+            State = state,
+            EventsAddress = eventsAddress,
+            EventCapacity = eventCapacity,
+            OutCountAddress = outCountAddress,
+            WaiterId = waiterId,
+            Timeline = gpuWait ? FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait) : default,
+        };
+        bool requestedBlock;
+        try
+        {
+            requestedBlock = GuestThreadExecution.RequestCurrentThreadBlock(
+                ctx,
+                "sceKernelWaitEqueue",
+                state.WakeKey,
+                waiter,
+                blockDeadlineTimestamp);
+        }
+        catch
+        {
+            waiter.EndTimeline();
+            throw;
+        }
         if (requestedBlock)
         {
             var wakeAfterRegistration = false;
@@ -901,6 +937,7 @@ public static class KernelEventQueueCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        waiter.EndTimeline();
         if (timeoutAddress != 0)
         {
             var deadline = Environment.TickCount64 +
@@ -920,6 +957,7 @@ public static class KernelEventQueueCompatExports
                         break;
                     }
 
+                    using var timeline = gpuWait ? FrameTimeline.Measure(FrameTimelineAccumulator.Metric.GuestWait) : default;
                     Monitor.Wait(_eventQueueGate, (int)Math.Min(remaining, 100));
                 }
 

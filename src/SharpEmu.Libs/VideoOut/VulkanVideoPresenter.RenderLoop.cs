@@ -82,7 +82,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     using var waitProfile = RenderPhaseProfile.MeasureDetail(waitPhase);
                     SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.WaitStarted,
                         detail: waitMilliseconds);
-                    var signaled = System.Threading.Monitor.Wait(_gate, waitMilliseconds);
+                    bool signaled;
+                    using (FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Idle))
+                        signaled = System.Threading.Monitor.Wait(_gate, waitMilliseconds);
                     // The result describes the monitor wait, not the arrival of runnable guest work.
                     SubmissionFlowProfile.Record(signaled ? SubmissionFlowProfile.EventKind.WaitSignaled
                         : SubmissionFlowProfile.EventKind.WaitTimedOut, detail: (int)waitPhase);
@@ -117,6 +119,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void RenderCore()
         {
+            using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Render);
+            using var timelineThread = FrameTimeline.OnRenderThread();
             using var profileScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Unattributed);
             RenderDocCapture.DiscardTimedOutFrame();
 
@@ -480,6 +484,7 @@ internal static unsafe partial class VulkanVideoPresenter
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
             VideoOutExports.ReportPresentedFrame();
+            if (FrameTimeline.Enabled) FrameTimeline.Note(FrameTimelineAccumulator.Event.HostPresent);
             PerfOverlay.RecordPresent();
             RenderPhaseProfile.RecordFrame();
             if (_swapchainReadbackPending)

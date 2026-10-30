@@ -350,15 +350,18 @@ internal static class RenderPhaseProfile
     {
         private readonly Phase _previous;
         private readonly bool _active;
+        private readonly FrameTimeline.PhaseScope _timeline;
 
-        internal Scope(Phase previous)
+        internal Scope(Phase previous, FrameTimeline.PhaseScope timeline = default, bool active = true)
         {
             _previous = previous;
-            _active = true;
+            _active = active;
+            _timeline = timeline;
         }
 
         public void Dispose()
         {
+            _timeline.Dispose();
             if (!_active)
             {
                 return;
@@ -383,21 +386,23 @@ internal static class RenderPhaseProfile
 
     public static Scope Measure(Phase phase)
     {
+        var timeline = FrameTimeline.Enabled ? FrameTimeline.MeasurePhase(phase) : default;
         if (!Enabled)
         {
-            return default;
+            return new Scope(default, timeline, active: false);
         }
 
         var previous = Charge(phase);
         _scopeDepth++;
         _entries[(int)phase]++;
-        return new Scope(previous);
+        return new Scope(previous, timeline);
     }
 
     // Cache calls on other threads must not enter the render-thread counters.
     // Check the switch first to avoid thread-local storage allocation when profiling is disabled.
     internal static Scope MeasureDetail(Phase phase) =>
-        Enabled && _scopeDepth > 0 ? Measure(phase) : default;
+        Enabled && _scopeDepth > 0 ? Measure(phase) :
+        FrameTimeline.Enabled ? new Scope(default, FrameTimeline.MeasurePhase(phase), active: false) : default;
 
     internal static bool DetailMeasurementsEnabled => Enabled && _scopeDepth > 0;
 

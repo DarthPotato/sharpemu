@@ -119,6 +119,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     owner._boundGraphicsPipeline?.Id ?? 0, 0, 0, 0,
                     owner._profileMeshDrawState with { Width = owner._renderingState.Width, Height = owner._renderingState.Height });
                 owner.CountDraw();
+                if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
             }
 
             public void Dispose()
