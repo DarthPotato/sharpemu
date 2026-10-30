@@ -329,6 +329,7 @@ public sealed unsafe partial class GuestImageCache
     // Writes the stencil aspect back to its guest plane once the current tick completes.
     private void WriteBackStencilPlane(CachedImage depth, GuestSpan plane)
     {
+        using var readbackSource = SharpEmu.Libs.Gpu.Scheduling.ReadbackSourceProfile.Begin("StencilWriteback");
         var info = StencilPlaneLayout(depth, plane, "write-back");
         var download = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
         if (!download.TryMap(plane.Size, out var offset, 4))
@@ -374,6 +375,7 @@ public sealed unsafe partial class GuestImageCache
         };
         _scheduler.EndRendering();
         VulkanSynchronization.PipelineBarrier(_device.Vk, new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
+        _scheduler.ProfileReadback(plane.Size, "StencilWriteback");
         var backing = _backing;
         // Until the tick completes guest memory holds the plane this replaces; an upload of the
         // range waits for it (AwaitPublishingDownloads).
@@ -1040,6 +1042,7 @@ public sealed unsafe partial class GuestImageCache
     // Publishes a GPU-owned image to guest memory after its tick completes; false when it cannot.
     private bool TryDownloadToGuest(ResourceSlotIdentifier imageIdentifier)
     {
+        using var readbackSource = SharpEmu.Libs.Gpu.Scheduling.ReadbackSourceProfile.Begin("ImagePublication");
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDownload);
         var image = _slots[imageIdentifier];
         if (image.DepthOwner.IsValid)
@@ -1072,6 +1075,7 @@ public sealed unsafe partial class GuestImageCache
             return false;
         }
 
+        _scheduler.ProfileReadback(range.Size, "ImagePublication");
         download.Flush(offset, range.Size);
         DownloadToBuffer(image, download, offset, range.Size, plan);
         var barrier = new BufferMemoryBarrier2

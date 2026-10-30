@@ -9,6 +9,15 @@ namespace SharpEmu.Libs.Gpu.Scheduling;
 
 public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 {
+    private readonly Dictionary<string, ulong> _readbackBytes = new();
+
+    internal void ProfileReadback(ulong bytes, string? source = null)
+    {
+        if (!VideoOut.RenderPhaseProfile.Enabled) return;
+        source ??= ReadbackSourceProfile.Source;
+        _readbackBytes.TryGetValue(source, out var old);
+        _readbackBytes[source] = old + bytes;
+    }
     internal static Action<string> OnFatal = message =>
     {
         // Diagnostic: give a crash-dump tool (such as the Vulkan crash diagnostic layer, which
@@ -574,7 +583,15 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
         _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
         if (VideoOut.GpuBacklogProfile.Enabled) VideoOut.GpuBacklogProfile.NoteSubmit(tick, completedBefore);
-        if (nonempty) SubmitReasonProfile.Count(reason);
+        if (nonempty)
+        {
+            SubmitReasonProfile.Count(reason);
+            foreach (var source in _readbackBytes)
+                ReadbackSourceProfile.Count(bytes: source.Value, source: source.Key);
+            if ((reason == SubmitReason.Readback || ReadbackSourceProfile.Source != "Other") &&
+                !_readbackBytes.ContainsKey(ReadbackSourceProfile.Source)) ReadbackSourceProfile.Count();
+            _readbackBytes.Clear();
+        }
         _command.Buffer = 0;
         _submitted?.Invoke(tick);
         return tick;

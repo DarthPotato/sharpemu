@@ -1334,6 +1334,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // Render thread only, never inside a completion action.
     internal void ResolvePendingSharedMerges(ulong guestAddress, ulong size, bool wait)
     {
+        using var sourceScope = ReadbackSourceProfile.Begin("SharedPageMerge");
         if (Volatile.Read(ref _pendingSharedMergeCount) == 0 || _resolvingSharedMerges ||
             !_scheduler.Active || _scheduler.InsideTickCallback)
         {
@@ -1436,6 +1437,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // table and become in flight. Never waits for the GPU and never submits.
     private List<SharedMergeBatch> IssueSharedMergeReads(List<SharedMergeCandidate> candidates, List<SharedMergeCandidate> unissued)
     {
+        using var sourceScope = ReadbackSourceProfile.Begin("SharedPageMerge");
         const ulong pageBytes = TrackerLayout.PageBytes;
         var issued = new List<SharedMergeBatch>();
         var readback = AsyncReadback;
@@ -1748,6 +1750,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // copy goes through the download ring and the call drains the scheduler.
     private ulong ReadOwnerPages(List<SharedMergeCandidate> pages, int first, int count, byte[] snapshot)
     {
+        using var sourceScope = ReadbackSourceProfile.Begin("SharedPageMerge");
         const ulong pageBytes = TrackerLayout.PageBytes;
         var waitTick = 0UL;
         for (var index = 0; index < count; index++)
@@ -1790,6 +1793,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         _download.Commit();
+        _scheduler.ProfileReadback(total);
         var copyTick = _scheduler.CurrentTick;
         _scheduler.Finish();
         _scheduler.WaitForPriorityOperations(copyTick);
@@ -2388,6 +2392,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private EagerStart StartEagerReadback(HotWindow hot)
     {
+        using var sourceScope = ReadbackSourceProfile.Begin("Eager");
         if (FindOwner(hot.Address, hot.Size) is not { } buffer)
         {
             return EagerStart.Nothing;
@@ -2546,6 +2551,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private PendingDownload? BeginReadMemoryOnGpu(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source,
         bool allowPending, bool markHot = false)
     {
+        using var sourceScope = ReadbackSourceProfile.Begin(RenderPhaseProfile.Enabled && ReadbackSourceProfile.Source == "Other" ? source.ToString() : ReadbackSourceProfile.Source);
         if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("cpu-synchronize", guestAddress, size, $"write={isWrite} source={source}");
         using var readbackScope = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.BufferReadback);
         using var foreignRead = _device.Slabs.BeginForeignRead();
@@ -2888,8 +2894,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private const ulong AsyncReadbackLimit = 64UL << 20;
 
     // Packs pieces into the download ring, waits for the copy, then writes each through the backing alias.
-    private void DownloadBufferMemory(List<DownloadPiece> copies)
+    private void DownloadBufferMemory(List<DownloadPiece> copies, [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
     {
+        using var sourceScope = ReadbackSourceProfile.Begin(RenderPhaseProfile.Enabled && ReadbackSourceProfile.Source == "Other" ? "Download_" + caller : ReadbackSourceProfile.Source);
         if (TryDownloadAsync(copies))
         {
             foreach (var copy in copies)
@@ -3057,6 +3064,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         _download.Commit();
+        if (RenderPhaseProfile.Enabled)
+            _scheduler.ProfileReadback(batch.Aggregate(0UL, (sum, copy) => sum + copy.Placement.DataSize));
         var completionTick = _scheduler.CurrentTick;
         _scheduler.Finish();
         _scheduler.WaitForPriorityOperations(completionTick);

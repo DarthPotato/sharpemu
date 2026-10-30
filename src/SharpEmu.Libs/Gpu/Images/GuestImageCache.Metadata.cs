@@ -468,6 +468,7 @@ public sealed partial class GuestImageCache
     // whose every tile says so is cleared; any other slice keeps the depth in memory.
     private void ResolveRewrittenHtile(ulong address)
     {
+        using var readbackSource = SharpEmu.Libs.Gpu.Scheduling.ReadbackSourceProfile.Begin("HTile");
         ulong size;
         uint layers;
         using (var held = _lock.Hold())

@@ -303,6 +303,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             PSignalSemaphoreInfos = &signal,
         };
         Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
+        if (VideoOut.RenderPhaseProfile.Enabled)
+            ReadbackSourceProfile.Count(transfer: true, bytes: sizes.Aggregate(0UL, (sum, size) => sum + size));
         SharpEmu.Libs.Gpu.Scheduling.SubmitReasonProfile.Count(SharpEmu.Libs.Gpu.Scheduling.SubmitReason.Readback);
         slot.Busy = true;
         return new Ticket(slot, signalValue, offsets, sizes, waitTick);
