@@ -35,6 +35,7 @@ public sealed class OrderedOcclusionDumpTests
         Set("_guestPublications", pending);
         Set("_occlusionQueries", queries);
         Set("_guestMemory", host.Memory);
+        Set("_bufferCache", DeferredSignalHarness.EmptyBufferCache());
         Set("_supportsPreciseOcclusion", true);
         var streamHost = (ICommandStreamHost)presenter;
 

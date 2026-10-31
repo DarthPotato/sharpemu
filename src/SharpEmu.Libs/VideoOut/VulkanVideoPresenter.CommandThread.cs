@@ -61,6 +61,7 @@ internal static partial class VulkanVideoPresenter
 
         private readonly CommandStreamQueue _queue;
         private readonly ICpuMemory _memory;
+        private readonly Action<ulong, ulong> _orderedWrite;
         private readonly Action<AgcExports.DeferredWork> _runDeferred;
         private readonly ParallelProgramPrefetch? _prefetch;
         private readonly Thread _thread;
@@ -91,10 +92,11 @@ internal static partial class VulkanVideoPresenter
 
         private static readonly long RetryTicks = CommandStreamQueue.AllBlockedRetryMilliseconds * Stopwatch.Frequency / 1000L;
 
-        public CommandThread(CommandStreamQueue queue, ICpuMemory memory, Action<AgcExports.DeferredWork> runDeferred, ParallelProgramPrefetch? prefetch)
+        public CommandThread(CommandStreamQueue queue, ICpuMemory memory, Action<AgcExports.DeferredWork> runDeferred, ParallelProgramPrefetch? prefetch, Action<ulong, ulong> orderedWrite)
         {
             _queue = queue;
             _memory = memory;
+            _orderedWrite = orderedWrite;
             _runDeferred = runDeferred;
             _prefetch = prefetch;
             _thread = new Thread(Run) { IsBackground = true, Name = "SharpEmu command stream" };
@@ -476,6 +478,7 @@ internal static partial class VulkanVideoPresenter
             lock (_writeLock)
             {
                 var written = _memory.TryWrite(item.Address, item.Data);
+                if (written) _orderedWrite.Invoke(item.Address, (ulong)item.Data!.Length);
                 if (!ReferenceEquals(_pendingWrites.Peek(), item))
                 {
                     throw SubmissionScheduler.Fatal("The command stream stores ran out of order.");

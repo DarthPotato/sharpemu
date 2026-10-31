@@ -169,6 +169,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var destination = address + (ulong)block * strideBytes;
                 if (!_guestMemory.TryWrite(destination, bytes))
                     throw SubmissionScheduler.Fatal($"Cannot publish an occlusion result: address=0x{destination:X16}.");
+                _bufferCache.NoteOrderedGuestWrite(destination, (ulong)bytes.Length);
             }
         }
 

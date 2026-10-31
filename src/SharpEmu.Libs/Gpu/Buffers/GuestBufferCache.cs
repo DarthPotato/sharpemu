@@ -1880,6 +1880,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public void PrepareBda(IReadOnlyCollection<GuestSpan> mapped, ulong mapping)
     {
+        while (!_orderedGuestWrites.IsEmpty)
+        {
+            // An upload can collect scheduler completions that publish more CP stores.
+            // Drain into a separate reusable set so those stores survive this iteration.
+            (_orderedGuestWrites, _drainingOrderedGuestWrites) = (_drainingOrderedGuestWrites, _orderedGuestWrites);
+            _drainingOrderedGuestWrites.ForEach(_uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange);
+            _drainingOrderedGuestWrites.Clear();
+        }
         var traceAddress = GuestGpuMemoryHook.TraceAddress;
         if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaPrepares);
         var traceCovered = false;
@@ -1946,6 +1954,26 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     // Render-thread owned; only a completed sweep consumes the pending boundary.
     private bool _bdaVisibilityPending;
+
+    // Render-thread owned. Publication callbacks only enqueue ranges: recording uploads
+    // there could reenter scheduler completion. The next BDA read consumes them in order.
+    private SpanSet _orderedGuestWrites = new();
+    private SpanSet _drainingOrderedGuestWrites = new();
+
+    public void NoteOrderedGuestWrite(ulong address, ulong size)
+    {
+        if (size == 0) return;
+        var end = address + size;
+        for (var index = _registry.FindFirstOverlappingIndex(address);
+             index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end;
+             index++)
+        {
+            var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
+            var begin = Math.Max(address, buffer.CpuAddress);
+            var finish = Math.Min(end, buffer.CpuAddress + buffer.Size);
+            if (begin < finish) _orderedGuestWrites.Add(begin, finish - begin);
+        }
+    }
 
     public void NoteCpuGpuVisibilityBoundary()
     {

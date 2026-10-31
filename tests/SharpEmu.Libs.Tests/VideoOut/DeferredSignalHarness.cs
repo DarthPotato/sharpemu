@@ -3,6 +3,7 @@
 
 using System.Runtime.CompilerServices;
 using SharpEmu.Libs.Gpu.GpuCommands;
+using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Tests.Gpu.GpuCommands;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
@@ -29,6 +30,7 @@ internal sealed class DeferredSignalHarness : IDisposable, IEndOfPipeSink, IFlip
         Set("_scheduler", Scheduler);
         Set("_guestPublications", Pending);
         Set("_guestMemory", Runner.Host.Memory);
+        Set("_bufferCache", EmptyBufferCache());
         Set("_commandStream", Queue);
         Set("_endOfPipe", new EndOfPipe(this, this));
         var host = (ICommandStreamHost)Presenter;
@@ -38,6 +40,17 @@ internal sealed class DeferredSignalHarness : IDisposable, IEndOfPipeSink, IFlip
         Runner.Host.OrderedWrite = host.TryDeferOrderedWrite;
         Runner.Host.CrossQueueHold = host.MustHoldForCrossQueueOrder;
         Runner.Host.DeferredEndOfPipe = (queue, write) => host.TryDeferEndOfPipe(queue, in write);
+    }
+
+    // Scheduler-only presenters have no Vulkan buffers. Supply the empty resident
+    // registry consulted when actual label/query publication notes its BDA range.
+    internal static GuestBufferCache EmptyBufferCache()
+    {
+        var cache = (GuestBufferCache)RuntimeHelpers.GetUninitializedObject(typeof(GuestBufferCache));
+        typeof(GuestBufferCache).GetField("_registry", PresenterUnderTest.InstanceMembers)!
+            .SetValue(cache, new GuestBufferRegistry<GpuBuffer>(GuestBufferCache.CachingPageSize,
+                GuestBufferCache.CachingPageSize));
+        return cache;
     }
 
     internal void Set(string name, object value) => PresenterUnderTest.PresenterType

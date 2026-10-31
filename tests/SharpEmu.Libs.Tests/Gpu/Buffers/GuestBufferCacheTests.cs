@@ -1039,67 +1039,162 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         harness.Shutdown();
     }
 
-    [Fact]
-    public void DeviceAddressPreparationTracksHotWritesAndPreservesStreamedReads()
+    private delegate void PostOrderedWrite(ulong address, ReadOnlySpan<byte> data, int queueId);
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ResidentBdaReadObservesOrderedCommandWriteWithoutVisibilityPacket(bool queued)
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
-        using var harness = new CacheHarness(_vulkan);
-        var address = harness.MapBacked(0x20000, ReadWrite);
-        const ulong size = 0x8000;
-        var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, false));
-        for (var write = 1; write <= 3; write++)
+        var previous = GuestBufferCache.BdaVisibilitySweepEnabled;
+        GuestBufferCache.BdaVisibilitySweepEnabled = true;
+        try
         {
-            Assert.True(harness.Store.MarkCpuWrite(address, size));
-            var expected = Pattern((int)size, (byte)write);
-            harness.Write(address, expected);
+            using var harness = new CacheHarness(_vulkan);
+            GuestGpuMemoryHook.Attach(harness.Gpu);
+            var address = harness.MapBacked(0x20000, ReadWrite);
+            var unrelated = harness.MapBacked(0x20000, ReadWrite);
+            const ulong size = 0x8000;
+            var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, false));
+            harness.Worker.Run(() => harness.Cache.ObtainBuffer(unrelated, size, false));
+            GuestSpan[] mapped = [new(address, size), new(unrelated, size)];
             harness.Worker.Run(() =>
             {
-                harness.Cache.PrepareBda([new GuestSpan(address, size)]);
-                Assert.False(harness.Cache.HasCpuDirtyPages(address, size));
-                Assert.False(harness.Cache.HasGpuDirtyPages(address, size));
-                harness.Cache.PrepareBda([new GuestSpan(address, size)]);
+                harness.Cache.NoteCpuGpuVisibilityBoundary();
+                harness.Cache.PrepareBda(mapped); // First draw consumes the boundary.
             });
-            Assert.Equal(expected, harness.ReadBack(buffer, offset, size));
+            Assert.Equal(new byte[8], harness.ReadBack(buffer, offset, 8));
+            Assert.True(harness.Store.MarkCpuWrite(unrelated, size));
+            harness.Write(unrelated, Pattern((int)size, 9));
+            var expected = Bytes(0x12345678u, 0xabcdef01u);
+            harness.Worker.Run(() =>
+            {
+                if (queued)
+                {
+                    // Exercise WRITE_DATA's actual PostWrite -> ApplyWrite consumer path.
+                    var type = typeof(VulkanVideoPresenter).GetNestedType("CommandThread",
+                        System.Reflection.BindingFlags.NonPublic)!;
+                    var thread = Activator.CreateInstance(type,
+                        [null, harness.Memory, (Action<SharpEmu.Libs.Agc.AgcExports.DeferredWork>)(_ => { }),
+                         null, (Action<ulong, ulong>)harness.Cache.NoteOrderedGuestWrite])!;
+                    var post = type.GetMethod("PostWrite")!.CreateDelegate<PostOrderedWrite>(thread);
+                    post(address, expected, 0);
+                    type.GetMethod("RunBatch")!.Invoke(thread, [long.MaxValue, 64, (Action)(() => { })]);
+                }
+                else
+                {
+                    // Deferred publication and the synchronous wrapper notify only after writing.
+                    Assert.True(harness.Store.MarkCpuWrite(address, (ulong)expected.Length));
+                    harness.Write(address, expected);
+                    harness.Cache.NoteOrderedGuestWrite(address, (ulong)expected.Length);
+                }
+                harness.Cache.PrepareBda(mapped); // Second draw, same mapping, no boundary.
+            });
+            Assert.Equal(expected, harness.ReadBack(buffer, offset, (ulong)expected.Length));
+            Assert.False(harness.Cache.HasCpuDirtyPages(address, (ulong)expected.Length));
+            Assert.True(harness.Cache.HasCpuDirtyPages(unrelated, size));
+            harness.Shutdown();
         }
-
-        Assert.True(harness.Store.MarkCpuWrite(address, size));
-        var latest = Pattern((int)size, 4);
-        harness.Write(address, latest);
-        var (stream, streamOffset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, false));
-        Assert.NotSame(buffer, stream);
-        Assert.True(harness.Cache.HasCpuDirtyPages(address, size));
-        Assert.Equal(latest, harness.ReadBack(stream, streamOffset, size));
-        harness.Shutdown();
+        finally
+        {
+            GuestGpuMemoryHook.Attach(null);
+            GuestBufferCache.BdaVisibilitySweepEnabled = previous;
+        }
     }
-
-    [Fact]
-    public async Task CleanDeviceAddressSweepKeepsGpuOwnershipAndObservesTheNextCpuWrite()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeviceAddressPreparationTracksHotWritesAndPreservesStreamedReads(bool enabled)
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
-        using var harness = new CacheHarness(_vulkan);
-        var address = harness.MapBacked(0x20000, ReadWrite);
-        const ulong size = 0x8000;
-        var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, true));
-        harness.Worker.Run(() =>
+        var previous = GuestBufferCache.BdaVisibilitySweepEnabled;
+        GuestBufferCache.BdaVisibilitySweepEnabled = enabled;
+        try
         {
-            buffer.Fill(offset, size, 0x12345678);
-            harness.Cache.PrepareBda([new GuestSpan(address, size)]);
-            Assert.True(harness.Cache.HasGpuDirtyPages(address, size));
-        });
-        Assert.Equal(Bytes(0x12345678u), harness.ReadBack(buffer, offset, 4));
-        Assert.True(harness.Cache.TrySynchronizeCpuRead(address, size));
-        harness.Worker.Run(() => harness.Cache.PrepareBda([new GuestSpan(address, size)]));
+            using var harness = new CacheHarness(_vulkan);
+            var address = harness.MapBacked(0x20000, ReadWrite);
+            const ulong size = 0x8000;
+            var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, false));
+            for (var write = 1; write <= 3; write++)
+            {
+                Assert.True(harness.Store.MarkCpuWrite(address, size));
+                var expected = Pattern((int)size, (byte)write);
+                harness.Write(address, expected);
+                harness.Worker.Run(() =>
+                {
+                    if (enabled) harness.Cache.NoteCpuGpuVisibilityBoundary();
+                    harness.Cache.PrepareBda([new GuestSpan(address, size)]);
+                    Assert.False(harness.Cache.HasCpuDirtyPages(address, size));
+                    Assert.False(harness.Cache.HasGpuDirtyPages(address, size));
+                    if (enabled) harness.Cache.NoteCpuGpuVisibilityBoundary();
+                    harness.Cache.PrepareBda([new GuestSpan(address, size)]);
+                });
+                Assert.Equal(expected, harness.ReadBack(buffer, offset, size));
+            }
 
-        var expected = Pattern((int)size, 7);
-        await Task.Run(() =>
-        {
             Assert.True(harness.Store.MarkCpuWrite(address, size));
-            harness.Write(address, expected);
-        });
-        harness.Worker.Run(() => harness.Cache.PrepareBda([new GuestSpan(address, size)]));
-        Assert.False(harness.Cache.HasCpuDirtyPages(address, size));
-        Assert.Equal(expected, harness.ReadBack(buffer, offset, size));
-        harness.Shutdown();
+            var latest = Pattern((int)size, 4);
+            harness.Write(address, latest);
+            var (stream, streamOffset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, false));
+            Assert.NotSame(buffer, stream);
+            Assert.True(harness.Cache.HasCpuDirtyPages(address, size));
+            Assert.Equal(latest, harness.ReadBack(stream, streamOffset, size));
+            harness.Shutdown();
+        }
+        finally
+        {
+            GuestBufferCache.BdaVisibilitySweepEnabled = previous;
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CleanDeviceAddressSweepKeepsGpuOwnershipAndObservesTheNextCpuWrite(bool enabled)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var previous = GuestBufferCache.BdaVisibilitySweepEnabled;
+        GuestBufferCache.BdaVisibilitySweepEnabled = enabled;
+        try
+        {
+            using var harness = new CacheHarness(_vulkan);
+            var address = harness.MapBacked(0x20000, ReadWrite);
+            const ulong size = 0x8000;
+            var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, size, true));
+            harness.Worker.Run(() =>
+            {
+                buffer.Fill(offset, size, 0x12345678);
+                harness.Cache.PrepareBda([new GuestSpan(address, size)]);
+                Assert.True(harness.Cache.HasGpuDirtyPages(address, size));
+            });
+            Assert.Equal(Bytes(0x12345678u), harness.ReadBack(buffer, offset, 4));
+            Assert.True(harness.Cache.TrySynchronizeCpuRead(address, size));
+            harness.Worker.Run(() =>
+            {
+                if (enabled) harness.Cache.NoteCpuGpuVisibilityBoundary();
+                harness.Cache.PrepareBda([new GuestSpan(address, size)]);
+            });
+
+            var expected = Pattern((int)size, 7);
+            await Task.Run(() =>
+            {
+                Assert.True(harness.Store.MarkCpuWrite(address, size));
+                harness.Write(address, expected);
+            });
+            harness.Worker.Run(() =>
+            {
+                if (enabled) harness.Cache.NoteCpuGpuVisibilityBoundary();
+                harness.Cache.PrepareBda([new GuestSpan(address, size)]);
+            });
+            Assert.False(harness.Cache.HasCpuDirtyPages(address, size));
+            Assert.Equal(expected, harness.ReadBack(buffer, offset, size));
+            harness.Shutdown();
+        }
+        finally
+        {
+            GuestBufferCache.BdaVisibilitySweepEnabled = previous;
+        }
     }
 
     [Theory]

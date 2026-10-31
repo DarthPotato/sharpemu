@@ -125,6 +125,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     if (!_guestMemory.TryWrite(entry.Address, payload))
                         throw SubmissionScheduler.Fatal($"Cannot publish a held-back command write: address=0x{entry.Address:X16}.");
+                    _bufferCache.NoteOrderedGuestWrite(entry.Address, (ulong)payload.Length);
                 }), _guestPublications.PredecessorTick(entry));
                 _guestPublications.Register(entry, tick);
                 if (tick == _scheduler.CurrentTick) _ = BeginBatchedGuestCommands();
@@ -239,6 +240,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             BinaryPrimitives.WriteUInt64LittleEndian(bytes, write.Value);
                             if (!_guestMemory.TryWrite(write.Destination, bytes[..(int)entry.Size]))
                                 throw SubmissionScheduler.Fatal("Cannot publish a deferred end-of-pipe label.");
+                            _bufferCache.NoteOrderedGuestWrite(write.Destination, entry.Size);
                             Diagnostics.LabelLatencyProfile.Record(entry.Queue == 0
                                 ? Diagnostics.LabelLatencyProfile.Path.DeferredGraphics
                                 : Diagnostics.LabelLatencyProfile.Path.DeferredCompute, deferredAt);

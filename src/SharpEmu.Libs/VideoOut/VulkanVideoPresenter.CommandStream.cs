@@ -216,7 +216,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (_commandThread is null)
             {
-                _commandThread = new CommandThread(_commandStream, _guestMemory, RunDeferredWork, _translation.Prefetch);
+                _commandThread = new CommandThread(_commandStream, _guestMemory, RunDeferredWork, _translation.Prefetch, _bufferCache.NoteOrderedGuestWrite);
                 _betweenCommandItems = RunRelayBetweenCommandItems;
                 _translation.Sink = _commandThread;
                 _commandThread.Start();
@@ -312,7 +312,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 drain();
-                return inner.TryWrite(virtualAddress, source);
+                var written = inner.TryWrite(virtualAddress, source);
+                if (written) presenter._bufferCache.NoteOrderedGuestWrite(virtualAddress, (ulong)source.Length);
+                return written;
             }
 
             public bool TryCompare(ulong virtualAddress, ReadOnlySpan<byte> expected, out bool equal)
@@ -341,7 +343,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 drain();
                 presenter.CompleteOverlappingPublications(destinationAddress, length);
                 presenter.CompleteOverlappingPublications(sourceAddress, length);
-                return inner.TryCopy(destinationAddress, sourceAddress, length);
+                var copied = inner.TryCopy(destinationAddress, sourceAddress, length);
+                if (copied) presenter._bufferCache.NoteOrderedGuestWrite(destinationAddress, length);
+                return copied;
             }
 
             public bool TryScanCString(ulong address, byte needle, bool findLast, ulong maxLength, out ulong match) =>
