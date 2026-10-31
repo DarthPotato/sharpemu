@@ -57,16 +57,16 @@ public sealed class ParallelProgramPrefetch : IProgramPrefetch, IDisposable
         }
     }
 
-    // SHARPEMU_PREFETCH_UNGATE=1: command-processor stores and dispatches stop gating the jobs after
+    // On by default (SHARPEMU_PREFETCH_UNGATE=0 turns it off): command-processor stores and dispatches stop gating the jobs after
     // them, so the worker resolves ahead of them. A resolution is then checked, when taken, against
     // every store since it began by range (range-aware staleness), including the guest writes the
     // stream threads make for those items (GpuWritebackEpoch.AttachStreamStores); compute jobs are on.
     // (Declared before ComputeEnabled, which reads it: static fields initialize in text order.)
     public static bool Ungated { get; internal set; } =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_UNGATE"), "1", StringComparison.Ordinal);
+        !string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREFETCH_UNGATE"), "0", StringComparison.Ordinal);
 
-    // SHARPEMU_PREFETCH_COMPUTE=1 resolves dispatches' compute programs on the worker too. Off by
-    // default: while every dispatch gates the jobs after it, the worker reaches a dispatch's job only
+    // SHARPEMU_PREFETCH_COMPUTE=1 resolves dispatches' compute programs on the worker too. On whenever
+    // the prefetch is ungated (the default); off when gated: while every dispatch gates the jobs after it, the worker reaches a dispatch's job only
     // once the item before it ran, so most jobs are cancelled and the rest are waited for (Ghost of
     // Yotei: 3.65 vs 3.82 fps). It pays off once dispatches stop gating the prefetch.
     public static readonly bool ComputeEnabled =

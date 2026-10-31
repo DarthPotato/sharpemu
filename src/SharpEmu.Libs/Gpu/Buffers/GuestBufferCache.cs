@@ -1950,7 +1950,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private Action<ulong, ulong>? _uploadDirtyBuffersInRange;
     private Action<ulong, ulong>? _touchBuffersInRange;
     internal static bool BdaVisibilitySweepEnabled { get; set; } =
-        Environment.GetEnvironmentVariable("SHARPEMU_BDA_VISIBILITY_SWEEP") == "1";
+        Environment.GetEnvironmentVariable("SHARPEMU_BDA_VISIBILITY_SWEEP") != "0";
 
     // Render-thread owned; only a completed sweep consumes the pending boundary.
     private bool _bdaVisibilityPending;
