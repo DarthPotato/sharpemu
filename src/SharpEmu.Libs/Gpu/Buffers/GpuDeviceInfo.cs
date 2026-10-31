@@ -226,6 +226,7 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
             }
             else
             {
+                if (VramTrace) TraceAllocation(memory, info.AllocationSize, info.MemoryTypeIndex);
                 var live = Interlocked.Increment(ref _liveAllocations);
                 int peak;
                 while ((peak = Volatile.Read(ref _peakAllocations)) < live &&
@@ -246,6 +247,41 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         }
 
         Vk.FreeMemory(Device, memory, null);
+        if (VramTrace) _traced.TryRemove(memory.Handle, out _);
         Interlocked.Decrement(ref _liveAllocations);
+    }
+
+    // SHARPEMU_VRAM_TRACE=1: live device memory grouped by the code that allocated it.
+    internal static readonly bool VramTrace = Environment.GetEnvironmentVariable("SHARPEMU_VRAM_TRACE") == "1";
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, (ulong Size, uint Type, string Site)> _traced = new();
+    private long _nextTraceReport;
+
+    private void TraceAllocation(DeviceMemory memory, ulong size, uint type)
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var parts = new List<string>(3);
+        foreach (var frame in frames)
+        {
+            var method = frame.GetMethod();
+            var owner = method?.DeclaringType?.Name ?? "?";
+            if (owner is "GpuDeviceInfo" or "OptimalImageMemoryPool" or "GpuMemorySlabs" || owner.StartsWith('<')) continue;
+            parts.Add(owner + "." + method!.Name);
+            if (parts.Count == 3) break;
+        }
+        _traced[memory.Handle] = (size, type, string.Join("<", parts));
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var next = Interlocked.Read(ref _nextTraceReport);
+        if (now >= next && Interlocked.CompareExchange(ref _nextTraceReport, now + 2 * System.Diagnostics.Stopwatch.Frequency, next) == next)
+            Console.Error.WriteLine($"[PERF][VRAM_SITES] {DescribeTracedMemory()}");
+    }
+
+    internal string DescribeTracedMemory()
+    {
+        var values = _traced.Values.ToArray();
+        var groups = values.GroupBy(entry => (entry.Site, entry.Type))
+            .Select(group => (group.Key.Site, group.Key.Type, Bytes: group.Sum(entry => (long)entry.Size), Count: group.Count()))
+            .OrderByDescending(group => group.Bytes).Take(12);
+        var total = values.Sum(entry => (long)entry.Size);
+        return $"total_mb={total >> 20} " + string.Join(" | ", groups.Select(group => $"{group.Bytes >> 20}MB/{group.Count} t{group.Type} {group.Site}"));
     }
 }
