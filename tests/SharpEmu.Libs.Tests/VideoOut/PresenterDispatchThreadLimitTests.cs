@@ -78,6 +78,10 @@ public sealed class PresenterDispatchThreadLimitTests(HeadlessVulkanFixture fixt
                 var prepared = presenter.RenderHost.PrepareBindings(stage);
                 presenter.RenderHost.BindResources(prepared);
                 presenter.RenderHost.CommitBindings(PipelineBindPoint.Compute, in pipeline, [prepared]);
+                // The disabled diagnostic must not even create its tables; the dispatch below
+                // still validates the same GPU output for both switch settings.
+                if (!SharpEmu.Libs.VideoOut.ReuseProbe.Enabled)
+                    Assert.Null(presenter.GetField<object?>("_reuseProbe"));
                 presenter.RenderHost.ShaderWriteHazardBarrier();
                 presenter.RenderHost.BindPipeline(PipelineBindPoint.Compute, in pipeline);
                 presenter.RenderHost.Dispatch(2, 2, 2);

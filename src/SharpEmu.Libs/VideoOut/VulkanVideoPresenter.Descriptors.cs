@@ -458,6 +458,8 @@ internal static unsafe partial class VulkanVideoPresenter
             (stage.Stage with { TessellationData = data }).WriteTessellationData(stage.ShaderData);
         }
 
+        private ReuseProbeState? _reuseProbe;
+
         public IPreparedBindings PrepareBindings(ShaderStageResources stage)
         {
             if (MeshDrawTrace.Active) MeshDrawTrace.Write("stage-binding", $"stage={stage.Program?.Stage} hash=0x{stage.Program?.Hash:X16} shaderBase=0x{stage.ShaderBase:X16} userData={string.Join(",", stage.Resources.UserData.Select(value => value.ToString("X8")))}");
@@ -1050,6 +1052,19 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorCommit);
             var preparation = RequirePreparation();
+            if (ReuseProbe.Enabled)
+            {
+                var probe = _reuseProbe ??= new ReuseProbeState();
+                probe.BeginItem(bindPoint == PipelineBindPoint.Compute);
+                foreach (var prepared in stages)
+                {
+                    var stage = (PreparedStageBindings)prepared;
+                    RuntimeDescriptorSet? runtime = null;
+                    if (_runtimeDescriptorSets is not null)
+                        _runtimeDescriptorSets.TryGetValue((stage.Program.Stage, stage.Program.Hash), out runtime);
+                    probe.Record<TextureResource>(stage.Stage, stage.ShaderData, runtime?.Registry);
+                }
+            }
             var entry = RequirePipelineEntry(in pipeline);
             var command = BeginBatchedGuestStateCommands();
             _commandBuffer = command;

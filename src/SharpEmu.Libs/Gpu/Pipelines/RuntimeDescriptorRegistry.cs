@@ -66,6 +66,9 @@ internal sealed class RuntimeDescriptorRegistry<TResolved> where TResolved : cla
 
     public int SamplerCount => _samplers.Count;
 
+    // Render-thread diagnostics can inspect the already parsed words without reading guest memory.
+    internal Dictionary<RuntimeDescriptorKey, RuntimeSamplerEntry> SamplerEntries => _samplers;
+
     public int RejectedCount => _rejected.Count;
 
     public int PendingMisses => _misses.Count;
