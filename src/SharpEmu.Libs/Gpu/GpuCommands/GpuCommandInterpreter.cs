@@ -164,6 +164,7 @@ public sealed partial class GpuCommandInterpreter
         Reset();
         IndexBaseAddress = 0;
         InstanceCount = 1;
+        _gpuInstanceCount = false;
         DrawIndexOffset = 0;
         ConditionalWaitEnabled = false;
         _host.OnQueueReset(QueueId);

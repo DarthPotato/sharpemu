@@ -441,6 +441,10 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     long IRenderHost.DeferredBarrierPromotions => Promotions;
 
+    public uint GpuInstanceCount { get; set; }
+
+    public uint ReadInheritedInstances(GpuInstanceState state) => GpuInstanceCount;
+
     public bool RetainTargetlessDraws { get; set; }
 
     public List<(RegisterBanks Banks, GraphicsPrograms Programs, TargetlessDrawArguments Arguments)> RetainedDraws { get; } = new();

@@ -7,6 +7,25 @@ using SharpEmu.Libs.Gpu.Scheduling;
 
 namespace SharpEmu.Libs.Gpu.GpuCommands;
 
+// Identity of one CP register; GPU execution, rather than recording order, owns its value.
+public sealed class GpuInstanceRegister { }
+
+public sealed class GpuIndirectCount
+{
+    internal uint? CpuValue;
+}
+
+public readonly record struct GpuInstanceState(
+    GpuInstanceRegister? Register = null,
+    ulong CaptureAddress = 0,
+    bool Inherit = false,
+    ulong CountAddress = 0,
+    uint RecordIndex = 0,
+    bool Initialize = false,
+    uint InitialCount = 1,
+    GpuIndirectCount? DrawCount = null,
+    uint? CpuCount = null);
+
 public enum DrawOffsetSource
 {
     Packet,
@@ -31,7 +50,8 @@ public readonly record struct DrawIndexedArguments(
     // The guest set no index buffer size: IndexCount is only the range seen so far and
     // must not clamp the count read from the arguments.
     bool UnboundedIndexBuffer = false,
-    int StartInstanceUserData = -1);
+    int StartInstanceUserData = -1,
+    GpuInstanceState GpuInstances = default);
 
 // Arguments of a non-indexed draw as the packet stream describes them.
 public readonly record struct DrawAutoArguments(
@@ -43,7 +63,8 @@ public readonly record struct DrawAutoArguments(
     uint FirstInstance,
     DrawOffsetSource OffsetSource,
     int StartInstanceUserData = -1,
-    ulong IndirectArgumentsAddress = 0);
+    ulong IndirectArgumentsAddress = 0,
+    GpuInstanceState GpuInstances = default);
 
 public enum EndOfPipeWriteKind
 {

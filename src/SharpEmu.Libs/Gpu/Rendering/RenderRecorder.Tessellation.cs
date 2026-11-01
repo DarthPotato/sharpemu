@@ -20,7 +20,7 @@ internal sealed partial class RenderRecorder
     {
         var draw = record.Draw;
         var count = draw.Count;
-        var instances = draw.InstanceCount;
+        var instances = record.GpuInstances.Inherit ? _host.ReadInheritedInstances(record.GpuInstances) : draw.InstanceCount;
         var firstInstance = draw.FirstInstance;
         var indexAddress = record.TessellationIndexAddress;
         var indexSize = record.TessellationIndexSize;

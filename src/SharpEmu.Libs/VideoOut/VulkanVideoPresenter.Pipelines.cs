@@ -1840,6 +1840,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DestroyRenderPipelines()
         {
+            DestroyInstanceRegisters();
             _meshIndirectPipeline?.Dispose();
             _meshIndirectPipeline = null;
             foreach (var entry in _pipelineEntries.Values)

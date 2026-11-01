@@ -167,8 +167,39 @@ public sealed partial class RenderExecutor
     }
 
     // Reads the indirect arguments now and draws from them, as the interpreter would have.
+    private void RecordCpuInstanceCount(ulong submitId, GpuInstanceState state, uint count)
+    {
+        if (state.CaptureAddress == 0) return;
+        var capture = _pool.RentDraw();
+        capture.SubmitId = submitId;
+        // CPU expansion has already synchronized one entire record. Preserve that exact generation.
+        capture.GpuInstances = state with { CpuCount = count, CountAddress = 0 };
+        Record(capture);
+    }
+
+    private bool CpuIndirectRecordExecutes(ulong submitId, GpuInstanceState state)
+    {
+        if (state.CountAddress == 0) return true;
+        uint count;
+        lock (state.DrawCount!)
+        {
+            if (state.DrawCount.CpuValue is not { } known)
+            {
+                Span<byte> bytes = stackalloc byte[4];
+                if (!_host.TryReadGuest(state.CountAddress, bytes)) throw _host.Fatal("The indirect draw count is unreadable.");
+                known = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+                state.DrawCount.CpuValue = known;
+            }
+            count = known;
+        }
+        if (state.RecordIndex < count) return true;
+        if (state.Initialize) RecordCpuInstanceCount(submitId, state, state.InitialCount);
+        return false;
+    }
+
     private void DrawIndexedWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
     {
+        if (!CpuIndirectRecordExecutes(submitId, arguments.GpuInstances)) return;
         Span<byte> bytes = stackalloc byte[(int)IndexedIndirectArgumentsSize];
         if (!_host.TryReadGuest(arguments.IndirectArgumentsAddress, bytes))
         {
@@ -176,6 +207,7 @@ public sealed partial class RenderExecutor
         }
 
         var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
+        RecordCpuInstanceCount(submitId, arguments.GpuInstances, words[1]);
         if (words[1] > (1u << 24))
             Console.Error.WriteLine($"[GPU][ERROR][DRAW_INSTANCE_COUNT] phase=render-cpu-indirect submit={submitId} packet=0x{arguments.PacketAddress:X16} opcode=0x{arguments.Opcode:X2} source=indirect-argument-record address=0x{arguments.IndirectArgumentsAddress:X16} count={words[0]} instances={words[1]} words={Convert.ToHexString(bytes)} primitive={banks.UserConfig.PrimitiveType} vs=0x{banks.Shader.Vertex.ExportAddress:X16} ps=0x{banks.Shader.Pixel.Address:X16} thread={Thread.CurrentThread.Name}");
         var elementSize = (GuestIndexType)arguments.IndexTypeAndSize switch
@@ -192,6 +224,7 @@ public sealed partial class RenderExecutor
             BaseVertex = unchecked((int)words[3]),
             FirstInstance = words[4],
             IndirectArgumentsAddress = 0,
+            GpuInstances = default,
             UnboundedIndexBuffer = false,
         };
         if (resolved.IndexCount == 0 || resolved.InstanceCount == 0)
@@ -210,6 +243,7 @@ public sealed partial class RenderExecutor
         if (MeshDrawTrace.Active) MeshDrawTrace.Write("selection", $"indexed=true count={arguments.IndexCount}");
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawExecutor);
         var record = _pool.RentDraw();
+        record.GpuInstances = arguments.GpuInstances;
         record.Announce = true;
         record.Debug = new DebugInformation(RecordedOperation.DrawIndex, submitId, arguments.IndexCount, 0, 1, arguments.InstanceCount, arguments.IndexAddress);
         record.SubmitId = submitId;
@@ -418,6 +452,7 @@ public sealed partial class RenderExecutor
 
     private void DrawAutoWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
     {
+        if (!CpuIndirectRecordExecutes(submitId, arguments.GpuInstances)) return;
         Span<byte> bytes = stackalloc byte[(int)AutoIndirectArgumentsSize];
         if (!_host.TryReadGuest(arguments.IndirectArgumentsAddress, bytes))
         {
@@ -425,6 +460,7 @@ public sealed partial class RenderExecutor
         }
 
         var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
+        RecordCpuInstanceCount(submitId, arguments.GpuInstances, words[1]);
         if (words[1] > (1u << 24))
             Console.Error.WriteLine($"[GPU][ERROR][DRAW_INSTANCE_COUNT] phase=render-cpu-indirect submit={submitId} packet=0x{arguments.PacketAddress:X16} opcode=0x{arguments.Opcode:X2} source=indirect-argument-record address=0x{arguments.IndirectArgumentsAddress:X16} count={words[0]} instances={words[1]} words={Convert.ToHexString(bytes)} primitive={banks.UserConfig.PrimitiveType} vs=0x{banks.Shader.Vertex.ExportAddress:X16} ps=0x{banks.Shader.Pixel.Address:X16} thread={Thread.CurrentThread.Name}");
         DrawAutoCore(submitId, banks, arguments with
@@ -434,6 +470,7 @@ public sealed partial class RenderExecutor
             FirstVertex = words[2],
             FirstInstance = words[3],
             IndirectArgumentsAddress = 0,
+            GpuInstances = default,
         });
     }
 
@@ -443,6 +480,7 @@ public sealed partial class RenderExecutor
             MeshDrawTrace.Write("selection", $"count={arguments.VertexCount} instances={arguments.InstanceCount} firstVertex={arguments.FirstVertex} firstInstance={arguments.FirstInstance} primitive={banks.UserConfig.PrimitiveType} geometry=0x{banks.Shader.Vertex.GeometryAddress:X16} hull=0x{banks.Shader.Vertex.HullAddress:X16} local=0x{banks.Shader.Vertex.LocalAddress:X16}");
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawExecutor);
         var record = _pool.RentDraw();
+        record.GpuInstances = arguments.GpuInstances;
         record.Announce = true;
         record.Debug = new DebugInformation(RecordedOperation.DrawIndexAuto, submitId, arguments.VertexCount, 0, arguments.FirstVertex, arguments.InstanceCount, arguments.FirstInstance);
         record.SubmitId = submitId;

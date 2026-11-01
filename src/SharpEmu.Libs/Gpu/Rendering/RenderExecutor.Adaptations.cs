@@ -46,12 +46,25 @@ public sealed partial class RenderExecutor
         // Later draws can read these stores before flip. Do not defer their producer.
         if (state.ColorCount == 0 && !state.Depth.HasTarget && state.PixelActive &&
             programs.PixelInput.Stage.Program is { Images.Length: > 0 } &&
-            !DrawWritesMemory(programs.PixelInput.Stage) && !DrawWritesMemory(programs.VertexInput.Stage) &&
-            _host.TryRetainTargetlessDraw(banks, programs, in arguments))
+            !DrawWritesMemory(programs.PixelInput.Stage) && !DrawWritesMemory(programs.VertexInput.Stage))
         {
-            TraceTargetlessAttachments(banks, arguments.SubmitId);
-            TraceDrawDisposition(banks, in draw, "retained-targetless-draw");
-            return false;
+            var retained = arguments;
+            var instanceState = arguments.Indexed ? arguments.Indexed_.GpuInstances : arguments.Auto.GpuInstances;
+            if (instanceState.Inherit)
+            {
+                // Retention replays at flip, after this CP register may have changed again.
+                // The existing replay path needs a CPU snapshot, not the live register identity.
+                var count = _host.ReadInheritedInstances(instanceState);
+                retained = arguments.Indexed
+                    ? arguments with { Indexed_ = arguments.Indexed_ with { InstanceCount = count, GpuInstances = default } }
+                    : arguments with { Auto = arguments.Auto with { InstanceCount = count, GpuInstances = default } };
+            }
+            if (_host.TryRetainTargetlessDraw(banks, programs, in retained))
+            {
+                TraceTargetlessAttachments(banks, arguments.SubmitId);
+                TraceDrawDisposition(banks, in draw, "retained-targetless-draw");
+                return false;
+            }
         }
 
         return true;

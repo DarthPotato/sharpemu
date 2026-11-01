@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.Gpu.GpuCommands;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Rendering;
@@ -199,6 +200,25 @@ public sealed class RenderExecutorAdaptationTests : IDisposable
         var (_, _, arguments) = Assert.Single(_host.RetainedDraws);
         Assert.True(arguments.Indexed);
         Assert.Equal(6u, arguments.Indexed_.IndexCount);
+    }
+
+    [Theory]
+    [InlineData(false, 0u)]
+    [InlineData(false, 7u)]
+    [InlineData(true, 0u)]
+    [InlineData(true, 7u)]
+    public void RetainedTargetlessDraw_SnapshotsInheritedGpuCountBeforeReplay(bool indexed, uint count)
+    {
+        _host.RetainTargetlessDraws = true;
+        _host.GpuInstanceCount = count;
+        _pipelines.Graphics = Programs(pixelStage: Stage(Program(ShaderStageKind.Pixel, images: [new ImageResourceInfo(ImageResourceClass.Sampled, false)])));
+        var gpuState = new GpuInstanceState(new(), Inherit: true);
+        if (indexed) _executor.DrawIndexed(9, TargetlessBanks(), Indexed(6) with { GpuInstances = gpuState });
+        else _executor.DrawAuto(9, TargetlessBanks(), Auto(3) with { GpuInstances = gpuState });
+        _host.GpuInstanceCount = 1030888894;
+        var retained = Assert.Single(_host.RetainedDraws).Arguments;
+        Assert.Equal(count, indexed ? retained.Indexed_.InstanceCount : retained.Auto.InstanceCount);
+        Assert.Null(indexed ? retained.Indexed_.GpuInstances.Register : retained.Auto.GpuInstances.Register);
     }
 
     [Fact]

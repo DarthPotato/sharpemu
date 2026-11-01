@@ -85,9 +85,19 @@ public readonly record struct DrawScopeToken(long Scope, ulong Lookups, long Met
     public bool IsActive => Scope != 0;
 }
 
+// Keeps GPU-generated indirect commands alive through their final consumer.
+public interface IPreparedInstanceCount : IDisposable
+{
+    BufferBinding Arguments { get; }
+}
+
 // Everything the executor needs from the renderer, the caches and the pipeline objects.
 public interface IRenderHost
 {
+    IPreparedInstanceCount? CaptureInstanceCount(GpuCommands.GpuInstanceState state, bool indexed) => throw new NotSupportedException("GPU instance state");
+    BufferBinding PrepareInheritedInstances(GpuCommands.GpuInstanceState state, ReadOnlySpan<uint> arguments) => throw new NotSupportedException("GPU instance state");
+    uint ReadInheritedInstances(GpuCommands.GpuInstanceState state) => throw new NotSupportedException("GPU instance state fallback");
+
     bool TryCopyImage(in ImageRequest source, in ImageRequest destination) => false;
     int BeginImageSnapshot(IPreparedBindings? pixelBindings) => 0;
 

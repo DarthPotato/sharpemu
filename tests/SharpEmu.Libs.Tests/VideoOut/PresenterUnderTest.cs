@@ -86,6 +86,7 @@ internal sealed class PresenterUnderTest : IDisposable
         SetField("_renderHostLimits", new RenderHostLimits(16384, 16384, 16384, 16384));
         foreach (var name in new[]
         {
+            "_instanceRegisters", "_instanceRegisterGate",
             "_batchResources", "_batchRetireBuffers", "_pendingGuestSubmissions",
             "_deferredGuestImageVersionDestroys",
             "_pendingComputePipelines", "_pipelineEntries", "_shaderModules", "_shaderModuleSpirvBytes", "_rectangleStageCode",

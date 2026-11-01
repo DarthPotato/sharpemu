@@ -205,6 +205,15 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             SetDebugInformation(in record.Debug);
         }
 
+        using var instanceSnapshot = record.GpuInstances.CaptureAddress != 0
+            ? _host.CaptureInstanceCount(record.GpuInstances, record.Debug.Operation == RecordedOperation.DrawIndex) : null;
+        record.NormalizedArguments = instanceSnapshot?.Arguments ?? default;
+        // CPU-emulated metadata operations cannot be predicated by a Vulkan indirect command.
+        if (record.GpuInstances.Inherit && record.Kind is ResolvedDrawKind.ClearColorTargets or
+            ResolvedDrawKind.MultisampleResolve or ResolvedDrawKind.DepthStencilCopy)
+        {
+            if (_host.ReadInheritedInstances(record.GpuInstances) == 0) return;
+        }
         var state = record.State;
         if (record.Kind != ResolvedDrawKind.Draw)
         {
@@ -368,6 +377,14 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawResourcePreparation);
         var submitId = record.SubmitId;
+        // These CPU-expanded paths need a concrete count for batching or checked mesh limits.
+        // Read the GPU snapshot on the owner, never the mutable guest argument record.
+        if (record.GpuInstances.Inherit && (state.Programs.MeshInput is not null ||
+            record.PrimitiveType is GuestPrimitiveType.QuadListLegacy or GuestPrimitiveType.RectangleListLegacy))
+        {
+            record.Draw = record.Draw with { InstanceCount = _host.ReadInheritedInstances(record.GpuInstances) };
+            record.GpuInstances = record.GpuInstances with { Inherit = false };
+        }
         ref readonly var draw = ref record.Draw;
         var context = record.Context;
         var vertexInput = state.Programs.VertexInput;
@@ -514,6 +531,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             ? _host.ObtainBuffer(emission.IndirectArgumentsAddress,
                 emission.Indexed ? RenderExecutor.IndexedIndirectArgumentsSize : RenderExecutor.AutoIndirectArgumentsSize, isWritten: false)
             : default;
+        if (record.NormalizedArguments.Handle != 0) indirectArguments = record.NormalizedArguments;
         var pipeline = ResolvePipeline(record, ref state, vertexInput, state.PixelActive ? pixelInput : null);
         if (record.SetBindDebug)
         {
@@ -533,6 +551,17 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         if (pixelBindings is not null && record.SetAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x300);
+        }
+
+        if (record.GpuInstances.Inherit && meshInput is null && record.Kind != ResolvedDrawKind.Tessellation)
+        {
+            Span<uint> words = stackalloc uint[5];
+            words[0] = draw.Count;
+            words[1] = 0;
+            words[2] = emission.Indexed ? 0u : emission.FirstVertex;
+            words[3] = emission.Indexed ? unchecked((uint)emission.VertexOffset) : emission.FirstInstance;
+            words[4] = emission.FirstInstance;
+            indirectArguments = _host.PrepareInheritedInstances(record.GpuInstances, words[..(emission.Indexed ? 5 : 4)]);
         }
 
         Span<IPreparedBindings> stages = pixelBindings is null ? [vertexBindings] : [vertexBindings, pixelBindings];
@@ -577,11 +606,11 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         {
             DrawMeshTasks(record, mesh, meshVertexCount);
         }
-        else if (emission.IndirectArgumentsAddress != 0 && emission.Indexed)
+        else if ((emission.IndirectArgumentsAddress != 0 || record.GpuInstances.Inherit) && emission.Indexed)
         {
             _host.DrawIndexedIndirect(indirectArguments);
         }
-        else if (emission.IndirectArgumentsAddress != 0)
+        else if (emission.IndirectArgumentsAddress != 0 || record.GpuInstances.Inherit)
         {
             _host.DrawIndirect(indirectArguments);
         }

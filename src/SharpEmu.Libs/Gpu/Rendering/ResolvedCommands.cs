@@ -79,6 +79,8 @@ internal sealed class ResolvedDraw
     public bool ResetBindings;
     public bool TargetsResolved;
     public ulong SubmitId;
+    public GpuCommands.GpuInstanceState GpuInstances;
+    public BufferBinding NormalizedArguments;
     public DrawCall Draw;
     public DrawState State = DrawState.Create();
     public PrimitiveTopology Topology;
@@ -120,6 +122,8 @@ internal sealed class ResolvedDraw
         ResetBindings = false;
         TargetsResolved = false;
         SubmitId = 0;
+        GpuInstances = default;
+        NormalizedArguments = default;
         Draw = default;
         State.Begin(-1);
         Topology = default;
