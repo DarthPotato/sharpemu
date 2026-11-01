@@ -945,6 +945,24 @@ public sealed unsafe partial class GuestImageCache
     // Copies image data into the buffer without transferring GPU ownership to the buffer.
     public bool MayHaveImageBytes(ulong address, ulong size) => _pageOwners.MayHaveOwners(address, size);
 
+    // Whether an image (parked ones included) holds any of these exact bytes. Page ownership is
+    // coarser: a label next to an image on the same page is not image data.
+    public bool OverlapsImageBytes(ulong address, ulong size)
+    {
+        if (!_pageOwners.MayHaveOwners(address, size))
+        {
+            return false;
+        }
+
+        using var held = _lock.Hold();
+        foreach (var _ in FindImagesInRange(address, size, pageOverlap: false, includeParked: true))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     public bool TrySynchronizeBufferFromImage(GpuBuffer buffer, ulong address, ulong size)
     {
         if (!_pageOwners.MayHaveOwners(address, size))

@@ -1115,11 +1115,27 @@ internal static partial class VulkanVideoPresenter
             }
         }
 
+        // SHARPEMU_STORES_OVER_GPU=1: every command-stream store into GPU-dirty pages lands on both copies
+        // (as kernel stores do) instead of first downloading the GPU bytes of those pages.
+        private static readonly bool StoresOverGpu = Environment.GetEnvironmentVariable("SHARPEMU_STORES_OVER_GPU") == "1";
+        private int _refusedStoreLogs;
+
         private void ApplyWrite(Item item)
         {
             lock (_writeLock)
             {
-                var written = (item.Kernel && _presenter.TryApplyKernelWriteOverGpuBytes(item.Address, item.Data!)) || _memory.TryWrite(item.Address, item.Data);
+                var overGpu = (item.Kernel || StoresOverGpu) && _presenter.TryApplyKernelWriteOverGpuBytes(item.Address, item.Data!);
+                if (StoresOverGpu && !overGpu && _refusedStoreLogs < 30 &&
+                    _presenter._bufferCache.HasGpuDirtyPages(item.Address, (ulong)item.Data!.Length))
+                {
+                    _refusedStoreLogs++;
+                    var size = (ulong)item.Data!.Length;
+                    Console.Error.WriteLine(
+                        $"[GPU][INFO][STORE_OVER_GPU_REFUSED] address=0x{item.Address:X16} size={size} aligned={((item.Address | size) & 3) == 0} " +
+                        $"image_page={_presenter._imageCache.MayHaveImageBytes(item.Address, size)} image_bytes={_presenter._imageCache.OverlapsImageBytes(item.Address, size)} kernel={item.Kernel}");
+                }
+
+                var written = overGpu || _memory.TryWrite(item.Address, item.Data);
                 if (!ReferenceEquals(_pendingWrites.Peek(), item))
                 {
                     throw SubmissionScheduler.Fatal("The command stream stores ran out of order.");

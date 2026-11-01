@@ -40,5 +40,7 @@ public interface IGuestImageCache
     void ReclaimForAllocation();
     bool MayHaveImageBytes(ulong address, ulong size);
 
+    bool OverlapsImageBytes(ulong address, ulong size);
+
     bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear);
 }
