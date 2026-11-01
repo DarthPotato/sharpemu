@@ -12,10 +12,18 @@ internal static class ProducerWaitProfile
     internal static readonly bool TraceReads = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_PRODUCER_READS") == "1";
     private static int _tracedReads;
 
+    // SHARPEMU_TRACE_PRODUCER_READS_AFTER_S=N starts tracing N seconds after launch, so gameplay reads
+    // are not crowded out by startup; reads with no pending writer and no GPU-dirty bytes are skipped.
+    private static readonly long TraceAfterTicks =
+        long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_PRODUCER_READS_AFTER_S"), out var after) && after > 0
+            ? Stopwatch.GetTimestamp() + after * Stopwatch.Frequency : 0;
+
     // Bounded per process: stack capture is deliberately excluded from timing A/B runs.
     public static void TraceRead(ulong address, int size, string source, long pendingSequence, bool pendingRange, bool gpuDirty, bool table)
     {
-        if (!TraceReads || Interlocked.Increment(ref _tracedReads) > 512) return;
+        if (!TraceReads || (pendingSequence == 0 && !pendingRange && !gpuDirty) ||
+            (TraceAfterTicks != 0 && Stopwatch.GetTimestamp() < TraceAfterTicks) ||
+            Interlocked.Increment(ref _tracedReads) > 512) return;
         Console.Error.WriteLine($"[GPU][PRODUCER_READ] purpose={_purpose ?? "other"} address=0x{address:X} size={size} source={source} pending_sequence={pendingSequence} pending_range={pendingRange} gpu_dirty={gpuDirty} table={table} stack=" +
             string.Join("<-", new StackTrace(1, false).GetFrames().Take(24).Select(f => f.GetMethod()).Where(m => m is not null).Select(m => m!.DeclaringType?.Name + "." + m.Name)));
     }
