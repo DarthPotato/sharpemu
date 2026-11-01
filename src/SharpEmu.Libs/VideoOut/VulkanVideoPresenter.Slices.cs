@@ -27,6 +27,12 @@ internal sealed class SerialRequiredException(string reason, bool resumable = fa
 internal static unsafe partial class VulkanVideoPresenter
 {
     private static readonly bool DeferredGpuWritten = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_GPU_WRITTEN") == "1";
+    private static readonly bool TessBdaWorkers = Environment.GetEnvironmentVariable("SHARPEMU_TESS_BDA_WORKERS") == "1";
+    private static readonly ThreadCounter _tessBdaLeases = new();
+    private static readonly ThreadCounter _tessBdaJoinRejects = new();
+    private static readonly ConcurrentDictionary<string, StrongBox<long>> _tessBdaFallbacks = new();
+    private static string TakeTessBdaFallbacks() => string.Join(",", new[] { "allocate", "grow", "merge", "not_resident", "other" }
+        .Select(reason => reason + ":" + Interlocked.Exchange(ref _tessBdaFallbacks.GetOrAdd(reason, static _ => new()).Value, 0)));
     private static readonly ThreadCounter _gpuWrittenApplied = new();
     private static readonly ThreadCounter _gpuWrittenConflicts = new();
     private static readonly ThreadCounter _slicesRecorded = new();
@@ -169,6 +175,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
     internal static string TakeSliceReport() =>
         FormattableString.Invariant($"[PERF][SLICES] slices={_slicesRecorded.Take()} segments={_segmentsRecorded.Take()} empty={_segmentsEmpty.Take()} uses_shared={_usesShared.Take()} attachments_kept={RecordingHost.TakeAttachmentsKept()} worker_queries={RecordingHost.TakeWorkerQueries()} native_rechecks_failed={_nativeColorRechecksFailed.Take()} ") +
+        FormattableString.Invariant($"tess_bda_leases={_tessBdaLeases.Take()} tess_bda_fallbacks={TakeTessBdaFallbacks()} tess_bda_join_rejects={_tessBdaJoinRejects.Take()} ") +
         FormattableString.Invariant($"gpu_written_applied={_gpuWrittenApplied.Take()} gpu_written_conflicts={_gpuWrittenConflicts.Take()} ") +
         TakeRuntimeWorkerReport() + SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
         FormattableString.Invariant($"bda_sweeps={Interlocked.Exchange(ref GuestBufferCache.BdaSweeps, 0)}/skipped:{Interlocked.Exchange(ref GuestBufferCache.BdaSweepsSkipped, 0)} ") +
@@ -258,6 +265,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
     private sealed class SliceRequests
     {
+        public readonly List<BufferDeviceAddressLease> TessBdaLeases = new();
         public readonly List<GpuWrittenSliceMark> GpuWritten = new();
         public long GpuWrittenEpoch;
         public List<RuntimeWorkerUse>? RuntimeUses;
@@ -681,7 +689,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var prologueStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 RecordSlicePrologue(segment.Requests);
                 _prologueTicks.Add(System.Diagnostics.Stopwatch.GetTimestamp() - prologueStarted);
-                if (RuntimeRecordWorkers && !ValidateRuntimeUses(segment.Requests))
+                if (!ValidateTessBdaLeases(segment.Requests) || (RuntimeRecordWorkers && !ValidateRuntimeUses(segment.Requests)))
                 {
                     _slicesInvalid.Increment();
                     _scheduler.DiscardRecording(segment.Buffer!);
@@ -713,6 +721,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 runtimeAdopted = true;
+                if (segment.Requests.TessBdaLeases.Count != 0)
+                {
+                    var leases = segment.Requests.TessBdaLeases.ToArray();
+                    _scheduler.QueueCompletionAction(() =>
+                    {
+                        foreach (var lease in leases) lease.Buffer.ReleaseForeignRead();
+                    });
+                }
                 if (RuntimeRecordWorkers && segment.Requests.RuntimeUses is { } runtimeUses)
                     foreach (var use in runtimeUses) use.Adopt(_scheduler);
 
@@ -741,6 +757,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
+                if (!runtimeAdopted)
+                    foreach (var lease in segment.Requests.TessBdaLeases) lease.Buffer.ReleaseForeignRead();
                 if (RuntimeRecordWorkers && !runtimeAdopted && segment.Requests.RuntimeUses is { } unusedRuntimeUses)
                     foreach (var use in unusedRuntimeUses) use.Discard();
                 if (segment.QueryBlocks is { } unused)
@@ -775,9 +793,21 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        private bool ValidateTessBdaLeases(SliceRequests requests)
+        {
+            foreach (var lease in requests.TessBdaLeases)
+                if (!_bufferCache.ValidateDeviceAddressLease(in lease))
+                {
+                    _tessBdaJoinRejects.Increment();
+                    return false;
+                }
+            return true;
+        }
+
         private bool ValidateSegment(RenderSlice slice, SliceSegment segment)
         {
             var requests = segment.Requests;
+            if (!ValidateTessBdaLeases(requests)) return false;
             if ((DeferredGpuWritten && requests.GpuWrittenEpoch != Volatile.Read(ref GpuWrittenEpoch)) ||
                 !_imageCache.ValidateGpuWrittenMarks(requests.GpuWritten))
             {

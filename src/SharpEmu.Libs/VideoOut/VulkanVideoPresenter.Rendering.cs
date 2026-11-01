@@ -523,7 +523,22 @@ internal static unsafe partial class VulkanVideoPresenter
         public ulong ObtainBufferDeviceAddress(ulong address, ulong size, bool isWritten)
         {
             if (_worker)
-                throw Serial("tessellation device addresses");
+            {
+                if (!TessBdaWorkers) throw Serial("tessellation device addresses");
+                // The prologue applies buffer ownership before deferred image marks.
+                // A later raw write to a marked plane must preserve serial ownership order.
+                if (isWritten)
+                    foreach (var mark in Requests.GpuWritten)
+                        if (Overlaps(mark.Data) || Overlaps(mark.StencilRange)) throw TessBdaFallback("other");
+                var lease = LeaseDeviceAddress(address, size);
+                NoteSliceWrite(lease.Buffer, isWritten);
+                Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, false, false, lease.Buffer, RequiresDeviceAddress: true));
+                _tessBdaLeases.Increment();
+                return checked(lease.DeviceAddress + lease.Buffer.Offset(address));
+
+                bool Overlaps(SharpEmu.HLE.GpuMemory.GuestSpan range) =>
+                    address < range.End && range.Address < address + size;
+            }
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, isWritten, requiresDeviceAddress: true);
             return checked(buffer.DeviceAddress + offset);
         }
@@ -531,8 +546,36 @@ internal static unsafe partial class VulkanVideoPresenter
         public void PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges)
         {
             if (_worker)
-                throw Serial("tessellation device addresses");
+            {
+                if (!TessBdaWorkers) throw Serial("tessellation device addresses");
+                if (!_buffers.StableAllocationRanges(ranges, out var pages, out var reason))
+                    throw TessBdaFallback(reason);
+                // Pin the entire set before returning; no owner-side mutation occurs here.
+                foreach (var range in pages) _ = LeaseDeviceAddress(range.Address, range.Size);
+                return;
+            }
             _bufferCache.PrepareBufferAllocations(ranges);
+        }
+
+        private static SerialRequiredException TessBdaFallback(string reason)
+        {
+            Interlocked.Increment(ref _tessBdaFallbacks.GetOrAdd(reason, static _ => new()).Value);
+            return Serial("tessellation device addresses");
+        }
+
+        private BufferDeviceAddressLease LeaseDeviceAddress(ulong address, ulong size)
+        {
+            if (address == 0 || size == 0 || size > ulong.MaxValue - address)
+                throw TessBdaFallback("other");
+            if (_presenter.HasOverlappingPublications(address, size, includeLabels: true))
+                throw TessBdaFallback("other");
+            if (!_buffers.TryFind(address, size, out var buffer, out var identifier))
+                throw TessBdaFallback(_buffers.MissingRangeReason(address, size));
+            if (!_bufferCache.IsDeviceAddressRangeResident(address, size)) throw TessBdaFallback("not_resident");
+            if (!buffer.TryRetainDeviceAddress()) throw TessBdaFallback("not_resident");
+            var lease = new BufferDeviceAddressLease(address, size, buffer, identifier, buffer.DeviceAddress);
+            Requests.TessBdaLeases.Add(lease);
+            return lease;
         }
 
         public BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten)

@@ -3,7 +3,11 @@
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
-public readonly record struct BufferSliceUse(ulong Address, ulong Size, bool Written, bool Texel, bool InvalidateImages, GpuBuffer Buffer);
+public readonly record struct BufferSliceUse(ulong Address, ulong Size, bool Written, bool Texel, bool InvalidateImages, GpuBuffer Buffer,
+    bool RequiresDeviceAddress = false);
+
+public readonly record struct BufferDeviceAddressLease(ulong Address, ulong Size, GpuBuffer Buffer,
+    ResourceSlotIdentifier Identifier, ulong DeviceAddress);
 
 // A frozen view of the registered buffers for recording threads that run ahead of the stream order,
 // rebuilt by the render thread whenever a registration changed.
@@ -28,6 +32,51 @@ public sealed class BufferSnapshot
     public long Serial { get; }
 
     public int Count => _addresses.Length;
+
+    public string MissingRangeReason(ulong address, ulong size)
+    {
+        if (address == 0 || size == 0 || size > ulong.MaxValue - address) return "other";
+        var overlaps = 0;
+        for (var i = 0; i < Count; i++)
+            if (_addresses[i] < address + size && address < _ends[i]) overlaps++;
+        return overlaps == 0 ? "allocate" : overlaps == 1 ? "grow" : "merge";
+    }
+
+    // Match serial preparation's page rounding and adjacent-range coalescing.
+    // A union spanning owners would change earlier physical addresses.
+    public bool StableAllocationRanges(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges,
+        out SharpEmu.HLE.GpuMemory.GuestSpan[] pages, out string reason)
+    {
+        pages = new SharpEmu.HLE.GpuMemory.GuestSpan[ranges.Length];
+        reason = "other";
+        var mask = GuestBufferCache.CachingPageSize - 1;
+        for (var i = 0; i < ranges.Length; i++)
+        {
+            var r = ranges[i];
+            if (r.Address == 0 || r.Size == 0 || r.Address > ulong.MaxValue - mask ||
+                r.Size > ulong.MaxValue - mask - r.Address) return false;
+            var start = r.Address & ~mask;
+            pages[i] = new(start, ((r.End + mask) & ~mask) - start);
+        }
+        Array.Sort(pages, static (a, b) => a.Address.CompareTo(b.Address));
+        for (var i = 0; i < pages.Length;)
+        {
+            var r = pages[i];
+            var next = i + 1;
+            while (next < pages.Length && pages[next].Address <= r.End)
+            {
+                r = new(r.Address, Math.Max(r.End, pages[next].End) - r.Address);
+                next++;
+            }
+            if (!TryFind(r.Address, r.Size, out _, out _))
+            {
+                reason = MissingRangeReason(r.Address, r.Size);
+                return false;
+            }
+            i = next;
+        }
+        return true;
+    }
 
     public bool TryFind(ulong address, ulong size, out GpuBuffer buffer, out ResourceSlotIdentifier identifier)
     {
@@ -106,6 +155,9 @@ public sealed unsafe partial class GuestBufferCache
 
     public bool MayHaveCpuDirtyPages(ulong guestAddress, ulong size) => _tracker.MayHaveCpuDirtyPages(guestAddress, size);
 
+    public bool IsDeviceAddressRangeResident(ulong address, ulong size) =>
+        IsValidRange(address, size) && _backing.IsBackedRange(address, size);
+
     public long RegionStamp(ulong guestAddress, ulong size) => _registry.RegionStamp(guestAddress, size);
 
     public bool TryGetCleanWriteStamp(ulong address, ulong size, out long stamp) =>
@@ -150,9 +202,14 @@ public sealed unsafe partial class GuestBufferCache
         return true;
     }
 
+    public bool ValidateDeviceAddressLease(in BufferDeviceAddressLease lease) =>
+        ReferenceEquals(_registry.TryGetRegisteredBuffer(lease.Identifier), lease.Buffer) &&
+        ReferenceEquals(_registry.TryGetRegisteredBuffer(_registry.FindContainingBuffer(lease.Address, lease.Size)), lease.Buffer) &&
+        lease.Buffer.IsInBounds(lease.Address, lease.Size) && lease.Buffer.DeviceAddress == lease.DeviceAddress;
+
     public void ApplySliceUse(in BufferSliceUse use)
     {
-        _ = ObtainBuffer(use.Address, use.Size, use.Written, use.Texel, allowStream: false);
+        _ = ObtainBuffer(use.Address, use.Size, use.Written, use.Texel, allowStream: false, requiresDeviceAddress: use.RequiresDeviceAddress);
         if (use.InvalidateImages)
         {
             RequireImageCache().InvalidateMemoryFromGpu(use.Address, use.Size);

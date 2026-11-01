@@ -596,7 +596,25 @@ public unsafe class GpuBuffer : IDisposable
         }
     }
 
+    private readonly object _lifetimeLock = new();
+
+    // A stale worker snapshot must not resurrect a destroyed native allocation.
+    public bool TryRetainDeviceAddress()
+    {
+        lock (_lifetimeLock)
+        {
+            if (_handle.Handle == 0 || _deviceAddress == 0) return false;
+            RetainForeignRead();
+            return true;
+        }
+    }
+
     public void Dispose()
+    {
+        lock (_lifetimeLock) DisposeLocked();
+    }
+
+    private void DisposeLocked()
     {
         if (_handle.Handle == 0)
         {

@@ -24,6 +24,13 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 
 public sealed unsafe partial class RenderHostDeviceTests
 {
+    [Fact]
+    public void Tessellation_StencilDrawComposesDeferredOwnershipAndWorkerDeviceAddresses()
+    {
+        if (Environment.GetEnvironmentVariable("SHARPEMU_TESS_BDA_WORKERS") != "1" ||
+            Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_GPU_WRITTEN") != "1") return;
+        RenderTessellationPatch(1, true, true, workerStencil: true);
+    }
     [Theory]
     [InlineData(1f, true)]
     [InlineData(0f, false)]
@@ -78,7 +85,7 @@ public sealed unsafe partial class RenderHostDeviceTests
         RenderTessellationPatch(0, false, true, verifyOffset: true, indexed: indexed);
 
     private void RenderTessellationPatch(float firstOuter, bool visible, bool computeFactors, uint patchCount = 1,
-        bool verifyOffset = false, bool indexed = false, uint ringPatches = 1, uint primitiveType = 4)
+        bool verifyOffset = false, bool indexed = false, uint ringPatches = 1, uint primitiveType = 4, bool workerStencil = false)
     {
         if (!Ready()) return;
         Assert.False(GatePrerequisites.DeviceRequired && !_vulkan!.SupportsTessellation,
@@ -96,13 +103,22 @@ public sealed unsafe partial class RenderHostDeviceTests
         var target = harness.MapBacked(0x10000, ReadWrite);
         var guestFactors = computeFactors ? harness.MapBacked(0x10000, ReadWrite) : 0;
         var words = RegisterWords.Color(target, Size, Size);
-        var executor = new RenderExecutor(presenter.RenderHost,
-            new TessellationProgramProvider((IShaderPipelineHost)presenter.Instance, factors.DeviceAddress, guestFactors, firstOuter,
-                patchCount > 1 || verifyOffset, verifyOffset ? 2u : 0u, 24 * ringPatches));
+        var provider = new TessellationProgramProvider((IShaderPipelineHost)presenter.Instance, factors.DeviceAddress, guestFactors, firstOuter,
+            patchCount > 1 || verifyOffset, verifyOffset ? 2u : 0u, 24 * ringPatches);
+        var executor = new RenderExecutor(presenter.RenderHost, provider);
         GuestGpuMemoryHook.Attach(harness.Gpu);
         try
         {
             var banks = Banks(words);
+            if (workerStencil)
+            {
+                var depth = harness.MapBacked(0x10000, ReadWrite);
+                var stencil = harness.MapBacked(0x10000, ReadWrite);
+                banks.Context.DepthTarget = RegisterWords.Depth(depth, Size, Size, stencilBase: stencil,
+                    depthTest: false, depthWrite: false) with { DepthControl = 1u | (7u << 8) };
+                banks.Context.StencilControl = new() { Pass = 3 };
+                banks.Context.StencilMask = new() { Mask = 255, WriteMask = 255, TestValue = 0x6d, OperationValue = 0x6d };
+            }
             banks.UserConfig.PrimitiveType = primitiveType;
             if (computeFactors)
             {
@@ -130,6 +146,7 @@ public sealed unsafe partial class RenderHostDeviceTests
                         verifyOffset ? DrawOffsetSource.IndirectArguments : DrawOffsetSource.Packet)));
             }
             presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+            if (workerStencil) RecordTessellatedStencilWorker(presenter, provider, banks);
             harness.Finish();
             var image = harness.ReadImageBytes(TargetImage(presenter, words));
             Assert.Equal(visible ? Red : 0u, Pixel(image, Size / 2, Size / 2));
@@ -146,6 +163,45 @@ public sealed unsafe partial class RenderHostDeviceTests
         }
         finally { GuestGpuMemoryHook.Attach(null); }
         harness.Shutdown();
+    }
+
+    private void RecordTessellatedStencilWorker(PresenterUnderTest p, IShaderPipelineProvider provider, RegisterBanks banks)
+    {
+        const System.Reflection.BindingFlags Members = PresenterUnderTest.InstanceMembers;
+        var hostType = PresenterUnderTest.RecordingHostType;
+        var worker = Activator.CreateInstance(hostType, Members, null, [p.Instance, false], null)!;
+        void Set(string name, object value) => hostType.GetField(name, Members)!.SetValue(worker, value);
+        using var pool = new SharpEmu.Libs.VideoOut.SliceArenaPool(_vulkan!.DeviceInfo, p.Harness.Scheduler);
+        var arena = new SharpEmu.Libs.VideoOut.SliceArena(pool, _vulkan.DeviceInfo.NonCoherentAtomSize);
+        Set("_worker", true);
+        Set("_arena", arena);
+        Set("_hazards", new SharpEmu.Libs.VideoOut.SliceHazards());
+        Set("_spareBuffers", new System.Collections.Concurrent.ConcurrentBag<SharpEmu.Libs.Gpu.Scheduling.RecordingBuffer>());
+        Set("_buffers", p.Run(() => p.Harness.Cache.RefreshSnapshot()));
+        var sliceType = typeof(SharpEmu.Libs.VideoOut.VulkanVideoPresenter).GetNestedType("RenderSlice", System.Reflection.BindingFlags.NonPublic)!;
+        var slice = Activator.CreateInstance(sliceType, nonPublic: true)!;
+        sliceType.GetField("Host")!.SetValue(slice, worker);
+        object? segment = null;
+        p.Run(() =>
+        {
+            segment = hostType.GetMethod("BeginSegment", Members)!.Invoke(worker, [0]);
+            var executor = new RenderExecutor((IRenderHost)worker, provider);
+            executor.DrawAuto(2, banks, new(0, 0, 4, 1, 0, 0, DrawOffsetSource.Packet));
+            var segmentType = segment!.GetType();
+            segmentType.GetField("Count")!.SetValue(segment, 1);
+            var requests = segmentType.GetField("Requests")!.GetValue(segment)!;
+            var marks = (System.Collections.ICollection)requests.GetType().GetField("GpuWritten")!.GetValue(requests)!;
+            var leases = (System.Collections.ICollection)requests.GetType().GetField("TessBdaLeases")!.GetValue(requests)!;
+            Assert.True(marks.Count > 0);
+            Assert.True(leases.Count > 0);
+            Assert.True((bool)hostType.GetMethod("EndSliceAtGpuWritten", Members | System.Reflection.BindingFlags.Static)!.Invoke(null, [slice, segment, 0, 0])!);
+            hostType.GetMethod("EndSegment", Members)!.Invoke(worker, [slice, segment]);
+            Assert.True((bool)p.InvokeMethod("JoinSegment", slice, segment)!);
+            p.InvokeMethod("FlushBatchedGuestCommands");
+        });
+        p.Harness.Finish();
+        foreach (var chunk in arena.TakeChunks()) pool.Return(chunk);
+        p.Run(() => hostType.GetMethod("DisposeWorker", Members)!.Invoke(worker, null));
     }
 
     private sealed class TessellationProgramProvider(IShaderPipelineHost host, ulong factorAddress, ulong guestFactors, float firstOuter,
