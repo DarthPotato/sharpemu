@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using SharpEmu.Libs.Diagnostics;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 
 namespace SharpEmu.Libs.Gpu.GpuCommands;
@@ -9,6 +10,7 @@ namespace SharpEmu.Libs.Gpu.GpuCommands;
 public sealed partial class GpuCommandInterpreter
 {
     internal static readonly bool GpuInstanceStateEnabled = Environment.GetEnvironmentVariable("SHARPEMU_GPU_INSTANCE_STATE") != "0";
+    internal static readonly bool MappedIndirectBoundsEnabled = Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_INDIRECT_BOUNDS") == "1";
     private readonly GpuInstanceRegister _gpuInstanceRegister = new();
     private bool _gpuInstanceCount;
 
@@ -115,6 +117,7 @@ public sealed partial class GpuCommandInterpreter
             !Pipelines.ShaderPipelineCache.IsMergedTessellationMask(TypedRegisters.Context.ShaderStages) && TypedRegisters.Shader.Vertex.GeometryAddress == 0;
         if (countAddress != 0 && !gpuCount)
         {
+            using var countPurpose = ProducerWaitProfile.Begin("indirect_count");
             drawCount = Math.Min(ReadDword(countAddress), maxCountOrCount);
         }
 
@@ -138,8 +141,15 @@ public sealed partial class GpuCommandInterpreter
 
     private void DrawIndirectArguments(ulong packetAddress, uint opcode, ulong argumentsAddress, bool indexed, int startInstanceUserData, ulong countAddress = 0, uint recordIndex = 0, GpuIndirectCount? countState = null)
     {
+        var path = !indexed ? (_host.ResolvesIndirectDrawOnGpu ? "gpu_auto" : "cpu_auto")
+            : !_host.ResolvesIndirectDrawOnGpu ? "cpu_expansion"
+            : IndexTypeAndSize == 2 ? "index8"
+            : (argumentsAddress & 3) != 0 ? "unaligned"
+            : IndexBufferSize == 0 ? "unsized_discovery" : "gpu_sized";
+        using var purpose = ProducerWaitProfile.Begin(path);
         if (!indexed && _host.ResolvesIndirectDrawOnGpu)
         {
+            if (CommandThreadTally.Enabled) ProducerWaitProfile.Path(opcode.ToString("X2") + ".gpu_auto");
             // Capture persistent CP state before later packets/submissions can reuse this record.
             var gpuInstances = GpuInstanceStateEnabled && (argumentsAddress & 3) == 0 ? CaptureGpuInstances(argumentsAddress, countAddress, recordIndex, countState) : default;
             if (gpuInstances.Register is null) SetIndirectInstanceCount(ReadDword(argumentsAddress + 4), packetAddress, opcode, argumentsAddress);
@@ -153,6 +163,7 @@ public sealed partial class GpuCommandInterpreter
         Span<byte> argumentBytes = stackalloc byte[(int)DrawIndexedIndirectArgumentsSize];
         if (!indexed)
         {
+            if (CommandThreadTally.Enabled) ProducerWaitProfile.Path(opcode.ToString("X2") + ".cpu_auto");
             argumentBytes = argumentBytes[..(int)DrawIndirectArgumentsSize];
             ReadOperandBytes(argumentsAddress, argumentBytes);
             var vertexCount = BinaryPrimitives.ReadUInt32LittleEndian(argumentBytes);
@@ -166,6 +177,8 @@ public sealed partial class GpuCommandInterpreter
 
         if (_host.ResolvesIndirectDrawOnGpu && IndexTypeAndSize is 0 or 1 && TryGetGpuIndexRange(out var gpuIndexCount))
         {
+            using var gpuPurpose = ProducerWaitProfile.Begin(IndexBufferSize != 0 ? "gpu_sized" : "gpu_unsized");
+            if (CommandThreadTally.Enabled) ProducerWaitProfile.Path(opcode.ToString("X2") + (IndexBufferSize != 0 ? ".gpu_sized" : ".gpu_unsized"));
             // The host reads the five arguments on the GPU. It draws from the whole index
             // range; the arguments pick the indices. The host falls back to reading them
             // itself when the draw needs the counts; persistent CP state is captured now.
@@ -179,6 +192,7 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
+        if (CommandThreadTally.Enabled) ProducerWaitProfile.Path(opcode.ToString("X2") + "." + path);
         ReadOperandBytes(argumentsAddress, argumentBytes);
         var indexCountPerInstance = BinaryPrimitives.ReadUInt32LittleEndian(argumentBytes);
         var indexedInstanceCount = BinaryPrimitives.ReadUInt32LittleEndian(argumentBytes[4..]);
@@ -238,6 +252,14 @@ public sealed partial class GpuCommandInterpreter
             return true;
         }
 
+        // Mapping metadata needs no synchronization with GPU-produced arguments.
+        // Opt-in: a larger binding can increase buffer-cache and mesh expansion work.
+        if (MappedIndirectBoundsEnabled && _host.RenderHost is { } renderHost)
+        {
+            indexCount = MappedIndexCount(IndexBaseAddress, IndexElementSize, renderHost.ClampMappedSize);
+            if (indexCount != 0) return true;
+        }
+
         indexCount = 0;
         if ((++_indexExtentDraws & 1023) == 0 || !_indexExtents.TryGetValue(IndexBaseAddress, out var extentBytes))
         {
@@ -246,6 +268,14 @@ public sealed partial class GpuCommandInterpreter
 
         indexCount = (uint)(extentBytes / IndexElementSize);
         return indexCount != 0;
+    }
+
+    internal static uint MappedIndexCount(ulong address, ulong elementSize, Func<ulong, ulong, ulong> clamp)
+    {
+        if (address == 0 || (address & (elementSize - 1)) != 0 || address > ulong.MaxValue - MaxIndexExtentBytes - elementSize) return 0;
+        var bytes = clamp(address, MaxIndexExtentBytes + elementSize);
+        // Never invent a smaller bound for a larger mapping.
+        return bytes == 0 || bytes > MaxIndexExtentBytes ? 0 : (uint)(bytes / elementSize);
     }
 
     private void LearnIndexExtent(uint startIndex, uint indexCount)
@@ -344,6 +374,7 @@ public sealed partial class GpuCommandInterpreter
 
     internal uint DrawIndirectPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {
+        if (CommandThreadTally.Enabled) ProducerWaitProfile.Path(packet.Opcode == PacketOpcode.DrawIndexIndirect ? "DrawIndexIndirect.packets" : "DrawIndirect.packets");
         var indexed = packet.Header == PacketHeader.Make(5, PacketOpcode.DrawIndexIndirect);
         if (!indexed && packet.Header != PacketHeader.Make(5, PacketOpcode.DrawIndirect))
         {

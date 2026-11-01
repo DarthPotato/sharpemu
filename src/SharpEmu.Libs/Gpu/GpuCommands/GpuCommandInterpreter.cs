@@ -405,6 +405,7 @@ public sealed partial class GpuCommandInterpreter
             var waitedBefore = SharpEmu.Libs.Diagnostics.PacketHandlerTally.WaitedTicks;
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandPacketHandler))
             {
+                using var producerPurpose = SharpEmu.Libs.Diagnostics.ProducerWaitProfile.Packet(opcode, header);
                 consumed = handler(this, in packet, payload) + 1;
             }
 

@@ -227,6 +227,7 @@ internal static partial class VulkanVideoPresenter
             var elapsed = Stopwatch.GetTimestamp() - started;
             Diagnostics.PacketHandlerTally.WaitedTicks += elapsed;
             Presenter.NoteRoundTrip(caller, elapsed);
+            Diagnostics.ProducerWaitProfile.Note("run", elapsed, caller);
         }
 
         public T Run<T>(Func<T> function, [CallerMemberName] string caller = "")

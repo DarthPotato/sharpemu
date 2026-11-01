@@ -21,6 +21,9 @@ internal static class PacketHandlerTally
     private static readonly string[] _opcodeNames = Names(typeof(PacketOpcode), 256);
     private static readonly string[] _customNames = Names(typeof(PacketCustomCode), (int)PacketCustomCode.Count);
 
+    public static string Purpose(uint opcode, uint header) => opcode == PacketOpcode.Nop
+        ? _customNames[PacketHeader.CustomCode(header)] : _opcodeNames[opcode];
+
     public static void Note(uint opcode, uint header, long ticks)
     {
         if (opcode == PacketOpcode.Nop)

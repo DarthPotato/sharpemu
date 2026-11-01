@@ -94,6 +94,8 @@ public sealed partial class RenderExecutor
             if (arguments.IndirectArgumentsAddress != 0 &&
                 (UsesMeshExecution(banks) ? !CanDrawMeshIndirectOnGpu(banks, in arguments) : !CanDrawIndirectOnGpu(banks, in arguments)))
             {
+                if (SharpEmu.Libs.Diagnostics.CommandThreadTally.Enabled)
+                    SharpEmu.Libs.Diagnostics.ProducerWaitProfile.Path("render_indexed." + IndirectCpuReason(banks, in arguments));
                 DrawIndexedWithCpuArguments(submitId, banks, in arguments);
                 return;
             }
@@ -143,6 +145,17 @@ public sealed partial class RenderExecutor
         }
 
         return (ulong)arguments.IndexCount * (index32 ? 4ul : 2ul) <= MaxIndirectIndexBufferBytes;
+    }
+
+    private static string IndirectCpuReason(RegisterBanks banks, in DrawIndexedArguments arguments)
+    {
+        if (Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages)) return "tessellation";
+        if (arguments.IndexTypeAndSize == 2) return "index8";
+        if ((arguments.IndirectArgumentsAddress & 3) != 0) return "unaligned";
+        if ((GuestPrimitiveType)banks.UserConfig.PrimitiveType == GuestPrimitiveType.TriangleStrip) return "strip_metadata";
+        if ((banks.UserConfig.PrimitiveResetControl & 1) != 0) return "restart_conversion";
+        if (banks.Shader.Vertex.GeometryAddress != 0) return "mesh_expansion";
+        return "primitive_or_capacity";
     }
 
     private const ulong MaxIndirectIndexBufferBytes = 64ul << 20;
@@ -380,6 +393,7 @@ public sealed partial class RenderExecutor
         if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
         {
             Record(record);
+            SharpEmu.Libs.Diagnostics.ProducerWaitProfile.Path("render_indexed.targetless_metadata");
             DrawIndexedWithCpuArguments(submitId, banks, in arguments);
             return;
         }

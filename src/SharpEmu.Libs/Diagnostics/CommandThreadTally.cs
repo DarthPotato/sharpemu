@@ -30,14 +30,23 @@ internal static class CommandThreadTally
         Interlocked.Add(ref _sliceTicks, ticks);
     }
 
-    public static void NoteIdle(long ticks) => Interlocked.Add(ref _idleTicks, ticks);
+    public static void NoteIdle(long ticks)
+    {
+        ProducerWaitProfile.Note("idle", ticks);
+        Interlocked.Add(ref _idleTicks, ticks);
+    }
 
     public static void NoteAllocated(long bytes) => Interlocked.Add(ref _allocated, bytes);
 
-    public static void NoteBlocked(long ticks) => Interlocked.Add(ref _blockedTicks, ticks);
+    public static void NoteBlocked(long ticks)
+    {
+        ProducerWaitProfile.Note("blocked_submission_retry", ticks);
+        Interlocked.Add(ref _blockedTicks, ticks);
+    }
 
     public static void NoteSpaceWait(long ticks)
     {
+        ProducerWaitProfile.Note("queue_space", ticks);
         Interlocked.Increment(ref _spaceWaits);
         Interlocked.Add(ref _spaceWaitTicks, ticks);
     }
@@ -49,6 +58,7 @@ internal static class CommandThreadTally
 
     public static void NoteRangeWait(long ticks, int bucket)
     {
+        ProducerWaitProfile.Note("range", ticks);
         Interlocked.Increment(ref _rangeWaits);
         Interlocked.Add(ref _rangeWaitTicks, ticks);
         Interlocked.Increment(ref _rangeHits[bucket]);
@@ -64,12 +74,14 @@ internal static class CommandThreadTally
 
     public static void NotePendingWait(long ticks)
     {
+        ProducerWaitProfile.Note("pending", ticks);
         Interlocked.Increment(ref _pendingWaits);
         Interlocked.Add(ref _pendingWaitTicks, ticks);
     }
 
     public static void NoteRoundTrip(long ticks)
     {
+        ProducerWaitProfile.Note("read_round_trip", ticks);
         Interlocked.Increment(ref _roundTrips);
         Interlocked.Add(ref _roundTripTicks, ticks);
     }
