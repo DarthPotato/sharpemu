@@ -530,9 +530,18 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             var buffer = new byte[destination.Length];
-            var read = _commandThread!.Run(() => operand ? TryReadGuestOperand(address, buffer) : TryReadGuest(address, buffer));
+            long lambdaStart = 0, lambdaEnd = 0;
+            var read = _commandThread!.Run(() =>
+            {
+                lambdaStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                var result = operand ? TryReadGuestOperand(address, buffer) : TryReadGuest(address, buffer);
+                lambdaEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+                return result;
+            });
             buffer.CopyTo(destination);
             var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+            if (RenderPhaseProfile.Enabled && lambdaStart != 0)
+                RoundTripSplit.Note(lambdaStart - started, lambdaEnd - lambdaStart, System.Diagnostics.Stopwatch.GetTimestamp() - lambdaEnd);
             Diagnostics.CommandThreadTally.NoteRoundTrip(elapsed);
             RoundTripTotals.NoteRead((int)source * 2 + (publication ? 0 : 1), elapsed, address, ReadSite());
             return read;
