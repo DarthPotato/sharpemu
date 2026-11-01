@@ -1219,6 +1219,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"device-address-mapping-check readable={_guestMemory.CanRead(traceAddress, 1)} backed={_guestBacking.IsBackedView(traceAddress)}");
             if (_worker)
             {
+                // Fault-assisted shader pointers do not have an exhaustive read footprint.
+                if (DeferredGpuWritten) Requests.UnrecordedOwnershipAccess = true;
                 Requests.NeedsBdaSweep = true;
                 Requests.BdaSpans = spans;
                 Requests.BdaMapping = _bdaSpanMapping;

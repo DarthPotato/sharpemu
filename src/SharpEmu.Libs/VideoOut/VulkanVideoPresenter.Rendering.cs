@@ -1907,8 +1907,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            _imageCache.MarkGpuWritten(image);
-            if (DeferredGpuWritten) Interlocked.Increment(ref _presenter.GpuWrittenEpoch);
+            _presenter.MarkGpuWrittenOrdered(image);
         }
 
         public void NoteKnownGpuContents(ulong address, ReadOnlySpan<uint> words)

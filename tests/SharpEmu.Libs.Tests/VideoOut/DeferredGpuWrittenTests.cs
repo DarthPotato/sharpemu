@@ -134,7 +134,8 @@ public sealed class DeferredGpuWrittenTests(HeadlessVulkanFixture fixture) : ICl
         p.Run(() =>
         {
             Assert.True((bool)p.InvokeMethod("ApplyGpuWrittenMarks", requests)!);
-            Assert.Equal(1L, p.GetField<long>("GpuWrittenEpoch"));
+            Assert.Equal(Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_GPU_WRITTEN") == "1" ? 1L : 0L,
+                p.GetField<long>("GpuWrittenEpoch"));
             if (Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_GPU_WRITTEN") == "1")
                 Assert.False((bool)p.InvokeMethod("ValidateSegment", slice, segment)!);
         });
@@ -167,6 +168,59 @@ public sealed class DeferredGpuWrittenTests(HeadlessVulkanFixture fixture) : ICl
             Assert.False(cut.Resumable);
             Assert.Empty(Marks(requests));
         }
+        h.Shutdown();
+    }
+
+    [Theory]
+    [InlineData("unrelated", true)]
+    [InlineData("buffer-stencil-read", false)]
+    [InlineData("buffer-depth-write", false)]
+    [InlineData("image-target", false)]
+    [InlineData("stream-read", false)]
+    [InlineData("unrecorded", false)]
+    public void OwnershipHistoryRejectsOnlyOverlappingOrUnrecordedSegments(string access, bool survives)
+    {
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_GPU_WRITTEN") != "1") return;
+        if (!GatePrerequisites.Ready(fixture.Vulkan)) return;
+        using var p = new PresenterUnderTest(fixture.Vulkan!);
+        var h = p.Harness;
+        var address = h.MapBacked(0x10000, ReadWrite);
+        var id = Depth(h, address);
+        Assert.True(h.Images.TryCaptureGpuWrittenMark(id, out var mark));
+        var segment = New(SegmentType);
+        var requests = SegmentType.GetField("Requests")!.GetValue(segment)!;
+        RequestsType.GetField("BufferSerial")!.SetValue(requests, h.Cache.RegistrationSerial);
+        RequestsType.GetField("LookupGeneration")!.SetValue(requests, h.Images.LookupGeneration);
+        RequestsType.GetField("MetadataGeneration")!.SetValue(requests, h.Images.MetadataGeneration);
+        var buffers = (List<BufferSliceUse>)RequestsType.GetField("Buffers")!.GetValue(requests)!;
+        var reads = (List<GuestSpan>)RequestsType.GetField("OwnershipReads")!.GetValue(requests)!;
+        switch (access)
+        {
+            case "unrelated": buffers.Add(new(address + 0x8000, 16, false, false, false, null!)); break;
+            case "buffer-stencil-read": buffers.Add(new(mark.StencilRange.Address, 1, false, false, false, null!)); break;
+            case "buffer-depth-write": buffers.Add(new(mark.Data.Address, 1, true, false, false, null!)); break;
+            case "stream-read": reads.Add(new(mark.StencilRange.Address - 1, 2)); break;
+            case "image-target":
+                var images = (List<ImageSliceUse>)RequestsType.GetField("Images")!.GetValue(requests)!;
+                var request = AsDepthTarget(LinearRequest(address, 16, Format.D32SfloatS8Uint,
+                    GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 4, 1), Format.D32SfloatS8Uint);
+                images.Add(new(id, mark.Expected, request));
+                break;
+            case "unrecorded": RequestsType.GetField("UnrecordedOwnershipAccess")!.SetValue(requests, true); break;
+        }
+        p.Run(() =>
+        {
+            Assert.True((bool)p.InvokeMethod("ValidateOwnership", requests)!);
+            // Use the serial wrapper too: inline replay must enter the same history
+            // as deferred join, including the stencil proxy's guest span.
+            p.InvokeMethod("MarkGpuWrittenOrdered", id);
+            var enabled = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_GPU_WRITTEN") == "1";
+            Assert.Equal(!enabled || survives, (bool)p.InvokeMethod("ValidateOwnership", requests)!);
+            Assert.Equal(!enabled || survives, (bool)p.InvokeMethod("ValidateSegment", New(SliceType), segment)!);
+            // New segments begin after this change and do not conflict with it.
+            RequestsType.GetField("GpuWrittenEpoch")!.SetValue(requests, p.GetField<long>("GpuWrittenEpoch"));
+            Assert.True((bool)p.InvokeMethod("ValidateOwnership", requests)!);
+        });
         h.Shutdown();
     }
 }

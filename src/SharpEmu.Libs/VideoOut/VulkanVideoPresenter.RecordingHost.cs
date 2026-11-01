@@ -71,7 +71,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        public bool TryReadGuest(ulong address, Span<byte> destination) => ((ICommandStreamHost)_presenter).TryReadGuest(address, destination);
+        public bool TryReadGuest(ulong address, Span<byte> destination)
+        {
+            if (_worker && DeferredGpuWritten)
+                Requests.OwnershipReads.Add(new(address, (ulong)destination.Length));
+            return ((ICommandStreamHost)_presenter).TryReadGuest(address, destination);
+        }
 
         public Exception Fatal(string message) => ((ICommandStreamHost)_presenter).Fatal(message);
 

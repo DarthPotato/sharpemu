@@ -787,7 +787,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _imageCache.AcquireTextureView(attachmentIdentifier, sampledRequest);
             if (writeBack)
             {
-                _imageCache.MarkGpuWritten(attachmentIdentifier);
+                _presenter.MarkGpuWrittenOrdered(attachmentIdentifier);
             }
 
             storage = _imageCache.AcquireStencilStorageImage(attachmentIdentifier, description.Extent.Width, description.Extent.Height);
@@ -1258,7 +1258,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     return;
                 }
 
-                _imageCache.MarkGpuWritten(destination.ImageIdentifier);
+                MarkGpuWrittenOrdered(destination.ImageIdentifier);
                 var sourceImage = _imageCache.GetImage(source.ImageIdentifier);
                 var destinationImage = _imageCache.GetImage(destination.ImageIdentifier);
                 destinationImage.ResolveFrom(

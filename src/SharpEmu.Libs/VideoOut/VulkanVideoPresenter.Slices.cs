@@ -35,6 +35,9 @@ internal static unsafe partial class VulkanVideoPresenter
         .Select(reason => reason + ":" + Interlocked.Exchange(ref _tessBdaFallbacks.GetOrAdd(reason, static _ => new()).Value, 0)));
     private static readonly ThreadCounter _gpuWrittenApplied = new();
     private static readonly ThreadCounter _gpuWrittenConflicts = new();
+    private static readonly ThreadCounter _gpuWrittenOverlap = new();
+    private static readonly ThreadCounter _gpuWrittenUnrecorded = new();
+    private static readonly ThreadCounter _gpuWrittenMarkRejects = new();
     private static readonly ThreadCounter _slicesRecorded = new();
     private static readonly ThreadCounter _segmentsRecorded = new();
     private static readonly ThreadCounter _usesShared = new();
@@ -176,7 +179,7 @@ internal static unsafe partial class VulkanVideoPresenter
     internal static string TakeSliceReport() =>
         FormattableString.Invariant($"[PERF][SLICES] slices={_slicesRecorded.Take()} segments={_segmentsRecorded.Take()} empty={_segmentsEmpty.Take()} uses_shared={_usesShared.Take()} attachments_kept={RecordingHost.TakeAttachmentsKept()} worker_queries={RecordingHost.TakeWorkerQueries()} native_rechecks_failed={_nativeColorRechecksFailed.Take()} ") +
         FormattableString.Invariant($"tess_bda_leases={_tessBdaLeases.Take()} tess_bda_fallbacks={TakeTessBdaFallbacks()} tess_bda_join_rejects={_tessBdaJoinRejects.Take()} ") +
-        FormattableString.Invariant($"gpu_written_applied={_gpuWrittenApplied.Take()} gpu_written_conflicts={_gpuWrittenConflicts.Take()} ") +
+        FormattableString.Invariant($"gpu_written_applied={_gpuWrittenApplied.Take()} gpu_written_conflicts={_gpuWrittenConflicts.Take()} gpu_written_overlap={_gpuWrittenOverlap.Take()} gpu_written_unrecorded_fallback={_gpuWrittenUnrecorded.Take()} gpu_written_mark_rejects={_gpuWrittenMarkRejects.Take()} ") +
         TakeRuntimeWorkerReport() + SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
         FormattableString.Invariant($"bda_sweeps={Interlocked.Exchange(ref GuestBufferCache.BdaSweeps, 0)}/skipped:{Interlocked.Exchange(ref GuestBufferCache.BdaSweepsSkipped, 0)} ") +
         FormattableString.Invariant($"serial_cuts={_slicesSerial.Take()} invalid={_slicesInvalid.Take()} frontend_textures_stale={_frontendTexturesStale.Take()} ") +
@@ -268,6 +271,9 @@ internal static unsafe partial class VulkanVideoPresenter
         public readonly List<BufferDeviceAddressLease> TessBdaLeases = new();
         public readonly List<GpuWrittenSliceMark> GpuWritten = new();
         public long GpuWrittenEpoch;
+        public bool UnrecordedOwnershipAccess;
+        public readonly List<GuestSpan> OwnershipReads = DeferredGpuWritten ? new() : null!;
+        public readonly HashSet<(ResourceSlotIdentifier Image, GuestSpan Data, GuestSpan Stencil, GuestSpan Metadata)> OwnershipImages = DeferredGpuWritten ? new() : null!;
         public List<RuntimeWorkerUse>? RuntimeUses;
         public readonly List<BufferSliceUse> Buffers = new();
         public readonly List<(ulong Address, ulong Size)> SyncRanges = new();
@@ -780,16 +786,17 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!_imageCache.ValidateGpuWrittenMarks(requests.GpuWritten))
             {
                 _gpuWrittenConflicts.Increment();
+                _gpuWrittenMarkRejects.Increment();
                 return false;
             }
             // No later item is recorded past a mark: RecordSlice ends this slice here.
             // Apply ownership at this stream position before submitting its commands.
             foreach (var mark in requests.GpuWritten)
             {
-                _imageCache.MarkGpuWritten(mark.Image);
+                MarkGpuWrittenOrdered(mark.Image);
                 _gpuWrittenApplied.Increment();
             }
-            if (requests.GpuWritten.Count != 0) Interlocked.Increment(ref GpuWrittenEpoch);
+
             return true;
         }
 
@@ -808,10 +815,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var requests = segment.Requests;
             if (!ValidateTessBdaLeases(requests)) return false;
-            if ((DeferredGpuWritten && requests.GpuWrittenEpoch != Volatile.Read(ref GpuWrittenEpoch)) ||
-                !_imageCache.ValidateGpuWrittenMarks(requests.GpuWritten))
+            if (!ValidateOwnership(requests)) return false;
+            if (!_imageCache.ValidateGpuWrittenMarks(requests.GpuWritten))
             {
                 _gpuWrittenConflicts.Increment();
+                _gpuWrittenMarkRejects.Increment();
                 return false;
             }
             if (RuntimeRecordWorkers && !ValidateRuntimeUses(requests)) return false;
@@ -1090,6 +1098,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (DeferredGpuWritten)
+                for (var index = 0; index < draw.Reads.Count; index++)
+                {
+                    var bytes = draw.Reads.Bytes(index, out var address);
+                    requests.OwnershipReads.Add(new(address, (ulong)bytes.Length));
+                }
+
             if (requests.ReadsVersion is not { } version)
             {
                 requests.ReadsVersion = draw.Reads.Version;
@@ -1161,8 +1176,20 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private CachedImage Image(ResourceSlotIdentifier imageIdentifier) =>
-            _worker ? _imageCache.PeekImage(imageIdentifier) ?? throw Serial("image released", resumable: true) : _imageCache.GetImage(imageIdentifier);
+        private CachedImage Image(ResourceSlotIdentifier imageIdentifier)
+        {
+            var image = _worker ? _imageCache.PeekImage(imageIdentifier) ?? throw Serial("image released", resumable: true) : _imageCache.GetImage(imageIdentifier);
+            if (_worker && DeferredGpuWritten)
+            {
+                Requests.OwnershipImages.Add((imageIdentifier, image.Description.Data, image.Description.Stencil, image.Description.Metadata.Range));
+                // Some DCC descriptions carry an address with a zero-sized metadata
+                // range; guest-clear probing still reads the per-layer slices.
+                if (image.Description.DccSliceSize != 0)
+                    Requests.OwnershipReads.Add(new(image.Description.Metadata.Range.Address,
+                        image.Description.DccSliceSize * Math.Max(image.Description.Resources.Layers, 1u)));
+            }
+            return image;
+        }
 
         private ref ImageBindingState BindingOf(CachedImage image)
         {
@@ -1192,6 +1219,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return GuestBufferCache.NullBufferId;
             }
 
+            if (DeferredGpuWritten) Requests.OwnershipReads.Add(new(address, size));
             return _buffers.TryFind(address, size, out _, out var identifier) ? identifier : throw Serial("buffer lookup", resumable: true);
         }
 
@@ -1249,6 +1277,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         _arena.Commit(in reservation);
                         _streamCopies.Increment();
+                        if (DeferredGpuWritten) Requests.OwnershipReads.Add(new(address, size));
                         return (reservation.Chunk.Buffer, reservation.Offset, (size + 3) & ~3UL);
                     }
                 }
