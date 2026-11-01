@@ -31,6 +31,12 @@ public sealed class TrackedRegion
     private int _cpuDirtyVersion;
 
     public int CpuDirtyVersion => Volatile.Read(ref _cpuDirtyVersion);
+    // Updated under the region lock even when an already-dirty range is written again.
+    // Consumers must also require clean pages: dirty CPU pages can remain writable.
+    private long _writeVersion;
+    public long WriteVersion => Volatile.Read(ref _writeVersion);
+    internal static readonly bool TrackInspectionWrites = Environment.GetEnvironmentVariable("SHARPEMU_DCC_NONCLEAR_MEMO") == "1";
+    internal void NoteInspectionWrite() => Interlocked.Increment(ref _writeVersion);
 
     public PageMask CpuDirtyPages(in PageMask pages) => _cpuDirty & pages;
 
@@ -153,6 +159,7 @@ public sealed class TrackedRegion
 
     public void MarkCpuWriteKeepingProtection(ulong address, ulong size)
     {
+        if (TrackInspectionWrites) NoteInspectionWrite();
         var (start, end) = GetPageRange(address, size);
         if (new PageMask(_gpuDirty, start, end).Any)
         {
@@ -170,6 +177,7 @@ public sealed class TrackedRegion
 
     public void ChangeState(WriteOrigin side, bool enable, ulong address, ulong size)
     {
+        if (TrackInspectionWrites && enable) NoteInspectionWrite();
         var (start, end) = GetPageRange(address, size);
         if (enable && side == WriteOrigin.Cpu && _gpuDirty.AnyInRange(start, end))
         {

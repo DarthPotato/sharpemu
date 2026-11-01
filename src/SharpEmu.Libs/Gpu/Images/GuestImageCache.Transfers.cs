@@ -427,6 +427,7 @@ public sealed unsafe partial class GuestImageCache
             }
             finally
             {
+                if (DccNonclearMemo) _bufferCache.NoteExternalWriteForInspection(plane.Address, plane.Size);
                 lock (_publishingDownloads) _publishingDownloads.Remove(publishing);
             }
         });

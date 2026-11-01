@@ -97,6 +97,47 @@ internal static unsafe partial class VulkanVideoPresenter
     private static readonly ThreadCounter _workerBusyTicks = new();
     private static readonly ThreadCounter _workerItems = new();
     private static readonly ThreadCounter _inlineTicks = new();
+    private const int InlineReasonLimit = 64;
+    private static readonly object InlineReasonGate = new();
+    private static readonly ConcurrentDictionary<string, int> InlineReasonSlots = new();
+    private static readonly ThreadCounter[] InlineReasonTicks = NewThreadCounters(InlineReasonLimit + 1);
+    private static readonly ThreadCounter[] InlineReasonItems = NewThreadCounters(InlineReasonLimit + 1);
+
+    private static void NoteInlineReason(string reason, long ticks)
+    {
+        int slot;
+        if (!InlineReasonSlots.TryGetValue(reason, out slot))
+        {
+            lock (InlineReasonGate)
+            {
+                if (!InlineReasonSlots.TryGetValue(reason, out slot))
+                {
+                    slot = InlineReasonSlots.Count < InlineReasonLimit ? InlineReasonSlots.Count : InlineReasonLimit;
+                    if (slot < InlineReasonLimit) InlineReasonSlots.TryAdd(reason, slot);
+                }
+            }
+        }
+        InlineReasonTicks[slot].Add(ticks);
+        InlineReasonItems[slot].Increment();
+    }
+
+    private static string TakeInlineReasons()
+    {
+        var parts = new List<string>();
+        lock (InlineReasonGate)
+        {
+            foreach (var (reason, slot) in InlineReasonSlots) Take(reason.Replace(' ', '_'), slot);
+            Take("other", InlineReasonLimit);
+        }
+        return "inline_reason_ms=" + string.Join(",", parts);
+
+        void Take(string reason, int slot)
+        {
+            var ticks = InlineReasonTicks[slot].Take();
+            var items = InlineReasonItems[slot].Take();
+            if (items != 0) parts.Add(FormattableString.Invariant($"{reason}:{ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}/{items}"));
+        }
+    }
     private static readonly ThreadCounter _joinTicks = new();
     private static readonly ThreadCounter _validateTicks = new();
     private static readonly ThreadCounter _prologueTicks = new();
@@ -142,7 +183,7 @@ internal static unsafe partial class VulkanVideoPresenter
         FormattableString.Invariant($"tail_producer=busy:{_tailByProducer[0].Take()},idle:{_tailByProducer[1].Take()},blocked:{_tailByProducer[2].Take()},space:{_tailByProducer[3].Take()},run:{_tailByProducer[4].Take()} ") +
         "round_trips=" + TakeRoundTrips() + " " + Presenter.TakeCommandReadReport() + " " + SharpEmu.ShaderCompiler.Resources.ResourceMaterializer.TakeProgramReport() + " " +
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializer.TakeFastReport() + " " + SharpEmu.Libs.Gpu.Pipelines.ShaderPipelineCache.TakePairReport() + " " + SubmissionScheduler.TakeDeferredReport() + " " +
-        "serial_reasons=" + TakeSerialReasons() + " " + GuestImageCache.TakeSliceLookupReport() + " " + TakeGcReport() + " " + Diagnostics.ItemCostTally.TakeReport() + " posts=" + TakePosts();
+        "serial_reasons=" + TakeSerialReasons() + " " + TakeInlineReasons() + " " + GuestImageCache.TakeSliceLookupReport() + " " + TakeGcReport() + " " + Diagnostics.ItemCostTally.TakeReport() + " posts=" + TakePosts();
 
     private static double Ticks(ThreadCounter ticks) => ticks.Take() * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
@@ -906,6 +947,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     catch (SerialRequiredException serial)
                     {
                         segment!.SerialReason = serial.Message;
+                        slice.Items[index].PublicationCut |= serial.Message == "image publication";
                         Interlocked.Increment(ref _serialReasons.GetOrAdd(serial.Message, static _ => new StrongBox<long>()).Value);
                         EndSegment(slice, segment);
                         segment = null;

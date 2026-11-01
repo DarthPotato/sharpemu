@@ -610,6 +610,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             throw SubmissionScheduler.Fatal("The host DMA write range is invalid.");
         }
 
+        // DMA updates both backing and resident buffers without a dirty-state transition.
+        _tracker.NoteExternalWriteForInspection(guestAddress, (ulong)data.Length);
         if (!_backing.TryWriteBacking(guestAddress, data))
         {
             throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{data.Length:X16}");

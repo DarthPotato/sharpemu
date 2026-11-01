@@ -541,6 +541,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void MarkGpuModified()
     {
+        InspectionWrite?.Invoke(Description.Data.Address, Description.Data.Size);
         RawWriteAfterGpuWrite = false;
         _gpuModified = true;
         _bufferHoldsGpuContents = false;
@@ -549,6 +550,8 @@ public sealed unsafe partial class CachedImage : IDisposable
         _guestPieceHashes = null;
         HeapChanged?.Invoke(this);
     }
+
+    internal Action<ulong, ulong>? InspectionWrite;
 
     // The GPU write the image contents reflect. A copy from a same-layout alias takes the
     // source's sequence, so the alias is not copied back while neither image is written again.

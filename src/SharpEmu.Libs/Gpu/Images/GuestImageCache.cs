@@ -67,6 +67,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _scheduler = scheduler;
         _pages = pages;
         _bufferCache = bufferCache;
+        if (DccNonclearMemo) _readbackLandings.InspectionWrite = bufferCache.NoteExternalWriteForInspection;
         _backing = backing;
         _readbackLinearImages = readbackLinearImages;
         ConfigureCollectionBudget();

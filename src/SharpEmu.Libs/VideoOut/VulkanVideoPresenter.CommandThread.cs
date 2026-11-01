@@ -43,6 +43,8 @@ internal static partial class VulkanVideoPresenter
 
         internal sealed class Item
         {
+            public string? FirstCutReason;
+            public bool PublicationCut;
             public Kind Kind;
             public bool IsDraw;
             public AgcExports.DeferredWork? Work;
@@ -708,6 +710,7 @@ internal static partial class VulkanVideoPresenter
                     CompleteItem(item);
                     NoteItemCost(item, Diagnostics.ItemCostTally.Inline, started);
                     betweenItems();
+                    NoteInlineReason(item.FirstCutReason ?? "direct", Stopwatch.GetTimestamp() - started);
                     ran++;
                 }
 
@@ -787,6 +790,7 @@ internal static partial class VulkanVideoPresenter
             _cutting = null;
             foreach (var item in slice.Items)
             {
+                item.FirstCutReason ??= "short tail";
                 _units.Add(new Unit { Item = item });
             }
 
@@ -822,6 +826,7 @@ internal static partial class VulkanVideoPresenter
         private int JoinSlice(RenderSlice slice, Action betweenItems)
         {
             var ran = 0;
+            string? lastCutReason = null;
             if (!slice.Dispatched)
             {
                 _presenter.DispatchSlice(slice);
@@ -872,14 +877,15 @@ internal static partial class VulkanVideoPresenter
                     {
                         for (var position = segment.First; position < end; position++)
                         {
-                            RunInline(slice.Items[position], betweenItems);
+                            RunInline(slice.Items[position], betweenItems, segment.SerialReason ?? "validation");
                             ran++;
                         }
                     }
 
                     if (segment.SerialReason is not null)
                     {
-                        RunInline(slice.Items[end], betweenItems);
+                        lastCutReason = segment.SerialReason;
+                        RunInline(slice.Items[end], betweenItems, segment.SerialReason);
                         ran++;
                     }
                 }
@@ -890,6 +896,8 @@ internal static partial class VulkanVideoPresenter
             }
 
             var remaining = slice.Items.Count - slice.Resume;
+            for (var position = slice.Resume; position < slice.Items.Count; position++)
+                slice.Items[position].FirstCutReason ??= lastCutReason ?? "tail";
             if (remaining == 0)
             {
                 return ran;
@@ -925,15 +933,30 @@ internal static partial class VulkanVideoPresenter
         private static void NoteItemCost(Item item, int stage, long started) =>
             Diagnostics.ItemCostTally.Note(item.Work?.CostKind ?? Diagnostics.ItemCostTally.Other, stage, Stopwatch.GetTimestamp() - started);
 
-        private void RunInline(Item item, Action betweenItems)
+        private void RunInline(Item item, Action betweenItems, string? reason = null)
         {
+            item.FirstCutReason ??= reason ?? "stolen";
             var started = Stopwatch.GetTimestamp();
-            Execute(item);
-            CompleteItem(item);
+            var previousPublicationReplay = Gpu.Images.GuestImageCache.PublicationCutReplay;
+            var previousPublicationPublished = Gpu.Images.GuestImageCache.PublicationReplayPublished;
+            Gpu.Images.GuestImageCache.PublicationCutReplay = item.PublicationCut;
+            Gpu.Images.GuestImageCache.PublicationReplayPublished = false;
+            try
+            {
+                Execute(item);
+                CompleteItem(item);
+            }
+            finally
+            {
+                if (item.PublicationCut) Gpu.Images.GuestImageCache.NotePublicationReplay();
+                Gpu.Images.GuestImageCache.PublicationCutReplay = previousPublicationReplay;
+                Gpu.Images.GuestImageCache.PublicationReplayPublished = previousPublicationPublished;
+            }
             NoteItemCost(item, Diagnostics.ItemCostTally.Inline, started);
             betweenItems();
             _serialItems.Increment();
             _inlineTicks.Add(Stopwatch.GetTimestamp() - started);
+            NoteInlineReason(item.FirstCutReason, Stopwatch.GetTimestamp() - started);
         }
 
         private void CompleteItem(Item item)

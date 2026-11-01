@@ -57,17 +57,26 @@ public sealed partial class GuestImageCache
 
     private static bool SliceLookupFailed(SliceLookupFailure reason, ImageRole role)
     {
+        if (reason == SliceLookupFailure.DccClear) Interlocked.Increment(ref _dccClearCuts);
         Interlocked.Increment(ref SliceLookupFailures[(int)reason]);
         Interlocked.Increment(ref SliceLookupRoleFailures[(int)role]);
         return false;
     }
 
+    // On by default: the worker publication check matches the serial publication selector.
+    // SHARPEMU_PUBLICATION_EXACT=0 restores the legacy predicate.
+    private static readonly bool PublicationExact = Environment.GetEnvironmentVariable("SHARPEMU_PUBLICATION_EXACT") != "0";
+    private static long _publicationCuts, _publicationAttempts, _publicationReal, _publicationDownloads;
+    private static long _dccMemoHits, _dccMemoInvalidations, _dccClearCuts;
     private static long _parks;
     private static long _parkReleases;
     private static long _unparks;
     private static long _parkExpiries;
 
     public static string TakeSliceLookupReport() =>
+        FormattableString.Invariant($"dcc_clear_cuts={Interlocked.Exchange(ref _dccClearCuts, 0)} ") +
+        TakePublicationCutReport() +
+        FormattableString.Invariant($"publication_cuts={Interlocked.Exchange(ref _publicationCuts, 0)} publication_attempts={Interlocked.Exchange(ref _publicationAttempts, 0)} publication_real={Interlocked.Exchange(ref _publicationReal, 0)} publication_downloads={Interlocked.Exchange(ref _publicationDownloads, 0)} dcc_memo_hits={Interlocked.Exchange(ref _dccMemoHits, 0)} dcc_memo_invalidations={Interlocked.Exchange(ref _dccMemoInvalidations, 0)} ") +
         "lookup_fail=" + TakeCounts(SliceLookupFailures, SliceLookupFailureNames) + " lookup_fail_role=" + TakeCounts(SliceLookupRoleFailures, SliceLookupRoleNames) +
         FormattableString.Invariant($" parks={Interlocked.Exchange(ref _parks, 0)} park_releases={Interlocked.Exchange(ref _parkReleases, 0)} unparks={Interlocked.Exchange(ref _unparks, 0)} park_expiries={Interlocked.Exchange(ref _parkExpiries, 0)}");
 
@@ -423,6 +432,7 @@ public sealed partial class GuestImageCache
         for (uint slice = 0; slice < count; slice++)
         {
             var address = range.Address + sliceSize * (first + slice);
+            if (DccNonclearMemo && ReuseDccNonclear(request, address, sliceSize)) continue;
             if (!_backing.TryReadBacking(address, firstByte))
             {
                 return false;
@@ -637,7 +647,7 @@ public sealed partial class GuestImageCache
     private static bool SameMetadataPlacement(in MetadataDescription cached, in MetadataDescription requested) =>
         cached.Range.Address == requested.Range.Address && cached.Kind == requested.Kind && cached.Compression == requested.Compression;
 
-    // Whether TryClearImageFromBuffer would select an image for the fill without recording anything.
+    // Whether serial publication would select an owner, without obtaining buffers or downloading.
     public bool WouldPublishImagesUnderWrite(ulong address, ulong size, bool wholeImages)
     {
         if (!IsValidRange(address, size))
@@ -650,10 +660,12 @@ public sealed partial class GuestImageCache
         {
             var image = _slots[imageIdentifier];
             var range = image.Description.Data;
-            if (image.IsGpuModified && !image.DepthOwner.IsValid && image.Overlaps(address, size) &&
+            if (PublicationExact ? ShouldPublishImage(imageIdentifier, image, address, size, wholeImages, exactImages: !wholeImages) :
+                image.IsGpuModified && !image.DepthOwner.IsValid && image.Overlaps(address, size) &&
                 (wholeImages || address > range.Address || address + size < range.Address + range.Size) &&
                 image.SafeToDownload && !image.RawWriteAfterGpuWrite)
             {
+                Interlocked.Increment(ref _publicationCuts);
                 return true;
             }
         }
@@ -743,6 +755,11 @@ public sealed partial class GuestImageCache
             if (!image.Registered || image.Parked || image.Binding.NeedsRebind || image.DepthOwner.IsValid)
             {
                 return false;
+            }
+
+            if (DccNonclearMemo && !DccClearMaterializationIsNoop(image, use.Request))
+            {
+                return SliceLookupFailed(SliceLookupFailure.MetadataChangedAtJoin, use.Request.Role);
             }
 
             var range = UnionRange(use.Request.Description.Data, image.Description.Data);

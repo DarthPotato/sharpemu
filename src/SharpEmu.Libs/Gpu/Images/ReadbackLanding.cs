@@ -14,6 +14,13 @@ internal sealed class ReadbackLandings
     private ReadbackLanding[] _pending = [];
 
     public ReadbackLanding[] Pending => Volatile.Read(ref _pending);
+    internal Action<ulong, ulong>? InspectionWrite;
+    internal bool Overlaps(ulong address, ulong size)
+    {
+        foreach (var landing in Pending)
+            if (landing.Overlaps(address, size)) return true;
+        return false;
+    }
 
     // A readback queued over these guest bytes.
     public ReadbackLanding Queue(ulong address, ReadOnlySpan<byte> snapshot)
@@ -29,6 +36,9 @@ internal sealed class ReadbackLandings
 
     public void Remove(ReadbackLanding landing)
     {
+        // Publish a write generation before the pending range disappears, even if all
+        // pages were retained. Inspectors reject the range while it is still pending.
+        InspectionWrite?.Invoke(landing.Address, landing.Size);
         lock (_gate)
         {
             var index = Array.IndexOf(_pending, landing);
@@ -70,6 +80,9 @@ internal sealed class ReadbackLanding
     private readonly long[] _storedPages;
     private readonly object _gate = new();
     private bool _landed;
+    internal ulong Address => _address;
+    internal ulong Size => (ulong)_size;
+    internal bool Overlaps(ulong address, ulong size) => address < _address + (ulong)_size && _address < address + size;
 
     internal ReadbackLanding(ReadbackLandings queue, ulong address, ReadOnlySpan<byte> snapshot)
     {

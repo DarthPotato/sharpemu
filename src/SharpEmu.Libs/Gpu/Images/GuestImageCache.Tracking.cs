@@ -31,6 +31,12 @@ public sealed partial class GuestImageCache
         }
 
         image.Registered = true;
+        if (DccNonclearMemo)
+        {
+            image.InspectionWrite = _bufferCache.NoteExternalWriteForInspection;
+            // Invalidate prior inspections even if this image was written before registration.
+            image.InspectionWrite(image.Description.Data.Address, image.Description.Data.Size);
+        }
         InvalidateLookups(image.Description.Data.Address, image.Description.Data.End);
         image.RecencyEntryIndex = _recencyQueue.Insert(imageIdentifier, _collectionTick);
         _totalUsedMemory += image.AccountedSize;
@@ -661,6 +667,8 @@ public sealed partial class GuestImageCache
     // well. The buffer is obtained outside the lock; contents that cannot be copied are lost as before.
     private bool PublishPartlyWrittenImages(ulong address, ulong size, bool wholeImages = false, bool exactImages = false)
     {
+        Interlocked.Increment(ref _publicationAttempts);
+        if (PublicationCutReplay) Interlocked.Increment(ref _publicationCutAttempts);
         var published = false;
         List<ResourceSlotIdentifier>? partlyWritten = null;
         using (var held = _lock.Hold())
@@ -668,11 +676,7 @@ public sealed partial class GuestImageCache
             foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: false))
             {
                 var image = _slots[imageIdentifier];
-                var range = image.Description.Data;
-                var exact = exactImages && address == range.Address && size == range.Size;
-                if (image.IsGpuModified && image.Overlaps(address, size) &&
-                    (wholeImages || exact || address > range.Address || address + size < range.Address + range.Size) &&
-                    image.SafeToDownload && !image.RawWriteAfterGpuWrite && !HasNewerHandedOverImage(imageIdentifier, image))
+                if (ShouldPublishImage(imageIdentifier, image, address, size, wholeImages, exactImages))
                 {
                     (partlyWritten ??= []).Add(imageIdentifier);
                 }
@@ -711,11 +715,28 @@ public sealed partial class GuestImageCache
                     image.ClearGpuModified();
                     MarkOlderOverlappingImagesOverwritten(imageIdentifier, image);
                     published = true;
+                    Interlocked.Increment(ref _publicationDownloads);
+                    if (PublicationCutReplay) Interlocked.Increment(ref _publicationCutDownloads);
                 }
             }
         }
 
+        if (published) Interlocked.Increment(ref _publicationReal);
+        if (published && PublicationCutReplay) Interlocked.Increment(ref _publicationCutReal);
+        if (published && PublicationCutReplay) PublicationReplayPublished = true;
         return published;
+    }
+
+    // The serial selector and exact worker preflight share eligibility, including depth proxies.
+    // Both callers hold the image lock. The download still revalidates after obtaining its buffer.
+    private bool ShouldPublishImage(ResourceSlotIdentifier identifier, CachedImage image, ulong address, ulong size,
+        bool wholeImages, bool exactImages)
+    {
+        var range = image.Description.Data;
+        var exact = exactImages && address == range.Address && size == range.Size;
+        return image.IsGpuModified && image.Overlaps(address, size) &&
+            (wholeImages || exact || address > range.Address || address + size < range.End) &&
+            image.SafeToDownload && !image.RawWriteAfterGpuWrite && !HasNewerHandedOverImage(identifier, image);
     }
 
     // A newer GPU-written image over the same memory that has already handed its bytes to the buffer (or lost
@@ -724,12 +745,20 @@ public sealed partial class GuestImageCache
     private bool HasNewerHandedOverImage(ResourceSlotIdentifier imageIdentifier, CachedImage image)
     {
         var range = image.Description.Data;
-        foreach (var otherIdentifier in FindImagesInRange(range.Address, range.Size, pageOverlap: false))
+        if (!ImagePageOwnerTable.TryGetPageRange(range.Address, range.Size, out var first, out var last)) return false;
+        // An existence query needs no deduplication or mutable QueryEpoch, so it is safe
+        // under the worker read lock and does not allocate an extra candidate list.
+        for (var page = first; page < last; page++)
         {
-            if (otherIdentifier != imageIdentifier && _slots.TryGet(otherIdentifier) is { IsGpuModified: false } other &&
-                other.DepthOwner != imageIdentifier && other.GpuWriteSequence > image.GpuWriteSequence && other.Overlaps(range.Address, range.Size))
+            if (_pageOwners.Find(page) is not { } owners) continue;
+            for (var index = 0; index < owners.Count; index++)
             {
-                return true;
+                var otherIdentifier = owners[index];
+                if (otherIdentifier != imageIdentifier && _slots.TryGet(otherIdentifier) is { IsGpuModified: false, Parked: false } other &&
+                    other.DepthOwner != imageIdentifier && other.GpuWriteSequence > image.GpuWriteSequence && other.Overlaps(range.Address, range.Size))
+                {
+                    return true;
+                }
             }
         }
 

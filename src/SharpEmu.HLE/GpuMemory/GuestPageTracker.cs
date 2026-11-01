@@ -153,6 +153,39 @@ public sealed class GuestPageTracker
 
     public long CpuDirtyEpoch => _cpuDirtySummary.Epoch;
 
+    // Conservative block-granularity write stamp from the existing page tracker. Never
+    // certify dirty/untracked pages: CPU stores into writable dirty pages need not fault.
+    public bool TryGetCleanWriteStamp(ulong address, ulong size, out long stamp)
+    {
+        stamp = 0;
+        if (!TrackedRegion.TrackInspectionWrites) return false;
+        ValidateRange(address, size);
+        var end = address + size;
+        for (var cursor = address; cursor < end;)
+        {
+            var index = cursor / BlockBytes;
+            var bytes = Math.Min(end - cursor, BlockBytes - cursor % BlockBytes);
+            if (Volatile.Read(ref _regions[index]) is not { } region) return false;
+            using var held = region.Lock.Hold();
+            if (region.IsModified(WriteOrigin.Cpu, cursor % BlockBytes, bytes) ||
+                region.IsModified(WriteOrigin.Gpu, cursor % BlockBytes, bytes)) return false;
+            stamp = unchecked(stamp + region.WriteVersion);
+            cursor += bytes;
+        }
+        return true;
+    }
+
+    // Image ownership and coherent DMA can write without a buffer dirty-state transition.
+    public void NoteExternalWriteForInspection(ulong address, ulong size)
+    {
+        if (!TrackedRegion.TrackInspectionWrites) return;
+        VisitRegions(address, size, create: false, (region, _, _) =>
+        {
+            region.NoteInspectionWrite();
+            return false;
+        });
+    }
+
     // Returns whether this was a full sweep. Mapping changes rescan even dirtiness
     // discarded outside the old mapping. Only BDA drains this notification record.
     public bool ForEachBdaDirtyRange(IReadOnlyCollection<GuestSpan> mapped, bool full, Action<ulong, ulong> visit)

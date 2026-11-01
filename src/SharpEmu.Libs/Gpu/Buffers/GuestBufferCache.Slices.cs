@@ -108,6 +108,12 @@ public sealed unsafe partial class GuestBufferCache
 
     public long RegionStamp(ulong guestAddress, ulong size) => _registry.RegionStamp(guestAddress, size);
 
+    public bool TryGetCleanWriteStamp(ulong address, ulong size, out long stamp) =>
+        _tracker.TryGetCleanWriteStamp(address, size, out stamp);
+
+    internal void NoteExternalWriteForInspection(ulong address, ulong size) =>
+        _tracker.NoteExternalWriteForInspection(address, size);
+
     // Whether TryCopyWordsOnHost would copy, without copying.
     public bool WouldCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words)
     {

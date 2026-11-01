@@ -93,6 +93,8 @@ public sealed partial class GuestImageCache
             for (uint slice = 0; slice < count; slice++)
             {
                 var address = range.Address + sliceSize * (first + slice);
+                long before = 0;
+                var canMemo = DccNonclearMemo && TryDccInspectionStamp(address, sliceSize, out before);
                 if (!_backing.TryReadBacking(address, firstByte))
                 {
                     throw SubmissionScheduler.Fatal(
@@ -108,6 +110,7 @@ public sealed partial class GuestImageCache
                         out var clear))
                 {
                     Interlocked.Increment(ref _dccSlicesUndecodable);
+                    if (canMemo) RememberDccNonclear(request, address, sliceSize, before);
                     continue;
                 }
 
@@ -131,6 +134,7 @@ public sealed partial class GuestImageCache
                 if (!uniform)
                 {
                     Interlocked.Increment(ref _dccSlicesMixed);
+                    if (canMemo) RememberDccNonclear(request, address, sliceSize, before);
                     continue;
                 }
 
