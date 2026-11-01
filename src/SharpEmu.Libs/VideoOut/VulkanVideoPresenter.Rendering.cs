@@ -1854,10 +1854,18 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (_worker)
             {
-                throw Serial("mark gpu written");
+                if (!DeferredGpuWritten || !_imageCache.TryCaptureGpuWrittenMark(image, out var mark))
+                    throw Serial("mark gpu written");
+                // Prologue buffer ownership is applied before image ownership. Do not
+                // fold an earlier raw write to either plane across this new boundary.
+                if (Requests.WritesRange(mark.Data) || Requests.WritesRange(mark.StencilRange))
+                    throw Serial("mark gpu written");
+                Requests.GpuWritten.Add(mark);
+                return;
             }
 
             _imageCache.MarkGpuWritten(image);
+            if (DeferredGpuWritten) Interlocked.Increment(ref _presenter.GpuWrittenEpoch);
         }
 
         public void NoteKnownGpuContents(ulong address, ReadOnlySpan<uint> words)

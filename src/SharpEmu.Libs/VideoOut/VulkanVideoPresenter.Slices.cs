@@ -26,6 +26,9 @@ internal sealed class SerialRequiredException(string reason, bool resumable = fa
 
 internal static unsafe partial class VulkanVideoPresenter
 {
+    private static readonly bool DeferredGpuWritten = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_GPU_WRITTEN") == "1";
+    private static readonly ThreadCounter _gpuWrittenApplied = new();
+    private static readonly ThreadCounter _gpuWrittenConflicts = new();
     private static readonly ThreadCounter _slicesRecorded = new();
     private static readonly ThreadCounter _segmentsRecorded = new();
     private static readonly ThreadCounter _usesShared = new();
@@ -166,6 +169,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
     internal static string TakeSliceReport() =>
         FormattableString.Invariant($"[PERF][SLICES] slices={_slicesRecorded.Take()} segments={_segmentsRecorded.Take()} empty={_segmentsEmpty.Take()} uses_shared={_usesShared.Take()} attachments_kept={RecordingHost.TakeAttachmentsKept()} worker_queries={RecordingHost.TakeWorkerQueries()} native_rechecks_failed={_nativeColorRechecksFailed.Take()} ") +
+        FormattableString.Invariant($"gpu_written_applied={_gpuWrittenApplied.Take()} gpu_written_conflicts={_gpuWrittenConflicts.Take()} ") +
         TakeRuntimeWorkerReport() + SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
         FormattableString.Invariant($"bda_sweeps={Interlocked.Exchange(ref GuestBufferCache.BdaSweeps, 0)}/skipped:{Interlocked.Exchange(ref GuestBufferCache.BdaSweepsSkipped, 0)} ") +
         FormattableString.Invariant($"serial_cuts={_slicesSerial.Take()} invalid={_slicesInvalid.Take()} frontend_textures_stale={_frontendTexturesStale.Take()} ") +
@@ -254,6 +258,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
     private sealed class SliceRequests
     {
+        public readonly List<GpuWrittenSliceMark> GpuWritten = new();
+        public long GpuWrittenEpoch;
         public List<RuntimeWorkerUse>? RuntimeUses;
         public readonly List<BufferSliceUse> Buffers = new();
         public readonly List<(ulong Address, ulong Size)> SyncRanges = new();
@@ -380,6 +386,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public int Resume;
         public RecordingHost? Host;
         public List<SliceArenaChunk> Chunks = [];
+        public bool GpuWrittenBoundary;
         public bool Submitted;
         public bool Dispatched;
         public long DispatchedAt;
@@ -487,6 +494,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
     private sealed partial class Presenter
     {
+        // Conservative validation for slices already recording when a deferred mark joins.
+        // This also covers stream-copy/resolve reads which are not image-use entries.
+        internal long GpuWrittenEpoch;
         internal static readonly int RenderWorkerCount =
             int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RENDER_WORKERS"), out var workers) && workers >= 0
                 ? workers
@@ -677,6 +687,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     _scheduler.DiscardRecording(segment.Buffer!);
                     return false;
                 }
+                if (!ApplyGpuWrittenMarks(segment.Requests))
+                {
+                    _slicesInvalid.Increment();
+                    _scheduler.DiscardRecording(segment.Buffer!);
+                    return false;
+                }
                 var uploads = _spareSubmissionResources is { Count: not 0 } spare ? spare.Pop() : new SubmissionUploadResources();
                 uploads.DebugName = "SharpEmu slice";
                 _batchResources.Add(uploads);
@@ -741,9 +757,33 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        private bool ApplyGpuWrittenMarks(SliceRequests requests)
+        {
+            if (!_imageCache.ValidateGpuWrittenMarks(requests.GpuWritten))
+            {
+                _gpuWrittenConflicts.Increment();
+                return false;
+            }
+            // No later item is recorded past a mark: RecordSlice ends this slice here.
+            // Apply ownership at this stream position before submitting its commands.
+            foreach (var mark in requests.GpuWritten)
+            {
+                _imageCache.MarkGpuWritten(mark.Image);
+                _gpuWrittenApplied.Increment();
+            }
+            if (requests.GpuWritten.Count != 0) Interlocked.Increment(ref GpuWrittenEpoch);
+            return true;
+        }
+
         private bool ValidateSegment(RenderSlice slice, SliceSegment segment)
         {
             var requests = segment.Requests;
+            if ((DeferredGpuWritten && requests.GpuWrittenEpoch != Volatile.Read(ref GpuWrittenEpoch)) ||
+                !_imageCache.ValidateGpuWrittenMarks(requests.GpuWritten))
+            {
+                _gpuWrittenConflicts.Increment();
+                return false;
+            }
             if (RuntimeRecordWorkers && !ValidateRuntimeUses(requests)) return false;
             foreach (var (frontend, words) in requests.FrontendTextures)
             {
@@ -927,6 +967,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 for (var index = 0; index < slice.Items.Count; index++)
                 {
                     var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var marksBefore = segment!.Requests.GpuWritten.Count;
                     try
                     {
                         if (RuntimeRecordWorkers) _runtimeItemRecorded = false;
@@ -943,10 +984,16 @@ internal static unsafe partial class VulkanVideoPresenter
                         if (RuntimeRecordWorkers && _runtimeItemRecorded) _runtimeWorkerRecords.Increment();
                         segment!.Count++;
                         NoteReadsVersion(segment.Requests, slice.Items[index].Work!);
+                        if (EndSliceAtGpuWritten(slice, segment, index, marksBefore))
+                        {
+                            break;
+                        }
                     }
                     catch (SerialRequiredException serial)
                     {
-                        segment!.SerialReason = serial.Message;
+                        // Failed items replay inline; do not publish their speculative marks.
+                        segment!.Requests.GpuWritten.RemoveRange(marksBefore, segment.Requests.GpuWritten.Count - marksBefore);
+                        segment.SerialReason = serial.Message;
                         slice.Items[index].PublicationCut |= serial.Message == "image publication";
                         Interlocked.Increment(ref _serialReasons.GetOrAdd(serial.Message, static _ => new StrongBox<long>()).Value);
                         EndSegment(slice, segment);
@@ -976,6 +1023,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 slice.Chunks = _arena!.TakeChunks();
                 _segment = null;
             }
+        }
+
+        private static bool EndSliceAtGpuWritten(RenderSlice slice, SliceSegment segment, int index, int marksBefore)
+        {
+            if (segment.Requests.GpuWritten.Count == marksBefore) return false;
+            // A later item may read or publish the written bytes. Dispatch it
+            // only after this segment joins and updates ownership.
+            slice.GpuWrittenBoundary = true;
+            slice.Resume = index + 1;
+            return true;
         }
 
         private void RecordGuestCacheFlush()
@@ -1016,6 +1073,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private SliceSegment BeginSegment(int first)
         {
             var segment = new SliceSegment { First = first };
+            segment.Requests.GpuWrittenEpoch = Volatile.Read(ref _presenter.GpuWrittenEpoch);
             segment.Requests.BufferSerial = _buffers.Serial;
             segment.Requests.LookupGeneration = _imageCache.LookupGeneration;
             segment.Requests.MetadataGeneration = _imageCache.MetadataGeneration;

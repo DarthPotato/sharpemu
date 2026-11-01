@@ -896,14 +896,27 @@ internal static partial class VulkanVideoPresenter
             }
 
             var remaining = slice.Items.Count - slice.Resume;
-            for (var position = slice.Resume; position < slice.Items.Count; position++)
-                slice.Items[position].FirstCutReason ??= lastCutReason ?? "tail";
+            if (!slice.GpuWrittenBoundary || lastCutReason is not null)
+                for (var position = slice.Resume; position < slice.Items.Count; position++)
+                    slice.Items[position].FirstCutReason ??= lastCutReason ?? "tail";
             if (remaining == 0)
             {
                 return ran;
             }
 
             var inline = slice.Items.Count;
+            // A successful deferred mark is an ordered boundary, not an inline failure.
+            // Keep its suffix together: dispatching many speculative chunks here would
+            // invalidate them all at the next mark's ownership epoch change.
+            if (slice.GpuWrittenBoundary && _presenter.SlicesEnabled && remaining >= MinimumSliceItems)
+            {
+                var rest = new RenderSlice { Origin = 2 };
+                rest.Items.AddRange(slice.Items.GetRange(slice.Resume, remaining));
+                _units.Insert(_unitHead, new Unit { Slice = rest });
+                _presenter.DispatchSlice(rest, urgent: true);
+                Presenter.NoteRestChunk(remaining);
+                return ran;
+            }
             if (_presenter.SlicesEnabled && remaining >= RestInlineItems + MinimumSliceItems)
             {
                 inline = slice.Resume + RestInlineItems;
