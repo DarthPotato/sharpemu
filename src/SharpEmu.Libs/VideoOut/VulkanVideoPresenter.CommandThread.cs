@@ -47,6 +47,7 @@ internal static partial class VulkanVideoPresenter
             public bool PublicationCut;
             public Kind Kind;
             public bool IsDraw;
+            public int DirectSubtype = 8;
             public AgcExports.DeferredWork? Work;
             public Action? Action;
             public ulong Address;
@@ -84,7 +85,8 @@ internal static partial class VulkanVideoPresenter
         }
 
         private const int SliceItems = 256;
-        private const int MinimumSliceItems = 8;
+        private static readonly int MinimumSliceItems = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MIN_SLICE_ITEMS"), out var minimum) && minimum > 0 && minimum <= SliceItems ? minimum : 8;
+        private static readonly bool TailLookahead = Environment.GetEnvironmentVariable("SHARPEMU_TAIL_LOOKAHEAD") == "1";
         private const int RestInlineItems = 8;
         private const int RestChunkItems = 32;
         internal const ulong SmallTransferBytes = 64;
@@ -206,13 +208,17 @@ internal static partial class VulkanVideoPresenter
         public void Post(Action action, [CallerMemberName] string caller = "")
         {
             Presenter.NotePost(caller);
-            Enqueue(new Item { Kind = Kind.Call, Action = action });
+            Enqueue(new Item { Kind = Kind.Call, Action = action, DirectSubtype = caller switch
+            {
+                "RecordEndOfPipe" => 0, "Flush" => 4, "BeginSubmission" => 5,
+                "RunGarbageCollector" => 6, "FlushFrame" => 7, _ => 8,
+            } });
         }
 
         public void Run(Action action, [CallerMemberName] string caller = "")
         {
             var started = Stopwatch.GetTimestamp();
-            var item = new Item { Kind = Kind.Call, Action = action, Sync = true };
+            var item = new Item { Kind = Kind.Call, Action = action, Sync = true, DirectSubtype = 3 };
             Enqueue(item);
             var previous = _producerState;
             _producerState = ProducerRunWait;
@@ -239,7 +245,7 @@ internal static partial class VulkanVideoPresenter
 
         public void PostWrite(ulong address, ReadOnlySpan<byte> data, bool kernel = false)
         {
-            var item = new Item { Kind = Kind.Write, Address = address, Data = data.ToArray(), Kernel = kernel };
+            var item = new Item { Kind = Kind.Write, DirectSubtype = 1, Address = address, Data = data.ToArray(), Kernel = kernel };
             lock (_writeLock)
             {
                 _pendingWrites.Enqueue(item);
@@ -253,7 +259,7 @@ internal static partial class VulkanVideoPresenter
         // A fill or copy the render thread runs in order; reads of its destination wait for it.
         public long PostRange(Action action, ulong address, ulong size, RangeKind kind)
         {
-            var item = new Item { Kind = Kind.Call, Action = action, Address = address, RangeSize = size, Range = kind };
+            var item = new Item { Kind = Kind.Call, Action = action, DirectSubtype = 2, Address = address, RangeSize = size, Range = kind };
             if (size != 0)
             {
                 lock (_writeLock)
@@ -683,6 +689,13 @@ internal static partial class VulkanVideoPresenter
                         return ran;
                     }
 
+                    // One snapshot, one bounded refill. Never wait for future producer work.
+                    if (TailLookahead && TryRefillTail())
+                    {
+                        continue;
+                    }
+
+                    if (RenderPhaseProfile.Enabled) _tailReady[SchedulingBucket(ReadyCount())].Increment();
                     if (_presenter.SlicesEnabled && _cutting.Items.Count >= 2 * RestChunkItems)
                     {
                         SplitTail();
@@ -694,6 +707,7 @@ internal static partial class VulkanVideoPresenter
                         Presenter.NoteTail(_producerState);
                     }
 
+                    if (TailLookahead) betweenItems(); // Existing relay work is independent of stream units.
                     continue;
                 }
 
@@ -706,7 +720,10 @@ internal static partial class VulkanVideoPresenter
                 {
                     var item = unit.Item!;
                     var started = Stopwatch.GetTimestamp();
+                    var directStarted = RenderPhaseProfile.Enabled && item.Kind != Kind.Deferred ? Stopwatch.GetTimestamp() : 0;
+                    var relayBefore = directStarted != 0 ? RenderPhaseProfile.RelayElapsedTicks : 0;
                     Execute(item);
+                    if (directStarted != 0) _directSubtypeTicks[item.DirectSubtype].Add(Stopwatch.GetTimestamp() - directStarted - (RenderPhaseProfile.RelayElapsedTicks - relayBefore));
                     CompleteItem(item);
                     NoteItemCost(item, Diagnostics.ItemCostTally.Inline, started);
                     betweenItems();
@@ -763,17 +780,53 @@ internal static partial class VulkanVideoPresenter
                 }
 
                 _units.Add(new Unit { Item = item });
+                if (TailLookahead && item.Sync) break;
             }
         }
 
-        private bool RefillDraining()
+        private int ReadyCount()
+        {
+            lock (_lock) return _draining.Count - _drainIndex + _incoming.Count;
+        }
+
+        private bool TryRefillTail()
+        {
+            // Calls, Writes and synchronous Runs are observation boundaries. Do not
+            // pull them or anything after them into the deferred run.
+            if (!Monitor.TryEnter(_lock)) return false;
+            int budget;
+            try { budget = Math.Min(SliceItems, _draining.Count - _drainIndex + _incoming.Count); }
+            finally { Monitor.Exit(_lock); }
+            var pulled = 0;
+            while (pulled < budget)
+            {
+                if (_drainIndex == _draining.Count && !RefillDraining(nonBlocking: true)) break;
+                var item = _draining[_drainIndex];
+                if (item.Kind != Kind.Deferred) break;
+                _draining[_drainIndex++] = null!;
+                _cutting!.Items.Add(item);
+                pulled++;
+                if (_cutting.Items.Count >= SliceItems)
+                {
+                    CloseSlice();
+                    break;
+                }
+            }
+            if (RenderPhaseProfile.Enabled) _tailRefillItems.Add(pulled);
+            return pulled != 0;
+        }
+
+        private bool RefillDraining(bool nonBlocking = false)
         {
             _draining.Clear();
             _drainIndex = 0;
-            lock (_lock)
+            if (nonBlocking)
             {
-                (_incoming, _draining) = (_draining, _incoming);
+                if (!Monitor.TryEnter(_lock)) return false;
             }
+            else Monitor.Enter(_lock);
+            try { (_incoming, _draining) = (_draining, _incoming); }
+            finally { Monitor.Exit(_lock); }
 
             return _draining.Count != 0;
         }
@@ -781,9 +834,10 @@ internal static partial class VulkanVideoPresenter
         private bool FlushCutting()
         {
             var slice = _cutting!;
+            NoteDeferredRun(slice);
             if (slice.Items.Count >= MinimumSliceItems)
             {
-                CloseSlice();
+                CloseSlice(noteRun: false);
                 return true;
             }
 
@@ -801,6 +855,7 @@ internal static partial class VulkanVideoPresenter
         private void SplitTail()
         {
             var tail = _cutting!;
+            NoteDeferredRun(tail);
             _cutting = null;
             var chunks = (tail.Items.Count + RestChunkItems - 1) / RestChunkItems;
             var start = 0;
@@ -815,9 +870,10 @@ internal static partial class VulkanVideoPresenter
             }
         }
 
-        private void CloseSlice()
+        private void CloseSlice(bool noteRun = true)
         {
             var slice = _cutting!;
+            if (noteRun) NoteDeferredRun(slice);
             _cutting = null;
             _units.Add(new Unit { Slice = slice });
             _presenter.DispatchSlice(slice);
@@ -835,6 +891,7 @@ internal static partial class VulkanVideoPresenter
             if (slice.TryClaim())
             {
                 Presenter.NoteStolen(slice);
+                _presenter.NoteStealState();
                 slice.Done.Set();
                 try
                 {

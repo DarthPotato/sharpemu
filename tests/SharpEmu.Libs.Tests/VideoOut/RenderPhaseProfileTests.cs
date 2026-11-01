@@ -9,6 +9,27 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class RenderPhaseProfileTests
 {
     [Fact]
+    public void RelayElapsedCountsNestedWorkOnceAndDoesNotCountOtherScopes()
+    {
+        if (!RenderPhaseProfile.Enabled) return;
+        var before = RenderPhaseProfile.RelayElapsedTicks;
+        using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.CommandStream))
+        {
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay))
+            {
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay))
+                    Thread.SpinWait(10000);
+                Assert.Equal(before, RenderPhaseProfile.RelayElapsedTicks);
+            }
+            Assert.True(RenderPhaseProfile.RelayElapsedTicks > before);
+            var after = RenderPhaseProfile.RelayElapsedTicks;
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.Flush))
+                Thread.SpinWait(10000);
+            Assert.Equal(after, RenderPhaseProfile.RelayElapsedTicks);
+        }
+    }
+
+    [Fact]
     public void ResolveWorkers_ReportEveryScopeOnceAcrossThreads()
     {
         if (!RenderPhaseProfile.Enabled) return;

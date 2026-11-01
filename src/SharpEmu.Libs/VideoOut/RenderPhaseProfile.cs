@@ -409,15 +409,23 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(FormattableString.Invariant($"[PERF][RESOLVE_MS] window_s={seconds:F1} frames={frames} ") + string.Join(" ", parts));
     }
 
+    [ThreadStatic] private static long _relayElapsedTicks;
+    [ThreadStatic] private static int _relayDepth;
+    internal static long RelayElapsedTicks => _relayElapsedTicks;
+
     internal readonly ref struct Scope
     {
         private readonly Phase _previous;
+        private readonly bool _relay;
+        private readonly long _relayStarted;
         private readonly bool _active;
         private readonly FrameTimeline.PhaseScope _timeline;
 
-        internal Scope(Phase previous, FrameTimeline.PhaseScope timeline = default, bool active = true)
+        internal Scope(Phase previous, FrameTimeline.PhaseScope timeline = default, bool active = true, bool relay = false)
         {
             _previous = previous;
+            _relay = relay;
+            _relayStarted = relay && _relayDepth++ == 0 ? Stopwatch.GetTimestamp() : 0;
             _active = active;
             _timeline = timeline;
         }
@@ -425,6 +433,8 @@ internal static class RenderPhaseProfile
         public void Dispose()
         {
             _timeline.Dispose();
+            if (_relay && --_relayDepth == 0)
+                _relayElapsedTicks += Stopwatch.GetTimestamp() - _relayStarted;
             if (!_active)
             {
                 return;
@@ -473,7 +483,7 @@ internal static class RenderPhaseProfile
             _entries[(int)phase]++;
         }
 
-        return new Scope(previous);
+        return new Scope(previous, relay: phase == Phase.QueueRelay);
     }
 
     // Cache calls on other threads must not enter the render-thread counters.

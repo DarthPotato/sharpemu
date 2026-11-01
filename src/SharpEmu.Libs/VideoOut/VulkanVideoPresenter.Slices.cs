@@ -176,11 +176,42 @@ internal static unsafe partial class VulkanVideoPresenter
     private static long _renderAllocated;
     private static readonly ThreadCounter _workerAllocated = new();
 
+    private static readonly ThreadCounter[] _runLengths = NewThreadCounters(7);
+    private static readonly ThreadCounter[] _runKinds = NewThreadCounters(21);
+    private static readonly ThreadCounter[] _workerClaimLatency = NewThreadCounters(7);
+    private static readonly ThreadCounter[] _stealQueueDepth = NewThreadCounters(7);
+    private static readonly ThreadCounter[] _stealRecording = NewThreadCounters(7);
+    private static readonly ThreadCounter[] _tailReady = NewThreadCounters(7);
+    private static readonly ThreadCounter[] _directSubtypeTicks = NewThreadCounters(9);
+    private static readonly ThreadCounter _tailRefillItems = new();
+
+    // Count buckets: 0, 1, 2-3, 4-7, 8-15, 16-31, 32+.
+    private static int SchedulingBucket(int count) => count == 0 ? 0 : count == 1 ? 1 : count < 4 ? 2 : count < 8 ? 3 : count < 16 ? 4 : count < 32 ? 5 : 6;
+
+    private static void NoteDeferredRun(RenderSlice slice)
+    {
+        if (!RenderPhaseProfile.Enabled) return;
+        var count = slice.Items.Count;
+        var bucket = count == 1 ? 0 : count < 4 ? 1 : count < 8 ? 2 : count < 16 ? 3 : count < 32 ? 4 : count < 64 ? 5 : 6;
+        _runLengths[bucket].Increment();
+        foreach (var item in slice.Items)
+            _runKinds[bucket * 3 + (item.IsDraw ? 0 : item.Work is SharpEmu.Libs.Agc.AgcExports.GlobalBarrierWork ? 2 : 1)].Increment();
+    }
+
+    private static string TakeSchedulingReport()
+    {
+        static string Counts(ThreadCounter[] counters) => string.Join(",", counters.Select(c => c.Take()));
+        return "run_lengths=" + Counts(_runLengths) + " run_kind_items=" + Counts(_runKinds) +
+            " worker_claim_us=" + Counts(_workerClaimLatency) + " steal_queue=" + Counts(_stealQueueDepth) +
+            " steal_recording=" + Counts(_stealRecording) + " tail_ready=" + Counts(_tailReady) +
+            " tail_refill_items=" + _tailRefillItems.Take() + " direct_subtype_ms=" +
+            string.Join(",", _directSubtypeTicks.Select(c => Ticks(c).ToString("F3", System.Globalization.CultureInfo.InvariantCulture))) + " ";
+    }
     internal static string TakeSliceReport() =>
         FormattableString.Invariant($"[PERF][SLICES] slices={_slicesRecorded.Take()} segments={_segmentsRecorded.Take()} empty={_segmentsEmpty.Take()} uses_shared={_usesShared.Take()} attachments_kept={RecordingHost.TakeAttachmentsKept()} worker_queries={RecordingHost.TakeWorkerQueries()} native_rechecks_failed={_nativeColorRechecksFailed.Take()} ") +
         FormattableString.Invariant($"tess_bda_leases={_tessBdaLeases.Take()} tess_bda_fallbacks={TakeTessBdaFallbacks()} tess_bda_join_rejects={_tessBdaJoinRejects.Take()} ") +
         FormattableString.Invariant($"gpu_written_applied={_gpuWrittenApplied.Take()} gpu_written_conflicts={_gpuWrittenConflicts.Take()} gpu_written_overlap={_gpuWrittenOverlap.Take()} gpu_written_unrecorded_fallback={_gpuWrittenUnrecorded.Take()} gpu_written_mark_rejects={_gpuWrittenMarkRejects.Take()} ") +
-        TakeRuntimeWorkerReport() + SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
+        TakeSchedulingReport() + TakeRuntimeWorkerReport() + SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
         FormattableString.Invariant($"bda_sweeps={Interlocked.Exchange(ref GuestBufferCache.BdaSweeps, 0)}/skipped:{Interlocked.Exchange(ref GuestBufferCache.BdaSweepsSkipped, 0)} ") +
         FormattableString.Invariant($"serial_cuts={_slicesSerial.Take()} invalid={_slicesInvalid.Take()} frontend_textures_stale={_frontendTexturesStale.Take()} ") +
         FormattableString.Invariant($"slice_items={_sliceItems.Take()} serial_items={_serialItems.Take()} join_wait_ms={_sliceWaitTicks.Take() * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} ") +
@@ -420,6 +451,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private volatile bool _stopping;
         private readonly Thread[] _threads;
         private readonly RecordingHost[] _hosts;
+        private int _recording;
+        public int Recording => Volatile.Read(ref _recording);
+        public int QueueDepth => _queue.Count + _urgent.Count;
 
         public RenderWorkerPool(Presenter presenter, int count)
         {
@@ -465,6 +499,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
+                if (RenderPhaseProfile.Enabled)
+                {
+                    Interlocked.Increment(ref _recording);
+                    var us = (System.Diagnostics.Stopwatch.GetTimestamp() - slice.DispatchedAt) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    _workerClaimLatency[us < 10 ? 0 : us < 25 ? 1 : us < 50 ? 2 : us < 100 ? 3 : us < 250 ? 4 : us < 1000 ? 5 : 6].Increment();
+                }
                 var allocated = RenderPhaseProfile.Enabled ? GC.GetAllocatedBytesForCurrentThread() : 0;
                 var busyStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 try
@@ -483,6 +523,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         _workerAllocated.Add(GC.GetAllocatedBytesForCurrentThread() - allocated);
                     }
 
+                    if (RenderPhaseProfile.Enabled) Interlocked.Decrement(ref _recording);
                     _workerBusyTicks.Add(System.Diagnostics.Stopwatch.GetTimestamp() - busyStarted);
                     slice.Done.Set();
                     slice.Progress.Set();
@@ -551,6 +592,13 @@ internal static unsafe partial class VulkanVideoPresenter
             slice.Generation = _scheduler.BeginSliceCut();
             _bufferCache.RefreshSnapshot();
             _workers!.Dispatch(slice, urgent);
+        }
+
+        internal void NoteStealState()
+        {
+            if (!RenderPhaseProfile.Enabled) return;
+            _stealQueueDepth[SchedulingBucket(_workers!.QueueDepth)].Increment();
+            _stealRecording[SchedulingBucket(_workers.Recording)].Increment();
         }
 
         internal static void NoteStolen(RenderSlice slice)
