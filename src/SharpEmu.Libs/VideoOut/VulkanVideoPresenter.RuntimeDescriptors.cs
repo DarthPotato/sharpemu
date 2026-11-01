@@ -28,8 +28,10 @@ using Silk.NET.Vulkan;
 // with the number of descriptors its shader has registered, not with the number the draw reads.
 internal static unsafe partial class VulkanVideoPresenter
 {
-    private sealed partial class Presenter
+    private sealed partial class RecordingHost
     {
+        private RuntimeDescriptorHeap? _runtimeDescriptorHeap => _presenter._runtimeDescriptorHeap;
+
         private sealed class RuntimeDescriptorSet
         {
             // The entries and the pending misses of the shader.
@@ -44,7 +46,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // The buffers whose miss buffer the tick being recorded has bound; copied out just before it is submitted.
         private readonly List<RuntimeDescriptorBuffers> _runtimeMissBuffersThisTick = [];
 
-        private void RecordRuntimeMissCopies()
+        internal void RecordRuntimeMissCopies()
         {
             // A presenter built without its constructor (the tests do) has no list.
             var pending = _runtimeMissBuffersThisTick;
@@ -88,7 +90,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool IsBackedRuntimeTexture(RuntimeImageEntry<TextureResource> entry)
         {
             if (!ImageRequestBuilders.DescribesHostTexture(entry.Key.AsSpan(1)) ||
-                !ImageRequestBuilders.TryTexture(entry.Key.AsSpan(1), ShapeOf(RuntimeImageResource(entry)), out var resolution))
+                !ImageRequestBuilders.TryTexture(entry.Key.AsSpan(1), ImageRequestBuilders.ShapeOf(RuntimeImageResource(entry)), out var resolution))
             {
                 return false;
             }
@@ -228,7 +230,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var entry = prepared.RuntimeEntries[index];
                 var binding = prepared.RuntimeImages[index];
-                var slot = binding.View.Handle == 0 ? 0 : heap.GetOrCreateImageSlot(binding.View, binding.Layout);
+                var slot = binding.View.Handle == 0 ? 0 : heap.GetOrCreateImageSlot(binding.View, ImageLayout.General);
                 if (slot != entry.Slot)
                 {
                     entry.Slot = slot;
@@ -244,7 +246,7 @@ internal static unsafe partial class VulkanVideoPresenter
             prepared.Descriptors.RuntimeMisses = new BufferView(misses.Handle, 0, misses.Size);
         }
 
-        private void DestroyRuntimeDescriptors()
+        internal void DestroyRuntimeDescriptors()
         {
             foreach (var descriptors in _runtimeDescriptorSets.Values)
             {

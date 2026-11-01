@@ -50,6 +50,8 @@ internal sealed class DeferredSignalHarness : IDisposable, IEndOfPipeSink, IFlip
         typeof(GuestBufferCache).GetField("_registry", PresenterUnderTest.InstanceMembers)!
             .SetValue(cache, new GuestBufferRegistry<GpuBuffer>(GuestBufferCache.CachingPageSize,
                 GuestBufferCache.CachingPageSize));
+        typeof(GuestBufferCache).GetField("_orderedGuestWrites", PresenterUnderTest.InstanceMembers)!
+            .SetValue(cache, new SharpEmu.HLE.GpuMemory.SpanSet());
         return cache;
     }
 

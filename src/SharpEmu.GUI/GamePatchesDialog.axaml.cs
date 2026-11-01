@@ -125,7 +125,8 @@ public partial class GamePatchesDialog : Window
         HintText.Text = Localization.Instance.Get("Library.Patches.Downloading");
         try
         {
-            var count = await GamePatchDownloader.DownloadAsync(titleId, _game.Version, _repository.DirectoryPath, _downloadCancellation.Token);
+            var count = await GamePatchDownloader.DownloadAsync(titleId, _game.Version, _repository.DirectoryPath,
+                _downloadCancellation.Token, compatibilityMode: _game.CompatibilityMode);
             if (_closed) return;
             StatusText.Text = string.Empty;
             if (count > 0)
@@ -254,7 +255,7 @@ public partial class GamePatchesDialog : Window
             Directory.CreateDirectory(_repository.DirectoryPath);
             var start = new ProcessStartInfo
             {
-                FileName = OperatingSystem.IsWindows() ? "explorer.exe" : OperatingSystem.IsMacOS() ? "open" : "xdg-open",
+                FileName = OperatingSystem.IsWindows() ? "explorer.exe" : "xdg-open",
                 UseShellExecute = false,
             };
             start.ArgumentList.Add(_repository.DirectoryPath);

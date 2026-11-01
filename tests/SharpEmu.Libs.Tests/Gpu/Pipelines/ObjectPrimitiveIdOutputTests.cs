@@ -34,7 +34,10 @@ public sealed class ObjectPrimitiveIdOutputTests
             userDataAddress: PipelineTestGuest.MemoryBase + 0x9000);
         guest.RegisterProgram(PixelAddress, PipelineTestGuest.MemoryBase + 0x8100, [0xF8001801, 0x00000000, 0xBF810000],
             userDataAddress: PipelineTestGuest.MemoryBase + 0xA000);
-        var context = new ContextRegisters();
+        var banks = new RegisterBanks(message => new InvalidOperationException(message));
+        var context = banks.Context;
+        banks.Shader.Vertex.ExportAddress = VertexAddress;
+        banks.Shader.Pixel.Address = PixelAddress;
         context.ColorTargets[0] = RegisterWords.Color(InstanceTarget, 64, 64, layout: ChannelLayout.Bits16, type: ChannelType.UInt);
         for (var slot = 1; slot < ContextRegisters.ColorTargetCount; slot++)
         {
@@ -50,8 +53,7 @@ public sealed class ObjectPrimitiveIdOutputTests
         Array.Fill(mapping, ColorComponentMap.Identity);
 
         Assert.True(cache.GetGraphicsPrograms(
-            new VertexStageRegisters { ExportAddress = VertexAddress }, new PixelStageRegisters { Address = PixelAddress },
-            context.ShaderInterface, context, mapping, pixelActive: true, depthBound: true).Available);
+            banks, mapping, pixelActive: true, depthBound: true).Available);
 
         var pixel = Assert.Single(guest.Compiler.Requests, request => request.Stage == ShaderStage.Pixel);
         var slots = pixel.PixelOutputs.Select(output => output.GuestSlot).ToArray();

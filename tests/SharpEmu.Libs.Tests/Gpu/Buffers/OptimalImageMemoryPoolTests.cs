@@ -222,4 +222,20 @@ public sealed class OptimalImageMemoryPoolTests
         Assert.Single(device.Allocations);
         pool.Free(live);
     }
+    [Fact]
+    public void GrowingArraysDoNotRetainEverySupersededDedicatedSize()
+    {
+        var device = new LimitedDevice(512UL << 20);
+        var pool = new OptimalImageMemoryPool(device, 64UL << 20, retainedDedicatedLimit: 128UL << 20);
+        for (ulong layers = 8; layers <= 14; layers++)
+        {
+            var requirements = new MemoryRequirements { Size = layers * (8UL << 20), Alignment = 256, MemoryTypeBits = 1 };
+            Assert.Equal(Result.Success, pool.Allocate(requirements, 0, out var allocation));
+            pool.Free(allocation);
+            Assert.True(pool.AllocatedBytes <= 128UL << 20);
+            Assert.Equal(0UL, pool.PlacedBytes);
+        }
+        pool.ReleaseRetained();
+        Assert.Empty(device.Allocations);
+    }
 }

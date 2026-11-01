@@ -4,7 +4,10 @@
 using System.Collections;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Buffers.Binary;
+using SharpEmu.GnmMode.Shaders;
 using SharpEmu.HLE.Host;
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Images;
@@ -36,7 +39,55 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFixture>
 {
     private const BindingFlags InstanceMembers = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    private static int RefindStaleBindings(bool[] stale, Action<int, bool> findAgain) =>
+        (int)RecordingHostType.GetMethod("RefindStaleBindings", BindingFlags.Static | BindingFlags.NonPublic)!
+            .Invoke(null, [stale.Length, (Func<int, bool>)(index => stale[index]), findAgain])!;
+
+    // Two bindings over the same memory whose images replace each other whenever one is found
+    // again: one of them ends as a null image instead of a fatal.
+    [Fact]
+    public void StaleBindings_ThatKeepReplacingEachOther_EndWithANullImage()
+    {
+        var stale = new[] { true, true };
+        var asNull = new bool[2];
+        var nulled = RefindStaleBindings(stale, (index, toNull) =>
+        {
+            stale[index] = false;
+            asNull[index] |= toNull;
+            if (!toNull)
+            {
+                stale[1 - index] = true;
+            }
+        });
+
+        Assert.Equal(1, nulled);
+        Assert.Equal([true, false], asNull);
+        Assert.Equal([false, false], stale);
+    }
+
+    // A binding replaced once by a later one is found again without a null image.
+    [Fact]
+    public void StaleBindings_ReplacedOnce_AreFoundAgain()
+    {
+        var stale = new[] { true, false };
+        var replaced = false;
+        var nulled = RefindStaleBindings(stale, (index, toNull) =>
+        {
+            Assert.False(toNull);
+            stale[index] = false;
+            if (index == 0 && !replaced)
+            {
+                replaced = true;
+                stale[1] = true;
+            }
+        });
+
+        Assert.Equal(0, nulled);
+        Assert.Equal([false, false], stale);
+    }
     private static readonly Type PresenterType = typeof(VulkanVideoPresenter).GetNestedType("Presenter", BindingFlags.NonPublic)!;
+    private static readonly Type RecordingHostType = typeof(VulkanVideoPresenter).GetNestedType("RecordingHost", BindingFlags.NonPublic)!;
     private static readonly Type ColorAttachmentType = typeof(VulkanVideoPresenter).GetNestedType("ColorAttachment", BindingFlags.NonPublic)!;
     private static readonly Type TextureResourceType = typeof(VulkanVideoPresenter).GetNestedType("TextureResource", BindingFlags.NonPublic)!;
     private static readonly ShaderImageShape Sampled2D = new(false, false, false, false, TextureNumericClass.Float);
@@ -44,6 +95,80 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
     private readonly HeadlessVulkan? _vulkan;
 
     public PresenterImageBindingTests(HeadlessVulkanFixture fixture) => _vulkan = fixture.Vulkan;
+
+    [Fact]
+    public void GnmPreparedTextureRefreshesTheSameBackingAfterCpuAndGpuWrites()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        using var presenter = new PresenterUnderTest(_vulkan!);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var source = harness.MapBacked(0x4000, ReadWrite);
+        var backing = harness.MapBacked(0x4000, ReadWrite);
+        harness.Write(source, Bytes(Enumerable.Repeat(0x3F800000u, 64).ToArray()));
+        var frontend = new GcnShaderFrontend(harness.Memory, size =>
+        {
+            Assert.Equal(0x4000UL, size);
+            return backing;
+        });
+        uint[] raw = [(uint)(source >> 8), (4u << 20) | (7u << 26), 7u | (7u << 14),
+            (9u << 28) | (13u << 20) | 0xFAC, 7u << 13, 0, 0, 0];
+        var words = presenter.Run(() => frontend.NormalizeImageForResolution(raw, ShaderStage.Pixel, 456, "test-prepared", true));
+        var image = new ImageResource { ResourceClass = PlanImageResourceClass.Sampled, NumericClass = ImageNumericClass.Float,
+            Dimension = ImageDimension.Dim2D, Read = true };
+        var info = new ShaderResourceInfo { Images = [image] };
+        var program = new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Pixel,
+            Frontend = frontend,
+            Images = [new ImageResourceInfo(ImageResourceClass.Sampled, false)],
+            Resources = new SpecializedResourceInfo { Info = info },
+            Bindings = BindingLayout.Allocate(info, [], false, false, false),
+        };
+        var stage = new ShaderStageResources(program, new ResourceSnapshot { Images = [words] });
+        CachedImage Bind() => presenter.Run(() =>
+        {
+            presenter.RenderHost.ResetBindings();
+            using var preparation = presenter.RenderHost.BeginPreparation();
+            var bindings = presenter.RenderHost.PrepareBindings(stage);
+            presenter.RenderHost.BindResources(bindings);
+            var textures = (Array)bindings.GetType().GetProperty("Textures")!.GetValue(bindings)!;
+            return (CachedImage)GetFieldValue(textures.GetValue(0)!, "CachedImage");
+        });
+        GuestGpuMemoryHook.Attach(harness.Gpu);
+        try
+        {
+            var first = Bind();
+            presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+            harness.Finish();
+            Assert.Equal(0x3F800000u, BinaryPrimitives.ReadUInt32LittleEndian(harness.ReadImageBytes(first)));
+            harness.Write(source, Bytes(Enumerable.Repeat(0x40000000u, 64).ToArray()));
+            typeof(GcnShaderFrontend).Assembly.GetType("SharpEmu.GnmMode.Shaders.GcnSampledImageDetiler")!
+                .GetMethod("AdvanceEpoch", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, null);
+            var updated = Bind();
+            presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+            harness.Finish();
+            Assert.Equal(first.Description.Data.Address, updated.Description.Data.Address);
+            Assert.Equal(0x40000000u, BinaryPrimitives.ReadUInt32LittleEndian(harness.ReadImageBytes(updated)));
+            presenter.Run(() =>
+            {
+                _ = harness.Cache.ObtainBuffer(source, 256, isWritten: true);
+                harness.Cache.FillBuffer(source, 256, 0x40400000, isGds: false);
+                Assert.True(harness.Cache.HasGpuDirtyBytes(source, 256));
+            });
+            var second = Bind();
+            presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+            harness.Finish();
+            Assert.Equal(first.Description.Data.Address, second.Description.Data.Address);
+            Assert.Equal(0x40400000u, BinaryPrimitives.ReadUInt32LittleEndian(harness.ReadImageBytes(second)));
+        }
+        finally
+        {
+            GuestGpuMemoryHook.Attach(null);
+        }
+        harness.Shutdown();
+    }
 
     [Fact]
     public void SamplerClassesFollowCurrentViewsAndClearPreviousResults()
@@ -72,7 +197,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             images.SetValue(texture, index);
         }
         var classes = new byte[5];
-        var method = PresenterType.GetMethod("ClassifySamplerViews", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var method = RecordingHostType.GetMethod("ClassifySamplerViews", BindingFlags.Static | BindingFlags.NonPublic)!;
         method.Invoke(null, [info, images, classes]);
         Assert.Equal(new byte[] { 1, 3, 0, 0, 0 }, classes);
         TextureResourceType.GetField("Request")!.SetValue(images.GetValue(0),
@@ -156,9 +281,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             Assert.Equal(first, second);
 
             // A removed image is not served again: the binding looks the descriptor up afresh.
-            var generation = harness.Images.LookupGeneration;
             typeof(GuestImageCache).GetMethod("DeleteImage", InstanceMembers)!.Invoke(harness.Images, [first, true]);
-            Assert.NotEqual(generation, harness.Images.LookupGeneration);
             var third = (ResourceSlotIdentifier)GetFieldValue(presenter.InvokeMethod("ResolveImageBinding", resource, words, program, 0)!, "ImageIdentifier");
             Assert.True(harness.Images.TryGetImage(third, out var image) && image.Registered);
             presenter.RenderHost.ResetBindings();
@@ -255,8 +378,8 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             attachment = (CachedImage)GetFieldValue(depth, "Image");
             var range = new ImageSubresourceRange(ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit, 0, 1, 0, layers);
             var initial = new ClearDepthStencilValue(0.25f, 0x37);
-            attachment.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, presenter.Command);
-            _vulkan.Vk.CmdClearDepthStencilImage(presenter.Command, attachment.Backing.Handle, ImageLayout.TransferDstOptimal, &initial, 1, &range);
+            attachment.Transition(AccessFlags.TransferWriteBit, null, presenter.Command);
+            _vulkan.Vk.CmdClearDepthStencilImage(presenter.Command, attachment.Backing.Handle, ImageLayout.General, &initial, 1, &range);
             presenter.RenderHost.ResetBindings();
 
             var storageImage = new ImageResource { ResourceClass = PlanImageResourceClass.Storage, NumericClass = ImageNumericClass.Uint, Dimension = ImageDimension.Dim2DArray, Read = true, Written = true };
@@ -315,10 +438,10 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
                     else
                     {
                         // An abandoned preparation must not publish even if its working image changed.
-                        working.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, presenter.Command);
+                        working.Transition(AccessFlags.TransferWriteBit, null, presenter.Command);
                         var discarded = new ClearColorValue(0x55u, 0u, 0u, 0u);
                         var colorRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, layers);
-                        _vulkan.Vk.CmdClearColorImage(presenter.Command, working.Backing.Handle, ImageLayout.TransferDstOptimal, &discarded, 1, &colorRange);
+                        _vulkan.Vk.CmdClearColorImage(presenter.Command, working.Backing.Handle, ImageLayout.General, &discarded, 1, &colorRange);
                     }
                 }
                 // CPU descriptions are returned immediately; the GPU resources
@@ -419,6 +542,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         var harness = presenter.Harness;
         var region = harness.MapBacked(0x200000, ReadWrite);
         CachedImage attachment = null!, first = null!, again = null!, smaller = null!;
+        ResourceSlotIdentifier stencilOwner = default;
         ulong accountedBefore = 0, accountedAfterFirst = 0, accountedAfterSecond = 0, usedBefore = 0, usedAfter = 0;
         presenter.Run(() =>
         {
@@ -428,6 +552,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             presenter.InvokeMethod("AcquireDepthAttachment", depth, GuestDepthState.Default);
             var identifier = (ResourceSlotIdentifier)GetFieldValue(depth, "ImageIdentifier");
             attachment = (CachedImage)GetFieldValue(depth, "Image");
+            stencilOwner = identifier;
             presenter.RenderHost.ResetBindings();
 
             accountedBefore = attachment.AccountedSize;
@@ -446,6 +571,14 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         Assert.True(accountedAfterFirst > accountedBefore);
         Assert.True(accountedAfterSecond > accountedAfterFirst);
         Assert.Equal(accountedAfterSecond - accountedBefore, usedAfter - usedBefore);
+        // Children must stay counted through deferred destruction, not just while registered.
+        var beforeRetirement = harness.Images.TotalUsedMemory;
+        presenter.Run(() =>
+        {
+            attachment.ClearGpuModified();
+            harness.Images.DeleteImageForTest(stencilOwner);
+        });
+        Assert.Equal(beforeRetirement, harness.Images.TotalUsedMemory);
         Assert.Empty(fatal.Messages);
         harness.Finish();
         harness.Shutdown();
@@ -465,7 +598,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
     {
         // A surface fast-cleared and only sampled has no CB clear word: the register code (0x20)
         // never decodes there, every fixed code decodes to its own colour.
-        var decode = PresenterUnderTest.PresenterType.GetMethod("TryDecodeDccClear", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var decode = typeof(VulkanVideoPresenter).GetNestedType("RecordingHost", BindingFlags.NonPublic)!.GetMethod("TryDecodeDccClear", BindingFlags.NonPublic | BindingFlags.Static)!;
         var arguments = new object?[] { code, false, fixedSupported, default(ClearColorValue), default(ClearColorValue) };
         var decoded = (bool)decode.Invoke(null, arguments)!;
         var value = (ClearColorValue)arguments[4]!;
@@ -519,7 +652,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
     [InlineData(true, false, true, true)]
     [InlineData(true, false, false, true)]
     [InlineData(false, true, true, true)]
-    public void SampledDepth_PreservesAttachmentLayoutOrRejectsOverlappingWrites(bool depthWrite, bool stencilWrite, bool sampleStencil, bool pendingClear = false)
+    public void SampledDepth_ConsumesTheClearOrRejectsOverlappingWrites(bool depthWrite, bool stencilWrite, bool sampleStencil, bool pendingClear = false)
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var presenter = new PresenterUnderTest(_vulkan);
@@ -567,7 +700,6 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
                 presenter.InvokeMethod("RecordDrawTextureTransitions", bindings, depth, state);
                 Assert.False((bool)GetFieldValue(depth, "ClearDepth"));
                 Assert.False((bool)GetFieldValue(depth, "ClearStencil"));
-                Assert.Equal(GetFieldValue(depth, "Layout"), GetFieldValue(binding, "Layout"));
                 harness.Scheduler.Finish();
                 if (pendingClear)
                     clearedImage = image;
@@ -605,10 +737,10 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             var depth = presenter.InvokeMethod("DiscoverDepthTarget", depthTarget)!;
             presenter.InvokeMethod("AcquireDepthAttachment", depth, GuestDepthState.Default);
             depthImage = (CachedImage)GetFieldValue(depth, "Image");
-            depthImage.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, presenter.Command);
+            depthImage.Transition(AccessFlags.TransferWriteBit, null, presenter.Command);
             var range = new ImageSubresourceRange(ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit, 0, 1, 0, 1);
             var initial = new ClearDepthStencilValue(0.75f, 0x37);
-            harness.Vulkan.Vk.CmdClearDepthStencilImage(presenter.Command, depthImage.Backing.Handle, ImageLayout.TransferDstOptimal, &initial, 1, &range);
+            harness.Vulkan.Vk.CmdClearDepthStencilImage(presenter.Command, depthImage.Backing.Handle, ImageLayout.General, &initial, 1, &range);
             depth.GetType().GetField("ClearDepth")!.SetValue(depth, clearDepth);
             depth.GetType().GetField("ClearStencil")!.SetValue(depth, clearStencil);
             depth.GetType().GetField("ClearStencilValue")!.SetValue(depth, (byte)0x6A);
@@ -648,7 +780,6 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         };
         state.ColorAttachments[0] = new RenderingAttachment(
             (ImageView)GetFieldValue(attachment, "View"),
-            (ImageLayout)GetFieldValue(attachment, "Layout"),
             ((ImageRequest)GetFieldValue(attachment, "Request")).View.Format,
             clear.Uint32_0, clear.Uint32_1, clear.Uint32_2, clear.Uint32_3,
             true, false, false, false, false);
@@ -698,6 +829,64 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             _ => Format.R32Sfloat,
         };
         Assert.Equal(expected, request.View.Format);
+        presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NullTexture_ForAVolume_IsAThreeDimensionalView(bool storage)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var texture = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, storage,
+            Descriptor: [], Shape: new ShaderImageShape(true, false, storage, false, TextureNumericClass.Float));
+
+        var resource = presenter.Run(() => AcquireTexture(presenter, texture));
+        Assert.NotEqual(0UL, ((ImageView)GetFieldValue(resource, "View")).Handle);
+        var request = (ImageRequest)GetFieldValue(resource, "Request");
+        Assert.Equal(ImageViewType.Type3D, request.View.Type);
+        presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
+    // A null descriptor of a one-dimensional image binds a one-dimensional placeholder: a 1D view cannot be taken from
+    // a 2D image.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NullTexture_ForAOneDimensionalImage_IsAOneDimensionalView(bool storage)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var texture = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, storage,
+            Descriptor: [], Shape: new ShaderImageShape(false, false, storage, false, TextureNumericClass.Float) with { OneDimensional = true });
+
+        var resource = presenter.Run(() => AcquireTexture(presenter, texture));
+        Assert.NotEqual(0UL, ((ImageView)GetFieldValue(resource, "View")).Handle);
+        var request = (ImageRequest)GetFieldValue(resource, "Request");
+        Assert.Equal(ImageViewType.Type1D, request.View.Type);
+        presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
+        presenter.Harness.Finish();
+        presenter.Harness.Shutdown();
+    }
+
+    // A null descriptor of a multisampled image binds a placeholder with the samples the shader declares.
+    [Fact]
+    public void NullTexture_ForAMultisampledImage_IsMultisampled()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var texture = new GuestDrawTexture(0, 1, 1, 0, 0, [], false, false,
+            Descriptor: [], Shape: new ShaderImageShape(false, false, false, false, TextureNumericClass.Float) with { Multisampled = true });
+
+        var resource = presenter.Run(() => AcquireTexture(presenter, texture));
+        var request = (ImageRequest)GetFieldValue(resource, "Request");
+        var image = (CachedImage)GetFieldValue(resource, "CachedImage");
+        Assert.Equal(request.Description.Samples, image.Backing.Samples);
         presenter.Run(() => presenter.InvokeMethod("ResetImageBindings"));
         presenter.Harness.Finish();
         presenter.Harness.Shutdown();
@@ -762,7 +951,6 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
 
         presenter.Run(() => presenter.InvokeMethod("AcquireColorAttachment", attachment));
         Assert.NotEqual(0UL, ((ImageView)GetFieldValue(attachment, "View")).Handle);
-        Assert.Equal(ImageLayout.ColorAttachmentOptimal, (ImageLayout)GetFieldValue(attachment, "Layout"));
         Assert.False((bool)GetFieldValue(attachment, "Clear"));
         Assert.Same(image, GetFieldValue(attachment, "Image"));
 
@@ -773,7 +961,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
     }
 
     [Fact]
-    public void TargetSampledByItsOwnDraw_UsesTheGeneralLayout()
+    public void TargetSampledByItsOwnDraw_BindsTheTargetAsATexture()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var presenter = new PresenterUnderTest(_vulkan);
@@ -792,14 +980,12 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             Assert.False(image.Binding.ShaderWrite);
 
             presenter.InvokeMethod("AcquireColorAttachment", attachment);
-            Assert.Equal(ImageLayout.General, (ImageLayout)GetFieldValue(attachment, "Layout"));
 
             var bindings = Array.CreateInstance(TextureResourceType, 1);
             bindings.SetValue(resource, 0);
             presenter.InvokeMethod("AcquireTextureViews", bindings, new List<GuestDrawTexture> { texture });
             presenter.InvokeMethod("RecordTextureTransitions", bindings);
             var bound = bindings.GetValue(0)!;
-            Assert.Equal(ImageLayout.General, (ImageLayout)GetFieldValue(bound, "Layout"));
             Assert.NotEqual(0UL, ((ImageView)GetFieldValue(bound, "View")).Handle);
             Assert.NotEqual(0UL, ((Sampler)GetFieldValue(bound, "Sampler")).Handle);
             Assert.True(image.Uses.Texture);
@@ -813,7 +999,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
     }
 
     [Fact]
-    public void DepthTarget_LayoutFollowsTheWrittenAspects()
+    public void DepthTarget_AcquiresAViewWithoutAClear()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var presenter = new PresenterUnderTest(_vulkan);
@@ -832,15 +1018,7 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
 
             presenter.InvokeMethod("AcquireDepthAttachment", depth, new GuestDepthState(true, true, 7));
             Assert.NotEqual(0UL, ((ImageView)GetFieldValue(depth, "View")).Handle);
-            Assert.Equal(ImageLayout.DepthAttachmentStencilReadOnlyOptimal, (ImageLayout)GetFieldValue(depth, "Layout"));
             Assert.False((bool)GetFieldValue(depth, "ClearDepth"));
-
-            presenter.InvokeMethod("AcquireDepthAttachment", depth, new GuestDepthState(true, false, 7));
-            Assert.Equal(ImageLayout.DepthStencilReadOnlyOptimal, (ImageLayout)GetFieldValue(depth, "Layout"));
-
-            var stencilWrite = new GuestDepthState(true, true, 7, StencilTestEnable: true, StencilFront: new GuestStencilFaceState(1, 1, 1, 7, 0xFF, 0xFF, 0, 0));
-            presenter.InvokeMethod("AcquireDepthAttachment", depth, stencilWrite);
-            Assert.Equal(ImageLayout.DepthStencilAttachmentOptimal, (ImageLayout)GetFieldValue(depth, "Layout"));
             presenter.InvokeMethod("ResetImageBindings");
         });
         harness.Finish();
@@ -945,7 +1123,6 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             Assert.NotEqual(bufferBefore, harness.Scheduler.Current.Handle);
             Assert.True((bool)GetFieldValue(presenter.Instance, "_batchOpen"));
             Assert.Equal(harness.Scheduler.Current.Handle, ((CommandBuffer)presenter.InvokeMethod("BeginBatchedGuestCommands")!).Handle);
-            Assert.Equal(ImageLayout.ColorAttachmentOptimal, (ImageLayout)GetFieldValue(attachment, "Layout"));
             presenter.InvokeMethod("ResetImageBindings");
         });
         harness.Finish();
@@ -1019,7 +1196,6 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         {
             var bindings = (Array)presenter.InvokeMethod("ResolveDrawTextures", new List<GuestDrawTexture> { Texture(address) })!;
             Assert.True(harness.Scheduler.Active);
-            Assert.Equal(ImageLayout.ShaderReadOnlyOptimal, (ImageLayout)GetFieldValue(bindings.GetValue(0)!, "Layout"));
         });
         harness.Finish();
         harness.Shutdown();

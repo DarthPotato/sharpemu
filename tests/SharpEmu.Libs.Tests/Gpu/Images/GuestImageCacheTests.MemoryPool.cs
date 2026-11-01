@@ -385,4 +385,12 @@ public sealed partial class GuestImageCacheTests
         harness.Finish();
         harness.Shutdown();
     }
+    [Theory]
+    [InlineData(6UL, 32UL)]
+    [InlineData(10UL, 64UL)]
+    [InlineData(24UL, 128UL)]
+    [InlineData(48UL, 256UL)]
+    public void ImagePoolBlocksScaleToTheHeapInsteadOfStrandingGigabytes(ulong heapGiB, ulong blockMiB) =>
+        Assert.Equal(blockMiB << 20, GuestImageCache.ComputeImagePoolBlockSize(heapGiB << 30));
+
 }

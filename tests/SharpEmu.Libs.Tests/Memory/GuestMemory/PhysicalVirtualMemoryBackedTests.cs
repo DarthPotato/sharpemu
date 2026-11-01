@@ -4,6 +4,7 @@
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.HLE.Host;
 using Xunit;
 using static SharpEmu.Libs.Tests.Memory.HostViews.HostViewTestSupport;
@@ -224,6 +225,42 @@ public sealed unsafe class PhysicalVirtualMemoryBackedTests
     }
 
     [Fact]
+    public void ProtectFindsItsRegionsAmongManyLowerRegions()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var memory = new PhysicalVirtualMemory(hostMemory: PlatformMemory);
+        const ulong size = 0x10000;
+        var regions = new List<ulong>();
+        for (var index = 0; index < 32; index++)
+        {
+            Assert.True(memory.TryAllocateAtOrAbove(0x2_0000_0000 + (ulong)index * size * 2, size, executable: false, size, out var address));
+            regions.Add(address);
+        }
+
+        var target = regions[20];
+        Assert.True(memory.TryProtect(target + 0x1000, 0x1000, GuestPageProtection.Read));
+        Assert.Equal(HostPageProtection.ReadOnly, ProtectionOf(target + 0x1000));
+        Assert.Equal(HostPageProtection.ReadWrite, ProtectionOf(target));
+        Assert.Equal(HostPageProtection.ReadWrite, ProtectionOf(target + 0x2000));
+        Assert.Equal(HostPageProtection.ReadWrite, ProtectionOf(regions[19] + size - 0x1000));
+
+        var last = regions[^1];
+        var start = regions[^2] + size - 0x1000;
+        Assert.True(memory.TryProtect(start, last + 0x2000 - start, GuestPageProtection.Read));
+        Assert.Equal(HostPageProtection.ReadOnly, ProtectionOf(start));
+        Assert.Equal(HostPageProtection.ReadOnly, ProtectionOf(last));
+        Assert.Equal(HostPageProtection.ReadOnly, ProtectionOf(last + 0x1000));
+        Assert.Equal(HostPageProtection.ReadWrite, ProtectionOf(last + 0x2000));
+        Assert.Equal(HostPageProtection.ReadWrite, ProtectionOf(regions[^2]));
+
+        static HostPageProtection ProtectionOf(ulong address)
+        {
+            Assert.True(PlatformMemory.Query(address, out var info));
+            return info.Protection;
+        }
+    }
+
+    [Fact]
     public void ClearKeepsTheSameMemoryObjectUsable()
     {
         if (!Supported) return;
@@ -274,6 +311,63 @@ public sealed unsafe class PhysicalVirtualMemoryBackedTests
         Assert.True(memory.TryCopy(privateRange, first, 0x100));
         Assert.True(memory.TryCopy(second + 0x200, privateRange, 0x100));
         Assert.Equal(((byte*)first)[7], ((byte*)second)[0x207]);
+    }
+
+    // Stands in for the GPU thread: each CPU-write notification is answered by an upload that copies
+    // the pages and leaves them clean before the managed write lands, a race a real upload can win.
+    private sealed class RacingUploadStore(PhysicalVirtualMemory memory, ulong address, int size) : IGuestBufferStore
+    {
+        public byte[] Uploaded { get; } = new byte[size];
+
+        public bool CpuDirty { get; private set; }
+
+        public bool MarkCpuWrite(ulong writeAddress, ulong writeSize)
+        {
+            Assert.True(memory.TryReadBacking(address, Uploaded));
+            CpuDirty = false;
+            return true;
+        }
+
+        public void MarkCpuWriteLanded(ulong writeAddress, ulong writeSize) => CpuDirty = true;
+
+        public bool DownloadToCpu(ulong downloadAddress, ulong downloadSize) => true;
+    }
+
+    [NativePageProtectionFact]
+    public void ManagedWritesMarkTheGpuStoresAgainOnceTheBytesLand()
+    {
+        if (!Supported) return;
+        const GuestPageProtection readWrite = GuestPageProtection.Read | GuestPageProtection.Write;
+        var host = HostViewMemory.Create();
+        using var memory = new PhysicalVirtualMemory(viewHost: host, backingBytes: BackingSize);
+        var source = Hold(memory, host);
+        var destination = Hold(memory, host);
+        Assert.True(memory.TryMapBacked(source, Segment, 0, readWrite, out _));
+        Assert.True(memory.TryMapBacked(destination, Segment, 2 * Segment, readWrite, out _));
+        var copied = Enumerable.Range(1, 0x100).Select(value => (byte)value).ToArray();
+        Assert.True(memory.TryWrite(source, copied));
+        using var gpu = new GuestGpuMemory(memory);
+        gpu.Register(destination, Segment, readWrite);
+        var store = new RacingUploadStore(memory, destination, copied.Length);
+        gpu.AttachStores(store, null);
+        GuestGpuMemoryHook.Attach(gpu);
+        try
+        {
+            // memcpy: the upload took the bytes from before the copy, so the store must hear of it again.
+            Assert.True(memory.TryCopy(destination, source, (ulong)copied.Length));
+            Assert.DoesNotContain(store.Uploaded, value => value != 0);
+            Assert.True(store.CpuDirty, "copy");
+
+            // memset and every other managed write.
+            var written = Enumerable.Repeat((byte)0xA5, copied.Length).ToArray();
+            Assert.True(memory.TryWrite(destination, written));
+            Assert.Equal(copied, store.Uploaded);
+            Assert.True(store.CpuDirty, "write");
+        }
+        finally
+        {
+            GuestGpuMemoryHook.Attach(null);
+        }
     }
 
     [Fact]

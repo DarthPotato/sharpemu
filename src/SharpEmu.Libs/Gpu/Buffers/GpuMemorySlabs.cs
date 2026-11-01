@@ -50,6 +50,18 @@ internal sealed unsafe class GpuMemorySlabs
 
     internal ulong AllocatedBytes { get { lock (_gate) return (ulong)_chunks.Count * ChunkSize; } }
 
+    internal string DescribeOccupancy()
+    {
+        lock (_gate)
+        {
+            ulong placed = 0, quarantined = 0;
+            foreach (var chunk in _chunks.Values)
+                placed += (ulong)chunk.InUse * (MinBlockSize << chunk.SizeClass);
+            foreach (var block in _quarantine) quarantined += block.Size;
+            return $"slab_chunks={_chunks.Count} slab_placed_mb={placed >> 20} slab_quarantined_mb={quarantined >> 20} slab_foreign_readers={Volatile.Read(ref _foreignReaders)}";
+        }
+    }
+
     private void DrainQuarantine()
     {
         if (Volatile.Read(ref _foreignReaders) != 0) return;

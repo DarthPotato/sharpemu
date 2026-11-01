@@ -44,6 +44,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
     private readonly IFileSystem _fileSystem;
     private readonly GuestGpuMemory? _gpuMemory;
     private readonly int _systemLanguage;
+    private readonly string? _executableRelativePath;
     private readonly object _dynamicModuleGate = new();
     private bool _disposed;
 
@@ -66,7 +67,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         CpuExecutionOptions cpuExecutionOptions = default,
         IFileSystem? fileSystem = null,
         GuestGpuMemory? gpuMemory = null,
-        int systemLanguage = 1)
+        int systemLanguage = 1,
+        string? executableRelativePath = null)
     {
         _gpuMemory = gpuMemory;
         _selfLoader = selfLoader ?? throw new ArgumentNullException(nameof(selfLoader));
@@ -80,9 +82,11 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             StrictDynlibResolution = cpuExecutionOptions.StrictDynlibResolution,
             ImportTraceLimit = Math.Max(0, cpuExecutionOptions.ImportTraceLimit),
             DebugHook = cpuExecutionOptions.DebugHook,
+            ProcessArguments = cpuExecutionOptions.ProcessArguments,
         };
         _fileSystem = fileSystem ?? new PhysicalFileSystem();
         _systemLanguage = systemLanguage;
+        _executableRelativePath = executableRelativePath;
     }
 
     public static ISharpEmuRuntime CreateDefault(SharpEmuRuntimeOptions options = default)
@@ -123,7 +127,9 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             options.SystemLanguage ?? 1);
     }
 
-    public SelfImage LoadImage(string ebootPath)
+    public SelfImage LoadImage(string ebootPath) => LoadImage(ebootPath, null);
+
+    private SelfImage LoadImage(string ebootPath, string? applicationRoot)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ebootPath);
 
@@ -145,7 +151,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             stream.ReadExactly(bytes);
         }
 
-        var mountRoot = Path.GetDirectoryName(fullPath);
+        var mountRoot = applicationRoot ?? Path.GetDirectoryName(fullPath);
 
         return _selfLoader.Load(bytes.AsSpan(), _virtualMemory, _moduleManager, _fileSystem, mountRoot, Path.GetFileName(fullPath));
     }
@@ -153,8 +159,22 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
     public OrbisGen2Result Run(string ebootPath)
     {
         using var archiveMount = MountArchive(ref ebootPath);
+        var applicationEbootPath = Path.GetFullPath(ebootPath);
+        using var app0Binding = BindApp0Root(applicationEbootPath);
+        var app0Root = Path.GetDirectoryName(applicationEbootPath) ?? string.Empty;
+        if (_executableRelativePath is { } selected)
+        {
+            var root = KernelMemoryCompatExports.ResolveGuestPath("/app0");
+            app0Root = root;
+            ebootPath = Path.GetFullPath(Path.Combine(root, selected));
+            var boundary = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
+            if (!ebootPath.StartsWith(boundary,
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                throw new InvalidDataException("The selected executable must remain inside the application.");
+            if (!File.Exists(ebootPath) && !App0Archive.Extract(ebootPath))
+                throw new FileNotFoundException("The selected executable was not found.", ebootPath);
+        }
         var normalizedEbootPath = Path.GetFullPath(ebootPath);
-        using var app0Binding = BindApp0Root(normalizedEbootPath);
         Console.Error.WriteLine($"[RUNTIME] Loading: {ebootPath}");
         LastExecutionDiagnostics = null;
         LastExecutionTrace = null;
@@ -166,7 +186,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         NpAuthExports.ResetRuntimeState();
         NpUniversalDataSystemExports.ResetRuntimeState();
         KernelModuleRegistry.Reset();
-        var image = LoadImage(normalizedEbootPath);
+        var image = LoadImage(normalizedEbootPath, _executableRelativePath is null ? null : app0Root);
         VideoOutExports.ConfigureApplicationInfo(image.Title, image.TitleId, image.Version);
         KernelMemoryCompatExports.ConfigureApplicationInfo(image.TitleId);
         SaveDataExports.ConfigureApplicationInfo(image.TitleId);
@@ -185,9 +205,9 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
         HleDataSymbols.ConfigureProcessImageName(processImageName);
         MergeKnownHleDataSymbols(activeRuntimeSymbols);
-        var loadedModuleImages = LoadAdjacentSceModules(ebootPath, image, activeImportStubs, activeRuntimeSymbols);
+        var loadedModuleImages = LoadAdjacentSceModules(_executableRelativePath is null ? ebootPath : Path.Combine(app0Root, "eboot.bin"),
+            image, activeImportStubs, activeRuntimeSymbols);
         RebindImportedDataSymbols(image, loadedModuleImages, activeRuntimeSymbols);
-        var app0Root = Path.GetDirectoryName(normalizedEbootPath) ?? string.Empty;
         KernelModuleRegistry.ConfigureModuleLoader(modulePath => LoadRequestedAppModule(
             modulePath,
             app0Root,

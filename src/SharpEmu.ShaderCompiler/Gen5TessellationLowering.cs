@@ -8,14 +8,17 @@ public static class Gen5TessellationLowering
     public static uint FindFactorBuffer(Resources.ShaderResourcePlan plan, uint hullEntryPc)
     {
         uint? resource = null;
+        var registers = plan.Graph.Program.TessellationRegisters;
+        var factor = registers.HullFactorStoreScalar;
         foreach (var instruction in plan.Graph.Program.Instructions)
         {
             // SGPR4 is the factor-ring byte offset in the merged HS ABI. Do
             // not mistake a later reuse of that register for a factor store.
-            if (instruction.Destinations.Any(d => d.Kind == Gen5OperandKind.ScalarRegister && d.Value == 4))
+            if ((!registers.HullEntrySetsFactor || instruction.Pc >= hullEntryPc) &&
+                instruction.Destinations.Any(d => d.Kind == Gen5OperandKind.ScalarRegister && d.Value == factor))
                 throw new NotSupportedException("The hull shader overwrites its hardware factor-ring offset.");
             if (instruction.Pc < hullEntryPc || !instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
-                instruction.Sources.Count < 3 || instruction.Sources[2] != Gen5Operand.Scalar(4)) continue;
+                instruction.Sources.Count < 3 || instruction.Sources[2] != Gen5Operand.Scalar(factor)) continue;
             if (!instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal) ||
                 instruction.Control is not Gen5BufferMemoryControl { Typed: false } ||
                 plan.Memory.Find(instruction.Pc) is not { Resource: var current } ||

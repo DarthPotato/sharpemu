@@ -48,7 +48,7 @@ public sealed unsafe class NarrowSrgbDeviceTests(HeadlessVulkanFixture fixture) 
         harness.Run(() =>
         {
             var command = new CommandBuffer(harness.Scheduler.Current.Handle);
-            image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
+            image.Transition(AccessFlags.TransferWriteBit, null, command);
             var color = new ClearColorValue(0.5f, 0.5f, 0.5f, 0.5f);
             var range = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1);
             harness.Vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &color, 1, &range);

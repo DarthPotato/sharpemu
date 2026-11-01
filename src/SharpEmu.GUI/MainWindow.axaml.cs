@@ -18,6 +18,8 @@ using Avalonia.Threading;
 using Avalonia.VisualTree;
 using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Runtime;
+using SharpEmu.GnmMode;
+using SharpEmu.GnmMode.Libraries.Np;
 using SharpEmu.HLE.FileSystem;
 using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Pad;
@@ -128,6 +130,11 @@ public partial class MainWindow : Window
         LocalizedChoice.FromKey("On", "Common.On"),
         LocalizedChoice.FromKey("Off", "Common.Off"),
     ];
+    private readonly LocalizedChoice[] _gpuReadbackChoices =
+    [
+        LocalizedChoice.FromKey("Full", "Options.GpuReadbacks.Full"),
+        LocalizedChoice.FromKey("Off", "Common.Off"),
+    ];
     private readonly LocalizedChoice[] _binkPlaybackChoices =
     [
         LocalizedChoice.FromKey("Host", "Options.Env.BinkPlayback.Host"),
@@ -221,7 +228,8 @@ public partial class MainWindow : Window
         string ConsoleType,
         string ConsoleLanguage,
         EffectiveLaunchSettings Settings,
-        SharpEmuRuntimeOptions RuntimeOptions);
+        SharpEmuRuntimeOptions RuntimeOptions,
+        GnmLoadExecRequest? LoadExec = null);
 
     public MainWindow()
     {
@@ -396,6 +404,7 @@ public partial class MainWindow : Window
             }
         };
         HdrModeBox.SelectionChanged += (_, _) => _settings.HdrMode = SelectedComboText(HdrModeBox, "Auto");
+        GpuReadbacksBox.SelectionChanged += (_, _) => _settings.GpuReadbacks = SelectedComboText(GpuReadbacksBox, "Full");
         OverlayEnabledToggle.IsCheckedChanged += (_, _) => _settings.OverlayEnabled = OverlayEnabledToggle.IsChecked == true;
         OverlayModeBox.SelectionChanged += (_, _) => _settings.OverlayMode = SelectedComboText(OverlayModeBox, "TitleBar");
         OverlayCornerBox.SelectionChanged += (_, _) => _settings.OverlayCorner = SelectedComboText(OverlayCornerBox, "TopRight");
@@ -431,6 +440,17 @@ public partial class MainWindow : Window
             SetEnvironmentToggle("SHARPEMU_CRASH_CAPTURE", CrashDumpToggle.IsChecked == true);
         DefaultProfileBox.TextChanged += (_, _) =>
             _settings.DefaultProfile = GuiSettings.NormalizeDefaultProfile(DefaultProfileBox.Text);
+        GnmTrophyKeyBox.TextChanged += (_, _) =>
+        {
+            var valid = GnmTrophyPackageReader.TryNormalizeKey(GnmTrophyKeyBox.Text, out var key);
+            GnmTrophyKeyError.IsVisible = !valid;
+            if (valid)
+            {
+                _settings.GnmTrophyKey = key;
+                GnmTrophyPackageReader.Configure(key);
+                LoadTrophyTestCatalog();
+            }
+        };
         LanguageBox.SelectionChanged += (_, _) => OnLanguageChanged();
 
         GameList.AddHandler(ContextRequestedEvent, OnGameContextRequested, RoutingStrategies.Tunnel);
@@ -685,6 +705,7 @@ public partial class MainWindow : Window
         OptionsLauncherNav,
         OptionsRenderingNav,
         OptionsEnvironmentNav,
+        OptionsGnmModeNav,
         OptionsAboutNav,
     ];
 
@@ -695,6 +716,7 @@ public partial class MainWindow : Window
         OptionsLauncherPanel,
         OptionsRenderingPanel,
         OptionsEnvironmentPanel,
+        OptionsGnmModePanel,
         OptionsAboutPanel,
     ];
 
@@ -1222,6 +1244,7 @@ public partial class MainWindow : Window
             OptionsAboutNav,
             OptionsAboutNavLabel,
             localization.Get("Options.About"));
+        SetOptionsNavigationLabel(OptionsGnmModeNav, OptionsGnmModeNavLabel, "GnmMode");
     }
 
     private static void SetOptionsNavigationLabel(Button button, TextBlock label, string value)
@@ -1332,6 +1355,7 @@ public partial class MainWindow : Window
         RunShutdownStep("Discord Rich Presence", () => _discord?.Dispose());
         RunShutdownStep("console window", () => _consoleWindow?.Close());
         RunShutdownStep("emulator process", () => _emulator?.Dispose());
+        RunShutdownStep("executable session", DisposeLoadExecSession);
         RunShutdownStep("console mirror", () => _consoleMirror?.Dispose());
         RunShutdownStep("pending console output", FlushAllPendingConsoleLines);
         RunShutdownStep("file log", DropFileLog);
@@ -1436,6 +1460,7 @@ public partial class MainWindow : Window
         WindowModeBox.ItemsSource = _windowModeChoices;
         ScalingModeBox.ItemsSource = _scalingModeChoices;
         HdrModeBox.ItemsSource = _hdrModeChoices;
+        GpuReadbacksBox.ItemsSource = _gpuReadbackChoices;
         BinkPlaybackBox.ItemsSource = _binkPlaybackChoices;
         OverlayModeBox.ItemsSource = _overlayModeChoices;
         OverlayCornerBox.ItemsSource = _overlayCornerChoices;
@@ -1450,6 +1475,7 @@ public partial class MainWindow : Window
         RefreshChoices(_windowModeChoices);
         RefreshChoices(_scalingModeChoices);
         RefreshChoices(_hdrModeChoices);
+        RefreshChoices(_gpuReadbackChoices);
         RefreshChoices(_binkPlaybackChoices);
         RefreshChoices(_overlayModeChoices);
         RefreshChoices(_overlayCornerChoices);
@@ -1513,6 +1539,8 @@ public partial class MainWindow : Window
         EnvDisableVkImplicitLayersToggle.IsChecked =
             _settings.EnvironmentToggles.Contains("SHARPEMU_VK_DISABLE_IMPLICITS");
         DefaultProfileBox.Text = _settings.DefaultProfile;
+        GnmTrophyPackageReader.Configure(_settings.GnmTrophyKey);
+        GnmTrophyKeyBox.Text = _settings.GnmTrophyKey;
         WindowModeBox.SelectedIndex = ChoiceIndex(_settings.WindowMode, "Windowed", "Borderless", "Exclusive");
         LoadHostDisplayOptions();
         ScalingModeBox.SelectedIndex = ChoiceIndex(_settings.ScalingMode, "Fit", "Cover", "Stretch", "Integer");
@@ -1521,6 +1549,7 @@ public partial class MainWindow : Window
             SharpEmu.Libs.SharpEmuPaths.CanWriteExecutableDirectory();
         PortableDataToggle.IsChecked = SharpEmu.Libs.SharpEmuPaths.IsPortableMarkerPresent();
         HdrModeBox.SelectedIndex = ChoiceIndex(_settings.HdrMode, "Auto", "On", "Off");
+        GpuReadbacksBox.SelectedIndex = ChoiceIndex(_settings.GpuReadbacks, "Full", "Off");
         OverlayEnabledToggle.IsChecked = _settings.OverlayEnabled;
         OverlayModeBox.SelectedIndex = ChoiceIndex(_settings.OverlayMode, "Full", "Minimal", "TitleBar");
         OverlayCornerBox.SelectedIndex = ChoiceIndex(_settings.OverlayCorner, "TopLeft", "TopRight", "BottomRight", "BottomLeft");
@@ -2188,9 +2217,12 @@ public partial class MainWindow : Window
         }
 
         var (title, titleId, version) = TryReadParamJson(metadataPath);
+        var compatibilityMode = title is null && titleId is null && GnmRuntime.UsesCompatibilityMode(fullPath);
+        if (compatibilityMode)
+            (title, titleId, version) = GnmRuntime.ReadApplicationInfo(fullPath);
         return new GameEntry(
             title ?? GameNameFor(metadataPath), titleId, version, fullPath, size,
-            FindCoverFor(metadataPath), FindBackgroundFor(metadataPath));
+            FindCoverFor(metadataPath), FindBackgroundFor(metadataPath), compatibilityMode);
     }
 
     /// <summary>
@@ -2735,7 +2767,7 @@ public partial class MainWindow : Window
             {
                 Process.Start(new ProcessStartInfo
                 {
-                    FileName = OperatingSystem.IsMacOS() ? "open" : "xdg-open",
+                    FileName = "xdg-open",
                     Arguments = $"\"{directory}\"",
                     UseShellExecute = false,
                 });
@@ -3094,6 +3126,7 @@ public partial class MainWindow : Window
             ? _allGames.FirstOrDefault(game =>
                 game.Path.Equals(ebootPath, GameLibraryPath.Comparison))?.TitleId
             : titleId;
+        resolvedTitleId ??= GnmRuntime.ReadApplicationInfo(ebootPath).TitleId;
         var perGame = PerGameSettings.Load(resolvedTitleId);
         var effective = EffectiveLaunchSettings.Resolve(_settings, perGame);
         var customEnvironment = CustomEnvironmentVariables.Merge(
@@ -3124,6 +3157,9 @@ public partial class MainWindow : Window
         }
 
         _appliedEnvironmentVariables.Clear();
+        var trophyKeyVariable = GnmTrophyPackageReader.KeyEnvironmentName;
+        Environment.SetEnvironmentVariable(trophyKeyVariable, string.IsNullOrEmpty(_settings.GnmTrophyKey) ? null : _settings.GnmTrophyKey);
+        _appliedEnvironmentVariables.Add(trophyKeyVariable);
         foreach (var entry in effective.EnvironmentToggles)
         {
             if (!TryParseEnvironmentEntry(entry, out var name, out var value))
@@ -3181,6 +3217,11 @@ public partial class MainWindow : Window
                 "0.###",
                 System.Globalization.CultureInfo.InvariantCulture));
         _appliedEnvironmentVariables.Add("SHARPEMU_RENDER_SCALE");
+
+        Environment.SetEnvironmentVariable(
+            "SHARPEMU_GPU_READBACKS",
+            string.Equals(effective.GpuReadbacks, "Off", StringComparison.OrdinalIgnoreCase) ? "off" : "full");
+        _appliedEnvironmentVariables.Add("SHARPEMU_GPU_READBACKS");
 
         foreach (var entry in customEnvironment)
         {
@@ -3296,12 +3337,15 @@ public partial class MainWindow : Window
 
     private void OnEmulatorExited(int exitCode)
     {
+        if (TryRestartGnmSession(exitCode))
+            return;
         FlushPendingConsoleLines();
         FlushAllPendingConsoleLines();
         _isRunning = false;
         _isStopping = false;
         _emulator?.Dispose();
         _emulator = null;
+        DisposeLoadExecSession();
         _pendingLaunch = null;
         UpdateEmbeddedConsoleVisibility();
 
@@ -3352,6 +3396,12 @@ public partial class MainWindow : Window
         try
         {
             var arguments = BuildEmulatorArguments(launch);
+            if (GnmRuntime.UsesCompatibilityMode(launch.EbootPath))
+            {
+                _loadExecSession = GnmLoadExecSession.Create(launch.EbootPath, launch.LoadExec);
+                arguments.Add(GnmLoadExecSession.ArgumentPrefix + _loadExecSession.FilePath);
+            }
+            _activeLaunch = launch;
             _emulator = process;
             _pendingLaunch = null;
             _runningEbootPath = launch.EbootPath;

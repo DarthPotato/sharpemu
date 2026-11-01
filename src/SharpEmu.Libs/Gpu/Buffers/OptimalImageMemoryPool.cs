@@ -36,6 +36,7 @@ public sealed unsafe class OptimalImageMemoryPool
 
     private readonly IDeviceMemoryAllocator _device;
     private readonly ulong _blockSize;
+    private readonly ulong _retainedDedicatedLimit;
     private readonly List<Block?> _blocks = [];
     private readonly List<(DeviceMemory Memory, ulong Size, uint MemoryType)> _retainedDedicated = [];
     private ulong _retainedDedicatedBytes;
@@ -43,10 +44,11 @@ public sealed unsafe class OptimalImageMemoryPool
     private long _allocatedBytes;
     private long _placedBytes;
 
-    public OptimalImageMemoryPool(IDeviceMemoryAllocator device, ulong blockSize = BlockSize)
+    public OptimalImageMemoryPool(IDeviceMemoryAllocator device, ulong blockSize = BlockSize, ulong retainedDedicatedLimit = RetainedDedicatedLimit)
     {
         _device = device;
         _blockSize = blockSize;
+        _retainedDedicatedLimit = retainedDedicatedLimit;
     }
 
     // Bytes reserved from the Vulkan driver, including free space left inside
@@ -108,6 +110,12 @@ public sealed unsafe class OptimalImageMemoryPool
                 memory = new OptimalImageMemoryAllocation(handle, 0, requirements.Size, -1, memoryType);
                 Interlocked.Add(ref _allocatedBytes, checked((long)requirements.Size));
                 Interlocked.Add(ref _placedBytes, checked((long)requirements.Size));
+            }
+            else if (dedicated == Result.ErrorOutOfDeviceMemory && TryPlaceInExistingBlock(requirements, memoryType, out memory))
+            {
+                // The device is full but the blocks hold free ranges: a large image fits into one
+                // of them rather than failing while that memory stays idle.
+                return Result.Success;
             }
 
             return dedicated;
@@ -183,7 +191,7 @@ public sealed unsafe class OptimalImageMemoryPool
                 _retainedDedicated.Add((memory.Memory, memory.Size, memory.MemoryType));
                 _retainedDedicatedBytes += memory.Size;
                 // Past the limit the oldest retained allocations go back to the driver.
-                while (_retainedDedicatedBytes > RetainedDedicatedLimit)
+                while (_retainedDedicatedBytes > _retainedDedicatedLimit)
                 {
                     var oldest = _retainedDedicated[0];
                     _retainedDedicated.RemoveAt(0);
@@ -257,6 +265,31 @@ public sealed unsafe class OptimalImageMemoryPool
             }
         }
     }
+
+    private bool TryPlaceInExistingBlock(in MemoryRequirements requirements, uint memoryType, out OptimalImageMemoryAllocation memory)
+    {
+        var alignment = Math.Max(requirements.Alignment, 1UL);
+        lock (_gate)
+        {
+            for (var index = 0; index < _blocks.Count; index++)
+            {
+                if (_blocks[index] is { } block && block.MemoryType == memoryType && TryPlace(block, requirements.Size, alignment, out var offset))
+                {
+                    memory = new OptimalImageMemoryAllocation(block.Memory, offset, requirements.Size, index);
+                    Interlocked.Increment(ref _placements);
+                    Interlocked.Add(ref _placedBytes, checked((long)requirements.Size));
+                    Interlocked.Increment(ref LargePlacementsInBlocks);
+                    return true;
+                }
+            }
+        }
+
+        memory = default;
+        return false;
+    }
+
+    // Large images placed into free block ranges after a dedicated allocation failed.
+    public static long LargePlacementsInBlocks;
 
     private static bool TryPlace(Block block, ulong size, ulong alignment, out ulong offset)
     {

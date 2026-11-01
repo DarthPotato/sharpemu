@@ -3,6 +3,7 @@
 
 using System.Runtime.InteropServices;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Diagnostics;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.HLE.GuestMemory;
 using SharpEmu.Libs.Gpu.Images;
@@ -21,7 +22,7 @@ public readonly record struct DownloadPiece(GpuBuffer Buffer, ulong SourceOffset
 public readonly record struct OverlapSpan(int First, int Last, ulong Begin, ulong End, bool HasStreamLeap);
 
 // Guest memory mirrored in device buffers: upload on use, download on CPU fault, page table for BDA.
-public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
+public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDisposable
 {
     public const int CachingPageBits = 14;
     public const ulong CachingPageSize = 1UL << CachingPageBits;
@@ -46,18 +47,39 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly GuestBufferUploader _uploader;
     private readonly IGuestBackedSpace _backing;
     private readonly ICpuMemory _guest;
-
-    // False for addresses the guest never mapped. A shader that follows a bad pointer there
-    // reads zeros, as on the console; caching that memory only fills VRAM with junk buffers.
-    internal bool IsGuestMemoryMapped(ulong guestAddress, ulong size) => _guest.CanRead(guestAddress, size);
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
     private readonly GpuBuffer _bdaPageTable;
+    private GpuBuffer? _bdaFallback;
+    private GpuBuffer? _bdaFallbackAddress;
     private readonly GuestBufferRegistry<GpuBuffer> _registry = new(CachingPageSize, PageOwnerTable.AddressSpaceSize);
     private readonly AvlSpanSet _gpuModifiedRanges = new();
+    private readonly ReaderWriterLockSlim _gpuModifiedGate = new(LockRecursionPolicy.NoRecursion);
+
+    private SpanSnapshot _gpuModifiedSnapshot = SpanSnapshot.Empty;
+
+    private GpuModifiedWrite WriteGpuModified()
+    {
+        _gpuModifiedGate.EnterWriteLock();
+        return new GpuModifiedWrite(this);
+    }
+
+    private readonly ref struct GpuModifiedWrite(GuestBufferCache cache)
+    {
+        public void Dispose()
+        {
+            Volatile.Write(ref cache._gpuModifiedSnapshot, cache._gpuModifiedRanges.Snapshot());
+            cache._gpuModifiedGate.ExitWriteLock();
+        }
+    }
+    private const int ObtainMemoSlots = 4096;
+    private readonly ObtainMemo[] _obtainMemos = new ObtainMemo[ObtainMemoSlots];
+
+    private readonly record struct ObtainMemo(ulong Address, ulong Size, ResourceSlotIdentifier Identifier, ulong Offset, GpuBuffer? Buffer);
     private long _gpuModifiedVersion;
     private readonly GuestPageTracker _tracker;
     private readonly GpuRingBuffer _staging;
+    private readonly ParallelGuestCopy _sweepCopy;
     private readonly GpuRingBuffer _stream;
     private readonly GpuRingBuffer _download;
     private readonly GpuRingBuffer _deviceRing;
@@ -66,6 +88,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private ShutdownOutcome _outcome;
     private bool _faultProcessPending;
     private bool _disposed;
+
+    public static bool PublishCopySourceImages { get; set; }
 
     public GuestBufferCache(
         GpuDeviceInfo device,
@@ -86,13 +110,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _tracker = new GuestPageTracker(pages);
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
-        _stream = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Stream, 64 * MiB);
+        // Up to three helper threads copy a large sweep's guest bytes with the render thread.
+        _sweepCopy = new ParallelGuestCopy(guest, Math.Clamp(Environment.ProcessorCount - 1, 0, 3));
+        _stream = new GpuRingBuffer(device, scheduler, GpuMemoryPlacement.StreamRing, 64 * MiB, GpuBuffer.AddressedFlags);
         _download = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Download, 64 * MiB);
         _deviceRing = new GpuRingBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 128 * MiB);
         StreamOffsetAlignment = device.MinUniformBufferOffsetAlignment;
+        // SHARPEMU_REBAR=0 keeps guest buffers out of mapped device memory (as under RenderDoc).
+        MappedBudget = RenderDocCapture.IsAvailable || Environment.GetEnvironmentVariable("SHARPEMU_REBAR") == "0"
+            ? 0 : device.MappedDeviceLocalBudget;
+        AllocatesMappedBuffers = device.ResizableBar && MappedBudget != 0;
         _gds.Mapped.Clear();
         _gds.Flush(0, _gds.Size);
-        var nullId = _registry.AllocateBuffer(new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, 16), 0, 16);
+        var nullId = _registry.AllocateBuffer(new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AddressedFlags, 16), 0, 16);
         if (nullId != NullBufferId)
         {
             throw SubmissionScheduler.Fatal("The null buffer occupies the wrong slot.");
@@ -109,9 +139,39 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // Arguments: buffer, offset of the guest address in that buffer, guest address, size.
     internal Action<GpuBuffer, ulong, ulong, ulong>? OverlayGuestPublications { get; set; }
 
+    internal Func<long>? PublicationOrdinal { get; set; }
+
+    public bool DefersGpuWriteProtection
+    {
+        get => _tracker.DefersGpuWriteProtection;
+        set => _tracker.DefersGpuWriteProtection = value;
+    }
+
+    public void ApplyPendingGpuProtections() => _tracker.ApplyPendingGpuProtections();
+
     public GpuBuffer GdsBuffer => _gds;
 
     public GpuBuffer BdaPageTableBuffer => _bdaPageTable;
+
+    // The address of a readable buffer, for programs with shader calls: their branchless device-address loads read there for
+    // an access they do not make and drop the value (DescriptorBindingKind.DeviceAddressFallback). Made at their first use.
+    public GpuBuffer DeviceAddressFallbackBuffer
+    {
+        get
+        {
+            if (_bdaFallbackAddress is null)
+            {
+                _bdaFallback = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
+                    GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, 256);
+                _bdaFallbackAddress = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, 16);
+                var address = _bdaFallback.DeviceAddress;
+                _bdaFallbackAddress.Fill(0, sizeof(uint), (uint)address);
+                _bdaFallbackAddress.Fill(sizeof(uint), sizeof(uint), (uint)(address >> 32));
+            }
+
+            return _bdaFallbackAddress;
+        }
+    }
 
     public GpuBuffer FaultBuffer => _faults.FaultBuffer;
 
@@ -132,7 +192,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public GpuBuffer GetBuffer(ResourceSlotIdentifier bufferIdentifier) => _registry.GetBuffer(bufferIdentifier);
 
-    public GpuRingBuffer GetUtilityBuffer(GpuBufferUsage usage) => usage switch
+    public GpuRingBuffer GetUtilityBuffer(GpuBufferUsage usage) => SubmissionScheduler.ReadOnlyThread ? throw SubmissionScheduler.ReadOnlyViolation("utility buffer") : usage switch
     {
         GpuBufferUsage.Upload => _staging,
         GpuBufferUsage.Stream => _stream,
@@ -150,6 +210,23 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (GuestGpuMemoryHook.Traces(address, size))
             GuestGpuMemoryHook.Trace(address, size, $"buffer-write tracked={tracked} completed={completed}");
         return tracked && completed;
+    }
+
+    // A managed write has landed: pages an upload cleaned between MarkCpuWrite and the write turn
+    // CPU-dirty again. GPU-dirty pages stay as they are, since a download now would replace the new bytes.
+    void IGuestBufferStore.MarkCpuWriteLanded(ulong address, ulong size)
+    {
+        var tracked = _tracker.MarkLandedCpuWrite(address, size);
+        if (GuestGpuMemoryHook.Traces(address, size))
+            GuestGpuMemoryHook.Trace(address, size, $"buffer-write-landed tracked={tracked}");
+    }
+
+    bool IGuestBufferStore.MayHoldGpuData(ulong address, ulong size) => _tracker.MayHaveGpuDirtyPages(address, size);
+
+    bool IGuestBufferStore.NoteEmulatorWrite(ulong address, ulong size)
+    {
+        var tracked = _tracker.MarkCpuWriteKeepingProtection(address, size, out var needsGpuFlush);
+        return needsGpuFlush ? _tracker.MarkLandedCpuWrite(address, size) : tracked;
     }
 
     public bool TrySynchronizeCpuRead(ulong address, ulong size) =>
@@ -211,7 +288,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
-    public ResourceSlotIdentifier FindBuffer(ulong guestAddress, ulong size)
+    public ResourceSlotIdentifier FindBuffer(ulong guestAddress, ulong size, [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferCacheLookup);
         if (guestAddress == 0)
@@ -230,14 +307,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return owner;
         }
 
-        return CreateBuffer(guestAddress, size);
+        return CreateBuffer(guestAddress, size, caller);
     }
 
-    // Resolves every allocation merge the ranges can trigger, so a draw does not capture a buffer
-    // handle that a later acquisition of the same draw replaces.
+    // Resolve merges before tessellation captures physical pointers into these allocations.
     public void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges)
     {
-        // Draws have few ranges; keep that common case off the managed heap.
         Span<GuestSpan> pages = ranges.Length <= 64 ? stackalloc GuestSpan[ranges.Length] : new GuestSpan[ranges.Length];
         for (var index = 0; index < ranges.Length; index++)
         {
@@ -253,24 +328,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             var range = pages[index];
             var next = index + 1;
-            // AcquireVertexBuffers also coalesces touching byte ranges. Reserve their
-            // whole union now, so its later acquisition cannot replace a shader binding.
             while (next < pages.Length && pages[next].Address <= range.End)
             {
                 range = new GuestSpan(range.Address, Math.Max(range.End, pages[next].End) - range.Address);
                 next++;
             }
 
-            // Disjoint read-only geometry can still use the stream ring, without another cache allocation.
             if (next > index + 1 || _registry.HasOverlap(range.Address, range.Size))
                 _ = FindBuffer(range.Address, range.Size);
             index = next;
         }
     }
 
+    private bool _publishingImageContents;
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false,
-        ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool requiresDeviceAddress = false)
+        ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool allowStream = true, bool requiresDeviceAddress = false)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("buffer obtain");
+        }
+
         CompleteGuestPublications?.Invoke(guestAddress, size, isWritten ? PublicationAccess.Write : PublicationAccess.OverlaidRead);
         if (isWritten && ImageClearTrace.Enabled) ImageCache?.TraceGuestWrite("shader-buffer-write", guestAddress, size, shaderHash: traceShaderHash);
         if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-obtain", guestAddress, size, $"written={isWritten} texel={isTexelBuffer} hash=0x{traceShaderHash:X16}", remember: true);
@@ -285,29 +364,64 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("A buffer request requires a command buffer that is recording.");
         }
 
-        if (isWritten && isTexelBuffer)
+        // Publish before choosing the binding buffer: publication can grow its owner.
+        // The publication itself obtains a writable buffer and must not recurse.
+        if (isWritten && !_publishingImageContents && ImageCache is { } images)
         {
-            // Preserving a partial image write can merge this buffer with the image's whole
-            // backing range. Finish that before returning a handle the shader will write.
-            RequireImageCache().InvalidateMemoryFromGpu(guestAddress, size);
+            if (isTexelBuffer) images.PublishImagesUnderFormattedWrite(guestAddress, size);
+            else images.PublishImagesUnderRawWrite(guestAddress, size);
         }
 
-        // A caller that needs a physical address cannot take the transient stream copy.
-        if (!requiresDeviceAddress && !isWritten &&
-            // Only this queue thread sets GPU ownership; a clear lock-free probe
-            // is exact here. Concurrent clears can only require the locked fallback.
-            (!_tracker.MayHaveGpuDirtyPages(guestAddress, size) || !_tracker.HasGpuDirtyPages(guestAddress, size)) &&
-            _tracker.HasCpuDirtyPages(guestAddress, size) &&
-            (size <= CachingPageSize || (!isTexelBuffer && _tracker.IsCpuWriteHotRange(guestAddress, size))))
+        var memoSlot = -1;
+        if (!isWritten)
         {
-            using var streamProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferStreamUpload);
-            if (_stream.TryMap(size, out var streamOffset, StreamOffsetAlignment, allowWait: false) &&
-                _backing.TryReadBacking(guestAddress, _stream.Mapped.Slice((int)streamOffset, (int)size)))
+            memoSlot = (int)(((guestAddress >> 4) ^ (guestAddress >> 17) ^ (size * 0x9E3779B1UL)) & (ObtainMemoSlots - 1));
+            ref var memo = ref _obtainMemos[memoSlot];
+            if (memo.Buffer is { } kept && memo.Address == guestAddress && memo.Size == size &&
+                ReferenceEquals(_registry.TryGetRegisteredBuffer(memo.Identifier), kept) && kept.IsInBounds(guestAddress, size) &&
+                !_tracker.MayHaveCpuDirtyPages(guestAddress, size) &&
+                (!isTexelBuffer || !RequireImageCache().MayHaveImageBytes(guestAddress, size)))
             {
-                _stream.Commit();
-                if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-stream-upload", guestAddress, size, $"offset=0x{streamOffset:X}");
-                OverlayGuestPublications?.Invoke(_stream, streamOffset, guestAddress, size);
-                return (_stream, streamOffset);
+                TouchBuffer(memo.Identifier);
+                OverlayGuestPublications?.Invoke(kept, memo.Offset, guestAddress, size);
+                return (kept, memo.Offset);
+            }
+        }
+
+        if (!isWritten && allowStream && !requiresDeviceAddress &&
+            _tracker.HasCpuDirtyPages(guestAddress, size) &&
+            !(_tracker.MayHaveGpuDirtyPages(guestAddress, size) && _tracker.HasGpuDirtyPages(guestAddress, size)) &&
+            (size <= CachingPageSize || (!isTexelBuffer && _tracker.IsCpuWriteHotRange(guestAddress, size))) &&
+            ImageCache?.QueryRegion(guestAddress, size).GpuImageBytes != true)
+        {
+            if (StreamUseExceeded(guestAddress, size) && !_tracker.IsCpuWriteHotRange(guestAddress, size))
+            {
+                Interlocked.Increment(ref StreamCleaned);
+                _streamCopyShares.Forget(guestAddress, size);
+            }
+            else
+            {
+                using var streamProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferStreamUpload);
+                var tick = _scheduler.CurrentTick;
+                var publications = PublicationOrdinal?.Invoke() ?? 0;
+                if (ObservationGated && _streamCopyShares.TryShare(guestAddress, size, _observation, tick, publications, out var sharedOffset))
+                {
+                    return (_stream, sharedOffset);
+                }
+
+                if (_stream.TryMap(size, out var streamOffset, StreamOffsetAlignment, allowWait: false) &&
+                    _backing.TryReadBacking(guestAddress, _stream.Mapped.Slice((int)streamOffset, (int)size)))
+                {
+                    _stream.Commit();
+                    if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-stream-upload", guestAddress, size, $"offset=0x{streamOffset:X}");
+                    OverlayGuestPublications?.Invoke(_stream, streamOffset, guestAddress, size);
+                    if (ObservationGated)
+                    {
+                        _streamCopyShares.Remember(guestAddress, size, _observation, tick, publications, streamOffset);
+                    }
+
+                    return (_stream, streamOffset);
+                }
             }
         }
 
@@ -340,19 +454,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (Diagnostics.GpuReadTrace.Enabled) Diagnostics.GpuReadTrace.NoteMark(guestAddress, size, device: false);
             if (!_gpuModifiedRanges.Contains(guestAddress, size))
             {
-                _gpuModifiedRanges.Add(guestAddress, size);
-                Interlocked.Increment(ref _gpuModifiedVersion);
+                using (WriteGpuModified())
+                {
+                    _gpuModifiedRanges.Add(guestAddress, size);
+                }
+
+                BumpGpuModifiedVersion();
             }
 
             NoteHotWindowWrite(guestAddress, size);
         }
         else OverlayGuestPublications?.Invoke(buffer, buffer.Offset(guestAddress), guestAddress, size);
 
+        if (memoSlot >= 0)
+        {
+            _obtainMemos[memoSlot] = new ObtainMemo(guestAddress, size, bufferIdentifier, buffer.Offset(guestAddress), buffer);
+        }
+
         return (buffer, buffer.Offset(guestAddress));
     }
 
-    // The image cache publishes an image's GPU-only contents into the buffer over the same bytes
-    // before it drops the image. The buffer then owns them, as after any GPU write.
+    // The image cache publishes an image's GPU-only contents into the buffer over the same bytes before a
+    // partial write drops them; the buffer then owns them, as after any GPU write. Null without backing.
     public GpuBuffer? ObtainBufferForImageWriteBack(ulong guestAddress, ulong size)
     {
         if (!IsValidRange(guestAddress, size) || !_backing.IsBackedRange(guestAddress, size))
@@ -360,7 +483,39 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return null;
         }
 
-        return ObtainBuffer(guestAddress, size, isWritten: true).Buffer;
+        var wasPublishing = _publishingImageContents;
+        _publishingImageContents = true;
+        try { return ObtainBuffer(guestAddress, size, isWritten: true).Buffer; }
+        finally { _publishingImageContents = wasPublishing; }
+    }
+
+    private const int UploadRunBudgetPages = 256;
+    public static long WidenedUploads;
+    public static long WidenedUploadBytes;
+    private const int StreamUseSlots = 1024;
+    internal const int StreamUsesBeforeClean = 3;
+    private readonly (ulong Address, ulong Size, int Uses)[] _streamUses = new (ulong, ulong, int)[StreamUseSlots];
+    private readonly StreamCopyShares _streamCopyShares = new();
+    public static long StreamCleaned;
+    public static long StreamUses;
+
+    private bool StreamUseExceeded(ulong guestAddress, ulong size)
+    {
+        Interlocked.Increment(ref StreamUses);
+        ref var slot = ref _streamUses[(int)(((guestAddress >> 4) ^ (guestAddress >> 17) ^ (size * 0x9E3779B1UL)) & (StreamUseSlots - 1))];
+        if (slot.Address != guestAddress || slot.Size != size)
+        {
+            slot = (guestAddress, size, 1);
+            return false;
+        }
+
+        if (++slot.Uses < StreamUsesBeforeClean)
+        {
+            return false;
+        }
+
+        slot = default;
+        return true;
     }
 
     public (GpuBuffer Buffer, ulong Offset) ObtainBufferForImage(ulong guestAddress, ulong size)
@@ -455,7 +610,6 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("The host DMA write range is invalid.");
         }
 
-        using var writebackScope = GpuWritebackEpoch.BeginWrite(guestAddress, (ulong)data.Length);
         if (!_backing.TryWriteBacking(guestAddress, data))
         {
             throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{data.Length:X16}");
@@ -544,10 +698,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         var (destination, destinationOffset) = ObtainBuffer(guestAddress, size, true, true, bufferIdentifier);
         destination.Fill(destinationOffset, size, value);
+        if (size >= 0x10000 && images.TryClearImageFromBuffer(guestAddress, size, value))
+        {
+            return;
+        }
+
         if ((publishFill || images.OverlapsDccMetadata(guestAddress, size)) && TryWriteFillToBacking(guestAddress, size, value))
         {
-            _gpuModifiedRanges.Remove(guestAddress, size);
-            Interlocked.Increment(ref _gpuModifiedVersion);
+            using (WriteGpuModified())
+            {
+                _gpuModifiedRanges.Remove(guestAddress, size);
+            }
+
+            BumpGpuModifiedVersion();
             ClearGpuDirtyPagesOfRemovedRange(guestAddress, size);
         }
     }
@@ -590,6 +753,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public void FillDccMetadata(ulong guestAddress, ulong size, uint value)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("dcc metadata fill");
+        }
+
         if (guestAddress == 0 || (guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > ulong.MaxValue - guestAddress ||
             HasGpuDirtyBytes(guestAddress, size))
         {
@@ -632,7 +800,6 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             for (ulong offset = 0; offset < size;)
             {
                 var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
-                using var writebackScope = GpuWritebackEpoch.BeginWrite(guestAddress + offset, (ulong)chunk);
                 if (!_backing.TryWriteBacking(guestAddress + offset, bytes[..chunk]))
                 {
                     return false;
@@ -653,6 +820,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("host copy");
+        }
+
         if (destination == 0 || source == 0 || sourceWords == 0 || words == 0 || ((destination | source) & 3) != 0 ||
             words > MaxHostCopyWords || sourceWords > MaxHostCopyWords)
         {
@@ -766,6 +938,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return;
         }
 
+        if (srcMemory && PublishCopySourceImages && srcRegion.GpuImageBytes)
+        {
+            images.PublishImagesUnderRead(srcVaddr, size);
+        }
+
         var command = _scheduler.Current;
         if (dstMemory)
         {
@@ -802,1005 +979,73 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public bool HasGpuDirtyPages(ulong guestAddress, ulong size) => _tracker.HasGpuDirtyPages(guestAddress, size);
 
-    public bool HasGpuDirtyBytes(ulong guestAddress, ulong size) => _gpuModifiedRanges.Overlaps(guestAddress, size);
+    public bool HasGpuDirtyBytes(ulong guestAddress, ulong size)
+    {
+        if (size == 0 || guestAddress + size < guestAddress)
+        {
+            Environment.FailFast($"The address range is invalid: 0x{guestAddress:X16}, 0x{size:X16}.");
+        }
+
+        return Volatile.Read(ref _gpuModifiedSnapshot).Overlaps(guestAddress, size);
+    }
+
+    public bool EverGpuWritten(ulong guestAddress, ulong size) => _tracker.MayHaveGpuWrittenPages(guestAddress, size);
 
     public long GpuModifiedVersion => Volatile.Read(ref _gpuModifiedVersion);
 
+    private static long _gpuVersionBumps;
+
+    private void BumpGpuModifiedVersion()
+    {
+        Interlocked.Increment(ref _gpuModifiedVersion);
+        Interlocked.Increment(ref _gpuVersionBumps);
+    }
+
+    public static long TakeGpuVersionBumps() => Interlocked.Exchange(ref _gpuVersionBumps, 0);
+
+    public long RegistrationSerial => _registry.RegistrationSerial;
+
     public bool HasCpuDirtyPages(ulong guestAddress, ulong size) => _tracker.HasCpuDirtyPages(guestAddress, size);
+
+    public readonly record struct ContentMark(GpuBuffer? Buffer, ulong Tick, long Writes);
+
+    public ContentMark MarkContents(ulong guestAddress, ulong size) =>
+        FindOwner(guestAddress, size) is { } owner ? new(owner, _scheduler.CurrentTick, owner.GpuWrites) : default;
+
+    public bool ContentsChangedSince(ulong guestAddress, ulong size, in ContentMark mark) =>
+        mark.Buffer is not { } buffer || _tracker.HasCpuDirtyPages(guestAddress, size) ||
+        !ReferenceEquals(FindOwner(guestAddress, size), buffer) ||
+        buffer.GpuWrites != mark.Writes && buffer.LastGpuWriteTickIn(buffer.Offset(guestAddress), size) >= mark.Tick;
 
     public void ProcessFaultBuffer() => _faults.ProcessFaultBuffer();
 
-    private static long _reportedDeviceWriteConflicts;
+    // The registered guest memory; a device-address fault inside it brings in the window around the page.
+    internal GuestGpuMemory? GpuMemory { get; set; }
 
-    // Pages that shaders wrote through device addresses (runtime V#s, global and FLAT stores,
-    // atomics) are reported by the GPU after the fact; no binding announced them. They become
-    // GPU-owned like any written binding, so CPU reads download them and a CPU write to the page
-    // flushes them first instead of a later upload overwriting them with stale guest bytes.
-    // A device page reported with the mask of the granules it wrote (DeviceAddressPaging) marks
-    // only those: a tracker page without one was not written, and the bytes of a written tracker
-    // page outside them stay guest-owned, so reading them waits for nothing.
-    internal void NoteDeviceAddressWrites(ulong guestAddress, ulong size, uint granuleMask = uint.MaxValue)
+    // A shader reaches some memory only through pointers it reads on the GPU, such as the nodes of a
+    // ray-tracing structure, and walks it a page at a time. A page the cache does not hold reads zeros and
+    // drops stores until the fault is processed, so a fault brings in the aligned window around the page,
+    // clipped to its registered span. A window the guest cannot read in one piece keeps the single page.
+    internal const ulong DeviceAddressFaultWindow = 2 * MiB;
+
+    internal GuestSpan DeviceAddressFaultRange(ulong pageAddress, ulong pageSize, ulong mappingStart = 0, ulong mappingLength = 0)
     {
-        if (!IsValidRange(guestAddress, size))
+        var mappedWindow = DeviceAddressFaultSpan(pageAddress, pageSize, mappingStart, GpuMemoryPolicyOptions.FaultKernelWindows ? mappingLength : 0);
+        if (GpuMemory is { } memory && memory.TryGetSpan(pageAddress, out var spanStart, out var spanEnd))
         {
-            return;
+            var windowStart = pageAddress & ~(DeviceAddressFaultWindow - 1);
+            var start = Math.Max(windowStart, spanStart);
+            var end = Math.Min(windowStart + DeviceAddressFaultWindow, spanEnd);
+            if (end - start >= mappedWindow.Size && pageAddress + pageSize <= end && _guest.CanRead(start, end - start))
+            {
+                return new GuestSpan(start, end - start);
+            }
         }
 
-        const ulong granuleBytes = 1UL << DeviceAddressPaging.WriteGranuleBits;
-        const int granulesPerTrackerPage = (int)(TrackerLayout.PageBytes / granuleBytes);
-        var byGranule = granuleMask != uint.MaxValue && size == DeviceAddressPaging.PageSize &&
-            (guestAddress & DeviceAddressPaging.PageOffsetMask) == 0;
-        var end = guestAddress + size;
-        var marked = false;
-        for (var page = guestAddress & ~(TrackerLayout.PageBytes - 1); page < end; page += TrackerLayout.PageBytes)
-        {
-            var pageGranules = byGranule
-                ? (granuleMask >> (int)((page - guestAddress) / granuleBytes)) & ((1u << granulesPerTrackerPage) - 1)
-                : (1u << granulesPerTrackerPage) - 1;
-            if (pageGranules == 0)
-            {
-                continue;
-            }
-
-            if (FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
-            {
-                continue;
-            }
-
-            var conflicts = _tracker.MarkGpuWrittenPages(page, TrackerLayout.PageBytes);
-            if (conflicts != 0)
-            {
-                // The CPU dirtied the page before the write was reported: the page stays
-                // CPU-owned and the shader's bytes are merged into guest memory instead: now when the
-                // owner's copy is mapped, otherwise once the render thread has downloaded the page.
-                if (_sharedPages.Contains(page))
-                {
-                    marked |= PullSharedPage(page, owner);
-                }
-                else
-                {
-                    AdoptLateSharedPage(page, owner);
-                }
-
-                continue;
-            }
-
-            // The first CPU access downloads the page; the shadow starts from the downloaded bytes.
-            if (!_sharedPages.Contains(page))
-            {
-                lock (_shaderWrittenPages)
-                {
-                    if (_shaderWrittenPages.Count < MaxShaderWrittenPages)
-                    {
-                        _shaderWrittenPages[page] = owner;
-                        Volatile.Write(ref _shaderWrittenPageCount, _shaderWrittenPages.Count);
-                    }
-                }
-            }
-
-            for (var first = 0; first < granulesPerTrackerPage;)
-            {
-                if ((pageGranules & (1u << first)) == 0)
-                {
-                    first++;
-                    continue;
-                }
-
-                var last = first;
-                while (last + 1 < granulesPerTrackerPage && (pageGranules & (1u << (last + 1))) != 0)
-                {
-                    last++;
-                }
-
-                var runAddress = page + (ulong)first * granuleBytes;
-                var runSize = (ulong)(last - first + 1) * granuleBytes;
-                if (Diagnostics.GpuReadTrace.Enabled) Diagnostics.GpuReadTrace.NoteMark(runAddress, runSize, device: true);
-                if (!_gpuModifiedRanges.Contains(runAddress, runSize))
-                {
-                    _gpuModifiedRanges.Add(runAddress, runSize);
-                    Interlocked.Increment(ref _gpuModifiedVersion);
-                }
-
-                first = last + 1;
-            }
-
-            owner.NoteGpuWrite();
-            marked = true;
-            if (GuestGpuMemoryHook.Traces(page, TrackerLayout.PageBytes))
-                GuestGpuMemoryHook.Trace(page, TrackerLayout.PageBytes, $"device-address-write-reported submission_tick={_scheduler.CurrentTick}");
-        }
-
-        if (marked)
-        {
-            RequireImageCache().InvalidateMemoryCopiesFromGpu(guestAddress, size);
-        }
+        return mappedWindow;
     }
 
-    // Pages shaders write through device addresses; see SharedPageShadows. 64 MiB of shadows at most.
-    private const int SharedPageCapacity = 16384;
-    private readonly SharedPageShadows _sharedPages = new(TrackerLayout.PageBytes, SharedPageCapacity);
-
-    // The GPU pass that writes the changed bytes of shared-page uploads (GpuTiler.MergeChangedBytes),
-    // set by the image cache that owns it; without it, uploads copy each changed run.
-    internal Action<TilerBufferSpan, TilerBufferSpan, uint, uint>? ChangedByteMerge { get; set; }
-
-    // SHARPEMU_SHARED_PAGE_MERGE=0 keeps copying each changed run of a shared page (for comparison).
-    private static readonly bool SharedPageMergeEnabled =
-        Environment.GetEnvironmentVariable("SHARPEMU_SHARED_PAGE_MERGE") != "0";
-    private static long _reportedLateSharedPages;
-    private static long _reportedSharedPageMerges;
-    private static int _reportedSharedPageCapacity;
-
-    // Pages shaders wrote that have no shadow yet, with their owner at the time of the write.
-    private const int MaxShaderWrittenPages = 1 << 20;
-    private readonly Dictionary<ulong, GpuBuffer> _shaderWrittenPages = new();
-    private int _shaderWrittenPageCount;
-
-    // A page the CPU dirtied before its first shader write was reported: shadowed from the GPU copy.
-    private void AdoptLateSharedPage(ulong page, GpuBuffer owner)
-    {
-        var adopted = owner.MappedPointer != null && owner.IsCoherent &&
-            _sharedPages.Adopt(page, owner, new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), (int)TrackerLayout.PageBytes),
-                _scheduler.CurrentTick);
-        if (!adopted && _sharedPages.Count >= SharedPageCapacity && Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
-        {
-            Console.Error.WriteLine("[GPU][WARN] The shared page shadows are full; CPU writes to further shader-written pages may lose shader bytes.");
-        }
-
-        var reported = Interlocked.Increment(ref adopted ? ref _reportedLateSharedPages : ref _reportedDeviceWriteConflicts);
-        if (reported <= 16 || (reported & (reported - 1)) == 0)
-        {
-            Console.Error.WriteLine(adopted
-                ? FormattableString.Invariant(
-                    $"[GPU][SHARED_PAGE] The CPU dirtied page=0x{page:X16} before its first shader write was reported; shader bytes an upload already overwrote are lost once shared={_sharedPages.Count} n={reported}")
-                : FormattableString.Invariant(
-                    $"[GPU][WARN] A device-address write reached a page the CPU dirtied and the page has no shadow: page=0x{page:X16} count={reported}"));
-        }
-    }
-
-    internal GuestPageTracker Tracker => _tracker;
-
-    // Writes downloaded GPU bytes into guest memory; shadows of shared pages take them too.
-    internal bool WriteDownloaded(ulong address, ReadOnlySpan<byte> bytes)
-    {
-        if (Diagnostics.GpuReadTrace.Enabled)
-        {
-            var previous = new byte[bytes.Length];
-            if (_backing.TryReadBacking(address, previous))
-            {
-                Diagnostics.GpuReadTrace.NoteDownload(address, previous, bytes);
-            }
-        }
-
-        if (!_backing.TryWriteBacking(address, bytes))
-        {
-            return false;
-        }
-
-        _sharedPages.NoteDownloaded(address, bytes);
-        AdoptDownloadedPages(address, (ulong)bytes.Length);
-        return true;
-    }
-
-    // Downloaded shader-written pages: the GPU-written bytes are in guest memory now, but guest
-    // memory says nothing about the bytes the owner's GPU copy holds elsewhere on the page. Those may
-    // never have received the guest's CPU writes (they can reach the GPU through the stream ring, or
-    // the owner can be newer than its last full upload), so a shadow taken from guest memory would
-    // filter out every later CPU write that repeats the guest's value and leave the stale GPU bytes.
-    // A readable owner is shadowed from its own GPU copy: the download made the GPU-written bytes
-    // equal in guest memory, and any other difference is a CPU change the next upload must carry.
-    // Otherwise the page has no baseline: its next upload copies all of it into the owner. The
-    // CPU's write to a page marks it dirty, so that upload happens before the GPU reads the CPU's
-    // value; the whole page is guest memory at that point, with the downloaded GPU bytes in it.
-    private void AdoptDownloadedPages(ulong address, ulong size)
-    {
-        if (Volatile.Read(ref _shaderWrittenPageCount) == 0)
-        {
-            return;
-        }
-
-        var end = address + size;
-        for (var page = address & ~(TrackerLayout.PageBytes - 1); page < end; page += TrackerLayout.PageBytes)
-        {
-            GpuBuffer? owner;
-            lock (_shaderWrittenPages)
-            {
-                if (!_shaderWrittenPages.Remove(page, out owner))
-                {
-                    continue;
-                }
-
-                Volatile.Write(ref _shaderWrittenPageCount, _shaderWrittenPages.Count);
-            }
-
-            // A retired owner may be unmapped: only the buffer that holds the page now is read.
-            var adopted = owner!.MappedPointer != null && owner.IsCoherent && ReferenceEquals(FindOwner(page, TrackerLayout.PageBytes), owner)
-                ? _sharedPages.Adopt(page, owner,
-                    new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), (int)TrackerLayout.PageBytes), _scheduler.CurrentTick)
-                : _sharedPages.AdoptUnsynchronized(page);
-            if (!adopted && Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
-            {
-                Console.Error.WriteLine("[GPU][WARN] The shared page shadows are full; CPU writes to further shader-written pages may lose shader bytes.");
-            }
-        }
-    }
-
-    // Merges what shaders wrote on a shared page into guest memory; true when bytes were merged. An
-    // owner the host cannot read through a coherent mapping is merged later, from a download.
-    private bool PullSharedPage(ulong page, GpuBuffer owner)
-    {
-        if (_sharedPages.Count == 0 || !_sharedPages.Contains(page))
-        {
-            return false;
-        }
-
-        if (owner.MappedPointer == null || !owner.IsCoherent)
-        {
-            DeferSharedPageMerge(page);
-            return false;
-        }
-
-        // The GPU may still write the page: merge one snapshot of it.
-        Span<byte> gpu = stackalloc byte[(int)TrackerLayout.PageBytes];
-        new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), gpu.Length).CopyTo(gpu);
-        return MergeSharedPage(page, owner, gpu, _scheduler.Timeline.CompletedTick);
-    }
-
-    // Merges a snapshot of the owner's copy of a shadowed page into guest memory and the shadow: the
-    // bytes shaders changed reach guest memory where the CPU left them alone, and the shadow takes the
-    // GPU state, so a later CPU write is compared with what the GPU holds. completedTick is the newest
-    // tick whose effects the snapshot is known to include. True when bytes were merged.
-    private bool MergeSharedPage(ulong page, GpuBuffer owner, ReadOnlySpan<byte> gpu, ulong completedTick)
-    {
-        var guest = new byte[TrackerLayout.PageBytes];
-        if (!_backing.TryReadBacking(page, guest))
-        {
-            return false;
-        }
-
-        var count = _sharedPages.PullGpuWrites(page, owner, gpu, guest, completedTick, (offset, length) =>
-        {
-            using var writebackScope = GpuWritebackEpoch.BeginWrite(page + (ulong)offset, (ulong)length);
-            if (!_backing.TryWriteBacking(page + (ulong)offset, guest.AsSpan(offset, length)))
-            {
-                throw SubmissionScheduler.Fatal($"Could not merge shader writes into guest memory: addr=0x{page + (ulong)offset:X16} size=0x{length:X}");
-            }
-        });
-        if (count == 0)
-        {
-            return false;
-        }
-
-        var reported = Interlocked.Increment(ref _reportedSharedPageMerges);
-        if (reported <= 16 || (reported & (reported - 1)) == 0)
-        {
-            Console.Error.WriteLine(FormattableString.Invariant(
-                $"[GPU][SHARED_PAGE] merged shader bytes into a CPU-dirty page=0x{page:X16} bytes={count} shared={_sharedPages.Count} merged_bytes={_sharedPages.MergedBytes} skipped_upload_bytes={_sharedPages.SkippedUploadBytes} n={reported}"));
-        }
-
-        if (GuestGpuMemoryHook.Traces(page, TrackerLayout.PageBytes))
-            GuestGpuMemoryHook.Trace(page, TrackerLayout.PageBytes, $"shared-page-merged bytes={count} submission_tick={_scheduler.CurrentTick}");
-        return true;
-    }
-
-    // Shadowed pages whose owner the host cannot read through a coherent mapping (device-local memory
-    // behind a non-coherent or unmapped heap) and that a shader wrote after the CPU dirtied them.
-    // The completion action that reports the write may not wait for the GPU, so it cannot download
-    // the page. Until the render thread does, the shader's bytes exist only in the GPU copy: the
-    // shadow does not know them, so an upload would filter out any CPU write that repeats the
-    // shadow's value and leave the shader's byte in the GPU copy for good.
-    // Each page waits here with the completed tick at the report, which the shader's writes precede.
-    // The render thread reads such a page back on the async readback queue as soon as the tick it
-    // depends on (that report and the last upload staged for the page) is submitted, without waiting:
-    // the page is then in flight until the copy completes and its snapshot is merged. Merging happens
-    // before an upload reads the page (SynchronizeBuffer), before a synchronized CPU read of it, and
-    // opportunistically after each batch submission and fault scan. Only a caller that needs a page
-    // whose copy is still in flight waits, for that copy alone. The owner is looked up again at the
-    // merge: a replaced owner holds the same bytes, and a retired one needs no merge.
-    // A CPU write that repeats the shadow's value between the report and the merge cannot be told
-    // from no write: the shader's byte wins there, as it would on a coherent owner for a write that
-    // came before the report.
-    private readonly Dictionary<ulong, ulong> _pendingSharedMerges = new();
-    private readonly Dictionary<ulong, SharedMergeFlight> _inflightSharedMerges = new();
-    private readonly List<SharedMergeBatch> _sharedMergeBatches = new();
-    private int _pendingSharedMergeCount;
-    private bool _resolvingSharedMerges;
-    private const int SharedMergeChunkPages = 256;
-
-    // One readback ticket covering several pages. SnapshotTick is the newest main-queue tick the copy
-    // waits for: every upload staged up to it and every shader write reported by it is in the bytes.
-    private sealed class SharedMergeBatch(VulkanAsyncReadback.Ticket ticket, ulong[] pages, ulong[] reported, GpuBuffer[] owners, ulong snapshotTick)
-    {
-        public VulkanAsyncReadback.Ticket Ticket { get; } = ticket;
-        public ulong[] Pages { get; } = pages;
-        public ulong[] Reported { get; } = reported;
-        public GpuBuffer[] Owners { get; } = owners;
-        public ulong SnapshotTick { get; } = snapshotTick;
-    }
-
-    private readonly record struct SharedMergeFlight(SharedMergeBatch Batch, int Index);
-
-    private readonly record struct SharedMergeCandidate(ulong Page, ulong Reported, GpuBuffer Owner, ulong WaitTick);
-
-    private enum SharedMergeCounter
-    {
-        Issued,
-        MergedWithoutWait,
-        WaitedInFlight,
-        IssuedAndWaited,
-        ForcedFlush,
-        Reissued,
-        Count,
-    }
-
-    // How a batch is consumed: whether its ticket had already completed, was in flight when a caller
-    // needed it, or was issued by that very call.
-    private enum SharedMergeArrival
-    {
-        Completed,
-        WaitedInFlight,
-        IssuedAndWaited,
-    }
-
-    private readonly long[] _sharedMergeCounts = new long[(int)SharedMergeCounter.Count];
-    private static readonly long[] ReportedSharedMergeCounts = new long[(int)SharedMergeCounter.Count];
-
-    private void CountSharedMerge(SharedMergeCounter counter, int pages)
-    {
-        if (pages == 0)
-        {
-            return;
-        }
-
-        Interlocked.Add(ref _sharedMergeCounts[(int)counter], pages);
-        Interlocked.Add(ref ReportedSharedMergeCounts[(int)counter], pages);
-    }
-
-    // Pages handed to the async readback queue (a page issued again counts again).
-    internal long SharedMergesIssued => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.Issued]);
-
-    // Pages merged from a copy that had already completed when it was looked at.
-    internal long SharedMergesMergedWithoutWait => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.MergedWithoutWait]);
-
-    // Pages merged after blocking on a copy that was issued earlier, which waits for that copy only.
-    internal long SharedMergesWaitedInFlight => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.WaitedInFlight]);
-
-    // Pages issued by the call that needed them at once (their tick was already submitted) and waited for.
-    internal long SharedMergesIssuedAndWaited => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.IssuedAndWaited]);
-
-    // Pages whose tick was still in the open command buffer or that found no free readback slot, so
-    // the call submitted the buffer and waited: the blocking path.
-    internal long SharedMergesForcedFlush => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.ForcedFlush]);
-
-    // Pages whose snapshot was dropped because an upload was staged after it was issued.
-    internal long SharedMergesReissued => Volatile.Read(ref _sharedMergeCounts[(int)SharedMergeCounter.Reissued]);
-
-    // True when every shared page readback in flight has completed, so merging them would not wait.
-    internal bool SharedMergeReadsComplete()
-    {
-        SharedMergeBatch[] batches;
-        lock (_pendingSharedMerges)
-        {
-            batches = _sharedMergeBatches.ToArray();
-        }
-
-        if (AsyncReadback is not { } readback)
-        {
-            return batches.Length == 0;
-        }
-
-        foreach (var batch in batches)
-        {
-            if (!readback.IsComplete(batch.Ticket))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    public static string TakeSharedMergeReport() => FormattableString.Invariant(
-        $"[PERF][SHARED_MERGE] issued={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.Issued], 0)} merged_nowait={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.MergedWithoutWait], 0)} waited_inflight={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.WaitedInFlight], 0)} issued_waited={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.IssuedAndWaited], 0)} forced_flush={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.ForcedFlush], 0)} reissued={Interlocked.Exchange(ref ReportedSharedMergeCounts[(int)SharedMergeCounter.Reissued], 0)}");
-
-    private void DeferSharedPageMerge(ulong page) =>
-        DeferSharedPageMerge(page, _scheduler.Timeline.CompletedTick);
-
-    private void DeferSharedPageMerge(ulong page, ulong reportedTick)
-    {
-        lock (_pendingSharedMerges)
-        {
-            _pendingSharedMerges[page] = _pendingSharedMerges.TryGetValue(page, out var earlier)
-                ? Math.Max(earlier, reportedTick)
-                : reportedTick;
-            PublishSharedMergeCount();
-        }
-    }
-
-    // Everything the resolve entry points still have to look at: pending pages, pages in flight and
-    // the batches that hold a readback slot (a batch whose pages were all superseded still does).
-    // Callers hold the _pendingSharedMerges lock.
-    private void PublishSharedMergeCount() =>
-        Volatile.Write(ref _pendingSharedMergeCount,
-            _pendingSharedMerges.Count + _inflightSharedMerges.Count + _sharedMergeBatches.Count);
-
-    private bool HasPendingSharedMerges(ulong guestAddress, ulong size)
-    {
-        if (Volatile.Read(ref _pendingSharedMergeCount) == 0)
-        {
-            return false;
-        }
-
-        lock (_pendingSharedMerges)
-        {
-            return TakePendingSharedMerges(guestAddress, size, null) || OverlapsSharedPages(_inflightSharedMerges, guestAddress, size);
-        }
-    }
-
-    private static bool OverlapsSharedPages<T>(Dictionary<ulong, T> pages, ulong guestAddress, ulong size)
-    {
-        const ulong pageBytes = TrackerLayout.PageBytes;
-        if (pages.Count == 0)
-        {
-            return false;
-        }
-
-        var first = guestAddress & ~(pageBytes - 1);
-        var end = guestAddress + size;
-        if ((end - first) / pageBytes <= (ulong)pages.Count)
-        {
-            for (var page = first; page < end; page += pageBytes)
-            {
-                if (pages.ContainsKey(page))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        foreach (var page in pages.Keys)
-        {
-            if (page < end && page + pageBytes > guestAddress)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    // The pending pages overlapping the range, removed from the table when a list takes them.
-    private bool TakePendingSharedMerges(ulong guestAddress, ulong size, List<KeyValuePair<ulong, ulong>>? taken)
-    {
-        const ulong pageBytes = TrackerLayout.PageBytes;
-        var first = guestAddress & ~(pageBytes - 1);
-        var end = guestAddress + size;
-        var any = false;
-        if ((end - first) / pageBytes <= (ulong)_pendingSharedMerges.Count)
-        {
-            for (var page = first; page < end; page += pageBytes)
-            {
-                if (!_pendingSharedMerges.TryGetValue(page, out var tick))
-                {
-                    continue;
-                }
-
-                any = true;
-                if (taken is null)
-                {
-                    return true;
-                }
-
-                taken.Add(new KeyValuePair<ulong, ulong>(page, tick));
-            }
-        }
-        else
-        {
-            foreach (var pair in _pendingSharedMerges)
-            {
-                if (pair.Key < end && pair.Key + pageBytes > guestAddress)
-                {
-                    any = true;
-                    if (taken is null)
-                    {
-                        return true;
-                    }
-
-                    taken.Add(pair);
-                }
-            }
-        }
-
-        if (taken is not null)
-        {
-            foreach (var pair in taken)
-            {
-                _pendingSharedMerges.Remove(pair.Key);
-            }
-
-            PublishSharedMergeCount();
-        }
-
-        return any;
-    }
-
-    // Brings the pending and in-flight pages in the range to guest memory and the shadows. With wait,
-    // every one is: a copy already in flight is waited for on its own, and a page not yet read is
-    // read at once (submitting its tick first when that is still being recorded). Without it, the
-    // call merges the copies that have completed, starts a copy for every page whose tick is
-    // submitted, and leaves the rest pending; it never waits for the GPU.
-    // Render thread only, never inside a completion action.
-    internal void ResolvePendingSharedMerges(ulong guestAddress, ulong size, bool wait)
-    {
-        using var sourceScope = ReadbackSourceProfile.Begin("SharedPageMerge");
-        if (Volatile.Read(ref _pendingSharedMergeCount) == 0 || _resolvingSharedMerges ||
-            !_scheduler.Active || _scheduler.InsideTickCallback)
-        {
-            return;
-        }
-
-        _resolvingSharedMerges = true;
-        try
-        {
-            ConsumeSharedMergeBatches(guestAddress, size, wait);
-            List<KeyValuePair<ulong, ulong>> pages;
-            lock (_pendingSharedMerges)
-            {
-                if (_pendingSharedMerges.Count == 0)
-                {
-                    return;
-                }
-
-                pages = new List<KeyValuePair<ulong, ulong>>();
-                if (!TakePendingSharedMerges(guestAddress, size, pages))
-                {
-                    return;
-                }
-            }
-
-            ResolveSharedMerges(pages, wait);
-        }
-        finally
-        {
-            _resolvingSharedMerges = false;
-        }
-    }
-
-    private void ResolveSharedMerges(List<KeyValuePair<ulong, ulong>> pages, bool wait)
-    {
-        var ready = new List<SharedMergeCandidate>(pages.Count);
-        foreach (var (page, reported) in pages)
-        {
-            // A page without a shadow or an owner has nothing to merge into or from.
-            if (!_sharedPages.TryGetStagedTick(page, out var staged) || FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
-            {
-                continue;
-            }
-
-            ready.Add(new SharedMergeCandidate(page, reported, owner, Math.Max(reported, staged)));
-        }
-
-        if (AsyncReadback is not { } readback)
-        {
-            // Without the readback queue the copy goes through the download ring and drains the scheduler.
-            if (wait)
-            {
-                CountSharedMerge(SharedMergeCounter.ForcedFlush, ready.Count);
-                MergeSharedPagesSynchronously(ready);
-            }
-            else
-            {
-                foreach (var candidate in ready)
-                {
-                    DeferSharedPageMerge(candidate.Page, candidate.Reported);
-                }
-            }
-
-            return;
-        }
-
-        var unissued = new List<SharedMergeCandidate>();
-        var issued = IssueSharedMergeReads(ready, unissued);
-        if (!wait)
-        {
-            // The pages whose tick is still being recorded are issued after the next submission.
-            foreach (var candidate in unissued)
-            {
-                DeferSharedPageMerge(candidate.Page, candidate.Reported);
-            }
-
-            return;
-        }
-
-        if (unissued.Count != 0)
-        {
-            // The newest tick the pages wait for is still in the open command buffer: submit it, then read.
-            CountSharedMerge(SharedMergeCounter.ForcedFlush, unissued.Count);
-            _scheduler.Flush(SubmitReason.Readback);
-            var stuck = new List<SharedMergeCandidate>();
-            issued.AddRange(IssueSharedMergeReads(unissued, stuck));
-            // No free readback slot: the synchronous slot or the download ring reads them.
-            MergeSharedPagesSynchronously(stuck);
-        }
-
-        foreach (var batch in issued)
-        {
-            readback.Wait(batch.Ticket);
-            ConsumeSharedMergeBatch(batch, SharedMergeArrival.IssuedAndWaited);
-        }
-    }
-
-    // Starts a copy on the async readback queue for every candidate whose wait tick is already
-    // submitted, in batches that share one ticket; the others go to unissued. Pages leave the pending
-    // table and become in flight. Never waits for the GPU and never submits.
-    private List<SharedMergeBatch> IssueSharedMergeReads(List<SharedMergeCandidate> candidates, List<SharedMergeCandidate> unissued)
-    {
-        using var sourceScope = ReadbackSourceProfile.Begin("SharedPageMerge");
-        const ulong pageBytes = TrackerLayout.PageBytes;
-        var issued = new List<SharedMergeBatch>();
-        var readback = AsyncReadback;
-        var submittedBelow = _scheduler.CurrentTick;
-        var eligible = new List<SharedMergeCandidate>(candidates.Count);
-        foreach (var candidate in candidates)
-        {
-            if (readback is null || candidate.WaitTick >= submittedBelow)
-            {
-                unissued.Add(candidate);
-            }
-            else
-            {
-                eligible.Add(candidate);
-            }
-        }
-
-        for (var first = 0; first < eligible.Count; first += SharedMergeChunkPages)
-        {
-            var count = Math.Min(SharedMergeChunkPages, eligible.Count - first);
-            var pieces = new ReadbackPiece[count];
-            var waitTick = 0UL;
-            for (var index = 0; index < count; index++)
-            {
-                var candidate = eligible[first + index];
-                pieces[index] = new ReadbackPiece(candidate.Owner, candidate.Owner.Offset(candidate.Page), pageBytes);
-                waitTick = Math.Max(waitTick, candidate.WaitTick);
-            }
-
-            VulkanAsyncReadback.Ticket? ticket;
-            using (_device.Slabs.BeginForeignRead())
-            {
-                if (!readback!.TryBegin(pieces, waitTick, out ticket) || ticket is null)
-                {
-                    unissued.AddRange(eligible.GetRange(first, eligible.Count - first));
-                    break;
-                }
-
-                // The owner may be retired while the copy is in flight; its memory stays until the merge.
-                foreach (var piece in pieces)
-                {
-                    piece.Source.RetainForeignRead();
-                }
-            }
-
-            var batchPages = new ulong[count];
-            var batchReported = new ulong[count];
-            var batchOwners = new GpuBuffer[count];
-            for (var index = 0; index < count; index++)
-            {
-                var candidate = eligible[first + index];
-                batchPages[index] = candidate.Page;
-                batchReported[index] = candidate.Reported;
-                batchOwners[index] = candidate.Owner;
-            }
-
-            var batch = new SharedMergeBatch(ticket, batchPages, batchReported, batchOwners, waitTick);
-            lock (_pendingSharedMerges)
-            {
-                for (var index = 0; index < count; index++)
-                {
-                    // A page read again supersedes its earlier copy, which is then only reaped.
-                    _inflightSharedMerges[batchPages[index]] = new SharedMergeFlight(batch, index);
-                }
-
-                _sharedMergeBatches.Add(batch);
-                PublishSharedMergeCount();
-            }
-
-            CountSharedMerge(SharedMergeCounter.Issued, count);
-            issued.Add(batch);
-        }
-
-        return issued;
-    }
-
-    // Merges the batches of in-flight copies that overlap the range and have completed, and, with
-    // wait, waits for the ones a page of the range still depends on. A copy outside the range is
-    // left alone unless the range covers everything.
-    private void ConsumeSharedMergeBatches(ulong guestAddress, ulong size, bool wait)
-    {
-        SharedMergeBatch[] batches;
-        lock (_pendingSharedMerges)
-        {
-            if (_sharedMergeBatches.Count == 0)
-            {
-                return;
-            }
-
-            batches = _sharedMergeBatches.ToArray();
-        }
-
-        if (AsyncReadback is not { } readback)
-        {
-            return;
-        }
-
-        const ulong pageBytes = TrackerLayout.PageBytes;
-        var end = guestAddress + size;
-        foreach (var batch in batches)
-        {
-            var overlaps = false;
-            var needed = false;
-            lock (_pendingSharedMerges)
-            {
-                for (var index = 0; index < batch.Pages.Length; index++)
-                {
-                    var page = batch.Pages[index];
-                    if (page >= end || page + pageBytes <= guestAddress)
-                    {
-                        continue;
-                    }
-
-                    overlaps = true;
-                    if (_inflightSharedMerges.TryGetValue(page, out var flight) && ReferenceEquals(flight.Batch, batch))
-                    {
-                        needed = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!overlaps)
-            {
-                continue;
-            }
-
-            if (readback.IsComplete(batch.Ticket))
-            {
-                ConsumeSharedMergeBatch(batch, SharedMergeArrival.Completed);
-            }
-            else if (wait && needed)
-            {
-                readback.Wait(batch.Ticket);
-                ConsumeSharedMergeBatch(batch, SharedMergeArrival.WaitedInFlight);
-            }
-        }
-    }
-
-    // Merges the snapshot of a completed copy page by page and frees its readback slot. A page that
-    // was read again since is left to its newer copy; one whose shadow got an upload staged after the
-    // copy's tick is not merged from this snapshot and goes back to the pending table.
-    private void ConsumeSharedMergeBatch(SharedMergeBatch batch, SharedMergeArrival arrival)
-    {
-        const int pageBytes = (int)TrackerLayout.PageBytes;
-        var readback = AsyncReadback ?? throw SubmissionScheduler.Fatal("The shared page readback lost its queue.");
-        lock (_pendingSharedMerges)
-        {
-            if (!_sharedMergeBatches.Remove(batch))
-            {
-                return;
-            }
-        }
-
-        var snapshot = new byte[batch.Pages.Length * pageBytes];
-        var copied = 0;
-        try
-        {
-            readback.Complete(batch.Ticket, (index, bytes) =>
-            {
-                bytes.CopyTo(snapshot.AsSpan(index * pageBytes, pageBytes));
-                copied++;
-            });
-        }
-        finally
-        {
-            foreach (var owner in batch.Owners)
-            {
-                owner.ReleaseForeignRead();
-            }
-        }
-
-        var current = new bool[batch.Pages.Length];
-        lock (_pendingSharedMerges)
-        {
-            for (var index = 0; index < batch.Pages.Length; index++)
-            {
-                if (_inflightSharedMerges.TryGetValue(batch.Pages[index], out var flight) && ReferenceEquals(flight.Batch, batch))
-                {
-                    current[index] = true;
-                    _inflightSharedMerges.Remove(batch.Pages[index]);
-                }
-            }
-
-            PublishSharedMergeCount();
-        }
-
-        var merged = 0;
-        var stale = 0;
-        for (var index = 0; index < batch.Pages.Length; index++)
-        {
-            if (!current[index])
-            {
-                continue;
-            }
-
-            var page = batch.Pages[index];
-            if (copied != batch.Pages.Length)
-            {
-                // The queue closed before the copy was read: nothing was snapshotted.
-                DeferSharedPageMerge(page, batch.Reported[index]);
-                continue;
-            }
-
-            // The owner may have been replaced meanwhile; its copy of the page holds the same bytes.
-            if (!_sharedPages.TryGetStagedTick(page, out var staged) || FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
-            {
-                continue;
-            }
-
-            if (staged > batch.SnapshotTick)
-            {
-                // An upload or buffer copy was staged after the copy's tick; the snapshot lacks those bytes.
-                DeferSharedPageMerge(page, batch.Reported[index]);
-                stale++;
-                continue;
-            }
-
-            merged++;
-            var slice = snapshot.AsSpan(index * pageBytes, pageBytes);
-            if (MergeSharedPage(page, owner, slice, batch.SnapshotTick))
-            {
-                RequireImageCache().InvalidateMemoryCopiesFromGpu(page, TrackerLayout.PageBytes);
-            }
-
-            // A later report the snapshot already covers needs no copy of its own.
-            lock (_pendingSharedMerges)
-            {
-                if (_pendingSharedMerges.TryGetValue(page, out var pendingTick) && pendingTick <= batch.SnapshotTick)
-                {
-                    _pendingSharedMerges.Remove(page);
-                    PublishSharedMergeCount();
-                }
-            }
-        }
-
-        CountSharedMerge(arrival switch
-        {
-            SharedMergeArrival.Completed => SharedMergeCounter.MergedWithoutWait,
-            SharedMergeArrival.WaitedInFlight => SharedMergeCounter.WaitedInFlight,
-            _ => SharedMergeCounter.IssuedAndWaited,
-        }, merged);
-        CountSharedMerge(SharedMergeCounter.Reissued, stale);
-    }
-
-    // Reads the candidates through the synchronous readback slot, or the download ring without a
-    // readback queue, and merges them. Submits and waits for the GPU as the read needs.
-    private void MergeSharedPagesSynchronously(List<SharedMergeCandidate> ready)
-    {
-        for (var first = 0; first < ready.Count; first += SharedMergeChunkPages)
-        {
-            var count = Math.Min(SharedMergeChunkPages, ready.Count - first);
-            var snapshot = new byte[count * (int)TrackerLayout.PageBytes];
-            var snapshotTick = ReadOwnerPages(ready, first, count, snapshot);
-            for (var index = 0; index < count; index++)
-            {
-                var (page, reported, _, _) = ready[first + index];
-                // The owner may have been replaced meanwhile; its copy of the page holds the same bytes.
-                if (!_sharedPages.TryGetStagedTick(page, out var staged) || FindOwner(page, TrackerLayout.PageBytes) is not { } owner)
-                {
-                    continue;
-                }
-
-                if (staged > snapshotTick)
-                {
-                    // An upload or buffer copy was staged after the snapshot; it lacks those bytes.
-                    DeferSharedPageMerge(page, reported);
-                    continue;
-                }
-
-                var slice = snapshot.AsSpan(index * (int)TrackerLayout.PageBytes, (int)TrackerLayout.PageBytes);
-                if (MergeSharedPage(page, owner, slice, snapshotTick))
-                {
-                    RequireImageCache().InvalidateMemoryCopiesFromGpu(page, TrackerLayout.PageBytes);
-                }
-            }
-        }
-    }
-
-    // Teardown: waits for the copies in flight and drops them; their pages need no merge any more.
-    private void AbandonSharedMergeBatches()
-    {
-        SharedMergeBatch[] batches;
-        lock (_pendingSharedMerges)
-        {
-            batches = _sharedMergeBatches.ToArray();
-            _sharedMergeBatches.Clear();
-            _inflightSharedMerges.Clear();
-            PublishSharedMergeCount();
-        }
-
-        var readback = AsyncReadback;
-        foreach (var batch in batches)
-        {
-            if (readback is not null)
-            {
-                readback.Wait(batch.Ticket);
-                readback.Complete(batch.Ticket, null);
-            }
-
-            foreach (var owner in batch.Owners)
-            {
-                owner.ReleaseForeignRead();
-            }
-        }
-    }
-
-    // Copies each page out of its owner after the ticks it waits for, and returns the newest tick the
-    // snapshot is known to include. The async readback queue waits for only those ticks; without it the
-    // copy goes through the download ring and the call drains the scheduler.
-    private ulong ReadOwnerPages(List<SharedMergeCandidate> pages, int first, int count, byte[] snapshot)
-    {
-        using var sourceScope = ReadbackSourceProfile.Begin("SharedPageMerge");
-        const ulong pageBytes = TrackerLayout.PageBytes;
-        var waitTick = 0UL;
-        for (var index = 0; index < count; index++)
-        {
-            waitTick = Math.Max(waitTick, pages[first + index].WaitTick);
-        }
-
-        if (AsyncReadback is { } readback)
-        {
-            using var foreignRead = _device.Slabs.BeginForeignRead();
-            // The newest tick may still be recording: the readback queue needs it submitted.
-            if (waitTick >= _scheduler.CurrentTick)
-            {
-                _scheduler.Flush(SubmitReason.Readback);
-            }
-
-            var pieces = new ReadbackPiece[count];
-            for (var index = 0; index < count; index++)
-            {
-                var (page, _, owner, _) = pages[first + index];
-                pieces[index] = new ReadbackPiece(owner, owner.Offset(page), pageBytes);
-            }
-
-            readback.Read(pieces, waitTick, (index, bytes) => bytes.CopyTo(snapshot.AsSpan((int)((uint)index * pageBytes), (int)pageBytes)));
-            return waitTick;
-        }
-
-        var total = (ulong)count * pageBytes;
-        if (!_download.TryMap(total, out var baseOffset, BufferDownloadBatchPlanner.Alignment))
-        {
-            throw SubmissionScheduler.Fatal("The download ring could not map the shared page snapshot.");
-        }
-
-        for (var index = 0; index < count; index++)
-        {
-            var (page, _, owner, _) = pages[first + index];
-            _download.CopyFrom(
-                _scheduler.Current, owner, owner.Offset(page), baseOffset + (ulong)index * pageBytes, pageBytes,
-                AccessFlags.MemoryWriteBit, AccessFlags.None, AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit, AccessFlags.HostReadBit);
-        }
-
-        _download.Commit();
-        _scheduler.ProfileReadback(total);
-        var copyTick = _scheduler.CurrentTick;
-        _scheduler.Finish();
-        _scheduler.WaitForPriorityOperations(copyTick);
-        _download.Invalidate(baseOffset, total);
-        _download.Mapped.Slice((int)baseOffset, (int)total).CopyTo(snapshot);
-        return copyTick;
-    }
+    internal bool CanReadGuest(ulong address, ulong size) => _guest.CanRead(address, size);
 
     // Uploads every mapped range before a BDA draw; the fault pass runs at the next collection.
     // Every device-address program prepares all GPU-mapped memory; visiting each registered
@@ -1809,6 +1054,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // runs once per tick (and when the mapping changes; new buffers register with the current
     // tick), and uploads only visit buffers in blocks the tracker does not know to be clean.
     // Hot pages stay dirty and writable, so every preparation still re-uploads them.
+    private static long _bdaPrepares, _bdaVisits, _bdaSynchronizedBuffers;
+    private SpanSet _orderedGuestWrites = new();
+    private SpanSet _drainingOrderedGuestWrites = new();
+    public void NoteOrderedGuestWrite(ulong address, ulong size)
+    {
+        if (address == 0 || size == 0 || size > ulong.MaxValue - address) return;
+        _orderedGuestWrites.Add(address, size);
+        NoteObservation();
+    }
+
     private ulong _bdaTouchTick = ulong.MaxValue;
     private ulong _bdaTouchMapping;
 
@@ -1831,7 +1086,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A guest buffer the GPU reads through pointers (a per-frame ring, for one) is reached a
     // page at a time, and every first touch reads zeros for that frame. A fault therefore
     // brings in the aligned window around it, clipped to the guest mapping that holds it.
-    internal const ulong DeviceAddressFaultWindow = 2UL << 20;
+
 
     internal static GuestSpan DeviceAddressFaultSpan(ulong pageAddress, ulong pageSize, ulong mappingStart, ulong mappingLength)
     {
@@ -1874,18 +1129,21 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public void PrepareBda(IEnumerable<GuestSpan> mapped)
     {
-        var spans = mapped as IReadOnlyCollection<GuestSpan> ?? mapped.ToList();
+        var spans = mapped as IReadOnlyList<GuestSpan> ?? mapped.ToList();
         PrepareBda(spans, MappingKey(spans));
     }
 
-    public void PrepareBda(IReadOnlyCollection<GuestSpan> mapped, ulong mapping)
+    public void PrepareBda(IReadOnlyList<GuestSpan> spans, ulong mapping)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("bda");
+        }
+
         while (!_orderedGuestWrites.IsEmpty)
         {
-            // An upload can collect scheduler completions that publish more CP stores.
-            // Drain into a separate reusable set so those stores survive this iteration.
             (_orderedGuestWrites, _drainingOrderedGuestWrites) = (_drainingOrderedGuestWrites, _orderedGuestWrites);
-            _drainingOrderedGuestWrites.ForEach(_uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange);
+            _drainingOrderedGuestWrites.ForEach(UploadDirtyBuffersInRange);
             _drainingOrderedGuestWrites.Clear();
         }
         var traceAddress = GuestGpuMemoryHook.TraceAddress;
@@ -1893,8 +1151,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var traceCovered = false;
         if (traceAddress != 0)
         {
-            foreach (var span in mapped)
+            for (var index = 0; index < spans.Count; index++)
             {
+                var span = spans[index];
                 if (traceAddress != 0 && GuestGpuMemoryHook.Traces(span.Address, span.Size))
                     traceCovered = true;
                 SynchronizeBuffersInRange(span.Address, span.Size);
@@ -1902,45 +1161,83 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
         else
         {
-            var spans = mapped;
             if (_retirementPolicy.CurrentTick != _bdaTouchTick || mapping != _bdaTouchMapping)
             {
-                foreach (var span in spans)
-                    TouchBuffersInRange(span.Address, span.Size);
-                PruneUnmappedDeviceAddressFaults();
-                _deviceAddressFaultSpans.ForEach(_touchBuffersInRange ??= TouchBuffersInRange);
+                for (var index = 0; index < spans.Count; index++)
+                    TouchBuffersInRange(spans[index].Address, spans[index].Size);
+                if (GpuMemoryPolicyOptions.FaultRetain)
+                {
+                    PruneUnmappedDeviceAddressFaults();
+                    _deviceAddressFaultSpans.ForEach(TouchBuffersInRange);
+                }
                 _bdaTouchTick = _retirementPolicy.CurrentTick;
                 _bdaTouchMapping = mapping;
             }
 
             var epoch = _tracker.CpuDirtyEpoch;
-            var mappingChanged = mapping != _bdaSweepMapping || _bdaSweepEpoch == -1;
-            var dirty = epoch != _bdaSweepEpoch || mappingChanged;
-            if (dirty && (mappingChanged || !BdaVisibilitySweepEnabled || _bdaVisibilityPending))
+            if (mapping != _bdaSweepMapping || (epoch != _bdaSweepEpoch && (!ObservationGated || _observation != _bdaSweepObservation)))
             {
-                var visit = _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange;
-                var full = true;
-                if (BdaVisibilitySweepEnabled)
-                    full = _tracker.ForEachBdaDirtyRange(spans, mappingChanged, visit);
-                else
-                    foreach (var span in spans)
-                        _tracker.ForEachPossiblyCpuDirtyRange(span.Address, span.Size, visit);
+                if (!_bdaSweepPlanBuilt || mapping != _bdaSweepPlanMapping)
+                {
+                    _bdaSweepPlan = GuestPageTracker.PlanSweep(spans);
+                    _bdaSweepPlanMapping = mapping;
+                    _bdaSweepPlanBuilt = true;
+                }
+
+                // The buffers' copies are collected as the sweep visits them and staged when it ends.
+                _sweepActive = true;
+                _inDeviceAddressSweep = true;
+                try
+                {
+                    // Retained non-GPU mappings share the same observation gate and upload batch.
+                    if (GpuMemoryPolicyOptions.FaultRetain && GpuMemoryPolicyOptions.FaultRetainGated)
+                        _deviceAddressFaultSpans.ForEach(UploadDirtyBuffersInRange);
+                    if (_bdaSweepPlan is { } plan && _bufferPages.Complete)
+                    {
+                        _handleWindows.Sort();
+                        // Only a registered buffer has anything to upload, so only the pages buffers cover are looked at.
+                        _tracker.ForEachCoveredCpuDirtyPageRun(plan, _bufferPages, _uploadClearedRun ??= UploadClearedRun,
+                            _flushClearedRuns ??= FlushClearedRuns);
+                    }
+                    else
+                    {
+                        var upload = _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange;
+                        for (var index = 0; index < spans.Count; index++)
+                            _tracker.ForEachPossiblyCpuDirtyRange(spans[index].Address, spans[index].Size, upload);
+                    }
+                }
+                finally
+                {
+                    DiscardClearedRuns();
+                    _sweepActive = false;
+                    try
+                    {
+                        FlushSweepUploads();
+                    }
+                    finally
+                    {
+                        _inDeviceAddressSweep = false;
+                        if (_uploadBatchDepth == 0)
+                        {
+                            CloseSweepBarrier();
+                        }
+                    }
+                }
+
                 _bdaSweepEpoch = epoch;
                 _bdaSweepMapping = mapping;
-                _bdaVisibilityPending = false;
-                if (VideoOut.RenderPhaseProfile.Enabled)
-                {
-                    Interlocked.Increment(ref _bdaSweeps);
-                    if (full) Interlocked.Increment(ref _bdaFullSweeps);
-                    else Interlocked.Increment(ref _bdaIncrementalSweeps);
-                }
+                _bdaSweepObservation = _observation;
+                Interlocked.Increment(ref BdaSweeps);
             }
-            else if (dirty && VideoOut.RenderPhaseProfile.Enabled)
+            else if (epoch != _bdaSweepEpoch)
             {
-                Interlocked.Increment(ref _bdaSkippedNoBoundary);
+                Interlocked.Increment(ref BdaSweepsSkipped);
             }
         }
 
+        if (GpuMemoryPolicyOptions.FaultRetain && !GpuMemoryPolicyOptions.FaultRetainGated)
+            _deviceAddressFaultSpans.ForEach(SynchronizeBuffersInRange);
+        _handleWindows.Clear();
         if (traceAddress != 0)
             GuestGpuMemoryHook.Trace(traceAddress, 1,
                 $"device-address-preparation covered={traceCovered} registered={IsRegionRegistered(traceAddress, 1)} submission_tick={_scheduler.CurrentTick} collection_tick={_retirementPolicy.CurrentTick}");
@@ -1948,51 +1245,169 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private Action<ulong, ulong>? _uploadDirtyBuffersInRange;
-    private Action<ulong, ulong>? _touchBuffersInRange;
-    internal static bool BdaVisibilitySweepEnabled { get; set; } =
-        Environment.GetEnvironmentVariable("SHARPEMU_BDA_VISIBILITY_SWEEP") != "0";
+    private bool _inDeviceAddressSweep;
+    private int _uploadBatchDepth;
 
-    // Render-thread owned; only a completed sweep consumes the pending boundary.
-    private bool _bdaVisibilityPending;
+    public void BeginUploadBatch() => _uploadBatchDepth++;
 
-    // Render-thread owned. Publication callbacks only enqueue ranges: recording uploads
-    // there could reenter scheduler completion. The next BDA read consumes them in order.
-    private SpanSet _orderedGuestWrites = new();
-    private SpanSet _drainingOrderedGuestWrites = new();
-
-    public void NoteOrderedGuestWrite(ulong address, ulong size)
+    public void EndUploadBatch()
     {
-        if (size == 0) return;
-        var end = address + size;
-        for (var index = _registry.FindFirstOverlappingIndex(address);
-             index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end;
-             index++)
+        if (--_uploadBatchDepth == 0 && !_inDeviceAddressSweep)
         {
-            var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
-            var begin = Math.Max(address, buffer.CpuAddress);
-            var finish = Math.Min(end, buffer.CpuAddress + buffer.Size);
-            if (begin < finish) _orderedGuestWrites.Add(begin, finish - begin);
+            CloseSweepBarrier();
+        }
+    }
+    private CommandBuffer _sweepBarrierBuffer;
+
+    internal long UploadsRecorded { get; private set; }
+
+    internal long UploadBarrierPairs { get; private set; }
+
+    private sealed class SweepTarget
+    {
+        public ulong Begin;
+        public ulong End;
+        public readonly List<(ulong Offset, ulong End)> Ranges = [];
+    }
+
+    private readonly Dictionary<ulong, SweepTarget> _sweepTargets = [];
+    private readonly Stack<SweepTarget> _spareSweepTargets = new();
+
+    private void OpenSweepBarrier(CommandBuffer native, ulong buffer, ReadOnlySpan<BufferCopy> copies)
+    {
+        if (_sweepBarrierBuffer.Handle == native.Handle && !RepeatsSweepWrite(buffer, copies))
+        {
+            NoteSweepWrites(buffer, copies);
+            return;
+        }
+
+        CloseSweepBarrier();
+        NoteSweepWrites(buffer, copies);
+        _sweepBarrierBuffer = native;
+        UploadBarrierPairs++;
+        RecordSweepBarrier(native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit,
+            AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
+            AccessFlags2.TransferWriteBit);
+    }
+
+    private bool RepeatsSweepWrite(ulong buffer, ReadOnlySpan<BufferCopy> copies)
+    {
+        if (!_sweepTargets.TryGetValue(buffer, out var target))
+        {
+            return false;
+        }
+
+        foreach (var copy in copies)
+        {
+            var end = copy.DstOffset + copy.Size;
+            if (end <= target.Begin || copy.DstOffset >= target.End)
+            {
+                continue;
+            }
+
+            foreach (var (offset, rangeEnd) in target.Ranges)
+            {
+                if (copy.DstOffset < rangeEnd && offset < end)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void NoteSweepWrites(ulong buffer, ReadOnlySpan<BufferCopy> copies)
+    {
+        if (!_sweepTargets.TryGetValue(buffer, out var target))
+        {
+            target = _spareSweepTargets.Count != 0 ? _spareSweepTargets.Pop() : new SweepTarget();
+            target.Begin = ulong.MaxValue;
+            target.End = 0;
+            target.Ranges.Clear();
+            _sweepTargets.Add(buffer, target);
+        }
+
+        foreach (var copy in copies)
+        {
+            var end = copy.DstOffset + copy.Size;
+            target.Ranges.Add((copy.DstOffset, end));
+            target.Begin = Math.Min(target.Begin, copy.DstOffset);
+            target.End = Math.Max(target.End, end);
         }
     }
 
-    public void NoteCpuGpuVisibilityBoundary()
+    private void ForgetSweepWrites()
     {
-        _bdaVisibilityPending = true;
-        if (VideoOut.RenderPhaseProfile.Enabled) Interlocked.Increment(ref _bdaBoundaryMarkers);
+        foreach (var target in _sweepTargets.Values)
+        {
+            _spareSweepTargets.Push(target);
+        }
+
+        _sweepTargets.Clear();
     }
 
-    private static long _bdaPrepares, _bdaSweeps, _bdaBoundaryMarkers, _bdaSkippedNoBoundary;
-    private static long _bdaVisits, _bdaSynchronizedBuffers, _bdaFullSweeps, _bdaIncrementalSweeps;
-
-    public static string TakeBdaReport()
+    private void CloseSweepBarrier()
     {
-        var sweeps = Interlocked.Exchange(ref _bdaSweeps, 0);
-        var visits = Interlocked.Exchange(ref _bdaVisits, 0);
-        return FormattableString.Invariant(
-            $"[PERF][BDA_SWEEP] prepares={Interlocked.Exchange(ref _bdaPrepares, 0)} sweeps={sweeps} boundary_markers={Interlocked.Exchange(ref _bdaBoundaryMarkers, 0)} skipped_no_boundary={Interlocked.Exchange(ref _bdaSkippedNoBoundary, 0)} visits={visits} visits_per_sweep={(sweeps == 0 ? 0 : (double)visits / sweeps):F2} synchronized_buffers={Interlocked.Exchange(ref _bdaSynchronizedBuffers, 0)} full_sweeps={Interlocked.Exchange(ref _bdaFullSweeps, 0)} incremental_sweeps={Interlocked.Exchange(ref _bdaIncrementalSweeps, 0)}");
+        ForgetSweepWrites();
+        if (_sweepBarrierBuffer.Handle == 0)
+        {
+            return;
+        }
+
+        _sweepBarrierBuffer = default;
+        var current = _scheduler.Current;
+        current.EndRendering();
+        RecordSweepBarrier(new CommandBuffer(current.Handle), PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit,
+            AccessFlags2.TransferWriteBit, AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit);
     }
+
+    private void RecordSweepBarrier(CommandBuffer native, PipelineStageFlags sourceStages, PipelineStageFlags destinationStages,
+        AccessFlags2 sourceAccess, AccessFlags2 destinationAccess)
+    {
+        var barrier = new MemoryBarrier2
+        {
+            SType = StructureType.MemoryBarrier2,
+            SrcAccessMask = sourceAccess,
+            DstAccessMask = destinationAccess,
+        };
+        VulkanSynchronization.PipelineBarrier(_device.Vk, native, sourceStages, destinationStages, 0, 1, &barrier, 0, null, 0, null, BarrierSource.Sweep);
+    }
+
     private long _bdaSweepEpoch = -1;
+    private long _bdaSweepObservation = -1;
+    private long _observation;
+    public static long BdaSweeps;
+    public static long BdaSweepsSkipped;
+
+    // With the command stream on its own thread, guest CPU writes reach the GPU at the stream's
+    // order points (a submission, a label, a write or copy the stream performs); a device-address
+    // sweep between two of them finds nothing a later item may rely on.
+    public bool ObservationGated { get; set; }
+
+    public void NoteObservation() => _observation++;
     private ulong _bdaSweepMapping;
+    private GuestPageTracker.SweepPlan? _bdaSweepPlan;
+    private readonly PageCoverage _bufferPages = new();
+    private ulong _bdaSweepPlanMapping;
+    private bool _bdaSweepPlanBuilt;
+
+    // The uploads of the running sweep: each one's copies are a run of _sweepCopies, with source
+    // offsets inside its own bytes until they are staged.
+    private readonly record struct SweepUpload(GpuBuffer Buffer, ulong GuestAddress, ulong Size, int FirstCopy, int CopyCount, ulong TotalSize);
+    private readonly List<SweepUpload> _sweepUploads = [];
+    private readonly List<BufferCopy> _sweepCopies = [];
+    private ParallelGuestCopy.Piece[] _sweepPieces = [];
+    private bool _sweepActive;
+
+    // A sweep that stages fewer bytes copies them on the render thread alone.
+    internal const ulong ParallelSweepCopyBytes = 256 * 1024;
+
+    // Guest bytes per piece a copying thread takes.
+    private const ulong SweepPieceBytes = 64 * 1024;
+
+    // A sweep that stages more bytes stages each buffer on its own; tests lower it.
+    internal ulong SweepStagingLimit { get; set; } = ulong.MaxValue;
 
     private void TouchBuffersInRange(ulong guestAddress, ulong size)
     {
@@ -2021,8 +1436,171 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
+    // A visited buffer's copies wait for the end of the sweep. The tracker has protected its pages
+    // by then, so the bytes staged later are as new as the visit or newer, and a later CPU write
+    // marks the pages dirty again.
+    private void DeferSweepUpload(GpuBuffer buffer, ulong guestAddress, ulong size, List<BufferCopy> copies, ulong totalSize)
+    {
+        if (copies.Count != 0)
+        {
+            _sweepUploads.Add(new SweepUpload(buffer, guestAddress, size, _sweepCopies.Count, copies.Count, totalSize));
+            _sweepCopies.AddRange(copies);
+        }
+    }
+
+    // A sweep visits many buffers with a few dirty pages each: they share one staging reservation and
+    // one copy of their guest bytes, and each buffer's copy is recorded as SynchronizeBuffer records
+    // it, after all the bytes are staged.
+    private void FlushSweepUploads()
+    {
+        if (_sweepUploads.Count == 0)
+        {
+            return;
+        }
+
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySyncUpload);
+        try
+        {
+            var copies = CollectionsMarshal.AsSpan(_sweepCopies);
+            ulong total = 0;
+            foreach (var upload in _sweepUploads)
+                total += upload.TotalSize;
+
+            if (total <= SweepStagingLimit && _staging.TryMap(total, out var baseOffset, 4) && StageSweep(copies, baseOffset, total))
+            {
+                _staging.Commit();
+                var uploadBase = baseOffset;
+                foreach (var upload in _sweepUploads)
+                {
+                    var regions = copies.Slice(upload.FirstCopy, upload.CopyCount);
+                    foreach (ref var copy in regions)
+                        copy.SrcOffset += uploadBase;
+                    RecordUpload(upload.Buffer, _staging, regions, upload.GuestAddress, upload.Size, upload.TotalSize);
+                    uploadBase += upload.TotalSize;
+                }
+
+                return;
+            }
+
+            // More than the ring holds at once, or a read failed: each buffer stages on its own, as
+            // outside a sweep, which also reports a failed read.
+            foreach (var upload in _sweepUploads)
+            {
+                var regions = copies.Slice(upload.FirstCopy, upload.CopyCount);
+                if (_uploader.PrepareSource(upload.Buffer.CpuAddress, regions, upload.TotalSize, upload.GuestAddress, upload.Size) is { } source)
+                    RecordUpload(upload.Buffer, source, regions, upload.GuestAddress, upload.Size, upload.TotalSize);
+            }
+        }
+        finally
+        {
+            _sweepUploads.Clear();
+            _sweepCopies.Clear();
+        }
+    }
+
+    // Copies the sweep's guest bytes into the reservation at baseOffset, each buffer's after the last;
+    // helper threads take part once the sweep stages ParallelSweepCopyBytes. False when a read failed.
+    private bool StageSweep(Span<BufferCopy> copies, ulong baseOffset, ulong total)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferStagingUpload);
+        var pieces = 0;
+        foreach (var copy in copies)
+            pieces += (int)((copy.Size + SweepPieceBytes - 1) / SweepPieceBytes);
+        if (_sweepPieces.Length < pieces)
+            _sweepPieces = new ParallelGuestCopy.Piece[Math.Max(pieces, _sweepPieces.Length * 2)];
+
+        var count = 0;
+        var uploadBase = baseOffset;
+        fixed (byte* mapped = _staging.Mapped)
+        {
+            foreach (var upload in _sweepUploads)
+            {
+                foreach (var copy in copies.Slice(upload.FirstCopy, upload.CopyCount))
+                {
+                    var guestAddress = upload.Buffer.CpuAddress + copy.DstOffset;
+                    var staged = mapped + uploadBase + copy.SrcOffset;
+                    for (ulong done = 0; done < copy.Size; done += SweepPieceBytes)
+                        _sweepPieces[count++] = new ParallelGuestCopy.Piece(guestAddress + done, (nint)(staged + done),
+                            (int)Math.Min(SweepPieceBytes, copy.Size - done));
+                }
+
+                uploadBase += upload.TotalSize;
+            }
+
+            return _sweepCopy.Run(_sweepPieces, count, parallel: total >= ParallelSweepCopyBytes);
+        }
+    }
+
+    private Action<ulong, ulong>? _uploadClearedRun;
+    private Action? _flushClearedRuns;
+    private readonly UploadCollector _clearedRuns = new();
+    private GpuBuffer? _clearedRunsBuffer;
+    private long _clearedRunsStarted;
+
+    private void UploadClearedRun(ulong runAddress, ulong runSize)
+    {
+        CountSweptPages(runAddress, runSize);
+        var runEnd = runAddress + runSize;
+        var index = _registry.FindFirstOverlappingIndex(runAddress);
+        for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < runEnd; index++)
+        {
+            var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
+            var start = Math.Max(buffer.CpuAddress, runAddress);
+            var finish = Math.Min(buffer.CpuAddress + buffer.Size, runEnd);
+            if (start >= finish)
+            {
+                continue;
+            }
+
+            if (!ReferenceEquals(buffer, _clearedRunsBuffer))
+            {
+                FlushClearedRuns();
+                _clearedRunsBuffer = buffer;
+                _clearedRunsStarted = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                _clearedRuns.Begin(this, buffer, start, finish - start, defer: _sweepActive);
+            }
+
+            _clearedRuns.Extend(finish);
+            _clearedRuns.Collect(start, finish - start);
+        }
+    }
+
+    private void FlushClearedRuns()
+    {
+        if (_clearedRunsBuffer is not { } buffer)
+        {
+            return;
+        }
+
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySyncUpload);
+        try
+        {
+            var trackingStarted = RenderPhaseProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            _clearedRuns.Upload();
+            RecordCollectedUpload(_clearedRuns, buffer, _clearedRuns.GuestAddress, _clearedRuns.Size, trackingStarted, _clearedRunsStarted);
+        }
+        finally
+        {
+            DiscardClearedRuns();
+        }
+    }
+
+    private void DiscardClearedRuns()
+    {
+        if (_clearedRunsBuffer is not null)
+        {
+            _clearedRunsBuffer = null;
+            _clearedRuns.End();
+        }
+    }
+
     public void SynchronizeBuffersInRange(ulong guestAddress, ulong size)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("buffer sync");
+        }
+
         var end = guestAddress + size;
         var index = _registry.FindFirstOverlappingIndex(guestAddress);
         for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
@@ -2071,15 +1649,31 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // Called once per guest frame; see GuestPageTracker.DecayCpuWriteHeat.
     public void DecayCpuWriteHeat() => _tracker.DecayCpuWriteHeat();
 
+    private ulong _gcTraceEligibleBytes, _gcTraceCutoff;
+    private long _gcTraceCalls, _gcTraceBegun, _gcTraceVisited, _gcTraceDeleted, _gcTraceDirty, _gcTraceDirtySkipped, _gcTraceNext;
+
     public void RunGarbageCollector()
     {
+        using var profile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferRetirement);
         using var foreignRead = _device.Slabs.BeginForeignRead();
         ProcessPendingFaultBuffer();
+        _gcTraceCalls++;
+        if ((GpuDeviceInfo.VramTrace || RenderPhaseProfile.Enabled) && System.Diagnostics.Stopwatch.GetTimestamp() >= _gcTraceNext)
+        {
+            _gcTraceNext = System.Diagnostics.Stopwatch.GetTimestamp() + 2 * System.Diagnostics.Stopwatch.Frequency;
+            Console.Error.WriteLine($"[PERF][BUFFER_GC] registered_mb={_registry.RegisteredBytes >> 20} calls={_gcTraceCalls} begun={_gcTraceBegun} " +
+                $"visited={_gcTraceVisited} deleted={_gcTraceDeleted} dirty_downloaded={_gcTraceDirty} dirty_skipped={_gcTraceDirtySkipped} eligible_mb={_gcTraceEligibleBytes >> 20} cutoff_tick={_gcTraceCutoff} slab_mb={_device.Slabs.AllocatedBytes >> 20} mapped_mb={_promotedBytes >> 20} {_device.Slabs.DescribeOccupancy()} {DescribeBufferSizes()} policy_tick={_retirementPolicy.CurrentTick}");
+            ReportBufferCreations();
+            _gcTraceEligibleBytes = 0;
+            _gcTraceCalls = _gcTraceBegun = _gcTraceVisited = _gcTraceDeleted = _gcTraceDirty = _gcTraceDirtySkipped = 0;
+        }
         if (!_retirementPolicy.TryBeginCollection(_registry.RegisteredBytes, out var retirement))
         {
             return;
         }
 
+        _gcTraceBegun++;
+        _gcTraceCutoff = retirement.LatestEligibleTick;
         var dirtyBuffers = new List<ResourceSlotIdentifier>();
         var copies = new List<DownloadPiece>();
         var retireCount = 0;
@@ -2091,10 +1685,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 throw SubmissionScheduler.Fatal("The recency queue contains a deleted buffer.");
             }
 
+            _gcTraceVisited++;
+            _gcTraceEligibleBytes += buffer.Size;
             _tracker.ValidateGpuDirtyOwnership(_gpuModifiedRanges, buffer.CpuAddress, buffer.Size, "garbage collection");
             var dirty = _tracker.HasGpuDirtyPages(buffer.CpuAddress, buffer.Size);
             if (dirty && !retirement.DownloadDirtyBuffers)
             {
+                _gcTraceDirtySkipped++;
                 return false;
             }
 
@@ -2104,12 +1701,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (dirty)
             {
                 CollectDirtyPieces(buffer, copies, "garbage collection");
-                dirtyBuffers.Add(bufferIdentifier);
+                dirtyBuffers.Add(bufferIdentifier); _gcTraceDirty++;
             }
             else
             {
                 _tracker.UntrackMemory(buffer.CpuAddress, buffer.Size);
-                DeleteBuffer(bufferIdentifier);
+                DeleteBuffer(bufferIdentifier); _gcTraceDeleted++;
             }
 
             return ++retireCount == retirement.MaximumBufferCount;
@@ -2201,12 +1798,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         _disposed = true;
+        _tracker.ApplyPendingGpuProtections();
         _registry.Dispose();
         _deviceRing.Dispose();
         _download.Dispose();
         _stream.Dispose();
         _staging.Dispose();
+        _sweepCopy.Dispose();
         _bdaPageTable.Dispose();
+        _bdaFallback?.Dispose();
+        _bdaFallbackAddress?.Dispose();
         _gds.Dispose();
         _faults.Dispose();
     }
@@ -2223,15 +1824,42 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (!_relay.IsGpuQueueThread && AsyncReadback is { } readback && GuestReadsAwaitOffQueue)
         {
+            var slotWaits = 0;
             for (var attempt = 0; ; attempt++)
             {
                 var allowPending = attempt < MaxAsyncReadbackAttempts;
-                var markHot = attempt == 0 && !isWrite;
+                var markHot = attempt == 0 && slotWaits == 0 && !isWrite;
+                var waitForSlot = slotWaits < MaxReadbackSlotWaits;
                 PendingDownload? pending = null;
+                var slotsBusy = false;
+                var beginPosted = System.Diagnostics.Stopwatch.GetTimestamp();
+                var beginStarted = 0L;
+                var beginEnded = 0L;
+                var completedAtBegin = 0UL;
+                var frameAtBegin = 0L;
                 if (!_relay.TryRunOnGpuQueue(() =>
-                        pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending, markHot)))
+                    {
+                        beginStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                        pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending, markHot, waitForSlot, out slotsBusy);
+                        completedAtBegin = _scheduler.CompletedTick;
+                        frameAtBegin = FrameTicks.LatestSubmittedFrame + 1;
+                        beginEnded = System.Diagnostics.Stopwatch.GetTimestamp();
+                    }))
                 {
                     return AwaitShutdown();
+                }
+
+                var beginReturned = System.Diagnostics.Stopwatch.GetTimestamp();
+                RelayHopBegin.Increment();
+                RelayHopBeginTicks.Add(beginReturned - beginPosted);
+
+                if (slotsBusy)
+                {
+                    Interlocked.Increment(ref ReadbacksSlotWaits);
+                    slotWaits++;
+                    attempt--;
+                    readback.WaitForFreeSlot(1);
+                    continue;
                 }
 
                 if (pending is null)
@@ -2239,12 +1867,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     return true;
                 }
 
+                var gpuWaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 readback.Wait(pending.Ticket);
+                NoteGuestReadback(pending, completedAtBegin, frameAtBegin, beginStarted - beginPosted, beginEnded - beginStarted,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - gpuWaitStarted, beginStarted);
                 var complete = false;
+                var completePosted = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (!_relay.TryRunOnGpuQueue(() => complete = CompleteReadMemoryOnGpu(pending, consumed: true)))
                 {
                     return AwaitShutdown();
                 }
+
+                RelayHopComplete.Increment();
+                RelayHopCompleteTicks.Add(System.Diagnostics.Stopwatch.GetTimestamp() - completePosted);
 
                 if (complete)
                 {
@@ -2254,13 +1889,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var onQueue = _relay.IsGpuQueueThread;
-        if (_relay.TryRunOnGpuQueue(() =>
-            {
-                if (!onQueue || isWrite || !TryUseEagerReadback(guestAddress, size))
-                {
-                    _ = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: false, markHot: onQueue);
-                }
-            }))
+        if (_relay.TryRunOnGpuQueue(() => _ = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: false, markHot: onQueue, waitForSlot: false,
+                out _, useEager: onQueue)))
         {
             return true;
         }
@@ -2272,6 +1902,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private const long HotWindowLifetime = 512;
     private const int MaxEagerReadbacks = 4;
     private const int MaxAsyncReadbackAttempts = 4;
+    private const int MaxReadbackSlotWaits = 64;
     private const int EagerStrikeLimit = 3;
     private const long EagerMuteBatches = 4096;
     private readonly Dictionary<ulong, HotWindow> _hotWindows = new();
@@ -2420,8 +2051,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private EagerStart StartEagerReadback(HotWindow hot)
     {
-        using var sourceScope = ReadbackSourceProfile.Begin("Eager");
-        if (FindOwner(hot.Address, hot.Size) is not { } buffer)
+        if (FindOwner(hot.Address, hot.Size) is not { IsMapped: false } buffer)
         {
             return EagerStart.Nothing;
         }
@@ -2437,7 +2067,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return EagerStart.Nothing;
         }
 
-        if (!TryBeginDownloadAsync(copies, out var ticket, out var writeTicks))
+        if (!TryBeginDownloadAsync(copies, out var ticket, out var writeTicks, out _))
         {
             return EagerStart.Deferred;
         }
@@ -2577,9 +2207,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private PendingDownload? BeginReadMemoryOnGpu(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source,
-        bool allowPending, bool markHot = false)
+        bool allowPending, bool markHot, bool waitForSlot, out bool slotsBusy, bool useEager = false)
     {
-        using var sourceScope = ReadbackSourceProfile.Begin(RenderPhaseProfile.Enabled && ReadbackSourceProfile.Source == "Other" ? source.ToString() : ReadbackSourceProfile.Source);
+        slotsBusy = false;
         if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("cpu-synchronize", guestAddress, size, $"write={isWrite} source={source}");
         using var readbackScope = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.BufferReadback);
         using var foreignRead = _device.Slabs.BeginForeignRead();
@@ -2589,17 +2219,37 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return null;
         }
 
+        var buffer = _registry.GetBuffer(FindBuffer(guestAddress, size));
+        var copies = CollectReadbackWindow(buffer, guestAddress, size, out var windowBegin, out var windowEnd);
+
         if (!isWrite && allowPending && TakeEagerReadback(guestAddress, size) is { } eager)
         {
             return eager with { GuestAddress = guestAddress, Size = size, IsWrite = isWrite, Source = source };
         }
 
-        var copies = CollectReadbackWindow(guestAddress, size, out var windowBegin, out var windowEnd);
+        if (useEager && !isWrite && _eagerDownloads.Count != 0)
+        {
+            if (TryUseEagerReadback(guestAddress, size))
+            {
+                return null;
+            }
+
+            buffer = _registry.GetBuffer(FindBuffer(guestAddress, size));
+            copies = CollectReadbackWindow(buffer, guestAddress, size, out windowBegin, out windowEnd);
+        }
+
         if (markHot && copies.Count != 0)
         {
             NoteHotReadback(guestAddress, size);
         }
-        if (copies.Count != 0 && allowPending && TryBeginDownloadAsync(copies, out var ticket, out var writeTicks))
+
+        if (copies.Count != 0 && !buffer.IsMapped)
+        {
+            buffer.NoteReadback();
+        }
+
+        var busy = false;
+        if (copies.Count != 0 && allowPending && TryBeginDownloadAsync(copies, out var ticket, out var writeTicks, out busy))
         {
             foreach (var copy in copies)
             {
@@ -2621,8 +2271,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             };
         }
 
+        if (busy && waitForSlot)
+        {
+            slotsBusy = true;
+            return null;
+        }
+
         if (copies.Count != 0)
         {
+            Interlocked.Increment(ref ReadbacksSynchronous);
             DownloadBufferMemory(copies);
             _tracker.ClearGpuDirtyPages(windowBegin, windowEnd - windowBegin);
         }
@@ -2634,6 +2291,43 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         RecordReadback(windowBegin, windowEnd, isWrite, copies, readbackStarted, source);
         return null;
+    }
+
+    private ulong _promotedBytes;
+    private ulong _promotionCeiling = ulong.MaxValue;
+
+    internal ulong MappedBudget { get; set; }
+
+    internal ulong PromotedBytes => _promotedBytes;
+
+    private long _mappedBuffers;
+
+    public bool HasMappedBuffers => Volatile.Read(ref _mappedBuffers) != 0;
+
+    private static bool IsPromoted(GpuBuffer buffer) => buffer.Usage == GpuBufferUsage.MappedDeviceLocal && buffer.IsMapped;
+
+    internal bool AllocatesMappedBuffers { get; set; }
+
+    private bool FitsMappedBudget(ulong size, ulong released = 0) =>
+        AllocatesMappedBuffers && _promotedBytes - released + size <= Math.Min(MappedBudget, _promotionCeiling);
+
+    private void NotePromotion(GpuBuffer buffer, bool atCreation = false)
+    {
+        if (IsPromoted(buffer))
+        {
+            if (atCreation)
+            {
+                MappedCreations.Increment();
+                return;
+            }
+
+            Promotions.Increment();
+            PromotedBufferBytes.Add((long)buffer.Size);
+            return;
+        }
+
+        _promotionCeiling = _promotedBytes;
+        PromotionsBudgetFull.Increment();
     }
 
     private bool CompleteReadMemoryOnGpu(PendingDownload pending, bool consumed)
@@ -2661,8 +2355,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     return;
                 }
 
-                using var writebackScope = GpuWritebackEpoch.BeginWrite(copies[index].Address, (ulong)bytes.Length);
-                if (!WriteDownloaded(copies[index].Address, bytes))
+                if (!_backing.TryWriteBacking(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
                 }
@@ -2671,8 +2364,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             {
                 if (current[index])
                 {
-                    _gpuModifiedRanges.Remove(copies[index].Address, copies[index].Size);
-                    Interlocked.Increment(ref _gpuModifiedVersion);
+                    using (WriteGpuModified())
+                    {
+                        _gpuModifiedRanges.Remove(copies[index].Address, copies[index].Size);
+                    }
+
+                    BumpGpuModifiedVersion();
                 }
             }
 
@@ -2842,7 +2539,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void Register(ResourceSlotIdentifier bufferIdentifier) => UpdateRegistration(bufferIdentifier, insert: true);
 
-    private void Unregister(ResourceSlotIdentifier bufferIdentifier) => UpdateRegistration(bufferIdentifier, insert: false);
+    private void Unregister(ResourceSlotIdentifier bufferIdentifier)
+    {
+        _allocationSources?.Remove(_registry.GetBuffer(bufferIdentifier));
+        UpdateRegistration(bufferIdentifier, insert: false);
+    }
 
     private void UpdateRegistration(ResourceSlotIdentifier bufferIdentifier, bool insert)
     {
@@ -2853,14 +2554,23 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var sizePages = lastExclusive - first;
+        if (IsPromoted(buffer))
+        {
+            _promotedBytes = insert ? _promotedBytes + buffer.Size : _promotedBytes - buffer.Size;
+            Interlocked.Add(ref PromotedLiveBytes, insert ? (long)buffer.Size : -(long)buffer.Size);
+        }
+
+        if (buffer.IsMapped)
+        {
+            Interlocked.Add(ref _mappedBuffers, insert ? 1 : -1);
+        }
+
         if (GuestGpuMemoryHook.Traces(buffer.CpuAddress, buffer.Size))
             GuestGpuMemoryHook.Trace(buffer.CpuAddress, buffer.Size,
                 $"device-address-registration insert={insert} buffer={bufferIdentifier} submission_tick={_scheduler.CurrentTick} collection_tick={_retirementPolicy.CurrentTick}");
         if (insert)
         {
-            // Registration can expose untracked allocation padding to BDA. It has
-            // no dirty notification yet, so the next opt-in sweep must rescan.
-            if (BdaVisibilitySweepEnabled) _bdaSweepEpoch = -1;
+            _bufferPages.Set(buffer.CpuAddress, buffer.Size, covered: true);
             _registry.RegisterBuffer(bufferIdentifier, _retirementPolicy.CurrentTick);
             var addresses = new ulong[sizePages];
             for (ulong page = 0; page < sizePages; page++)
@@ -2872,6 +2582,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
         else
         {
+            _bufferPages.Set(buffer.CpuAddress, buffer.Size, covered: false);
             _registry.BeginRetirement(bufferIdentifier);
             _bdaPageTable.Fill(first * sizeof(ulong), sizePages * sizeof(ulong), 0);
         }
@@ -2891,6 +2602,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void DeleteBuffer(ResourceSlotIdentifier bufferIdentifier)
     {
+        _allocationSources?.Remove(_registry.GetBuffer(bufferIdentifier));
         if (_registry.TryGetRegisteredBuffer(bufferIdentifier) == null)
         {
             return;
@@ -2908,7 +2620,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     {
         if (_scheduler.Active)
         {
-            _scheduler.QueueCompletionAction(() => _registry.CompleteRetirement(bufferIdentifier));
+            _scheduler.QueueCompletionAction(() =>
+            {
+                using var profile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CompletedBufferErase);
+                _registry.CompleteRetirement(bufferIdentifier);
+            });
         }
         else
         {
@@ -2929,8 +2645,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             foreach (var copy in copies)
             {
-                _gpuModifiedRanges.Remove(copy.Address, copy.Size);
-                Interlocked.Increment(ref _gpuModifiedVersion);
+                using (WriteGpuModified())
+                {
+                    _gpuModifiedRanges.Remove(copy.Address, copy.Size);
+                }
+
+                BumpGpuModifiedVersion();
             }
 
             return;
@@ -2967,15 +2687,215 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         foreach (var copy in copies)
         {
-            _gpuModifiedRanges.Remove(copy.Address, copy.Size);
-            Interlocked.Increment(ref _gpuModifiedVersion);
+            using (WriteGpuModified())
+            {
+                _gpuModifiedRanges.Remove(copy.Address, copy.Size);
+            }
+
+            BumpGpuModifiedVersion();
         }
     }
 
-    private bool TryBeginDownloadAsync(List<DownloadPiece> copies, out VulkanAsyncReadback.Ticket ticket, out ulong[] writeTicks)
+    private static long _reportedKnownApplied;
+    private static long _reportedKnownUnbacked;
+
+    private static readonly ThreadCounter SweptPages = new();
+    private static readonly ThreadCounter SweptPagesInHandleWindows = new();
+    private const ulong HandleWindowBytes = 16 * MiB;
+    private readonly List<ulong> _handleWindows = [];
+
+    public static string TakeDirtyTrackingReport() => GuestPageTracker.TakeDirtyTrackingReport() + FormattableString.Invariant(
+        $" swept_pages={SweptPages.Take()} pages_in_handle_windows={SweptPagesInHandleWindows.Take()} stream_copies={StreamCopyShares.Copies.Take()} stream_shared={StreamCopyShares.Shared.Take()}");
+
+    public void NoteDeviceAddressWindow(ulong handleBase)
+    {
+        if (handleBase != 0 && _handleWindows.Count < 64)
+        {
+            _handleWindows.Add(handleBase);
+        }
+    }
+
+    private void CountSweptPages(ulong runAddress, ulong runSize)
+    {
+        SweptPages.Add((long)(runSize / TrackerLayout.PageBytes));
+        if (_handleWindows.Count == 0)
+        {
+            return;
+        }
+
+        var runEnd = runAddress + runSize;
+        var covered = 0UL;
+        var cursor = runAddress;
+        foreach (var window in _handleWindows)
+        {
+            var start = Math.Max(window, cursor);
+            var end = Math.Min(window + HandleWindowBytes, runEnd);
+            if (start < end)
+            {
+                covered += end - start;
+                cursor = end;
+            }
+        }
+
+        SweptPagesInHandleWindows.Add((long)(covered / TrackerLayout.PageBytes));
+    }
+
+    public static string TakeKnownContentsReport() => FormattableString.Invariant(
+        $"[PERF][KNOWN_GPU] applied={Interlocked.Exchange(ref _reportedKnownApplied, 0)} unbacked={Interlocked.Exchange(ref _reportedKnownUnbacked, 0)}");
+
+    public void NoteKnownGpuContents(ulong address, ReadOnlySpan<uint> words)
+    {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("known contents");
+        }
+
+        var bytes = MemoryMarshal.AsBytes(words);
+        var size = (ulong)bytes.Length;
+        if (size == 0)
+        {
+            return;
+        }
+
+        if (!_backing.TryWriteBacking(address, bytes))
+        {
+            Interlocked.Increment(ref _reportedKnownUnbacked);
+            return;
+        }
+
+        using (WriteGpuModified())
+        {
+            _gpuModifiedRanges.Remove(address, size);
+        }
+
+        var firstPage = address & ~(TrackerLayout.PageBytes - 1);
+        for (var page = firstPage; page < address + size; page += TrackerLayout.PageBytes)
+        {
+            if (!_gpuModifiedRanges.Overlaps(page, TrackerLayout.PageBytes))
+            {
+                _tracker.ClearGpuDirtyPages(page, TrackerLayout.PageBytes);
+            }
+        }
+        Interlocked.Increment(ref _reportedKnownApplied);
+    }
+
+    // A store the command stream computed, over GPU-dirty pages: the GPU copy takes it behind the earlier GPU work
+    // and the guest backing takes it as well, so its bytes leave GPU ownership while the bytes around them keep theirs.
+    public bool TryWriteOverGpuBytes(ulong guestAddress, ReadOnlySpan<byte> data)
+    {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("kernel store");
+        }
+
+        var size = (ulong)data.Length;
+        if (guestAddress == 0 || size == 0 || ((guestAddress | size) & 3) != 0 || size > ulong.MaxValue - guestAddress)
+        {
+            return false;
+        }
+
+        CompleteGuestPublications?.Invoke(guestAddress, size, PublicationAccess.Write);
+        if (RequireImageCache().MayHaveImageBytes(guestAddress, size))
+        {
+            return false;
+        }
+
+        var (destination, _) = ObtainBuffer(guestAddress, size, isWritten: true);
+        WriteDataBuffer(destination, guestAddress, data);
+        if (!_backing.TryWriteBacking(guestAddress, data))
+        {
+            throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{size:X16}");
+        }
+
+        using (WriteGpuModified())
+        {
+            _gpuModifiedRanges.Remove(guestAddress, size);
+        }
+
+        BumpGpuModifiedVersion();
+        ClearGpuDirtyPagesOfRemovedRange(guestAddress, size);
+        return true;
+    }
+
+    public static long ReadbacksStarted;
+    public static long ReadbacksNoWriter;
+    public static long ReadbacksTooLarge;
+    public static long ReadbacksBusy;
+    public static long ReadbacksSlotWaits;
+    public static long ReadbacksSynchronous;
+    public static readonly ThreadCounter Promotions = new();
+    public static readonly ThreadCounter PromotedBufferBytes = new();
+    public static readonly ThreadCounter PromotionsBudgetFull = new();
+    public static readonly ThreadCounter MappedCreations = new();
+    public static long PromotedLiveBytes;
+    public static readonly ThreadCounter RelayHopBegin = new();
+    public static readonly ThreadCounter RelayHopBeginTicks = new();
+    public static readonly ThreadCounter RelayHopComplete = new();
+    public static readonly ThreadCounter RelayHopCompleteTicks = new();
+    public static readonly ThreadCounter GuestReadbacks = new();
+    public static readonly ThreadCounter GuestReadbackQueueTicks = new();
+    public static readonly ThreadCounter GuestReadbackBeginTicks = new();
+    public static readonly ThreadCounter GuestReadbackGpuWaitTicks = new();
+    public static readonly ThreadCounter GuestReadbacksBehind = new();
+    public static readonly ThreadCounter GuestReadbackTicksBehind = new();
+    public static readonly ThreadCounter[] GuestReadbackFrameAge = [new(), new(), new(), new()];
+
+    public FrameTickLedger FrameTicks { get; } = new();
+
+    public static readonly ThreadCounter WriterHeldReads = new();
+    public static readonly ThreadCounter WriterHeldTicks = new();
+    public static readonly ThreadCounter WriterSubmittedByRead = new();
+    public static readonly ThreadCounter WriterAgeTicks = new();
+    public static readonly ThreadCounter WriterSinceSubmitTicks = new();
+    public static readonly ThreadCounter WriterTimedReads = new();
+
+    private void NoteGuestReadback(PendingDownload pending, ulong completedAtBegin, long frameAtBegin, long queueTicks, long beginTicks, long gpuWaitTicks, long beginStarted)
+    {
+        var waitTick = 0UL;
+        foreach (var tick in pending.WriteTicks)
+        {
+            waitTick = Math.Max(waitTick, tick);
+        }
+
+        var reservedAt = _scheduler.ReservedAt(waitTick);
+        var submittedAt = _scheduler.SubmittedAt(waitTick);
+        if (reservedAt != 0 && submittedAt != 0)
+        {
+            var done = System.Diagnostics.Stopwatch.GetTimestamp();
+            WriterTimedReads.Increment();
+            WriterAgeTicks.Add(beginStarted - reservedAt);
+            WriterSinceSubmitTicks.Add(done - Math.Max(submittedAt, beginStarted));
+            if (submittedAt > reservedAt)
+            {
+                WriterHeldReads.Increment();
+                WriterHeldTicks.Add(submittedAt - reservedAt);
+            }
+
+            if (submittedAt >= beginStarted)
+            {
+                WriterSubmittedByRead.Increment();
+            }
+        }
+
+        GuestReadbacks.Increment();
+        GuestReadbackQueueTicks.Add(queueTicks);
+        GuestReadbackBeginTicks.Add(beginTicks);
+        GuestReadbackGpuWaitTicks.Add(gpuWaitTicks);
+        if (waitTick > completedAtBegin)
+        {
+            GuestReadbacksBehind.Increment();
+            GuestReadbackTicksBehind.Add((long)(waitTick - completedAtBegin));
+        }
+
+        var age = frameAtBegin - FrameTicks.FrameOf(waitTick);
+        GuestReadbackFrameAge[(int)Math.Clamp(age, 0, GuestReadbackFrameAge.Length - 1)].Increment();
+    }
+
+    private bool TryBeginDownloadAsync(List<DownloadPiece> copies, out VulkanAsyncReadback.Ticket ticket, out ulong[] writeTicks, out bool busy)
     {
         ticket = null!;
         writeTicks = [];
+        busy = false;
         if (AsyncReadback is not { } readback || copies.Count == 0)
         {
             return false;
@@ -2989,6 +2909,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var written = copies[index].Buffer.LastGpuWriteTickIn(copies[index].SourceOffset, copies[index].Size);
             if (written == 0)
             {
+                Interlocked.Increment(ref ReadbacksNoWriter);
                 return false;
             }
 
@@ -2999,12 +2920,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (total > AsyncReadbackLimit)
         {
+            Interlocked.Increment(ref ReadbacksTooLarge);
             return false;
         }
 
         if (waitTick >= _scheduler.CurrentTick)
         {
             _scheduler.Flush(SubmitReason.Readback);
+        }
+        else
+        {
+            _scheduler.EnsureSubmitted(waitTick);
         }
 
         var pieces = new ReadbackPiece[copies.Count];
@@ -3015,8 +2941,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (!readback.TryBegin(pieces, waitTick, out var started) || started is null)
         {
+            Interlocked.Increment(ref ReadbacksBusy);
+            busy = true;
             return false;
         }
+
+        Interlocked.Increment(ref ReadbacksStarted);
 
         ticket = started;
         writeTicks = ticks;
@@ -3058,6 +2988,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             _scheduler.Flush(SubmitReason.Readback);
         }
+        else
+        {
+            _scheduler.EnsureSubmitted(waitTick);
+        }
 
         var pieces = new ReadbackPiece[copies.Count];
         for (var index = 0; index < pieces.Length; index++)
@@ -3067,8 +3001,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
-            using var writebackScope = GpuWritebackEpoch.BeginWrite(copies[index].Address, (ulong)bytes.Length);
-            if (!WriteDownloaded(copies[index].Address, bytes))
+            if (!_backing.TryWriteBacking(copies[index].Address, bytes))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
             }
@@ -3102,7 +3035,6 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var placement = copy.Placement;
             var offset = baseOffset + placement.DataOffset;
             _download.Invalidate(offset, placement.DataSize);
-            using var writebackScope = GpuWritebackEpoch.BeginWrite(copy.Address, placement.DataSize);
             if (GpuCommands.VisibilityResultTrace.Enabled)
                 GpuCommands.VisibilityResultTrace.Download(copy.Address,
                     _download.Mapped.Slice((int)offset, (int)placement.DataSize), _backing.TryReadBacking);
@@ -3166,26 +3098,42 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         DeleteBuffer(overlappingBufferIdentifier);
     }
 
-    private ResourceSlotIdentifier CreateBuffer(ulong guestAddress, ulong size)
+    private ResourceSlotIdentifier CreateBuffer(ulong guestAddress, ulong size, string caller)
     {
         if (_scheduler.Current.IsInvalid)
         {
             throw SubmissionScheduler.Fatal("Buffer creation requires a command buffer that is recording.");
         }
 
+        var requestedBytes = size;
         var end = (guestAddress + size + CachingPageSize - 1) & ~(CachingPageSize - 1);
         guestAddress &= ~(CachingPageSize - 1);
         size = end - guestAddress;
         var overlap = ResolveOverlaps(guestAddress, size);
         var overlapping = new List<ResourceSlotIdentifier>();
+        var promotedOverlap = 0UL;
         for (var index = overlap.First; index < overlap.Last; index++)
         {
-            overlapping.Add(_registry.GetRegisteredIdentifier(index));
+            var identifier = _registry.GetRegisteredIdentifier(index);
+            overlapping.Add(identifier);
+            if (IsPromoted(_registry.GetBuffer(identifier)))
+            {
+                promotedOverlap += _registry.GetBuffer(identifier).Size;
+            }
         }
 
+        var mergedSize = overlap.End - overlap.Begin;
+        var keepsPromotion = promotedOverlap != 0 && FitsMappedBudget(mergedSize, promotedOverlap);
+        if (promotedOverlap != 0 && !keepsPromotion)
+        {
+            PromotionsBudgetFull.Increment();
+        }
+
+        var mappedAtCreation = !keepsPromotion && AllocatesMappedBuffers && FitsMappedBudget(mergedSize, promotedOverlap);
+        var mapped = keepsPromotion || mappedAtCreation;
         GpuBuffer CreateGpuBuffer() => new(
-            _device, _scheduler, GpuBufferUsage.DeviceLocal, overlap.Begin,
-            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, allowSlab: true);
+            _device, _scheduler, mapped ? GpuBufferUsage.MappedDeviceLocal : GpuBufferUsage.DeviceLocal, overlap.Begin,
+            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, mergedSize, allowSlab: !mapped || AllocatesMappedBuffers);
         GpuBuffer created;
         try
         {
@@ -3193,25 +3141,24 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
         catch (GpuBuffer.OutOfMemoryException)
         {
-            // Images hold most of the device memory: free the ones that can go and try once more.
+            // Reclaim retired images before retrying the same upstream placement once.
             RequireImageCache().ReclaimForAllocation();
-            try
-            {
-                created = CreateGpuBuffer();
-            }
-            catch (GpuBuffer.OutOfMemoryException again)
-            {
-                throw SubmissionScheduler.Fatal(again.Message);
-            }
+            try { created = CreateGpuBuffer(); }
+            catch (GpuBuffer.OutOfMemoryException again) { throw SubmissionScheduler.Fatal(again.Message); }
         }
-
-        var bufferIdentifier = _registry.AllocateBuffer(created, overlap.Begin, overlap.End - overlap.Begin);
+        var bufferIdentifier = _registry.AllocateBuffer(created, overlap.Begin, mergedSize);
         foreach (var oldId in overlapping)
         {
             MergeOverlappingBuffer(bufferIdentifier, oldId, !overlap.HasStreamLeap);
         }
 
         Register(bufferIdentifier);
+        NoteBufferCreation(created, caller, requestedBytes, mergedSize, overlapping.Count);
+        if (mapped)
+        {
+            NotePromotion(_registry.GetBuffer(bufferIdentifier), mappedAtCreation);
+        }
+
         return bufferIdentifier;
     }
 
@@ -3233,9 +3180,35 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return isTexelBuffer && !readImageBacking && SynchronizeTexelFromImage(buffer, guestAddress, size);
         }
 
+        if (isWritten && !isTexelBuffer && _tracker.IsGpuOwned(guestAddress, size))
+        {
+            return false;
+        }
+
         profileScope.SwitchPhase(isWritten
             ? RenderPhaseProfile.Phase.BufferDirtySyncWritten
             : isTexelBuffer ? RenderPhaseProfile.Phase.BufferDirtySyncTexel : RenderPhaseProfile.Phase.BufferDirtySyncUpload);
+        if (isTexelBuffer && !isWritten && !_tracker.MayHaveCpuDirtyPages(guestAddress, size))
+        {
+            if (BufferUploadProfile.Enabled)
+                BufferUploadProfile.Record(guestAddress, size, 0, 0, 0, System.Diagnostics.Stopwatch.GetTimestamp() - startedAt);
+            return !readImageBacking && SynchronizeTexelFromImage(buffer, guestAddress, size);
+        }
+
+        _tracker.UploadBatch = (long)_scheduler.CurrentTick;
+        if (!isWritten && !isTexelBuffer)
+        {
+            var (runAddress, runSize) = _tracker.ExtendCpuDirtyRun(
+                guestAddress, size, buffer.CpuAddress, buffer.CpuAddress + buffer.Size, preserveCpuWriteHotPages, UploadRunBudgetPages);
+            if (runSize != size && _backing.IsBackedRange(runAddress, runSize))
+            {
+                Interlocked.Increment(ref WidenedUploads);
+                Interlocked.Add(ref WidenedUploadBytes, (long)(runSize - size));
+                guestAddress = runAddress;
+                size = runSize;
+            }
+        }
+
         var collector = _uploadCollector;
         if (collector is null || collector.InUse)
         {
@@ -3244,7 +3217,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _uploadCollector ??= collector;
         }
 
-        collector.Begin(this, buffer, guestAddress, size, readImageBacking ? _tryReadImageSource ??= TryReadImageSource : null);
+        collector.Begin(this, buffer, guestAddress, size, defer: _sweepActive && !isWritten && !isTexelBuffer,
+            readImageBacking ? _tryReadImageSource ??= TryReadImageSource : null);
         try
         {
             return SynchronizeBufferCore(collector, buffer, guestAddress, size, isWritten, isTexelBuffer, preserveCpuWriteHotPages, readImageBacking, startedAt);
@@ -3263,6 +3237,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         private GpuBuffer _buffer = null!;
         private ulong _guestAddress;
         private ulong _size;
+        private bool _defer;
         private GuestBufferSourceReader? _readSource;
         public readonly List<BufferCopy> Copies = new();
         public readonly SharedPageMergePlan Merges = new();
@@ -3279,18 +3254,32 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 Copies.Add(new BufferCopy(TotalSize, _buffer.Offset(address), bytes));
                 TotalSize += bytes;
             };
-            Upload = () => Source = _cache._uploader.PrepareSource(_buffer.CpuAddress, CollectionsMarshal.AsSpan(Copies), TotalSize, _guestAddress, _size, _readSource);
+            // A sweep takes the copies to stage with its other buffers; Source then stays null.
+            Upload = () =>
+            {
+                if (_defer && _readSource is null)
+                    _cache.DeferSweepUpload(_buffer, _guestAddress, _size, Copies, TotalSize);
+                else
+                    Source = _cache._uploader.PrepareSource(_buffer.CpuAddress, CollectionsMarshal.AsSpan(Copies), TotalSize, _guestAddress, _size, _readSource);
+            };
         }
 
-        public void Begin(GuestBufferCache cache, GpuBuffer buffer, ulong guestAddress, ulong size, GuestBufferSourceReader? readSource)
+        public void Begin(GuestBufferCache cache, GpuBuffer buffer, ulong guestAddress, ulong size, bool defer, GuestBufferSourceReader? readSource = null)
         {
             InUse = true;
             _cache = cache;
             _buffer = buffer;
             _guestAddress = guestAddress;
             _size = size;
+            _defer = defer;
             _readSource = readSource;
         }
+
+        public ulong GuestAddress => _guestAddress;
+
+        public ulong Size => _size;
+
+        public void Extend(ulong end) => _size = Math.Max(_size, end - _guestAddress);
 
         public void End()
         {
@@ -3298,6 +3287,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _cache = null!;
             _buffer = null!;
             _readSource = null;
+
             Copies.Clear();
             Merges.Clear();
             TotalSize = 0;
@@ -3310,12 +3300,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private bool SynchronizeBufferCore(UploadCollector collector, GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten,
         bool isTexelBuffer, bool preserveCpuWriteHotPages, bool readImageBacking, long startedAt)
     {
-        var copies = collector.Copies;
-        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferUploadTracking))
-        {
-            _tracker.ForEachUploadRange(guestAddress, size, isWritten, collector.Collect, collector.Upload, preserveCpuWriteHotPages);
-        }
+        var trackingStarted = RenderPhaseProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        _tracker.ForEachUploadRange(guestAddress, size, isWritten, collector.Collect, collector.Upload, preserveCpuWriteHotPages);
+        RecordCollectedUpload(collector, buffer, guestAddress, size, trackingStarted, startedAt);
+        return isTexelBuffer && !readImageBacking && SynchronizeTexelFromImage(buffer, guestAddress, size);
+    }
 
+    private void RecordCollectedUpload(UploadCollector collector, GpuBuffer buffer, ulong guestAddress, ulong size, long trackingStarted, long startedAt)
+    {
+        var copies = collector.Copies;
+        var recordStarted = trackingStarted != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var source = collector.Source;
         var totalSize = collector.TotalSize;
         var merges = SharedPageMergeEnabled && ChangedByteMerge is not null ? collector.Merges : null;
@@ -3332,44 +3326,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (source != null)
         {
-            using var recordScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferUploadRecording);
-            foreach (var copy in copies)
-            {
-                buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
-            }
+            RecordUpload(buffer, source, CollectionsMarshal.AsSpan(copies), guestAddress, size, totalSize);
+        }
 
-            if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-upload", guestAddress, size, $"bytes={totalSize} copies={copies.Count}");
-            var command = _scheduler.Current;
-            command.EndRendering();
-            var native = new CommandBuffer(command.Handle);
-            var vk = _device.Vk;
-            var before = new BufferMemoryBarrier2
+        if (source != null)
+        {
+            BufferUploadProfile.NoteUpload(copies.Count, totalSize, size);
+            if (recordStarted != 0)
             {
-                SType = StructureType.BufferMemoryBarrier2,
-                SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
-                DstAccessMask = AccessFlags2.TransferWriteBit,
-                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                Buffer = buffer.Handle,
-                Offset = 0,
-                Size = buffer.Size,
-            };
-            VulkanSynchronization.PipelineBarrier(vk,
-                native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
-                0, null, 1, &before, 0, null);
-            var regions = CollectionsMarshal.AsSpan(copies);
-            fixed (BufferCopy* pointer = regions)
-            {
-                vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)regions.Length, pointer);
-                VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.BufferCopy);
+                BufferUploadProfile.NoteUploadShape(guestAddress, size, totalSize, recordStarted - trackingStarted, System.Diagnostics.Stopwatch.GetTimestamp() - recordStarted);
             }
-
-            var after = before;
-            after.SrcAccessMask = AccessFlags2.TransferWriteBit;
-            after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
-            VulkanSynchronization.PipelineBarrier(vk,
-                native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
-                0, null, 1, &after, 0, null);
         }
 
         // Only after the copies above are recorded: staging the merge may wait for staging space, and
@@ -3387,88 +3353,64 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 hotBytes += _tracker.CountCpuWriteHotBytes(buffer.CpuAddress + copy.DstOffset, copy.Size);
             BufferUploadProfile.Record(guestAddress, size, copies.Count, totalSize, hotBytes, elapsedTicks);
         }
-
-        return isTexelBuffer && !readImageBacking && SynchronizeTexelFromImage(buffer, guestAddress, size);
     }
 
-    // The bytes a storage binding may add around a span: the descriptor offset rounds down to the
-    // device's storage offset alignment (at most 256) and the range up to a word.
-    private const ulong StorageBindingSlack = 256 + 4;
-
-    // Records the GPU pass that writes the bytes that differ into the buffer, in chunks that one
-    // storage descriptor binds on each side.
-    private void RecordSharedPageMerge(GpuBuffer buffer, SharedPageMergePlan plan)
+    // Records the copy of staged guest bytes into the buffer, ordered after earlier work on the buffer
+    // and before later reads of it.
+    private void RecordUpload(GpuBuffer buffer, GpuBuffer source, Span<BufferCopy> regions, ulong guestAddress, ulong size, ulong totalSize)
     {
-        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferUploadRecording);
-        var maxBytes = (ulong)_device.MaxStorageBufferRange - StorageBindingSlack;
-        foreach (var (start, count) in plan.Chunks(maxBytes))
+        foreach (var copy in regions)
         {
-            RecordSharedPageMergeChunk(buffer, plan, start, count);
-        }
-    }
-
-    // Stages one chunk's records, then each segment's new and old bytes, in one upload allocation.
-    private void RecordSharedPageMergeChunk(GpuBuffer buffer, SharedPageMergePlan plan, int start, int count)
-    {
-        var segments = plan.Segments;
-        var minimum = segments[start].DestinationOffset;
-        var maximum = 0UL;
-        var largest = 0u;
-        var dataBytes = 0UL;
-        for (var index = start; index < start + count; index++)
-        {
-            var segment = segments[index];
-            maximum = Math.Max(maximum, segment.DestinationOffset + segment.Bytes);
-            largest = Math.Max(largest, segment.Bytes);
-            dataBytes += 2UL * segment.Bytes;
+            buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
         }
 
-        var recordBytes = (ulong)count * SharedPageMergePlan.RecordBytes;
-        var total = recordBytes + dataBytes;
-        GpuBuffer input = _staging;
-        var temporary = false;
-        if (!_staging.TryMap(total, out var offset, sizeof(uint)))
+        if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-upload", guestAddress, size, $"bytes={totalSize} copies={regions.Length}");
+        var command = _scheduler.Current;
+        command.EndRendering();
+        var native = new CommandBuffer(command.TransferHandle);
+        var vk = _device.Vk;
+        var sweep = _inDeviceAddressSweep || _uploadBatchDepth != 0;
+        var before = new BufferMemoryBarrier2
         {
-            input = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Upload, 0, BufferUsageFlags.StorageBufferBit, total);
-            offset = 0;
-            temporary = true;
-        }
-
-        var mapped = input.Mapped.Slice(checked((int)offset), checked((int)total));
-        var records = MemoryMarshal.Cast<byte, uint>(mapped[..(int)recordBytes]);
-        var data = plan.Data;
-        var position = recordBytes;
-        for (var index = 0; index < count; index++)
+            SType = StructureType.BufferMemoryBarrier2,
+            SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
+            DstAccessMask = AccessFlags2.TransferWriteBit,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Buffer = buffer.Handle,
+            Offset = 0,
+            Size = buffer.Size,
+        };
+        UploadsRecorded++;
+        if (sweep)
         {
-            var segment = segments[start + index];
-            var record = records.Slice(index * (int)SharpEmu.ShaderCompiler.Vulkan.TilerShaders.MergeSegmentWords,
-                (int)SharpEmu.ShaderCompiler.Vulkan.TilerShaders.MergeSegmentWords);
-            var bytes = (int)segment.Bytes;
-            data.Slice(segment.NewIndex, bytes).CopyTo(mapped[(int)position..]);
-            data.Slice(segment.OldIndex, bytes).CopyTo(mapped[(int)(position + (ulong)bytes)..]);
-            record[0] = checked((uint)position);
-            record[1] = checked((uint)(position + (ulong)bytes));
-            record[2] = checked((uint)(segment.DestinationOffset - minimum));
-            record[3] = segment.Bytes;
-            position += 2UL * segment.Bytes;
-            buffer.NoteGpuWrite(segment.DestinationOffset, segment.Bytes);
-        }
-
-        if (temporary)
-        {
-            input.Flush(0, total);
-            _scheduler.QueueCompletionAction(input.Dispose);
+            OpenSweepBarrier(native, buffer.Handle.Handle, regions);
         }
         else
         {
-            _staging.Commit();
+            UploadBarrierPairs++;
+            VulkanSynchronization.PipelineBarrier(vk,
+                native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
+                0, null, 1, &before, 0, null, BarrierSource.Upload);
         }
 
-        ChangedByteMerge!(
-            new TilerBufferSpan(input.Handle, offset, total),
-            new TilerBufferSpan(buffer.Handle, minimum, maximum - minimum),
-            (uint)count,
-            largest);
+        fixed (BufferCopy* pointer = regions)
+        {
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)regions.Length, pointer);
+            }
+        }
+
+        if (!sweep)
+        {
+            var after = before;
+            after.SrcAccessMask = AccessFlags2.TransferWriteBit;
+            after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
+            VulkanSynchronization.PipelineBarrier(vk,
+                native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
+                0, null, 1, &after, 0, null, BarrierSource.Upload);
+        }
     }
 
     private bool SynchronizeTexelFromImage(GpuBuffer buffer, ulong guestAddress, ulong size)

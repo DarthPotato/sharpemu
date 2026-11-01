@@ -178,7 +178,7 @@ public sealed class RuntimeDescriptorDeviceTests(HeadlessVulkanFixture fixture, 
                 var command = new CommandBuffer(Harness.Scheduler.Current.Handle);
                 foreach (var image in Images)
                 {
-                    image.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+                    image.Transition(AccessFlags.ShaderReadBit, null, command);
                 }
 
                 Runner.Dispatch(Registers, boundBuffers, 1, flattenedTable: Snapshot.FlattenedResourceTable, heapSet: Heap.Set);
@@ -365,7 +365,7 @@ public sealed class RuntimeDescriptorDeviceTests(HeadlessVulkanFixture fixture, 
             var command = new CommandBuffer(scenario.Harness.Scheduler.Current.Handle);
             foreach (var image in scenario.Images)
             {
-                image.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+                image.Transition(AccessFlags.ShaderReadBit, null, command);
             }
 
             // One tick, several dispatches: each registers one more descriptor, so the table is rebuilt (the

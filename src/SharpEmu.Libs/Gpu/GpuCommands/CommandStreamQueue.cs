@@ -566,6 +566,8 @@ public sealed class CommandStreamQueue
 
         var firstSlice = !submission.Started;
         var processor = GetInterpreter(submission.QueueId);
+        if (submission.Completion?.PacketHandlers is { } handlers)
+            processor.SetPacketHandlers(handlers);
         if (firstSlice && submission.ResetInterpreter)
         {
             processor.Reset();
@@ -586,7 +588,8 @@ public sealed class CommandStreamQueue
         SlicesRun++;
         _host.BeginSubmission(submission.QueueId, submission.SubmissionId, submission.GeometrySnapshots);
         processor.ConstantEngineComplete = true;
-        var complete = processor.Process(submission.Commands, submission.Address, submission.DwordCount) == SubmissionProgress.Complete;
+        var complete = processor.Process(submission.Commands, submission.Address, submission.DwordCount,
+            submission.CommandBytes, submission.RegisterTables) == SubmissionProgress.Complete;
         submission.CommandsComplete = complete;
         if (submission.Commands.MadeProgress)
         {
@@ -600,6 +603,12 @@ public sealed class CommandStreamQueue
         else if (complete)
         {
             _host.RunGarbageCollector();
+        }
+
+        if (complete)
+        {
+            submission.Completion?.Consumed();
+            submission.ReleaseCommandBytes();
         }
 
         return complete;

@@ -14,7 +14,7 @@ internal static unsafe partial class VulkanVideoPresenter
     private static readonly bool NativeStateReuse =
         Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_STATE_REUSE") != "0";
 
-    private sealed partial class Presenter
+    private sealed partial class RecordingHost
     {
         private const int ShadowVertexBufferCapacity = 32;
 
@@ -51,7 +51,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            var tick = _scheduler.CurrentTick;
+            var tick = (ulong)CurrentRecording().Generation;
             var epoch = NativeBindingEpoch.Value;
             if (command.Handle == _shadowCommand && tick == _shadowTick && epoch == _shadowEpoch)
             {
@@ -94,7 +94,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 bound = pipeline;
             }
 
-            _vk.CmdBindPipeline(command, bindPoint, pipeline);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdBindPipeline(command, bindPoint, pipeline);
+            }
         }
 
         private void PushConstantsShadowed(CommandBuffer command, PipelineLayout layout, ShaderStageFlags stages, uint* data)
@@ -115,7 +118,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 values.CopyTo(shadowData);
             }
 
-            _vk.CmdPushConstants(command, layout, stages, 0, PushData.ByteSize, data);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdPushConstants(command, layout, stages, 0, PushData.ByteSize, data);
+            }
         }
 
         private bool DescriptorsAlreadyBound(CommandBuffer command, PipelineBindPoint bindPoint, PipelineLayout layout, ReadOnlySpan<WriteDescriptorSet> writes)

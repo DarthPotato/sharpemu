@@ -63,4 +63,21 @@ public sealed class BufferRetirementPolicyTests
         Assert.True(policy.TryBeginCollection(3, out var normalAgain));
         Assert.Equal(new BufferRetirementPlan(43, 32, false), normalAgain);
     }
+    [Fact]
+    public void SlowSubmissionsDoNotKeepUnusedBuffersForEightySubmissions()
+    {
+        long time = 0;
+        var policy = new BufferRetirementPolicy(() => time);
+        policy.SetThresholds(1, 2);
+        for (var tick = 0; tick < 8; tick++)
+        {
+            policy.TryBeginCollection(2, out _);
+            time += System.Diagnostics.Stopwatch.Frequency / 2;
+        }
+        Assert.True(policy.TryBeginCollection(2, out var plan));
+        Assert.Equal(4UL, plan.LatestEligibleTick);
+        // Buffers touched in the last two seconds remain protected; older buffers can go.
+        Assert.True(plan.LatestEligibleTick < policy.CurrentTick - 1);
+    }
+
 }

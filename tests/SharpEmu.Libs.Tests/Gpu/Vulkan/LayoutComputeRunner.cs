@@ -175,7 +175,7 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
     public GpuBuffer CreateBuffer(ulong size) => CreateBuffer([], size);
 
     // A clamp-to-edge sampler with one filter for both directions, kept until the runner is disposed.
-    public Sampler CreateSampler(Filter filter)
+    public Sampler CreateSampler(Filter filter, SamplerAddressMode addressMode = SamplerAddressMode.ClampToEdge, float maxLod = 1)
     {
         var info = new SamplerCreateInfo
         {
@@ -183,10 +183,10 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
             MagFilter = filter,
             MinFilter = filter,
             MipmapMode = SamplerMipmapMode.Nearest,
-            AddressModeU = SamplerAddressMode.ClampToEdge,
-            AddressModeV = SamplerAddressMode.ClampToEdge,
-            AddressModeW = SamplerAddressMode.ClampToEdge,
-            MaxLod = 1,
+            AddressModeU = addressMode,
+            AddressModeV = addressMode,
+            AddressModeW = addressMode,
+            MaxLod = maxLod,
         };
         Require(_harness.Vk.CreateSampler(_harness.Device.Device, &info, null, out var sampler), "vkCreateSampler");
         _samplers.Add(sampler);
@@ -217,15 +217,22 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         IReadOnlyDictionary<DescriptorBindingKind, DescriptorImageInfo[]>? boundImages = null,
         ulong shaderBase = 0,
         uint[]? dispatchThreadLimits = null,
-        uint[]? memoryOffsets = null,
-        DescriptorSet heapSet = default,
         uint[]? meshDrawParameters = null,
+        ulong[]? bufferRanges = null,
+        uint[]? memoryOffsets = null,
+        ulong[]? callArguments = null,
+        ulong[]? callTargets = null,
+        DescriptorSet heapSet = default,
         uint[]? tessellationData = null)
     {
         var vk = _harness.Vk;
         var device = _harness.Device.Device;
         var layout = _request.Bindings;
         var shaderData = new uint[layout.ShaderDataDwordCount];
+        if (layout.UsesBufferLengths && boundBuffers.TryGetValue(DescriptorBindingKind.Buffers, out var bounded))
+            for (var index = 0; index < bounded.Length; index++)
+                shaderData[layout.BufferLengthsDword + (uint)index] = checked((uint)(
+                    (bufferRanges is not null && index < bufferRanges.Length ? bufferRanges[index] : bounded[index].Size) / sizeof(uint)));
         if (layout.UsesTessellationData)
         {
             if (tessellationData is not { Length: (int)Gen5TessellationData.DwordCount })
@@ -247,10 +254,10 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
             shaderData[layout.ShaderBaseDword + 1] = (uint)(shaderBase >> 32);
         }
 
-        // The byte offset of each buffer's real base inside its aligned view, one byte per buffer.
-        for (var index = 0; memoryOffsets is not null && index < memoryOffsets.Length; index++)
+        if (memoryOffsets is not null)
         {
-            shaderData[layout.MemoryOffsetDword + (uint)index / 4] |= (memoryOffsets[index] & 0xFF) << ((index % 4) * 8);
+            for (var index = 0; index < memoryOffsets.Length; index++)
+                shaderData[layout.MemoryOffsetDword + (uint)index / 4] |= (memoryOffsets[index] & 0xFF) << (index % 4 * 8);
         }
 
         if (layout.UsesDispatchThreadLimits)
@@ -262,6 +269,47 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         {
             if (meshDrawParameters is not { Length: 6 }) throw new InvalidOperationException("The mesh draw requires six parameters.");
             meshDrawParameters.CopyTo(shaderData, (int)layout.MeshDrawParametersDword);
+        }
+        if (layout.CallArgumentCount != 0)
+        {
+            if (callArguments?.Length != layout.CallArgumentCount) throw new InvalidOperationException("The dispatch requires its call arguments.");
+            for (var index = 0; index < callArguments.Length; index++)
+            {
+                shaderData[layout.CallArgumentsDword + index * 2] = (uint)callArguments[index];
+                shaderData[layout.CallArgumentsDword + index * 2 + 1] = (uint)(callArguments[index] >> 32);
+            }
+        }
+        if (layout.CallTargetCount != 0)
+        {
+            if (callTargets?.Length != layout.CallTargetCount) throw new InvalidOperationException("The dispatch requires its call targets.");
+            for (var index = 0; index < callTargets.Length; index++)
+            {
+                shaderData[layout.CallTargetsDword + index * 2] = (uint)callTargets[index];
+                shaderData[layout.CallTargetsDword + index * 2 + 1] = (uint)(callTargets[index] >> 32);
+            }
+        }
+
+        if (layout.UsesTableBlock)
+        {
+            var bound = boundBuffers.TryGetValue(DescriptorBindingKind.Buffers, out var tableBuffers) ? tableBuffers : [];
+            var table = flattenedTable ?? [];
+            var block = new uint[layout.TableFlattenedDword + table.Length];
+            block[0] = (uint)table.Length;
+            for (var index = 0; index < layout.BufferCount; index++)
+            {
+                var buffer = index < bound.Length ? bound[index] : CreateBuffer(16);
+                var record = (int)(BindingLayout.TableBlockHeaderDwords + (uint)index * BindingLayout.TableBufferDwords);
+                var range = bufferRanges is not null && index < bufferRanges.Length ? bufferRanges[index] : buffer.Size;
+                block[record] = (uint)buffer.DeviceAddress;
+                block[record + 1] = (uint)(buffer.DeviceAddress >> 32);
+                block[record + 2] = (uint)(range >> 2);
+                block[record + 3] = memoryOffsets is not null && index < memoryOffsets.Length ? memoryOffsets[index] & 0xFF : 0;
+            }
+
+            table.CopyTo(block, (int)layout.TableFlattenedDword);
+            var blockAddress = CreateBuffer(MemoryMarshal.AsBytes<uint>(block)).DeviceAddress;
+            shaderData[layout.TableBlockDword] = (uint)blockAddress;
+            shaderData[layout.TableBlockDword + 1] = (uint)(blockAddress >> 32);
         }
 
         var setLayout = _setLayout;
@@ -297,6 +345,12 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
             {
                 buffers = [CreateBuffer(MemoryMarshal.AsBytes<uint>(shaderData))];
             }
+            else if (descriptor.Kind == DescriptorBindingKind.DeviceAddressFallback && !boundBuffers.ContainsKey(descriptor.Kind))
+            {
+                // As the buffer cache does: the address of a readable buffer.
+                ulong[] fallback = [CreateBuffer(256).DeviceAddress, 0];
+                buffers = [CreateBuffer(MemoryMarshal.AsBytes<ulong>(fallback))];
+            }
             else if (!boundBuffers.TryGetValue(descriptor.Kind, out buffers!))
             {
                 buffers = [CreateBuffer(16)];
@@ -308,9 +362,12 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
             }
 
             writes.Add((binding, type, infos.Count, count));
+            var first = infos.Count;
             foreach (var buffer in buffers)
             {
-                infos.Add(new DescriptorBufferInfo(buffer.Handle, 0, buffer.Size));
+                var range = descriptor.Kind == DescriptorBindingKind.Buffers && bufferRanges is not null && infos.Count - first < bufferRanges.Length
+                    ? bufferRanges[infos.Count - first] : buffer.Size;
+                infos.Add(new DescriptorBufferInfo(buffer.Handle, 0, range));
             }
         }
 

@@ -160,10 +160,8 @@ public static partial class KernelMemoryCompatExports
 
     private static ulong _nextVirtualAddress;
     // Start the address search outside the host memory regions.
-    // On macOS, also exclude the graphics memory region below 0x7000000000.
     private static readonly ulong DefaultMapSearchBase =
-        OperatingSystem.IsWindows() ? 0x1_0000_0000UL :
-        OperatingSystem.IsMacOS() ? 0x70_0000_0000UL : 0x20_0000_0000UL;
+        OperatingSystem.IsWindows() ? 0x1_0000_0000UL : 0x20_0000_0000UL;
     private static ulong _threadAtexitCountCallback;
     private static ulong _threadAtexitReportCallback;
     private static ulong _threadDtorsCallback;
@@ -3370,19 +3368,27 @@ public static partial class KernelMemoryCompatExports
             return MemoryInvalidArgument;
         lock (_memoryGate)
         {
-            if (length > _flexibleBacking.Available)
-                return MemoryNoSpace;
-            var space = ResolveBackingSpace(ctx);
-            if (space is null || !TrySelectBackingAddress(space, requested, length, alignment, flags, out var address))
-                return MemoryNoSpace;
-            if (!_flexibleBacking.TryMap(space, address, length, mode, out var blocks))
-                return MemoryNoSpace;
-            foreach (var block in blocks)
-                ReplaceMappedRegionRangeLocked(new MappedRegion(block.Address, block.Size, protection,
-                    true, false, 0, block.Offset));
-            GuestGpuMemoryHook.NoteMapped(address, length, mode);
-            return ctx.TryWriteUInt64(pointer, address) ? 0 : MemoryFault;
+            var result = MapFlexibleRangeLocked(ctx, requested, length, protection, flags, alignment, mode, out var address);
+            return result != 0 ? result : ctx.TryWriteUInt64(pointer, address) ? 0 : MemoryFault;
         }
+    }
+
+    private static int MapFlexibleRangeLocked(CpuContext ctx, ulong requested, ulong length, int protection,
+        ulong flags, ulong alignment, GuestPageProtection mode, out ulong address)
+    {
+        address = 0;
+        if (length > _flexibleBacking.Available)
+            return MemoryNoSpace;
+        var space = ResolveBackingSpace(ctx);
+        if (space is null || !TrySelectBackingAddress(space, requested, length, alignment, flags, out address))
+            return MemoryNoSpace;
+        if (!_flexibleBacking.TryMap(space, address, length, mode, out var blocks))
+            return MemoryNoSpace;
+        foreach (var block in blocks)
+            ReplaceMappedRegionRangeLocked(new MappedRegion(block.Address, block.Size, protection,
+                true, false, 0, block.Offset));
+        GuestGpuMemoryHook.NoteMapped(address, length, mode);
+        return 0;
     }
 
     [SysAbiExport(
@@ -6540,6 +6546,9 @@ public static partial class KernelMemoryCompatExports
 
         return false;
     }
+
+    public static bool TryReadGuestStructure(CpuContext ctx, ulong address, Span<byte> destination) =>
+        ctx.Memory.TryRead(address, destination) || TryReadShaderGuestMemory(address, destination);
 
     internal static bool TryReadShaderGuestMemory(
         ulong address,

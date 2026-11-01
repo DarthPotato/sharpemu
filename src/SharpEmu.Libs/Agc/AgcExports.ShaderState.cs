@@ -128,6 +128,7 @@ public static partial class AgcExports
             TraceAgcShader($"agc.fused_shader_retired code=0x{codeAddress:X16} replacement_header=0x{headerAddress:X16}");
         }
         _shaderHeadersByCode[codeAddress] = headerAddress;
+        Gpu.Pipelines.ShaderHeaderRegistry.NoteRegistration();
 
         TryRegisterEmbeddedFusedProgram(ctx, codeAddress, headerAddress);
 
@@ -475,20 +476,26 @@ public static partial class AgcExports
             }
         }
 
+        var fusedEntryCode = frontCodeAddress;
+        var fusedEntryHeader = frontAddress;
+        if (!isGeometryPair &&
+            !TryGetFusedHullEntry(ctx, frontAddress, backAddress, backCodeAddress, ref fusedEntryCode, out fusedEntryHeader))
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+
         if (!PatchFusedProgramAddress(
                 ctx,
                 fusedRegistersAddress,
                 registerCount,
                 isGeometryPair ? SpiShaderPgmLoEs : SpiShaderPgmLoLs,
-                frontCodeAddress))
+                fusedEntryCode))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         Gen5ShaderTranslator.RegisterFusedProgram(
             ctx,
-            frontCodeAddress,
-            frontAddress,
+            fusedEntryCode,
+            fusedEntryHeader,
             backCodeAddress,
             backAddress);
 
@@ -675,6 +682,44 @@ public static partial class AgcExports
             $"hull=0x{hullShaderAddress:X16} gs=0x{geometryShaderAddress:X16} type={shaderType} prim=0x{primitiveType:X8}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "Y3ymLfZ1384",
+        ExportName = "sceAgcUpdatePrimState",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int UpdatePrimState(CpuContext ctx)
+    {
+        var cxRegistersAddress = ctx[CpuRegister.Rdi];
+        var ucRegistersAddress = ctx[CpuRegister.Rsi];
+        var primitiveType = (uint)ctx[CpuRegister.Rdx];
+
+        if (cxRegistersAddress != 0)
+        {
+            if (!TryReadUInt32(ctx, cxRegistersAddress + 4, out var stages))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            // Tessellation and geometry shaders own their output primitive type.
+            if ((stages & 0x24u) == 0 &&
+                (!TryReadUInt32(ctx, cxRegistersAddress + 12, out var outputPrimitive) ||
+                 !TryWriteUInt32(ctx, cxRegistersAddress + 12,
+                     (outputPrimitive & ~7u) | AgcPrimitiveHelpers.PrimitiveTypeToGsOut(primitiveType))))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        if (ucRegistersAddress != 0 &&
+            (!TryReadUInt32(ctx, ucRegistersAddress + 20, out var inputPrimitive) ||
+             !TryWriteUInt32(ctx, ucRegistersAddress + 20, (inputPrimitive & ~0x1Fu) | primitiveType)))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     #pragma warning disable SHEM006

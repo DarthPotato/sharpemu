@@ -10,6 +10,45 @@ internal static unsafe partial class VulkanVideoPresenter
 {
     private sealed partial class Presenter
     {
+        // The pooled depth-feedback snapshots belong to the render thread's recording host;
+        // an allocation failing on a worker or the command thread leaves them alone.
+        private void ReleaseFeedbackSnapshotsOnRenderThread()
+        {
+            if (OnCommandThread || OnResolveWorker ||
+                Thread.CurrentThread.Name?.StartsWith("SharpEmu render worker", StringComparison.Ordinal) == true)
+            {
+                return;
+            }
+
+            _recording?.DestroyFeedbackSnapshotPool();
+        }
+
+        private Result CreateImageWithRecovery(in ImageCreateInfo info, out Image image)
+        {
+            var create = info;
+            var result = _vk.CreateImage(_device, &create, null, out image);
+            if ((result is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory) && _imageCache is not null)
+            {
+                ReleaseFeedbackSnapshotsOnRenderThread();
+                _imageCache.ReclaimForAllocation();
+                result = _vk.CreateImage(_device, &create, null, out image);
+            }
+            return result;
+        }
+
+        private Result AllocateMemoryWithRecovery(in MemoryAllocateInfo info, out DeviceMemory memory)
+        {
+            var result = _deviceInfo.AllocateMemory(info, out memory);
+            if ((result is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory) && _imageCache is not null)
+            {
+                // Presentation/feedback resources compete with guest images on the same heap.
+                ReleaseFeedbackSnapshotsOnRenderThread();
+                _imageCache.ReclaimForAllocation();
+                result = _deviceInfo.AllocateMemory(info, out memory);
+            }
+            return result;
+        }
+
         private static void Check(Result result, string operation)
         {
             if (result == Result.ErrorDeviceLost)

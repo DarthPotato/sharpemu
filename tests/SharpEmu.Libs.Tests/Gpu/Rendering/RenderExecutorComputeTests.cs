@@ -3,6 +3,7 @@
 
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
+using BindingLayout = SharpEmu.ShaderCompiler.Resources.BindingLayout;
 using Xunit;
 using static SharpEmu.Libs.Tests.Gpu.Rendering.RenderExecutorFixtures;
 
@@ -24,6 +25,37 @@ public sealed class RenderExecutorComputeTests : IDisposable
     public RenderExecutorComputeTests() => _executor = new RenderExecutor(_host, _pipelines);
 
     public void Dispose() => _fatal.Dispose();
+
+    [Fact]
+    public void FrontendImageCopyFallbackRunsOnlyWhenTheCommandIsRecorded()
+    {
+        var fallbackCalls = 0;
+        _pipelines.Compute = new ComputeProgram
+        {
+            ImageCopy = new(default, default, () =>
+            {
+                fallbackCalls++;
+                return new ComputeProgram { Consumed = true };
+            }),
+        };
+        var sink = new CapturedDispatch();
+        var resolver = new RenderExecutor(_host, _pipelines, sink);
+        resolver.Dispatch(5, Banks(), 1, 1, 1, 0x41);
+        Assert.Equal(0, fallbackCalls);
+        Assert.NotNull(sink.Command);
+        Assert.False(sink.Command.Skipped);
+        var recorder = new RenderRecorder(_host, _pipelines, true, returnsRecords: false);
+        recorder.Record(sink.Command);
+        Assert.Equal(1, fallbackCalls);
+    }
+
+    private sealed class CapturedDispatch : IResolvedCommandSink
+    {
+        public ResolvedDispatch? Command;
+        public long NextSequence() => 1;
+        public void Record(ResolvedDraw record) => throw new InvalidOperationException();
+        public void Record(ResolvedDispatch record) => Command = record;
+    }
 
     [Fact]
     public void CompletedPipeline_RetriesPublicationBeforeDispatch()
@@ -66,6 +98,27 @@ public sealed class RenderExecutorComputeTests : IDisposable
             await dispatch.WaitAsync(TimeSpan.FromSeconds(10));
         }
         Assert.Equal(2, _pipelines.ComputePipelineAttempts);
+        AssertDispatched(4, 2, 1);
+    }
+
+    // A program linked with its callees can take the driver minutes to compile: its dispatch is skipped while the module
+    // compiles, before any command is recorded for it, and runs once the module is ready.
+    [Fact]
+    public void LinkedProgram_SkipsItsDispatchWhileTheModuleCompiles()
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pipelines.PendingComputeCompletion = completion.Task;
+        var program = new ShaderProgramInfo { Stage = ShaderStageKind.Compute, Hash = 0x1234, Bindings = new BindingLayout { CallTargetCount = 1 } };
+        _pipelines.Compute = ComputeProgram(Stage(program));
+        _executor.Dispatch(5, Banks(), 4, 2, 1, 0x41);
+        AssertNotDispatched();
+        Assert.Equal(1, _pipelines.ComputePipelineAttempts);
+        Assert.DoesNotContain("preparation_begin", _host.Calls);
+        Assert.DoesNotContain("reset_bindings", _host.Calls);
+        Assert.StartsWith("debug DispatchDirect", _host.Calls[^1]);
+
+        completion.SetResult();
+        _executor.Dispatch(6, Banks(), 4, 2, 1, 0x41);
         AssertDispatched(4, 2, 1);
     }
 
@@ -191,6 +244,18 @@ public sealed class RenderExecutorComputeTests : IDisposable
         _executor.Dispatch(1, Banks(), 0, 0, 0, 0x41, 0x1000);
 
         Assert.Contains("create_compute_pipeline", _pipelines.Calls);
+    }
+
+    [Fact]
+    public void ThreadDimensionInitiator_WithNoThreads_IsSkippedBeforeTheProgramLookup()
+    {
+        var banks = Banks();
+        banks.Shader.Compute.ThreadsX = 8;
+        _executor.Dispatch(1, banks, 0, 17, 1, 0x41 | (1u << 5));
+
+        AssertNotDispatched();
+        Assert.Empty(_pipelines.Calls);
+        Assert.Equal(0, _host.PreparationsOpened);
     }
 
     [Fact]

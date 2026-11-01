@@ -56,6 +56,61 @@ public sealed partial class GuestImageCacheTests
         _vulkan.AssertNoValidationMessages();
     }
 
+    [Fact]
+    public void RepeatedNativeColorClearRegistrationKeepsTheMetadataGeneration()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var metadataAddress = address + 0x10000;
+        var target = AsColorTarget(LinearRequest(address, 8, Format.R16G16B16A16Sfloat,
+            GuestPixelFormat.Bits16_16_16_16Float, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 8, 1));
+        target.Description.Metadata.Kind = MetadataKind.Dcc;
+        target.Description.Metadata.Range = new GuestSpan(metadataAddress, 4096);
+        target.Description.Metadata.NativeColorClear = true;
+        target.Description.Metadata.PackedColorClearSupported = true;
+        target.Description.Metadata.PackedColorClear = new ClearColorValue(0f, 0f, 1f, 1f);
+        harness.Write(metadataAddress, Enumerable.Repeat((byte)0xFF, 4096).ToArray());
+        var identifier = harness.Find(ref target);
+        harness.Worker.Run(() => harness.Images.ApplyNativeColorClear(identifier, target));
+        var generation = harness.Images.MetadataGeneration;
+
+        harness.Worker.Run(() => harness.Images.ApplyNativeColorClear(identifier, target));
+
+        Assert.Equal(generation, harness.Images.MetadataGeneration);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void NativeColorClearIsSettledOnlyWhileTheRegistrationIsCurrentAndNoSliceHoldsAClearCode()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var metadataAddress = address + 0x10000;
+        var target = AsColorTarget(LinearRequest(address, 8, Format.R16G16B16A16Sfloat,
+            GuestPixelFormat.Bits16_16_16_16Float, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 8, 1));
+        target.Description.Metadata.Kind = MetadataKind.Dcc;
+        target.Description.Metadata.Range = new GuestSpan(metadataAddress, 4096);
+        target.Description.Metadata.NativeColorClear = true;
+        target.Description.Metadata.PackedColorClearSupported = true;
+        target.Description.Metadata.PackedColorClear = new ClearColorValue(0f, 0f, 1f, 1f);
+        harness.Write(metadataAddress, Enumerable.Repeat((byte)0xFF, 4096).ToArray());
+        var identifier = harness.Find(ref target);
+        Assert.False(harness.Images.NativeColorClearSettled(identifier, target));
+
+        harness.Worker.Run(() => harness.Images.ApplyNativeColorClear(identifier, target));
+        Assert.True(harness.Images.NativeColorClearSettled(identifier, target));
+
+        var otherClear = target;
+        otherClear.Description.Metadata.PackedColorClear = new ClearColorValue(1f, 0f, 0f, 1f);
+        Assert.False(harness.Images.NativeColorClearSettled(identifier, otherClear));
+
+        harness.Write(metadataAddress, Enumerable.Repeat((byte)0x20, 4096).ToArray());
+        Assert.False(harness.Images.NativeColorClearSettled(identifier, target));
+        harness.Shutdown();
+    }
+
     [Theory]
     [InlineData(0u, false, true)]
     [InlineData(0u, true, false)]
@@ -138,10 +193,10 @@ public sealed partial class GuestImageCacheTests
         harness.Worker.Run(() =>
         {
             var command = new CommandBuffer(harness.Scheduler.Current.Handle);
-            image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
+            image.Transition(AccessFlags.TransferWriteBit, null, command);
             var range = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1);
             var color = new ClearColorValue(1f, 0f, 0f, 0.5f);
-            _vulkan.Vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &color, 1, &range);
+            _vulkan.Vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.General, &color, 1, &range);
             harness.Images.MarkGpuWritten(identifier);
         });
         var written = harness.ReadImageBytes(image);
@@ -280,5 +335,41 @@ public sealed partial class GuestImageCacheTests
         Assert.Equal(0x40404040u, harness.ReadUInt32(metadataAddress));
         Assert.Equal(clears ? uint.MaxValue : 0x10101010u, harness.ReadUInt32(metadataAddress + 4096));
         harness.Shutdown();
+    }
+
+    // A texture can grow a surface into a mip chain whose range covers the surface's metadata slice. The fill that
+    // consumes the clear code then writes inside the image, and the clear must survive it.
+    [Fact]
+    public void NativeColorClear_SurvivesTheFillThatConsumesItsCodeInsideTheImage()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        var metadataAddress = address + 0x3000;
+        harness.Write(metadataAddress, Enumerable.Repeat((byte)0x40, 4096).ToArray());
+        var chain = LinearRequest(address, 0x4008, Format.R16G16B16A16Sfloat,
+            GuestPixelFormat.Bits16_16_16_16Float, GuestImageType.Color2D, new Extent3D(2, 2, 1), 1, 8, 1);
+        chain.Description.Resources = new SubresourceCount(2, 1);
+        chain.Description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = 32, Pitch = 2, Height = 2 };
+        chain.Description.MipLayout[1] = new MipLevelLayout { Offset = 0x4000, Size = 8, Pitch = 1, Height = 1 };
+        chain.View = chain.View with { LevelCount = 2 };
+        var chainIdentifier = harness.Find(ref chain);
+        var target = AsColorTarget(chain);
+        target.Description.Resources = new SubresourceCount(1, 1);
+        target.View = target.View with { LevelCount = 1 };
+        target.Description.Metadata.Kind = MetadataKind.Dcc;
+        target.Description.Metadata.Range = new GuestSpan(metadataAddress, 4096);
+        target.Description.Metadata.NativeColorClear = true;
+        harness.Worker.Run(() => harness.Images.SynchronizeColorMetadata(target));
+        var identifier = harness.Find(ref target);
+        Assert.Equal(chainIdentifier, identifier);
+        harness.Worker.Run(() => harness.Images.ApplyNativeColorClear(identifier, target));
+        Assert.False(harness.Image(identifier).IsBufferModified);
+        harness.Worker.Run(() => harness.Images.AcquireColorTargetView(identifier, target));
+        var opaqueBlack = Enumerable.Range(0, 4).SelectMany(_ => Bytes((ushort)0, (ushort)0, (ushort)0, (ushort)0x3c00)).ToArray();
+        Assert.Equal(opaqueBlack, harness.ReadImageBytes(harness.Image(identifier)));
+        Assert.Equal(uint.MaxValue, harness.ReadUInt32(metadataAddress));
+        harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
     }
 }

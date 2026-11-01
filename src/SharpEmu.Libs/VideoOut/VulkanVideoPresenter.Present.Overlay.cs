@@ -39,7 +39,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SharingMode = SharingMode.Exclusive,
                 InitialLayout = ImageLayout.Undefined,
             };
-            Check(_vk.CreateImage(_device, &imageInfo, null, out _overlayImage), "vkCreateImage(overlay)");
+            Check(CreateImageWithRecovery(imageInfo, out _overlayImage), "vkCreateImage(overlay)");
             _vk.GetImageMemoryRequirements(_device, _overlayImage, out var requirements);
             var memoryInfo = new MemoryAllocateInfo
             {
@@ -50,7 +50,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     MemoryPropertyFlags.DeviceLocalBit),
             };
             Check(
-                _deviceInfo.AllocateMemory(memoryInfo, out _overlayImageMemory),
+                AllocateMemoryWithRecovery(memoryInfo, out _overlayImageMemory),
                 "vkAllocateMemory(overlay)");
             Check(
                 _vk.BindImageMemory(_device, _overlayImage, _overlayImageMemory, 0),
@@ -117,13 +117,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
                 ImageExtent = new Extent3D(PerfOverlay.PixelBufferWidth, PerfOverlay.PixelBufferHeight, 1),
             };
-            _vk.CmdCopyBufferToImage(
-                _commandBuffer,
-                _overlayStagingBuffers[frameSlot],
-                _overlayImage,
-                ImageLayout.TransferDstOptimal,
-                1,
-                &copyRegion);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdCopyBufferToImage(
+                    _commandBuffer,
+                    _overlayStagingBuffers[frameSlot],
+                    _overlayImage,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &copyRegion);
+            }
 
             var toTransferSrc = new ImageMemoryBarrier2
             {
@@ -172,14 +175,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 DstOffset = new Offset3D(rectangle.Left, rectangle.Top, 0),
                 Extent = new Extent3D((uint)panelWidth, (uint)panelHeight, 1),
             };
-            _vk.CmdCopyImage(
-                _commandBuffer,
-                _overlayImage,
-                ImageLayout.TransferSrcOptimal,
-                presentationTarget,
-                ImageLayout.TransferDstOptimal,
-                1,
-                &copy);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdCopyImage(
+                    _commandBuffer,
+                    _overlayImage,
+                    ImageLayout.TransferSrcOptimal,
+                    presentationTarget,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &copy);
+            }
 
             var presentationTargetToFinal = new ImageMemoryBarrier2
             {

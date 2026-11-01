@@ -116,7 +116,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private uint _hostMovieChromaImageHeight;
         private uint _hostMovieChromaImageDstSelect;
         private bool _hostMovieChromaImageInitialized;
-        private byte[]? _hostMovieFramePixels;
+        internal byte[]? _hostMovieFramePixels;
         private uint _hostMovieFrameWidth;
         private uint _hostMovieFrameHeight;
         private long _hostMovieFrameSerial;
@@ -130,7 +130,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly HashSet<string> _tracedHostMovieTextureBindings =
             new(StringComparer.Ordinal);
 
-        private void PumpHostMovieFrame()
+        internal void PumpHostMovieFrame()
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.MovieFramePolling);
             if (!HostMovieBridge.TryDecodeNextFrame(
@@ -179,12 +179,12 @@ internal static unsafe partial class VulkanVideoPresenter
             _hostMovieFrameSerial = frameSerial;
         }
 
-        private readonly record struct HostMovieTextureBindings(int Luma, int Chroma)
+        internal readonly record struct HostMovieTextureBindings(int Luma, int Chroma)
         {
             public static HostMovieTextureBindings None { get; } = new(-1, -1);
         }
 
-        private HostMovieTextureBindings FindHostMovieTextureBindings(
+        internal HostMovieTextureBindings FindHostMovieTextureBindings(
             IReadOnlyList<GuestDrawTexture> textures)
         {
             if (_hostMovieFramePixels is null ||
@@ -295,7 +295,7 @@ internal static unsafe partial class VulkanVideoPresenter
             GuestDrawTexture chroma) =>
             IsHostMovieChromaCandidateForLuma(luma, chroma);
 
-        private TextureResource CreateHostMovieTextureResource(
+        internal TextureResource CreateHostMovieTextureResource(
             GuestDrawTexture texture,
             int plane)
         {
@@ -439,7 +439,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 InitialLayout = ImageLayout.Undefined,
             };
             Check(
-                _vk.CreateImage(_device, &imageInfo, null, out image),
+                CreateImageWithRecovery(imageInfo, out image),
                 $"vkCreateImage(host movie {planeName})");
             _vk.GetImageMemoryRequirements(_device, image, out var requirements);
             var allocationInfo = new MemoryAllocateInfo
@@ -451,7 +451,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     MemoryPropertyFlags.DeviceLocalBit),
             };
             Check(
-                _deviceInfo.AllocateMemory(allocationInfo, out memory),
+                AllocateMemoryWithRecovery(allocationInfo, out memory),
                 $"vkAllocateMemory(host movie {planeName})");
             Check(
                 _vk.BindImageMemory(_device, image, memory, 0),

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
 using Silk.NET.Vulkan;
@@ -24,6 +25,21 @@ public sealed class GraphicsPipelineDescription
 }
 
 public sealed record TessellationPipelineStages(ShaderProgram Control, ShaderProgram Evaluation, uint InputControlPoints);
+// Why a dispatch the CPU evaluated still runs on the GPU instead of landing as a store of the stream.
+internal enum KernelWriteRefusal
+{
+    None,
+    Unsupported,
+    Sparse,
+    Thread,
+    CrossQueue,
+    Publication,
+    PendingRange,
+    PendingWrite,
+    Image,
+    Metadata,
+    Count,
+}
 
 public sealed class ComputePipelineDescription
 {
@@ -56,6 +72,7 @@ internal interface IShaderPipelineHost
     // (RuntimeDescriptorTable): it keeps the persistent descriptor heap and fills the lookup table.
     // Plans for a host without it keep the null fallback for a descriptor they cannot bind ahead of time.
     bool RuntimeImageDescriptorsSupported => false;
+    bool RuntimeDescriptorResolutionRequiresSerial => false;
 
     bool ComputeWave64Supported { get; }
 
@@ -66,11 +83,26 @@ internal interface IShaderPipelineHost
 
     bool MipStatisticsSubgroupReduction => false;
 
+    // Whether the host reads a linked program's call records at run time, through descriptor set 1.
+    bool RuntimeCallRecordsSupported => false;
+
+    // The call marks of programs linked with run-time call records (CallMarks): whether the host binds and reads them, how
+    // many mark snapshots it has read, and the snapshot that last held a bit (0 when none did).
+    bool CallMarksSupported => false;
+    long CallMarkSnapshots => 0;
+    long CallMarkedAt(uint bit) => 0;
+
+    bool TableBlocks => false;
+
     bool GraphicsSubgroupOperationsEnabled { get; }
 
     // The device supports shaderSharedInt64Atomics, so LDS 64-bit atomics can be
     // emitted as real 64-bit atomics instead of a non-atomic 32-bit pair.
     bool SharedInt64AtomicsEnabled { get; }
+
+    // The device supports shaderImageInt64Atomics, so an atomic on a 64-bit image texel
+    // (a 32_32 UINT image) can be compiled; without it such a program is rejected.
+    bool ImageInt64AtomicsEnabled => false;
     bool ShaderSignedZeroInfNanPreserveFloat32Supported => false;
 
     // The device rounds f16 conversions to nearest even and preserves 16-bit denormals, so a shader
@@ -80,6 +112,7 @@ internal interface IShaderPipelineHost
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;
     bool ClipDistanceEnabled => false;
+    bool ShaderDrawParametersSupported => false;
 
     bool MeshShadersSupported => false;
 
@@ -102,10 +135,25 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
+    // For an error report: why a clean read of the dword can fail (mapping and GPU ownership).
+    string DescribeCleanRead(ulong address) => "";
+
     // Copies guest bytes the CPU already holds, without synchronizing. False when the GPU
     // may own the range (or, for a clean read, when a clean word read would be refused);
     // the resource cache then re-materializes instead of trusting a stale copy.
     bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean) => false;
+
+    bool TryCopyImage(in ImageRequest source, in ImageRequest destination) => false;
+
+    uint[] NormalizeImageDescriptor(IShaderFrontend frontend, ReadOnlySpan<uint> words,
+        ShaderStage stage, ulong shaderHash, string source) => frontend.NormalizeImageForResolution(words, stage, shaderHash, source, true);
+    // A resident read that refuses instead of waiting for pending command-thread work.
+    bool TryPeekResidentGuestBytes(ulong address, Span<byte> destination) => false;
+
+    bool CpuWriteNeedsGpuData(ulong address, ulong size) => false;
+
+    // Queues the words as a store at the current stream position when no earlier work may still touch the range.
+    KernelWriteRefusal TryPostKernelWrite(ulong address, ReadOnlySpan<uint> words) => KernelWriteRefusal.Unsupported;
 
     // Creates the host module of one compiled permutation and returns its handle.
     ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId);

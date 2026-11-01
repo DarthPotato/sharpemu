@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.Libs.Gpu.Scheduling;
 
 namespace SharpEmu.Libs.Gpu.GpuCommands;
 
@@ -28,7 +30,8 @@ public readonly record struct DrawIndexedArguments(
     ulong IndirectArgumentsAddress = 0,
     // The guest set no index buffer size: IndexCount is only the range seen so far and
     // must not clamp the count read from the arguments.
-    bool UnboundedIndexBuffer = false);
+    bool UnboundedIndexBuffer = false,
+    int StartInstanceUserData = -1);
 
 // Arguments of a non-indexed draw as the packet stream describes them.
 public readonly record struct DrawAutoArguments(
@@ -39,8 +42,7 @@ public readonly record struct DrawAutoArguments(
     uint FirstVertex,
     uint FirstInstance,
     DrawOffsetSource OffsetSource,
-    // Nonzero when the counts are still in guest memory at this address, laid out as
-    // (vertexCount, instanceCount, firstVertex, firstInstance).
+    int StartInstanceUserData = -1,
     ulong IndirectArgumentsAddress = 0);
 
 public enum EndOfPipeWriteKind
@@ -77,12 +79,15 @@ public readonly record struct EndOfPipeWrite(
     int FlipIndex = 0,
     int FlipMode = 0,
     long FlipArgument = 0,
-    ulong FlipRequestId = 0);
+    ulong FlipRequestId = 0,
+    bool WaitForGpu = false);
 
 // Everything a packet handler needs from the renderer, the caches, the scheduler and video out.
 public interface ICommandStreamHost
 {
     ICpuMemory Memory { get; }
+
+    IRenderHost? RenderHost => this as IRenderHost;
 
     bool TryRecordLodStatistics(ulong destination, uint size) => false;
 
@@ -112,9 +117,32 @@ public interface ICommandStreamHost
     // Reads the label a wait polls. A stale value only suspends the wait until a retry, so a host
     // that runs work behind the stream need not complete it first.
     bool TryReadGuestWaitOperand(ulong address, Span<byte> destination) => TryReadGuestOperand(address, destination);
+    bool TryReadGuestWaitOperand(ulong address, Span<byte> destination, bool allowStale, out bool stale)
+    {
+        stale = false;
+        return TryReadGuestWaitOperand(address, destination);
+    }
+
+    // Draws resolve ahead of the stream on this many worker threads; zero resolves them on the stream thread.
+    int ResolveWorkerCount => 0;
+
+    // Reads on this thread now serve a draw at this stream position: a range earlier work may still
+    // write refuses with SerialResolveRequiredException, every other read lands in the log.
+    void BeginWorkerResolve(long sequence, ResolveReadLog reads)
+    {
+    }
+
+    void EndWorkerResolve()
+    {
+    }
+
+    // At the stream position of the draw: whether the bytes a worker read are what it would read now.
+    bool ValidateWorkerReads(ResolveReadLog reads) => true;
 
     // Runs commands other threads posted to this worker. Called before every packet.
     void RunPendingCommands();
+
+    PendingCommandSignal CommandSignal => PendingCommandSignal.AlwaysRaised;
 
     // Starts a slice of a submission; the geometry snapshots were captured when it was submitted.
     void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots);
@@ -166,6 +194,8 @@ public interface ICommandStreamHost
     bool DumpOcclusionCounter(int queueId, ulong address, uint instanceMask, uint strideBytes) => false;
 
     bool HasPendingPublications(int queueId) => false;
+
+    bool HasGpuWrittenCommandData(ulong address, ulong size) => true;
 
     bool HasPendingMemoryPublication(ulong address, ulong size) => false;
 

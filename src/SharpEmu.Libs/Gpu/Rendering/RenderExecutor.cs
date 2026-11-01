@@ -53,49 +53,38 @@ public sealed partial class RenderExecutor
     private static int _tessellationWarningShown;
 
     private readonly IRenderHost _host;
+    private readonly DrawResolution _drawResolution = new();
     private readonly IShaderPipelineProvider _pipelines;
-    private readonly bool _strictDrawResources;
-    private readonly HashSet<(ulong ShaderHash, ImageType ImageType, ImageViewType ViewType)> _reportedDrawImageTypeMismatches = [];
+    private readonly IResolvedCommandSink _recorder;
+    private readonly RecordPool _pool;
+    private readonly Func<string, Exception> _fatal;
 
     public RenderExecutor(IRenderHost host, IShaderPipelineProvider pipelines)
-        : this(host, pipelines, Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0")
+        : this(host, pipelines, DefaultStrictDrawResources)
     {
     }
 
     internal RenderExecutor(IRenderHost host, IShaderPipelineProvider pipelines, bool strictDrawResources)
+        : this(host, pipelines, new PendingGpuWrites(), new RecordPool(), strictDrawResources)
+    {
+    }
+
+    private RenderExecutor(IRenderHost host, IShaderPipelineProvider pipelines, PendingGpuWrites pendingWrites, RecordPool pool, bool strictDrawResources)
+        : this(host, pipelines, new RenderRecorder(host, pipelines, strictDrawResources, pendingWrites, pool), pendingWrites, pool)
+    {
+    }
+
+    internal RenderExecutor(IRenderHost host, IShaderPipelineProvider pipelines, IResolvedCommandSink recorder, PendingGpuWrites? pendingWrites = null, RecordPool? pool = null)
     {
         _host = host;
+        _fatal = host.Fatal;
         _pipelines = pipelines;
-        _strictDrawResources = strictDrawResources;
+        _recorder = recorder;
+        PendingWrites = pendingWrites ?? new PendingGpuWrites();
+        _pool = pool ?? new RecordPool();
     }
 
-    private readonly record struct DrawCall(string Name, RecordedOperation Operation, uint Count, uint InstanceCount, uint FirstInstance);
-
-    // IndirectArgumentsAddress: the GPU reads the draw's counts from guest memory there.
-    private readonly record struct DrawEmission(bool Indexed, int VertexOffset, uint FirstVertex, uint FirstInstance, ulong IndirectArgumentsAddress = 0);
-
-    private readonly record struct IndexSource(bool Enabled, ulong Address, byte[]? HostData, ulong Size, IndexType Type);
-
-    [System.Runtime.CompilerServices.InlineArray(RenderingState.ColorAttachmentCapacity)]
-    private struct ColorTargetStates
-    {
-        private ColorTargetState _element0;
-    }
-
-    private struct DrawState
-    {
-        public ColorTargetStates Colors;
-        public uint ColorCount;
-        public DepthAttachmentState Depth;
-        public bool PixelActive;
-        public RenderingState Rendering;
-        public GraphicsPrograms Programs;
-
-        public static DrawState Create() => new() { PixelActive = true, Programs = null! };
-    }
-
-    private static ReadOnlySpan<ColorTargetState> BoundColors(ref DrawState state) =>
-        ((ReadOnlySpan<ColorTargetState>)state.Colors)[..(int)state.ColorCount];
+    internal static bool DefaultStrictDrawResources => Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0";
 
     public void DrawIndexed(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
     {
@@ -187,6 +176,8 @@ public sealed partial class RenderExecutor
         }
 
         var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
+        if (words[1] > (1u << 24))
+            Console.Error.WriteLine($"[GPU][ERROR][DRAW_INSTANCE_COUNT] phase=render-cpu-indirect submit={submitId} packet=0x{arguments.PacketAddress:X16} opcode=0x{arguments.Opcode:X2} source=indirect-argument-record address=0x{arguments.IndirectArgumentsAddress:X16} count={words[0]} instances={words[1]} words={Convert.ToHexString(bytes)} primitive={banks.UserConfig.PrimitiveType} vs=0x{banks.Shader.Vertex.ExportAddress:X16} ps=0x{banks.Shader.Pixel.Address:X16} thread={Thread.CurrentThread.Name}");
         var elementSize = (GuestIndexType)arguments.IndexTypeAndSize switch
         {
             GuestIndexType.Index16 => 2ul,
@@ -205,7 +196,9 @@ public sealed partial class RenderExecutor
         };
         if (resolved.IndexCount == 0 || resolved.InstanceCount == 0)
         {
-            _host.ResetBindings();
+            var skipped = _pool.RentDraw();
+            skipped.ResetBindings = true;
+            Record(skipped);
             return;
         }
 
@@ -216,6 +209,10 @@ public sealed partial class RenderExecutor
     {
         if (MeshDrawTrace.Active) MeshDrawTrace.Write("selection", $"indexed=true count={arguments.IndexCount}");
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawExecutor);
+        var record = _pool.RentDraw();
+        record.Announce = true;
+        record.Debug = new DebugInformation(RecordedOperation.DrawIndex, submitId, arguments.IndexCount, 0, 1, arguments.InstanceCount, arguments.IndexAddress);
+        record.SubmitId = submitId;
         var traceSample = IndexedDrawTrace.Enabled && _host is ICommandStreamHost traceHost
             ? IndexedDrawTrace.Capture(arguments.IndexCount, arguments.IndexTypeAndSize, arguments.IndexAddress, traceHost.Memory.TryRead)
             : null;
@@ -226,30 +223,25 @@ public sealed partial class RenderExecutor
             TraceDrawTargets(banks, disposition);
         }
         IndexedDrawTrace.Write(traceSample, "executor", submitId, tracePacket);
-        if (!_host.IsRecording)
-        {
-            throw _host.Fatal("An indexed draw has no recording command buffer.");
-        }
-
         if (arguments.OffsetSource == DrawOffsetSource.Packet && arguments.FirstInstance != 0)
         {
             throw _host.Fatal($"A packet indexed draw carries a first instance: firstInstance={arguments.FirstInstance}.");
         }
 
-        _host.RunPendingOperations();
         var userConfig = banks.UserConfig;
         var shader = banks.Shader;
-        _host.SetDebugInformation(RecordedOperation.DrawIndex, submitId, arguments.IndexCount, 0, 1, arguments.InstanceCount, arguments.IndexAddress);
         if (arguments.IndexCount == 0 || arguments.InstanceCount == 0)
         {
             TraceDisposition("zero-count");
+            Record(record);
             return;
         }
 
-        if (ConsumesColorMetadataOperation(banks.Context) || TryDepthStencilCopy(banks.Context))
+        if (ConsumesColorMetadataOperation(banks.Context) || TryResolveDepthStencilCopy(banks.Context, record))
         {
             TraceDisposition("metadata-operation");
-            _host.ResetBindings();
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
@@ -257,8 +249,9 @@ public sealed partial class RenderExecutor
         {
             if (IsSupportedTessellation(banks))
             {
-                DrawTessellationIndexed(submitId, banks, arguments);
+                DrawTessellationIndexed(submitId, banks, arguments, record);
             }
+            else Record(record);
 
             TraceDisposition("tessellation");
             return;
@@ -267,12 +260,14 @@ public sealed partial class RenderExecutor
         if (!HasValidVertexShader(shader))
         {
             TraceDisposition("missing-vertex-shader");
+            Record(record);
             return;
         }
 
         if (IsUnsupportedGeometryStage(banks, autoDraw: false))
         {
             TraceDisposition("unsupported-geometry-stage");
+            Record(record);
             return;
         }
 
@@ -283,10 +278,11 @@ public sealed partial class RenderExecutor
                 $"indexAddress=0x{arguments.IndexAddress:X16} instances=0x{arguments.InstanceCount:X8} baseVertex=0x{(uint)arguments.BaseVertex:X8} firstInstance=0x{arguments.FirstInstance:X8}");
         }
 
-        ValidateDrawRegisters(banks);
+        ValidateChangedDrawRegisters(banks);
         if (!ResolveTopology(userConfig, autoDraw: false, out var topology))
         {
             TraceDisposition("no-topology");
+            Record(record);
             return;
         }
 
@@ -336,26 +332,30 @@ public sealed partial class RenderExecutor
             expandedIndices,
             expandedIndices is null ? indexSize : (ulong)expandedIndices.Length,
             indexType);
-        var state = DrawState.Create();
-        if (!TryResolveDrawTargets(banks, in draw, ref state))
+        ref var state = ref record.State;
+        state.Begin(arguments.StartInstanceUserData);
+        if (!TryResolveDrawTargets(banks, in draw, ref state, record))
         {
             TraceDisposition("no-targets");
-            _host.ResetBindings();
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
+        record.TargetsResolved = true;
         if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
         {
-            // A targetless draw may be retained and replayed later; it needs its counts.
+            Record(record);
             DrawIndexedWithCpuArguments(submitId, banks, in arguments);
             return;
         }
 
         ResolveShaderPrograms(banks, ref state, indexed: true);
-        if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, true, arguments, default)))
+        if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, true, arguments, default), record))
         {
             TraceDisposition("adapted");
-            _host.ResetBindings();
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
@@ -370,10 +370,11 @@ public sealed partial class RenderExecutor
             0,
             indirect ? arguments.FirstInstance : ResolveInstanceOffset(state.Programs.VertexInput),
             arguments.IndirectArgumentsAddress);
-        var disposition = RecordDraw(submitId, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart,
-            setBindDebug: true, setAutoDebug: false, indexedTrace: traceSample, packetAddress: tracePacket);
-        TraceDisposition(disposition);
-        _host.ResetBindings();
+        record.IndexedTrace = traceSample;
+        record.PacketAddress = tracePacket;
+        FillDraw(record, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
+        TraceDisposition("recorded");
+        Record(record);
     }
 
     public void DrawAuto(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
@@ -381,7 +382,7 @@ public sealed partial class RenderExecutor
         using var meshTrace = MeshDrawTrace.Begin(submitId, banks.Shader.Vertex.ExportAddress, banks.Context.ShaderStages);
         try
         {
-            if (arguments.IndirectArgumentsAddress != 0 && !CanDrawAutoIndirectOnGpu(banks))
+            if (arguments.IndirectArgumentsAddress != 0 && !CanDrawAutoIndirectOnGpu(banks, arguments.IndirectArgumentsAddress))
             {
                 DrawAutoWithCpuArguments(submitId, banks, in arguments);
                 return;
@@ -397,12 +398,11 @@ public sealed partial class RenderExecutor
         }
     }
 
-    // The GPU reads the arguments of a non-indexed indirect draw unless the draw is emulated
-    // from its vertex count: fans, polygons, legacy primitives, strips (metadata clear quads),
-    // mesh and merged tessellation draws, and rectangle lists without native rectangles.
-    private bool CanDrawAutoIndirectOnGpu(RegisterBanks banks)
+    private bool CanDrawAutoIndirectOnGpu(RegisterBanks banks, ulong argumentsAddress)
     {
-        if (UsesMeshExecution(banks) || Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages))
+        if (UsesMeshExecution(banks) || Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages) ||
+            (argumentsAddress & 3) != 0 || argumentsAddress > ulong.MaxValue - AutoIndirectArgumentsSize ||
+            _host.ClampMappedSize(argumentsAddress, AutoIndirectArgumentsSize) != AutoIndirectArgumentsSize)
         {
             return false;
         }
@@ -416,9 +416,6 @@ public sealed partial class RenderExecutor
         };
     }
 
-    private const ulong AutoIndirectArgumentsSize = 16;
-
-    // Reads the indirect arguments now and draws from them, as the interpreter would have.
     private void DrawAutoWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
     {
         Span<byte> bytes = stackalloc byte[(int)AutoIndirectArgumentsSize];
@@ -428,15 +425,16 @@ public sealed partial class RenderExecutor
         }
 
         var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
-        var resolved = arguments with
+        if (words[1] > (1u << 24))
+            Console.Error.WriteLine($"[GPU][ERROR][DRAW_INSTANCE_COUNT] phase=render-cpu-indirect submit={submitId} packet=0x{arguments.PacketAddress:X16} opcode=0x{arguments.Opcode:X2} source=indirect-argument-record address=0x{arguments.IndirectArgumentsAddress:X16} count={words[0]} instances={words[1]} words={Convert.ToHexString(bytes)} primitive={banks.UserConfig.PrimitiveType} vs=0x{banks.Shader.Vertex.ExportAddress:X16} ps=0x{banks.Shader.Pixel.Address:X16} thread={Thread.CurrentThread.Name}");
+        DrawAutoCore(submitId, banks, arguments with
         {
             VertexCount = words[0],
             InstanceCount = words[1],
             FirstVertex = words[2],
             FirstInstance = words[3],
             IndirectArgumentsAddress = 0,
-        };
-        DrawAutoCore(submitId, banks, in resolved);
+        });
     }
 
     private void DrawAutoCore(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
@@ -444,30 +442,29 @@ public sealed partial class RenderExecutor
         if (MeshDrawTrace.Active)
             MeshDrawTrace.Write("selection", $"count={arguments.VertexCount} instances={arguments.InstanceCount} firstVertex={arguments.FirstVertex} firstInstance={arguments.FirstInstance} primitive={banks.UserConfig.PrimitiveType} geometry=0x{banks.Shader.Vertex.GeometryAddress:X16} hull=0x{banks.Shader.Vertex.HullAddress:X16} local=0x{banks.Shader.Vertex.LocalAddress:X16}");
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawExecutor);
-        if (!_host.IsRecording)
-        {
-            throw _host.Fatal("An automatic draw has no recording command buffer.");
-        }
-
+        var record = _pool.RentDraw();
+        record.Announce = true;
+        record.Debug = new DebugInformation(RecordedOperation.DrawIndexAuto, submitId, arguments.VertexCount, 0, arguments.FirstVertex, arguments.InstanceCount, arguments.FirstInstance);
+        record.SubmitId = submitId;
         if (arguments.OffsetSource == DrawOffsetSource.Packet && arguments.FirstInstance != 0)
         {
             throw _host.Fatal($"A packet automatic draw carries a first instance: firstInstance={arguments.FirstInstance}.");
         }
 
-        _host.RunPendingOperations();
         var userConfig = banks.UserConfig;
         var shader = banks.Shader;
-        _host.SetDebugInformation(RecordedOperation.DrawIndexAuto, submitId, arguments.VertexCount, 0, arguments.FirstVertex, arguments.InstanceCount, arguments.FirstInstance);
         if (arguments.VertexCount == 0 || arguments.InstanceCount == 0)
         {
             TraceDrawTargets(banks, "zero-count");
+            Record(record);
             return;
         }
 
-        if (ConsumesColorMetadataOperation(banks.Context) || TryDepthStencilCopy(banks.Context))
+        if (ConsumesColorMetadataOperation(banks.Context) || TryResolveDepthStencilCopy(banks.Context, record))
         {
             TraceDrawTargets(banks, "metadata-operation");
-            _host.ResetBindings();
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
@@ -477,8 +474,9 @@ public sealed partial class RenderExecutor
                 (arguments.OffsetSource == DrawOffsetSource.IndirectArguments ? 0 : (int)userConfig.IndexOffset));
             if (IsSupportedTessellation(banks))
             {
-                DrawTessellation(submitId, banks, arguments.VertexCount, arguments.InstanceCount, 0, 0, tessellationVertexOffset, arguments.FirstInstance);
+                DrawTessellation(submitId, banks, arguments.VertexCount, arguments.InstanceCount, 0, 0, tessellationVertexOffset, arguments.FirstInstance, record);
             }
+            else Record(record);
 
             TraceDrawTargets(banks, "tessellation");
             return;
@@ -487,12 +485,14 @@ public sealed partial class RenderExecutor
         if (!HasValidVertexShader(shader))
         {
             TraceDrawTargets(banks, "missing-vertex-shader");
+            Record(record);
             return;
         }
 
         if (IsUnsupportedGeometryStage(banks, autoDraw: true))
         {
             TraceDrawTargets(banks, "unsupported-geometry-stage");
+            Record(record);
             return;
         }
 
@@ -503,36 +503,38 @@ public sealed partial class RenderExecutor
                 $"firstVertex=0x{arguments.FirstVertex:X8} firstInstance=0x{arguments.FirstInstance:X8}");
         }
 
-        ValidateDrawRegisters(banks);
+        ValidateChangedDrawRegisters(banks);
         var draw = new DrawCall("DrawAuto", RecordedOperation.DrawIndexAuto, arguments.VertexCount, arguments.InstanceCount, arguments.FirstInstance);
-        var state = DrawState.Create();
-        if (!TryResolveDrawTargets(banks, in draw, ref state))
+        ref var state = ref record.State;
+        state.Begin(arguments.StartInstanceUserData);
+        if (!TryResolveDrawTargets(banks, in draw, ref state, record))
         {
             TraceDrawTargets(banks, "no-targets");
-            _host.ResetBindings();
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
-        if (!ResolveTopology(userConfig, autoDraw: true, out var topology, arguments.VertexCount))
+        record.TargetsResolved = true;
+        if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
+        {
+            Record(record);
+            DrawAutoWithCpuArguments(submitId, banks, in arguments);
+            return;
+        }
+
+        if (!ResolveTopology(userConfig, autoDraw: true, out var topology, vertexCount: arguments.VertexCount))
         {
             TraceDrawDisposition(banks, in draw, "no-primitive-topology");
             TraceDrawTargets(banks, "no-topology");
-            _host.ResetBindings();
-            return;
-        }
-
-        if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
-        {
-            // A targetless draw may be retained and replayed later; it needs its counts.
-            DrawAutoWithCpuArguments(submitId, banks, in arguments);
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
         ResolveShaderPrograms(banks, ref state);
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;
-        // A legacy rectangle batch also draws as a patch list but keeps its draws: its pixel
-        // inputs may come from fixed-function interpolation of the three vertices.
         var rectangleList = topology == PrimitiveTopology.PatchList &&
             userConfig.PrimitiveType != (uint)GuestPrimitiveType.RectangleListLegacy;
         if (rectangleList && vertexInput.Buffers.Length == 0 && vertexInput.Stage.Program?.ParameterExportMask == 0 && pixelInput.InputCount != 0)
@@ -545,14 +547,16 @@ public sealed partial class RenderExecutor
             }
 
             TraceDrawTargets(banks, "rectangle-list-without-exports");
-            _host.ResetBindings();
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
-        if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, false, default, arguments)))
+        if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, false, default, arguments), record))
         {
             TraceDrawTargets(banks, "adapted");
-            _host.ResetBindings();
+            record.ResetBindings = true;
+            Record(record);
             return;
         }
 
@@ -567,9 +571,49 @@ public sealed partial class RenderExecutor
             (uint)vertexOffset,
             indirect ? arguments.FirstInstance : ResolveInstanceOffset(vertexInput),
             arguments.IndirectArgumentsAddress);
-        var disposition = RecordDraw(submitId, banks, in draw, ref state, topology, in emission, default, primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
-        TraceDrawTargets(banks, disposition);
-        _host.ResetBindings();
+        record.PacketAddress = arguments.PacketAddress;
+        FillDraw(record, banks, in draw, ref state, topology, in emission, default, primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
+        TraceDrawTargets(banks, "recorded");
+        Record(record);
+    }
+
+    private void FillDraw(ResolvedDraw record, RegisterBanks banks, in DrawCall draw, ref DrawState state, PrimitiveTopology topology,
+        in DrawEmission emission, in IndexSource indexSource, bool primitiveRestart, bool setBindDebug, bool setAutoDebug)
+    {
+        record.Kind = ResolvedDrawKind.Draw;
+        var context = banks.ShareContext();
+        var vertexInput = state.Programs.VertexInput;
+        var pixelInput = state.Programs.PixelInput;
+        var pixelProgram = state.PixelActive ? pixelInput.Stage.Program : null;
+        var writeStages = PipelineStageFlags.None;
+        if (HasBufferWrites(vertexInput.Stage))
+        {
+            writeStages |= state.Programs.MeshInput is not null ? PipelineStageFlags.MeshShaderBitExt
+                : vertexInput.Tessellation is not null ? PipelineStageFlags.TessellationEvaluationShaderBit : PipelineStageFlags.VertexShaderBit;
+        }
+
+        if (state.PixelActive && HasBufferWrites(pixelInput.Stage))
+        {
+            writeStages |= PipelineStageFlags.FragmentShaderBit;
+        }
+
+        record.Draw = draw;
+        record.Topology = topology;
+        record.PrimitiveRestart = primitiveRestart;
+        record.PrimitiveType = (GuestPrimitiveType)banks.UserConfig.PrimitiveType;
+        record.ObjectId = banks.UserConfig.ObjectId;
+        record.Emission = emission;
+        record.Index = indexSource;
+        record.Context = context;
+        record.ContextStamp = banks.ContextStamp;
+        record.DynamicStamp = banks.Stamp(RegisterStamp.ContextDynamic);
+        record.TargetVersion = _drawResolution.TargetVersion;
+        record.Dynamic = ResolveDynamicState(banks, in state, WrittenColorTargets(context, in state, pixelProgram), record.SubmitId, record.PacketAddress);
+        record.WritesMemory = DrawWritesMemory(vertexInput.Stage) || (state.PixelActive && DrawWritesMemory(pixelInput.Stage));
+        record.WriteStages = writeStages;
+        record.SetBindDebug = setBindDebug;
+        record.SetAutoDebug = setAutoDebug;
+        record.ResetBindings = true;
     }
 
     private byte[] ConvertRestartIndices(ulong indexAddress, uint indexCount, IndexType indexType, uint restartIndex)
@@ -682,11 +726,15 @@ public sealed partial class RenderExecutor
 
     // A tessellation configuration the bridge cannot express skips the draw, as an
     // unsupported geometry stage does, instead of stopping the emulator.
-    private static bool IsSupportedTessellation(RegisterBanks banks)
+    private bool IsSupportedTessellation(RegisterBanks banks)
     {
         var shaderInterface = banks.Context.ShaderInterface;
         string? error = null;
-        if (!Gen5TessellationInfo.TryDecode(shaderInterface.TessellationFactorParameter, out var tessellation, out var factorError))
+        if (!_host.SupportsTessellation)
+        {
+            error = "the render host does not support native tessellation";
+        }
+        else if (!Gen5TessellationInfo.TryDecode(shaderInterface.TessellationFactorParameter, out var tessellation, out var factorError))
         {
             error = factorError;
         }
@@ -799,11 +847,9 @@ public sealed partial class RenderExecutor
         return mode is ColorModeEliminateFastClear or ColorModeFmaskDecompress or ColorModeDccDecompress;
     }
 
-    // Several legacy rectangles in one draw: three vertices each, as the hardware takes them.
-    // One rectangle keeps the four-vertex strip, which needs no rectangle pipeline.
-    private static bool IsLegacyRectangleBatch(uint vertexCount) => vertexCount > 3 && vertexCount % 3 == 0;
+    internal static bool IsLegacyRectangleBatch(uint vertexCount) => vertexCount > 3 && vertexCount % 3 == 0;
 
-    public bool ResolveTopology(UserConfigRegisters userConfig, bool autoDraw, out PrimitiveTopology topology, uint vertexCount = 3)
+    public bool ResolveTopology(UserConfigRegisters userConfig, bool autoDraw, out PrimitiveTopology topology, uint vertexCount = 0)
     {
         topology = PrimitiveTopology.PointList;
         switch ((GuestPrimitiveType)userConfig.PrimitiveType)
@@ -838,8 +884,6 @@ public sealed partial class RenderExecutor
                     throw _host.Fatal($"The primitive type is unknown for an indexed draw: primitiveType={userConfig.PrimitiveType}.");
                 }
 
-                // Several rectangles take the rectangle-list path, which fills each one from its
-                // three vertices instead of rasterizing a made-up fourth vertex.
                 topology = _host.SupportsNativeRectangles || IsLegacyRectangleBatch(vertexCount) ? PrimitiveTopology.PatchList : PrimitiveTopology.TriangleStrip;
                 break;
             case GuestPrimitiveType.QuadListLegacy:
@@ -902,37 +946,63 @@ public sealed partial class RenderExecutor
 
     private const uint TessellationStageBits = 0x7u;
 
-    // The indexed mode changes only the primitive type of a draw run as a mesh shader, so a
-    // resolution records it only there: a prefetched resolution then also serves a draw whose
-    // path resolves without the mode (tessellation, targetless writes checks).
-    internal bool IndexedModeAffectsPrograms(RegisterBanks banks) => UsesMeshExecution(banks);
-
     private bool UsesMeshExecution(RegisterBanks banks) =>
         _pipelines.MeshShadersSupported && RequiresMeshExecution(banks.Context.ShaderStages) &&
         banks.Shader.Vertex.ExportAddress != 0 &&
         (banks.Context.ShaderStages & TessellationStageBits) == 0;
 
+    private void ValidateChangedDrawRegisters(RegisterBanks banks)
+    {
+        var resolution = _drawResolution;
+        var contextStamp = banks.ContextStamp;
+        var userConfigStamp = banks.Stamp(RegisterStamp.UserConfig);
+        if (resolution.ValidatedContextStamp == contextStamp && resolution.ValidatedUserConfigStamp == userConfigStamp)
+        {
+            return;
+        }
+
+        ValidateDrawRegisters(banks);
+        resolution.ValidatedContextStamp = contextStamp;
+        resolution.ValidatedUserConfigStamp = userConfigStamp;
+    }
+
     private void ResolveShaderPrograms(RegisterBanks banks, ref DrawState state, bool indexed = false)
     {
+        if (state.Programs is not null)
+        {
+            return;
+        }
+
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawProgramResolution);
-        var inputs = GraphicsProgramInputs.Create();
-        Span<ColorComponentMap> targetExportMapping = inputs.Mapping;
-        foreach (ref readonly var color in BoundColors(ref state))
+        Span<ColorComponentMapArray> mappingStorage = stackalloc ColorComponentMapArray[1];
+        Span<ColorComponentMap> targetExportMapping = mappingStorage[0];
+        targetExportMapping.Fill(ColorComponentMap.Identity);
+        foreach (ref readonly var color in DrawState.BoundColors(ref state))
         {
             targetExportMapping[(int)color.Slot] = color.Resolution.ExportMapping;
         }
 
-        inputs.Indexed = IndexedModeAffectsPrograms(banks) && indexed;
-        inputs.PixelActive = state.PixelActive;
-        inputs.DepthBound = state.Depth.HasTarget;
-        if (Prefetch is { } prefetch && prefetch.TryTakeGraphics(banks, in inputs, out var prefetched))
+        if (UsesMeshExecution(banks))
         {
-            state.Programs = prefetched;
+            var userConfig = banks.UserConfig;
+            if (indexed && userConfig.PrimitiveType is
+                (uint)GuestPrimitiveType.TriangleList or (uint)GuestPrimitiveType.TriangleStrip)
+            {
+                userConfig = userConfig.Copy();
+                userConfig.PrimitiveType = (uint)GuestPrimitiveType.TriangleList;
+            }
+
+            state.Programs = _pipelines.GetMeshGraphicsPrograms(banks, userConfig, targetExportMapping, state.PixelActive, state.Depth.HasTarget);
             return;
         }
 
-        using var resolveScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramSynchronousResolution);
-        state.Programs = ResolveGraphicsPrograms(banks, in inputs);
+        state.Programs = _pipelines.GetGraphicsPrograms(banks, targetExportMapping, state.PixelActive, state.Depth.HasTarget, state.StartInstanceUserData);
+    }
+
+    [System.Runtime.CompilerServices.InlineArray(RenderingState.ColorAttachmentCapacity)]
+    private struct ColorComponentMapArray
+    {
+        private ColorComponentMap _element0;
     }
 
     private static void TraceDrawState(ulong submitId, RegisterBanks banks, in DrawCall draw, in DrawState state)
@@ -947,7 +1017,7 @@ public sealed partial class RenderExecutor
         var colorWidth = state.ColorCount != 0 ? state.Colors[0].Resolution.Extent.Width : 0;
         var colorHeight = state.ColorCount != 0 ? state.Colors[0].Resolution.Extent.Height : 0;
         var depth = state.Depth.HasTarget ? state.Depth.Target : default;
-        ref readonly var viewport = ref banks.Context.ScreenViewport.Viewports[0];
+        ref readonly var viewport = ref banks.Context.ScreenViewport.Primary;
         var clip = banks.Context.Clip;
         RenderTrace.Write(
             $"DrawState seq={RenderTrace.NextSequence()} submit={submitId} name={draw.Name} export=0x{shader.Vertex.ExportAddress:X16} " +

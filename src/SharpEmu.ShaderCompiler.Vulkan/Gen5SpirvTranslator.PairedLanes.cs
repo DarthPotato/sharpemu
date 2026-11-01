@@ -138,7 +138,7 @@ public static partial class Gen5SpirvTranslator
         }
 
         private static bool IsPairedLaneInstruction(Gen5ShaderInstruction instruction) =>
-            instruction.Opcode is not ("VReadlaneB32" or "VReadfirstlaneB32" or "DsAppend" or "DsConsume") &&
+            instruction.Opcode is not ("VReadlaneB32" or "VReadfirstlaneB32" or "DsAppend" or "DsConsume" or "DsOrderedCount") &&
             instruction.Encoding is
                 Gen5ShaderEncoding.Mubuf or
                 Gen5ShaderEncoding.Mtbuf or
@@ -155,6 +155,11 @@ public static partial class Gen5SpirvTranslator
 
         private bool TryEmitPairedLaneInstruction(Gen5ShaderInstruction instruction, out string error)
         {
+            var shared = instruction.Control is Gen5DataShareControl { Gds: false } &&
+                instruction.Opcode is not ("DsSwizzleB32" or "DsBpermuteB32" or "DsPermuteB32");
+            // Both guest halves share LDS. Complete the previous instruction before any lane
+            // reads it, and finish these reads before the next instruction can overwrite it.
+            if (shared) _module.AddStatement(SpirvOp.ControlBarrier, UInt(3), UInt(2), UInt(0x108));
             _scalarSnapshot = SnapshotScalarSources(instruction);
             _inLanePass = true;
             try
@@ -176,6 +181,7 @@ public static partial class Gen5SpirvTranslator
                 _inLanePass = false;
                 _scalarSnapshot = null;
                 SelectLaneHalf(0);
+                if (shared) _module.AddStatement(SpirvOp.ControlBarrier, UInt(3), UInt(2), UInt(0x108));
             }
         }
 
@@ -251,7 +257,7 @@ public static partial class Gen5SpirvTranslator
                     SpirvOp.CompositeExtract,
                     _uintType,
                     workGroupId,
-                    (uint)_physicalAxisOfLogical[component]);
+                    (uint)_physicalGroupAxisOfLogical[component]);
             }
 
             var active = new uint[2];
@@ -291,9 +297,9 @@ public static partial class Gen5SpirvTranslator
 
             if (_request.ComputeSystemRegisters is { } registers)
             {
-                StoreComputeSystemRegister(registers.WorkGroupXRegister, workGroupId, (uint)_physicalAxisOfLogical[0]);
-                StoreComputeSystemRegister(registers.WorkGroupYRegister, workGroupId, (uint)_physicalAxisOfLogical[1]);
-                StoreComputeSystemRegister(registers.WorkGroupZRegister, workGroupId, (uint)_physicalAxisOfLogical[2]);
+                StoreComputeSystemRegister(registers.WorkGroupXRegister, workGroupId, (uint)_physicalGroupAxisOfLogical[0]);
+                StoreComputeSystemRegister(registers.WorkGroupYRegister, workGroupId, (uint)_physicalGroupAxisOfLogical[1]);
+                StoreComputeSystemRegister(registers.WorkGroupZRegister, workGroupId, (uint)_physicalGroupAxisOfLogical[2]);
                 if (registers.ThreadGroupSizeRegister is { } sizeRegister)
                 {
                     StoreS(sizeRegister, UInt(guestThreads));
@@ -342,6 +348,22 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, selectedLane, UInt(PairedHalfLaneCount)),
                 SubgroupBroadcast(lowerValue, lane),
                 SubgroupBroadcast(upperValue, lane));
+        }
+
+        // A pair of lanes past the group's thread count has no running invocation to read, but a scalar that V_WRITELANE
+        // spilled to either lane is in every invocation's spill slot.
+        private uint PairedReadLaneOrSpillSlot(Gen5ShaderInstruction instruction, uint selectedLane)
+        {
+            var value = PairedReadLane(instruction, selectedLane);
+            var spilled = ReadLaneSpillSlot(instruction, selectedLane, value);
+            if (spilled == value)
+            {
+                return value;
+            }
+
+            var pairBit = ShiftLeftLogical(UInt(1), BitwiseAnd(selectedLane, UInt(PairedHalfLaneCount - 1)));
+            var pairRuns = IsNotZero(BitwiseAnd(HalfBallot(_module.ConstantBool(true)), pairBit));
+            return _module.AddInstruction(SpirvOp.Select, _uintType, pairRuns, value, spilled);
         }
 
         private uint LogicalOr(uint left, uint right) =>
@@ -584,7 +606,7 @@ public static partial class Gen5SpirvTranslator
                 Gen5ShaderEncoding.Smem or Gen5ShaderEncoding.Smrd)
                 return TryEmitInstruction(instruction, out error);
 
-            if (instruction.Opcode is "DsAppend" or "DsConsume" or "DsSwizzleB32")
+            if (instruction.Opcode is "DsAppend" or "DsConsume" or "DsOrderedCount" or "DsSwizzleB32")
             {
                 error = "This cross-lane operation has no paired mesh implementation.";
                 return false;

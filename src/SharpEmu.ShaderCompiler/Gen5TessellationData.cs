@@ -6,7 +6,7 @@ namespace SharpEmu.ShaderCompiler;
 // Runtime ABI shared by the merged hull kernel and the native domain pipeline.
 public static class Gen5TessellationData
 {
-    public const uint DwordCount = 19;
+    public const uint DwordCount = 22;
     public const uint FirstPatch = 0, PatchCount = 1, VertexOffset = 2, InstanceId = 3;
     public const uint IndexAddress = 4, IndexSize = 6;
     public const uint FactorAddress = 7, FactorBytes = 9;
@@ -21,4 +21,5 @@ public static class Gen5TessellationData
     // instances in a row, and each thread splits its patch into an instance and a patch
     // within it. Zero keeps a single instance.
     public const uint PatchesPerInstance = 18;
+    public const uint LocalDataRingAddress = 19, LocalDataSlotBytes = 21;
 }

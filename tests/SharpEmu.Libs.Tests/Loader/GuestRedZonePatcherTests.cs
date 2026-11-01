@@ -53,7 +53,7 @@ public sealed class GuestRedZonePatcherTests
     [InlineData(true)]
     public void GroupingPreservesIncomingBranchFromAnotherFunction(bool separateSegment)
     {
-        if ((!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS()) ||
+        if (!OperatingSystem.IsWindows() ||
             RuntimeInformation.ProcessArchitecture != Architecture.X64) return;
         using var memory = new PhysicalVirtualMemory();
         var imageBase = memory.AllocateAt(0, 0x10000);
@@ -136,7 +136,7 @@ public sealed class GuestRedZonePatcherTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public unsafe void PatchesWindowsAndMacOsLeafFunctionWhileLeavingLinuxUnchanged(bool framePointer)
+    public unsafe void PatchesWindowsLeafFunctionWhileLeavingLinuxUnchanged(bool framePointer)
     {
         if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
             return;
@@ -189,7 +189,7 @@ public sealed class GuestRedZonePatcherTests
         var result = GuestRedZonePatcher.Patch(memory, memory, headers, imageBase, imageSize);
         var patched = new byte[function.Length];
         Assert.True(memory.TryRead(imageBase, patched));
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        if (OperatingSystem.IsWindows())
         {
             Assert.Equal(1, result.RedZoneFunctions);
             Assert.Equal(1, result.PatchedSites);
@@ -248,7 +248,7 @@ public sealed class GuestRedZonePatcherTests
         ];
 
         using var image = PatchedImage.Create(function, [(0x40, value)]);
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        if (OperatingSystem.IsWindows())
         {
             Assert.Equal(1, image.Result.PatchedSites);
             Assert.Equal(0xE9, image.ReadByte(15));
@@ -277,7 +277,7 @@ public sealed class GuestRedZonePatcherTests
         ];
 
         using var image = PatchedImage.Create(function, [(0x2000, 7u)]);
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        if (OperatingSystem.IsWindows())
         {
             Assert.Equal(1, image.Result.PatchedSites);
             Assert.Equal(0xE9, image.ReadByte(22));
@@ -309,7 +309,7 @@ public sealed class GuestRedZonePatcherTests
 
         using var image = PatchedImage.Create(function, [(0x2000, 7u)]);
         Assert.Equal(0, image.Result.PatchedSites);
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        if (OperatingSystem.IsWindows())
         {
             Assert.Equal(1, image.Result.RedZoneFunctions);
             Assert.Equal(1, image.Result.UnrelocatableSites);
@@ -373,357 +373,93 @@ public sealed class GuestRedZonePatcherTests
         Assert.Equal(1, image.Result.PatchedSites);
     }
 
-    // Ghost of Tsushima 0x80067A7B9: a 16-bit compare, movzx after the bound and a table
-    // register defined before the loop that contains the dispatch.
+    // A switch compiled as 'cmp; ja; lea table; movsxd; add; jmp' often has the spills of its arguments between the bounds check and the table
+    // load. The table and its four targets are still known, so the short accesses of the cases can borrow the instructions that follow them.
     [Fact]
-    public void ResolvesNarrowCompareWithZeroExtensionAndTableDefinedBeforeTheLoop()
+    public unsafe void PatchesShortAccessesInASwitchWhoseSetupSpillsRegisters()
     {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(6);
-        var table = function.Table(cases);
-        var loop = a.CreateLabel();
-        var next = a.CreateLabel();
-        a.lea(r15, __[table]);
-        a.Label(ref loop);
-        a.mov(edx, __dword_ptr[rdi]);
-        a.add(edx, r11d);
-        a.cmp(dx, 5);
-        a.ja(next);
-        a.movzx(edx, dx);
-        a.movsxd(rdx, __dword_ptr[r15 + rdx * 4]);
-        a.add(rdx, r15);
-        a.jmp(rdx);
-        a.Label(ref next);
-        a.add(rdi, 4);
-        a.jmp(loop);
-        function.EmitCases(cases, loop);
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            return;
 
-        function.AssertResolves(cases);
-    }
-
-    // Ghost of Tsushima 0x80067A824: a load from the stack between the table lea and the load.
-    [Fact]
-    public void ResolvesTableWithUnrelatedInstructionsBeforeTheLoad()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(4);
-        var table = function.Table(cases);
-        var done = a.CreateLabel();
-        a.mov(r9d, __dword_ptr[rdi]);
-        a.dec(r9d);
-        a.cmp(r9d, 3);
-        a.ja(done);
-        a.lea(rax, __[table]);
-        a.mov(rcx, __qword_ptr[rsp - 0x68]);
-        a.movsxd(rdx, __dword_ptr[rax + r9 * 4]);
-        a.add(rdx, rax);
-        a.jmp(rdx);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertResolves(cases);
-    }
-
-    // Ghost of Tsushima 0x80067A988 and 0x80067AA6D: the first dispatch redefines its table
-    // register after the add, the second reuses that register from every path into it.
-    [Fact]
-    public void ResolvesTableRegisterDefinedOnEveryPathIncludingJumpTableEdges()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var first = function.Cases(4);
-        var second = function.Cases(6);
-        var table = function.Table(first);
-        var secondTable = function.Table(second);
-        var outOfRange = a.CreateLabel();
-        var join = a.CreateLabel();
-        var done = a.CreateLabel();
-        a.mov(r9d, __dword_ptr[rdi]);
-        a.cmp(r9d, 3);
-        a.ja(outOfRange);
-        a.lea(rcx, __[table]);
-        a.lea(r11, __[rbx + rdx]);
-        a.movsxd(rax, __dword_ptr[rcx + r9 * 4]);
-        a.add(rax, rcx);
-        a.lea(rcx, __[secondTable]);
-        a.jmp(rax);
-        a.Label(ref outOfRange);
-        a.lea(rcx, __[secondTable]);
-        a.jmp(join);
-        function.EmitCases(first, join);
-        a.Label(ref join);
-        a.mov(edx, __dword_ptr[rsi]);
-        a.lea(eax, __[rdx + 0x1000]);
-        a.cmp(ax, 5);
-        a.ja(done);
-        a.movzx(eax, ax);
-        a.movsxd(rax, __dword_ptr[rcx + rax * 4]);
-        a.add(rax, rcx);
-        a.jmp(rax);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(second, done);
-
-        function.AssertResolves([.. first, .. second]);
-    }
-
-    // Ghost of Tsushima 0x80067AB85: the selector is copied through a narrower register and
-    // the table register is reused for a byte store before its lea.
-    [Fact]
-    public void ResolvesSelectorThroughZeroExtensionWithTableRegisterReused()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(0x1E);
-        var table = function.Table(cases);
-        var done = a.CreateLabel();
-        a.mov(edx, __dword_ptr[rdi]);
-        a.lea(ebx, __[rdx - 0xE31]);
-        a.cmp(bx, 0x1D);
-        a.ja(done);
-        a.mov(al, 1);
-        a.movzx(ebx, bx);
-        a.mov(__dword_ptr[rsp - 0x78], eax);
-        a.lea(rax, __[table]);
-        a.movsxd(rbx, __dword_ptr[rax + rbx * 4]);
-        a.add(rbx, rax);
-        a.jmp(rbx);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertResolves(cases);
-    }
-
-    [Fact]
-    public void RefusesUnboundedSelector()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(2);
-        var table = function.Table(cases);
-        var done = a.CreateLabel();
-        a.lea(r15, __[table]);
-        a.mov(edx, __dword_ptr[rdi]);
-        a.movsxd(rax, __dword_ptr[r15 + rdx * 4]);
-        a.add(rax, r15);
-        a.jmp(rax);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertRefuses();
-    }
-
-    [Fact]
-    public void RefusesNarrowCompareWithoutZeroExtension()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(6);
-        var table = function.Table(cases);
-        var done = a.CreateLabel();
-        a.lea(r15, __[table]);
-        a.mov(rdx, __qword_ptr[rdi]);
-        a.cmp(dx, 5);
-        a.ja(done);
-        a.movsxd(rax, __dword_ptr[r15 + rdx * 4]);
-        a.add(rax, r15);
-        a.jmp(rax);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertRefuses();
-    }
-
-    [Fact]
-    public void RefusesCompareOfAnotherRegister()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(4);
-        var table = function.Table(cases);
-        var done = a.CreateLabel();
-        a.mov(r9d, __dword_ptr[rdi]);
-        a.cmp(r8d, 3);
-        a.ja(done);
-        a.lea(rcx, __[table]);
-        a.movsxd(rax, __dword_ptr[rcx + r9 * 4]);
-        a.add(rax, rcx);
-        a.jmp(rax);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertRefuses();
-    }
-
-    [Fact]
-    public void RefusesSelectorRedefinedAfterTheBound()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(4);
-        var table = function.Table(cases);
-        var done = a.CreateLabel();
-        a.mov(r9d, __dword_ptr[rdi]);
-        a.cmp(r9d, 3);
-        a.ja(done);
-        a.inc(r9d);
-        a.lea(rcx, __[table]);
-        a.movsxd(rax, __dword_ptr[rcx + r9 * 4]);
-        a.add(rax, rcx);
-        a.jmp(rax);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertRefuses();
-    }
-
-    [Fact]
-    public void RefusesTwoDifferentTablesInTheSameRegister()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(2);
-        var table = function.Table(cases);
-        var otherTable = function.Table(cases);
-        var other = a.CreateLabel();
-        var join = a.CreateLabel();
-        var done = a.CreateLabel();
-        a.mov(r9d, __dword_ptr[rdi]);
-        a.test(esi, esi);
-        a.je(other);
-        a.lea(rcx, __[table]);
-        a.jmp(join);
-        a.Label(ref other);
-        a.lea(rcx, __[otherTable]);
-        a.Label(ref join);
-        a.cmp(r9d, 1);
-        a.ja(done);
-        a.movsxd(rax, __dword_ptr[rcx + r9 * 4]);
-        a.add(rax, rcx);
-        a.jmp(rax);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertRefuses();
-    }
-
-    [Fact]
-    public void RefusesTableRegisterLoadedFromMemoryOnOnePath()
-    {
-        var function = new JumpTableFunction();
-        var a = function.Assembler;
-        var cases = function.Cases(2);
-        var table = function.Table(cases);
-        var other = a.CreateLabel();
-        var join = a.CreateLabel();
-        var done = a.CreateLabel();
-        a.mov(r9d, __dword_ptr[rdi]);
-        a.test(esi, esi);
-        a.je(other);
-        a.lea(rcx, __[table]);
-        a.jmp(join);
-        a.Label(ref other);
-        a.mov(rcx, __qword_ptr[rdx]);
-        a.Label(ref join);
-        a.cmp(r9d, 1);
-        a.ja(done);
-        a.movsxd(rax, __dword_ptr[rcx + r9 * 4]);
-        a.add(rax, rcx);
-        a.jmp(rax);
-        a.Label(ref done);
-        a.ret();
-        function.EmitCases(cases, done);
-
-        function.AssertRefuses();
-    }
-
-    private sealed class JumpTableFunction
-    {
-        private const ulong BaseAddress = 0x8_0000_0000;
-        private readonly List<(Label Table, Label[] Entries)> _tables = [];
-
-        public Assembler Assembler { get; } = new(64);
-
-        public Label[] Cases(int count)
+        var function = BuildSwitchFunction(spill: [0x48, 0x89, 0x4C, 0x24, 0xD0]);
+        using var image = PatchedImage.Create(function.Code, [(0x2100, 100u)], (SwitchTableOffset, function.Table));
+        if (OperatingSystem.IsWindows())
         {
-            var cases = new Label[count];
-            for (var index = 0; index < count; index++)
+            Assert.Equal(1, image.Result.RedZoneFunctions);
+            Assert.Equal(0, image.Result.UnrelocatableSites);
+            Assert.Equal(0, image.Result.IndirectBranchRefusals);
+            Assert.Equal(0, image.Result.FailedSites);
+            Assert.True(image.Result.PatchedSites >= 4);
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            var call = (delegate* unmanaged<ulong, ulong, ulong>)image.Base;
+            for (var selector = 0UL; selector < 4; selector++)
             {
-                cases[index] = Assembler.CreateLabel();
+                Assert.Equal(101UL + selector, call(selector, image.Base + 0x2100));
             }
 
-            return cases;
+            Assert.Equal(0UL, call(7, image.Base + 0x2100));
         }
+    }
 
-        public Label Table(Label[] entries)
+    // A setup instruction that writes the selector keeps the jump unresolved: the targets the table names are no longer the ones reached.
+    [Fact]
+    public void KeepsRefusingASwitchWhoseSetupChangesTheSelector()
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            return;
+
+        var function = BuildSwitchFunction(spill: [0x48, 0x89, 0xD1]);
+        using var image = PatchedImage.Create(function.Code, [(0x2100, 100u)], (SwitchTableOffset, function.Table));
+        if (OperatingSystem.IsWindows())
         {
-            var table = Assembler.CreateLabel();
-            _tables.Add((table, entries));
-            return table;
+            Assert.Equal(0, image.Result.PatchedSites);
+            Assert.True(image.Result.IndirectBranchRefusals >= 4);
         }
+    }
 
-        public void EmitCases(Label[] cases, Label exit)
+    private const int SwitchTableOffset = 0x2000;
+
+    // switch (ecx) { case 0..3: return *rdx + ecx + 1; default: return 0; } as a jump table, for the Windows argument registers.
+    private static (byte[] Code, byte[] Table) BuildSwitchFunction(byte[] spill)
+    {
+        var code = new List<byte>();
+        code.AddRange([0x83, 0xF9, 0x03]);                          // cmp ecx, 3
+        var boundsBranch = code.Count;
+        code.AddRange([0x77, 0x00]);                                // ja default
+        var tableLoad = code.Count;
+        code.AddRange([0x4C, 0x8D, 0x0D, 0, 0, 0, 0]);              // lea r9, [rip + table]
+        code.AddRange([0x48, 0x89, 0x54, 0x24, 0xD8]);              // mov [rsp-0x28], rdx
+        code.AddRange(spill);                                       // mov [rsp-0x30], rcx (or a register write)
+        code.AddRange([0x49, 0x63, 0x04, 0x89]);                    // movsxd rax, [r9 + rcx*4]
+        code.AddRange([0x4C, 0x01, 0xC8]);                          // add rax, r9
+        code.AddRange([0xFF, 0xE0]);                                // jmp rax
+        var caseOffsets = new int[4];
+        for (var index = 0; index < caseOffsets.Length; index++)
         {
-            for (var index = 0; index < cases.Length; index++)
-            {
-                Assembler.Label(ref cases[index]);
-                Assembler.mov(eax, index);
-                Assembler.jmp(exit);
-            }
+            caseOffsets[index] = code.Count;
+            code.AddRange([0x8B, 0x02]);                            // mov eax, [rdx]
+            code.AddRange([0x83, 0xC0, (byte)(index + 1)]);         // add eax, index + 1
+            code.AddRange([0x48, 0x8B, 0x4C, 0x24, 0xD0]);          // mov rcx, [rsp-0x30]
+            code.Add(0xC3);                                         // ret
         }
 
-        public void AssertResolves(Label[] cases)
+        var defaultOffset = code.Count;
+        code.AddRange([0x31, 0xC0, 0xC3]);                          // xor eax, eax; ret
+        code[boundsBranch + 1] = (byte)(defaultOffset - (boundsBranch + 2));
+        var displacement = SwitchTableOffset - (tableLoad + 7);
+        var bytes = code.ToArray();
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(tableLoad + 3), displacement);
+
+        var table = new byte[caseOffsets.Length * sizeof(int)];
+        for (var index = 0; index < caseOffsets.Length; index++)
         {
-            var (image, codeLength, result) = Assemble();
-            Assert.True(GuestRedZonePatcher.TryResolveJumpTableTargets(image, BaseAddress, codeLength, out var targets));
-            Assert.Equal(cases.Select(label => result.GetLabelRIP(label)).Distinct().Order(), targets);
+            BinaryPrimitives.WriteInt32LittleEndian(table.AsSpan(index * sizeof(int)), caseOffsets[index] - SwitchTableOffset);
         }
 
-        public void AssertRefuses()
-        {
-            var (image, codeLength, _) = Assemble();
-            Assert.False(GuestRedZonePatcher.TryResolveJumpTableTargets(image, BaseAddress, codeLength, out _));
-        }
-
-        private (byte[] Image, int CodeLength, AssemblerResult Result) Assemble()
-        {
-            var codeEnd = Assembler.CreateLabel();
-            Assembler.Label(ref codeEnd);
-            Assembler.int3();
-            for (var index = 0; index < _tables.Count; index++)
-            {
-                var (table, entries) = _tables[index];
-                Assembler.Label(ref table);
-                Assembler.db(new byte[entries.Length * sizeof(int)]);
-                _tables[index] = (table, entries);
-            }
-
-            using var stream = new MemoryStream();
-            var result = Assembler.Assemble(
-                new StreamCodeWriter(stream), BaseAddress, BlockEncoderOptions.ReturnNewInstructionOffsets);
-            var image = stream.ToArray();
-            foreach (var (table, entries) in _tables)
-            {
-                var tableAddress = result.GetLabelRIP(table);
-                for (var index = 0; index < entries.Length; index++)
-                {
-                    BinaryPrimitives.WriteInt32LittleEndian(
-                        image.AsSpan((int)(tableAddress - BaseAddress) + index * sizeof(int)),
-                        (int)(result.GetLabelRIP(entries[index]) - tableAddress));
-                }
-            }
-
-            return (image, (int)(result.GetLabelRIP(codeEnd) - BaseAddress), result);
-        }
+        return (bytes, table);
     }
 
     private sealed unsafe class PatchedImage : IDisposable
@@ -742,7 +478,7 @@ public sealed class GuestRedZonePatcherTests
 
         public GuestRedZonePatcher.PatchResult Result { get; }
 
-        public static PatchedImage Create(byte[] function, (ulong Offset, uint Value)[] data)
+        public static PatchedImage Create(byte[] function, (ulong Offset, uint Value)[] data, (ulong Offset, byte[] Bytes)? readOnlyData = null)
         {
             var memory = new PhysicalVirtualMemory();
             const ulong holeSize = 0x4000000;
@@ -764,12 +500,17 @@ public sealed class GuestRedZonePatcherTests
             BinaryPrimitives.WriteUInt32LittleEndian(exceptionFrameHeader.AsSpan(12), 1);
             BinaryPrimitives.WriteUInt64LittleEndian(exceptionFrameHeader.AsSpan(16), imageBase);
             Assert.True(memory.TryWrite(imageBase + 0x1000, exceptionFrameHeader));
-            ProgramHeader[] headers =
-            [
+            var headers = new List<ProgramHeader>
+            {
                 CreateProgramHeader(ProgramHeaderType.Load, ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute,
                     0, (ulong)function.Length),
                 CreateProgramHeader(ProgramHeaderType.GnuEhFrame, ProgramHeaderFlags.Read, 0x1000, (ulong)exceptionFrameHeader.Length),
-            ];
+            };
+            if (readOnlyData is { } table)
+            {
+                Assert.True(memory.TryWrite(imageBase + table.Offset, table.Bytes));
+                headers.Add(CreateProgramHeader(ProgramHeaderType.Load, ProgramHeaderFlags.Read, table.Offset, (ulong)table.Bytes.Length));
+            }
 
             var result = GuestRedZonePatcher.Patch(memory, memory, headers, imageBase, ImageSize);
             return new PatchedImage(memory, imageBase, result);
@@ -813,7 +554,7 @@ public sealed class GuestRedZonePatcherTests
             0xC3,
         ];
         using var image = PatchedImage.Create(function, [(0x40, value)]);
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        if (OperatingSystem.IsWindows())
         {
             Assert.Equal(1, image.Result.PatchedSites);
             Assert.Equal(0, image.Result.FailedSites);
@@ -831,7 +572,7 @@ public sealed class GuestRedZonePatcherTests
     [InlineData(new byte[] { 0xEB, 0x00 }, 2)]
     public void GroupingStopsAtStackAndControlFlowBoundaries(byte[] separator, int expectedSites)
     {
-        if ((!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS()) ||
+        if (!OperatingSystem.IsWindows() ||
             RuntimeInformation.ProcessArchitecture != Architecture.X64)
             return;
 
@@ -850,7 +591,7 @@ public sealed class GuestRedZonePatcherTests
     [Fact]
     public void GroupingPreservesBranchTargetsAndDisablesExpansionForIndirectJumps()
     {
-        if ((!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS()) ||
+        if (!OperatingSystem.IsWindows() ||
             RuntimeInformation.ProcessArchitecture != Architecture.X64)
             return;
 
@@ -878,7 +619,7 @@ public sealed class GuestRedZonePatcherTests
     [Fact]
     public unsafe void GroupedRelocationPreservesRipRelativeDataFlagsAndRedZone()
     {
-        if ((!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS()) ||
+        if (!OperatingSystem.IsWindows() ||
             RuntimeInformation.ProcessArchitecture != Architecture.X64)
             return;
 
@@ -906,7 +647,7 @@ public sealed class GuestRedZonePatcherTests
     [Fact]
     public void LargeGroupsHaveEnoughTrampolineSpace()
     {
-        if ((!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS()) ||
+        if (!OperatingSystem.IsWindows() ||
             RuntimeInformation.ProcessArchitecture != Architecture.X64)
             return;
 
@@ -927,7 +668,7 @@ public sealed class GuestRedZonePatcherTests
     [Fact]
     public void BackwardSpanDoesNotOverwriteAnEarlierPatch()
     {
-        if ((!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS()) ||
+        if (!OperatingSystem.IsWindows() ||
             RuntimeInformation.ProcessArchitecture != Architecture.X64) return;
 
         using var memory = new PhysicalVirtualMemory();

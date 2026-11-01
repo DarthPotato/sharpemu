@@ -17,17 +17,12 @@ public sealed partial class GuestImageCache
     public void RunGarbageCollector(bool endsFrame)
     {
         using var held = _lock.Hold();
+        RefreshMemoryBudgetAndProfile();
         var tick = endsFrame ? _collectionTick++ : _collectionTick;
         if (endsFrame && SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled && tick % 300 == 0)
             ReportImageMemory("collection", true, tick);
-        _allocationCollectionBlocked = false;
-        if (MemoryUnderPressure)
-        {
-            // Idle pool memory is kept for reuse until the cache is short of memory.
-            ReleaseUnusedMemoryCore();
-        }
-
-        if (CollectionMemoryBytes < _collectionStartBytes)
+        ExpireParkedImages(tick);
+        if (_totalUsedMemory < _collectionStartBytes)
         {
             return;
         }
@@ -54,6 +49,7 @@ public sealed partial class GuestImageCache
     // frame larger than the target. The flip's collection removes what the frame did not use.
     private void CollectForAllocation(ulong requiredBytes)
     {
+        RefreshMemoryBudgetAndProfile();
         FinishRetiredImagesForAllocation(requiredBytes);
         var current = CollectionMemoryBytes;
         if (requiredBytes > _criticalMemoryBytes || current <= _criticalMemoryBytes - requiredBytes)
@@ -91,7 +87,7 @@ public sealed partial class GuestImageCache
 
     private void FinishRetiredImagesForAllocation(ulong requiredBytes)
     {
-        if (Interlocked.Read(ref _retiredImageMemoryBytes) == 0 || !_scheduler.Active || _scheduler.InsideTickCallback)
+        if (Interlocked.Read(ref _pendingDestroyBytes) == 0 || !_scheduler.Active || _scheduler.InsideTickCallback)
         {
             return;
         }
@@ -105,14 +101,14 @@ public sealed partial class GuestImageCache
         // Completion destroys the retired images and can call back into the cache: never wait
         // while holding its lock. Images this preparation touched stay registered; only the
         // previously retired ones are destroyed.
-        _lock.Exit();
+        _lock.ExitWrite();
         try
         {
             ReleaseRetiredImagesCore(RetiredBytesAllowed(requiredBytes));
         }
         finally
         {
-            _lock.Enter();
+            _lock.EnterWrite();
         }
 
         ReleaseUnusedMemoryCore();
@@ -127,7 +123,7 @@ public sealed partial class GuestImageCache
     private void ReleaseRetiredImagesCore(long allowedBytes)
     {
         _scheduler.RunCompletedOperations();
-        var retired = Interlocked.Read(ref _retiredImageMemoryBytes);
+        var retired = Interlocked.Read(ref _pendingDestroyBytes);
         if (retired <= allowedBytes)
         {
             return;
@@ -218,28 +214,32 @@ public sealed partial class GuestImageCache
 
     private void ReclaimAfterFailedAllocation()
     {
-        for (var rounds = 0; rounds < 64; rounds++)
+        for (var rounds = 0; rounds < 256; rounds++)
         {
             var before = _totalUsedMemory;
             Collect(_collectionTick, allowAggressive: true, reclaim: true);
-            if (_totalUsedMemory == before)
-            {
-                break;
-            }
+            // Readback/detile scratch and retired images must drain between batches.
+            // Accumulating every reclaim pass in one tick amplified pressure while recovering.
+            if (GpuMemoryPolicyOptions.OomBatch) FinishReclaimedImages();
+            if (_totalUsedMemory == before) break;
         }
+        if (!GpuMemoryPolicyOptions.OomBatch) FinishReclaimedImages();
+    }
 
+    private void FinishReclaimedImages()
+    {
         // Completion destroys the retired images and can call back into the cache, so the wait
         // happens without its lock.
         if (_scheduler.Active && !_scheduler.InsideTickCallback)
         {
-            _lock.Exit();
+            _lock.ExitWrite();
             try
             {
                 _scheduler.Finish();
             }
             finally
             {
-                _lock.Enter();
+                _lock.EnterWrite();
             }
         }
 
@@ -250,6 +250,7 @@ public sealed partial class GuestImageCache
     // chunks without a live buffer. Registered images and live buffers are untouched.
     private void ReleaseUnusedMemoryCore()
     {
+        if (GpuMemoryPolicyOptions.OomReleaseScratch) _tiler.ReleaseUnusedScratch();
         _backingPool?.ReleaseRetained();
         _imageMemoryPool.ReleaseRetained();
         _device.Slabs.ReleaseUnused();
@@ -271,7 +272,7 @@ public sealed partial class GuestImageCache
         CollectCore(tick, allowAggressive, reclaim, midFrame);
         Console.Error.WriteLine(
             $"[IMAGE_COLLECT] tick={tick} aggressive={allowAggressive} reclaim={reclaim} midFrame={midFrame} images={countBefore}->{_slots.Count} " +
-            $"live={usedBefore}->{_totalUsedMemory} retired={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
+            $"live={usedBefore}->{_totalUsedMemory} retired={Interlocked.Read(ref _pendingDestroyBytes)} " +
             $"pool_unused={_imageMemoryPool.UnusedBytes} pooled_backing={_backingPool?.PooledBytes ?? 0} " +
             $"thresholds={_memoryPressureBytes}/{_criticalMemoryBytes}/{_hardLimitBytes}");
     }
@@ -302,7 +303,7 @@ public sealed partial class GuestImageCache
             return;
         }
 
-        var deletions = aggressive ? 40 : pressured ? 20 : 10;
+        var deletions = reclaim && GpuMemoryPolicyOptions.OomBatch ? 4 : aggressive ? 40 : pressured ? 20 : 10;
         var candidates = new List<ResourceSlotIdentifier>(deletions);
         // The periodic sweep examines a bounded slice per step and resumes where the last one stopped;
         // the pressure and reclaim passes take every aged image at once.
@@ -469,6 +470,14 @@ public sealed partial class GuestImageCache
         _scheduledReadbacks.Clear();
     }
 
+    private long _pendingDestroyBytes;
+
+    private long _destroyedImageReclaims;
+
+    public void NoteDestroyedImageReclaim() => Interlocked.Increment(ref _destroyedImageReclaims);
+
+    public bool HoldsManyDestroyedImages => (ulong)Math.Max(0, Volatile.Read(ref _pendingDestroyBytes)) >= _memoryPressureBytes;
+
     // Test seams: thresholds, the recency order and the private state the tests inspect.
     internal void SetCollectionThresholds(ulong trigger, ulong pressure, ulong critical, ulong tick, ulong hardLimit = 0)
     {
@@ -520,6 +529,9 @@ public sealed partial class GuestImageCache
 
     internal void SetLinearReadback(bool enabled) => _readbackLinearImages = enabled;
 
+    // Runs inside a readback's landing once it has decided which pages to write, before it writes them.
+    internal Action? LandingDecidedForTest { get; set; }
+
     internal List<ResourceSlotIdentifier> FindImagesInRangeForTest(ulong address, ulong size, bool pageOverlap)
     {
         using var held = _lock.Hold();
@@ -554,15 +566,17 @@ public sealed partial class GuestImageCache
     internal void AddPageOwner(ulong address, ResourceSlotIdentifier imageIdentifier)
     {
         using var held = _lock.Hold();
-        InvalidateLookups();
-        _pageOwners.GetOrCreate(address >> ImagePageOwnerTable.PageBits).Add(imageIdentifier);
+        var page = address >> ImagePageOwnerTable.PageBits;
+        InvalidateLookups(page << ImagePageOwnerTable.PageBits, (page + 1) << ImagePageOwnerTable.PageBits);
+        _pageOwners.GetOrCreate(page).Add(imageIdentifier);
     }
 
     internal bool RemovePageOwner(ulong address, ResourceSlotIdentifier imageIdentifier)
     {
         using var held = _lock.Hold();
-        InvalidateLookups();
-        return _pageOwners.Find(address >> ImagePageOwnerTable.PageBits)?.Remove(imageIdentifier) == true;
+        var page = address >> ImagePageOwnerTable.PageBits;
+        InvalidateLookups(page << ImagePageOwnerTable.PageBits, (page + 1) << ImagePageOwnerTable.PageBits);
+        return _pageOwners.Find(page)?.Remove(imageIdentifier) == true;
     }
 
     internal uint QueryEpoch
@@ -640,14 +654,14 @@ public sealed partial class GuestImageCache
 
     internal readonly struct RegionLockScope : IDisposable
     {
-        private readonly HLE.GpuMemory.RegionLock _lock;
+        private readonly HLE.GpuMemory.SpinReadWriteLock _lock;
 
-        public RegionLockScope(HLE.GpuMemory.RegionLock regionLock)
+        public RegionLockScope(HLE.GpuMemory.SpinReadWriteLock cacheLock)
         {
-            _lock = regionLock;
-            regionLock.Enter();
+            _lock = cacheLock;
+            cacheLock.EnterWrite();
         }
 
-        public void Dispose() => _lock.Exit();
+        public void Dispose() => _lock.ExitWrite();
     }
 }

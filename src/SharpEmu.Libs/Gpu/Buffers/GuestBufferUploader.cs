@@ -14,6 +14,8 @@ internal delegate bool GuestBufferSourceReader(ulong address, Span<byte> destina
 internal sealed class GuestBufferUploader(
     GpuDeviceInfo device, SubmissionScheduler scheduler, ICpuMemory guest, GpuRingBuffer staging)
 {
+    private const ulong TemporaryPieceBytes = 1UL << 30;
+
     public GpuBuffer? PrepareSource(ulong bufferAddress, Span<BufferCopy> regions,
         ulong totalSize, ulong requestedAddress, ulong requestedSize, GuestBufferSourceReader? readSource = null)
     {
@@ -39,8 +41,13 @@ internal sealed class GuestBufferUploader(
         var temporary = new GpuBuffer(device, scheduler, GpuBufferUsage.Upload, 0, BufferUsageFlags.TransferSrcBit, totalSize);
         foreach (ref readonly var copy in regions)
         {
-            ReadGuestBytes(bufferAddress + copy.DstOffset,
-                temporary.Mapped.Slice((int)copy.SrcOffset, (int)copy.Size), requestedAddress, requestedSize, readSource);
+            for (var done = 0UL; done < copy.Size;)
+            {
+                var piece = (int)Math.Min(copy.Size - done, TemporaryPieceBytes);
+                ReadGuestBytes(bufferAddress + copy.DstOffset + done,
+                    temporary.MappedRange(copy.SrcOffset + done, piece), requestedAddress, requestedSize, readSource);
+                done += (ulong)piece;
+            }
         }
 
         temporary.Flush(0, totalSize);

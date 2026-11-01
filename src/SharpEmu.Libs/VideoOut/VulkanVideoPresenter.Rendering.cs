@@ -56,11 +56,86 @@ internal static unsafe partial class VulkanVideoPresenter
         }
     }
 
-    private sealed partial class Presenter : IRenderHost
+    private sealed partial class Presenter
+    {
+        internal ExtColorWriteEnable? _colorWriteEnableApi;
+        internal bool _supportsDepthClipControl;
+        internal bool _supportsDepthClipEnable;
+        internal bool _supportsDepthBounds;
+        internal bool _supportsShaderDrawParameters;
+        internal bool _supportsFillRectangle;
+        internal bool _supportsRectangleGeometry;
+        internal RenderHostLimits _renderHostLimits;
+        internal IGuestBackedSpace _guestBacking = null!;
+
+        internal readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, RenderPipelineEntry> _pipelineEntries = new();
+        private ulong _nextPipelineId;
+
+        private void LoadRenderingCommands(bool supportsColorWriteEnable, string deviceName)
+        {
+            if (!_vk.TryGetDeviceExtension(_instance, _device, out _pushDescriptorApi))
+            {
+                throw SubmissionScheduler.Fatal($"The device extension commands are unavailable: device={deviceName} extension={PushDescriptorExtensionName}.");
+            }
+
+            if (supportsColorWriteEnable)
+            {
+                if (!_vk.TryGetDeviceExtension(_instance, _device, out ExtColorWriteEnable colorWriteEnable))
+                {
+                    throw SubmissionScheduler.Fatal($"The device extension commands are unavailable: device={deviceName} extension={ColorWriteEnableExtensionName}.");
+                }
+
+                _colorWriteEnableApi = colorWriteEnable;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Vulkan rendering extensions color_write_enable={(supportsColorWriteEnable ? 1 : 0)} " +
+                $"depth_clip_control={(_supportsDepthClipControl ? 1 : 0)} depth_clip_enable={(_supportsDepthClipEnable ? 1 : 0)} " +
+                $"depth_bounds={(_supportsDepthBounds ? 1 : 0)} fill_rectangle={(_supportsFillRectangle ? 1 : 0)}");
+        }
+
+        public bool TryResolveColorOutput(
+            uint dataFormat,
+            uint numberType,
+            uint componentSwap,
+            out Gen5PixelOutputKind outputKind,
+            out Gen5ColorComponentMapping componentMapping)
+        {
+            if (VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+                    dataFormat,
+                    numberType,
+                    componentSwap,
+                    out var format))
+            {
+                outputKind = format.OutputKind;
+                componentMapping = format.ExportMapping;
+                return true;
+            }
+
+            outputKind = default;
+            componentMapping = default;
+            return false;
+        }
+    }
+
+    private sealed partial class RecordingHost : IRenderHost
     {
         // Keep each new stream allocation intact until the draw is recorded.
-        private sealed class RenderPreparation(Presenter owner, IDisposable streamRetention) : IResourcePreparation
+        private sealed class RenderPreparation(RecordingHost owner) : IResourcePreparation
         {
+            private IDisposable? streamRetention;
+
+            public RenderPreparation Open(IDisposable? retention)
+            {
+                streamRetention = retention;
+                StencilStorageImages = null;
+                StencilStorageWriteBackImages = null;
+                FeedbackSnapshots = null;
+                Committed = false;
+                CommandsRecorded = false;
+                return this;
+            }
+
             public List<PreparedStageBindings> Stages { get; } = new();
 
             // Host buffers that took an upload the ring could not hold; the committed draw owns them.
@@ -87,7 +162,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 owner._preparedTextures.Clear();
                 try
                 {
-                    streamRetention.Dispose();
+                    streamRetention?.Dispose();
                     if (StencilStorageImages is { } stencilImages)
                     {
                         foreach (var (attachment, storage) in stencilImages)
@@ -119,82 +194,61 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     foreach (var (buffer, memory) in OverflowBuffers)
                     {
-                        owner.RecycleHostBuffer(buffer, memory);
+                        owner._presenter.RecycleHostBuffer(buffer, memory);
                     }
                 }
                 finally
                 {
+                    // Textures are not returned here: committed ones stay with the submission until
+                    // RecycleSubmissionUploads, and a stage memo can hand them to a later draw.
                     foreach (var stage in Stages)
                     {
-                        owner.ReturnUnretainedTextures(stage, Committed);
                         owner.ReturnStageScratch(stage);
                     }
 
                     Stages.Clear();
+                    OverflowBuffers.Clear();
+                    streamRetention = null;
                 }
             }
         }
 
-        private ExtColorWriteEnable? _colorWriteEnableApi;
-        private bool _supportsDepthClipControl;
-        private bool _supportsDepthClipEnable;
-        private bool _supportsDepthBounds;
-        private bool _supportsFillRectangle;
-        private bool _supportsRectangleGeometry;
-        private RenderHostLimits _renderHostLimits;
-        private IGuestBackedSpace _guestBacking = null!;
-
-        private readonly Dictionary<ulong, RenderPipelineEntry> _pipelineEntries = new();
-        private ulong _nextPipelineId;
         private RenderPreparation? _preparation;
+        private RenderPreparation? _sparePreparation;
         private RenderPipelineEntry? _boundGraphicsPipeline;
         private ulong _profileComputePipeline;
 
-        private bool _renderingActive;
+        internal bool _renderingActive;
         private RenderingState _renderingState;
         private VulkanCommandProfile.MeshDrawState _profileMeshDrawState;
         private long _renderingScopesBegun;
         // SHARPEMU_DEFER_GLOBAL_BARRIERS=0 ends the rendering scope at every guest cache flush again.
-        private static readonly bool DeferGlobalBarriers =
+        internal static readonly bool DeferGlobalBarriers =
             Environment.GetEnvironmentVariable("SHARPEMU_DEFER_GLOBAL_BARRIERS") != "0";
-        private bool _renderingWritesMemory;
+        internal bool _renderingWritesMemory;
         private bool _nextDrawWritesMemory;
-        private bool _globalBarrierAfterRendering;
+        internal bool _globalBarrierAfterRendering;
         // Attachment barriers that order this rendering scope before later work; see TryDeferUntilRenderingEnds.
-        private readonly List<(PipelineStageFlags Source, PipelineStageFlags Destination, ImageMemoryBarrier2[] Barriers)> _barriersAfterRendering = new();
+        private readonly List<ImageMemoryBarrier2> _barriersAfterRendering = new();
+        private PipelineStageFlags _afterRenderingSourceStages;
+        private PipelineStageFlags _afterRenderingDestinationStages;
         private bool _hasBoundDepth;
         private DepthAttachmentState _boundDepth;
-        private ImageLayout _boundDepthLayout;
         private DepthStencilState _boundDepthLoadState;
         // A sampled depth target was cleared with a transfer; the rendering scope loads it instead.
         private bool _depthClearRecordedSeparately;
 
-        private void LoadRenderingCommands(bool supportsColorWriteEnable, string deviceName)
-        {
-            if (!_vk.TryGetDeviceExtension(_instance, _device, out _pushDescriptorApi))
-            {
-                throw SubmissionScheduler.Fatal($"The device extension commands are unavailable: device={deviceName} extension={PushDescriptorExtensionName}.");
-            }
-
-            if (supportsColorWriteEnable)
-            {
-                if (!_vk.TryGetDeviceExtension(_instance, _device, out ExtColorWriteEnable colorWriteEnable))
-                {
-                    throw SubmissionScheduler.Fatal($"The device extension commands are unavailable: device={deviceName} extension={ColorWriteEnableExtensionName}.");
-                }
-
-                _colorWriteEnableApi = colorWriteEnable;
-            }
-
-            Console.Error.WriteLine(
-                $"[LOADER][INFO] Vulkan rendering extensions color_write_enable={(supportsColorWriteEnable ? 1 : 0)} " +
-                $"depth_clip_control={(_supportsDepthClipControl ? 1 : 0)} depth_clip_enable={(_supportsDepthClipEnable ? 1 : 0)} " +
-                $"depth_bounds={(_supportsDepthBounds ? 1 : 0)} fill_rectangle={(_supportsFillRectangle ? 1 : 0)}");
-        }
-
         RenderHostLimits IRenderHost.Limits => _renderHostLimits;
 
-        bool IRenderHost.SupportsNativeRectangles => _supportsFillRectangle || _supportsRectangleGeometry;
+        bool IRenderHost.SupportsNativeRectangles => _presenter._supportsFillRectangle || _presenter._supportsRectangleGeometry;
+        bool IRenderHost.SupportsTessellation => _presenter._supportsTessellation;
+
+        bool IRenderHost.TryCopyImage(in ImageRequest source, in ImageRequest destination)
+        {
+            if (_worker)
+                throw Serial("frontend image copy");
+            return _imageCache.TryCopyImage(source, destination);
+        }
 
         IImageFormatSupport IRenderHost.FormatSupport => _deviceInfo;
 
@@ -202,12 +256,17 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             get
             {
-                if (_deviceLost)
+                if (_presenter._deviceLost)
                 {
                     return false;
                 }
 
-                _ = BeginBatchedGuestCommands();
+                if (_worker)
+                {
+                    return true;
+                }
+
+                EnsureBatchedGuestCommands();
                 return _scheduler.Active;
             }
         }
@@ -216,7 +275,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void RunPendingOperations()
         {
-            // Start of a draw or dispatch: nothing is bound yet, so the tick can end here.
+            if (_worker)
+            {
+                return;
+            }
+
+            _presenter.RunPendingCommands();
             if (_imageCache is { } images && _preparation is null && _scheduler.Active && !_scheduler.InsideTickCallback)
             {
                 // A slow frame can materialize many draws' textures before the next flip, so memory
@@ -238,11 +302,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
-            RunPendingCommands();
+            _presenter.RunPendingCommands();
         }
 
         public void SetDebugInformation(RecordedOperation operation, ulong submitId, uint argument0, uint argument1, uint argument2, uint argument3, ulong argument4) =>
-            _scheduler.Current.SetDebugInfo((uint)operation, submitId, argument0, argument1, argument2, argument3, argument4);
+            CurrentRecording().SetDebugInfo((uint)operation, submitId, argument0, argument1, argument2, argument3, argument4);
 
         // The part of the range that is mapped from its start; unmapped starts are fatal as the executor cannot bind them.
         public ulong ClampMappedSize(ulong address, ulong size)
@@ -251,14 +315,14 @@ internal static unsafe partial class VulkanVideoPresenter
         private ulong ClampMappedSize(ulong address, ulong size, PreparedStageBindings? prepared, int bufferIndex)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferMappedRangeValidation);
-            // A readable whole range proves its first byte too. Keep both queries only
-            // on the exceptional path, without caching mappings across bindings.
-            if (address != 0 && size != 0 && size <= ulong.MaxValue - address && _guestMemory.CanRead(address, size))
+            // A whole readable range is the common case and answers for its start too.
+            var valid = address != 0 && size != 0 && size <= ulong.MaxValue - address;
+            if (valid && _guestMemory.CanRead(address, size))
             {
                 return size;
             }
 
-            if (address == 0 || size == 0 || size > ulong.MaxValue - address || !_guestMemory.CanRead(address, 1))
+            if (!valid || !_guestMemory.CanRead(address, 1))
             {
                 var context = string.Empty;
                 if (prepared is not null)
@@ -301,8 +365,13 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             _imageCache.TraceNativeColorMetadata(request);
             _imageCache.TraceTextureMetadata(request);
-            _imageCache.SynchronizeColorMetadata(request);
-            _ = BeginBatchedGuestCommands();
+            SynchronizeColorMetadata(request);
+            if (_worker)
+            {
+                return LookUpImage(ref request, exactFormat);
+            }
+
+            EnsureBatchedGuestCommands();
             if (request.Role == ImageRole.ColorTarget && !request.Description.Metadata.NativeColorClear &&
                 request.Description.DccSliceSize is var sliceSize and not 0)
             {
@@ -311,9 +380,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var imageIdentifier = _imageCache.FindImage(ref request, exactFormat);
-            _imageCache.ApplyNativeColorClear(imageIdentifier, request);
+            ApplyNativeColorClear(imageIdentifier, request);
             return imageIdentifier;
         }
+
+        private ResourceSlotIdentifier LookUpImage(ref ImageRequest request, bool exactFormat = false) =>
+            _worker
+                ? _imageCache.TryFindImageForSlice(ref request, exactFormat, out var found) ? found : throw Serial("image lookup", resumable: true)
+                : _imageCache.FindImage(ref request, exactFormat);
 
         public void ResetBindings()
         {
@@ -335,14 +409,12 @@ internal static unsafe partial class VulkanVideoPresenter
             attachment.Resolution = target.Resolution;
             attachment.Image = null!;
             attachment.View = default;
-            attachment.Layout = default;
             attachment.Clear = false;
             attachment.ClearValue = default;
             AcquireColorAttachment(attachment);
             return new ColorAttachmentAcquisition(
                 attachment.ImageIdentifier,
                 attachment.View,
-                attachment.Layout,
                 attachment.Image.Backing.Samples,
                 attachment.Clear,
                 attachment.ClearValue);
@@ -350,6 +422,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         DepthAttachmentAcquisition IRenderHost.AcquireDepthAttachment(in DepthAttachmentState depth)
         {
+            if (_worker)
+            {
+                return AcquireDepthAttachmentForSlice(in depth);
+            }
+
             var resolution = depth.Target.Target;
             if (IsStaleImage(depth.Image, out _))
             {
@@ -357,7 +434,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var view = _imageCache.AcquireDepthTargetView(depth.Image, resolution.Request);
-            _ = BeginBatchedGuestCommands();
+            EnsureBatchedGuestCommands();
             var layer = resolution.Request.View.BaseLayer;
             if (resolution.HasHtile && resolution.DepthClearEnabled && !_imageCache.ClearMetadata(resolution.HtileAddress))
             {
@@ -375,26 +452,61 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // The image transition ends the scope only when it records a barrier.
-        public void TransitionDepthAttachment(in DepthAttachmentState depth, ImageLayout layout, ImageAspectFlags writeAspects)
+        public DrawScopeToken DrawScope =>
+            _renderingActive ? new DrawScopeToken(_renderingScopesBegun, _imageCache.LookupGeneration, _imageCache.MetadataGeneration) : default;
+
+        public void KeepDepthAttachment(in DepthAttachmentState depth)
         {
-            var command = BeginBatchedGuestCommands();
-            var image = _imageCache.GetImage(depth.Image);
-            var view = depth.Target.Target.Request.View;
-            var access = AccessFlags.DepthStencilAttachmentReadBit | (writeAspects != 0 ? AccessFlags.DepthStencilAttachmentWriteBit : 0);
-            image.Transition(layout, access, new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount), command);
             _hasBoundDepth = true;
             _boundDepth = depth;
-            _boundDepthLayout = layout;
             _boundDepthLoadState = depth.LoadState;
         }
 
-        public BufferBinding NullBuffer => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle.Handle, 0);
+        private readonly StagePreparationMemo?[] _keptTextureSets = new StagePreparationMemo?[2];
+        private readonly StagePreparationMemo?[] _committedTextureSets = new StagePreparationMemo?[2];
+        private DrawScopeToken _keptTextureScope;
+        private static long _texturesKept;
+
+        internal static long TakeTexturesKept() => Interlocked.Exchange(ref _texturesKept, 0);
+
+        private static int TextureSetSlot(ShaderProgramInfo program) => program.Stage switch
+        {
+            ShaderStageKind.Vertex => 0,
+            ShaderStageKind.Pixel => 1,
+            _ => -1,
+        };
+
+        private bool KeepsTextureSet(PreparedStageBindings stage)
+        {
+            var slot = TextureSetSlot(stage.Program);
+            return slot >= 0 && stage.Memoized && stage.Memo is { Valid: true } memo && ReferenceEquals(_keptTextureSets[slot], memo) &&
+                _keptTextureScope.IsActive && DrawScope == _keptTextureScope && _presenter._hostMovieFramePixels is null;
+        }
+
+        public void TransitionDepthAttachment(in DepthAttachmentState depth, ImageAspectFlags writeAspects)
+        {
+            var command = BeginBatchedGuestCommands();
+            var image = Image(depth.Image);
+            var view = depth.Target.Target.Request.View;
+            var access = AccessFlags.DepthStencilAttachmentReadBit | (writeAspects != 0 ? AccessFlags.DepthStencilAttachmentWriteBit : 0);
+            TransitionImage(image, access, new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount), command);
+            _hasBoundDepth = true;
+            _boundDepth = depth;
+            _boundDepthLoadState = depth.LoadState;
+        }
+
+        public BufferBinding NullBuffer => new(NullBufferHandle.Handle, 0);
 
         public ulong UploadMeshVertexIndices(ReadOnlySpan<uint> indices)
         {
+            if (_worker)
+            {
+                throw Serial("mesh index upload", resumable: true);
+            }
+
             var preparation = RequirePreparation();
             var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(indices);
-            var buffer = CreateHostBuffer(bytes,
+            var buffer = _presenter.CreateHostBuffer(bytes,
                 BufferUsageFlags.StorageBufferBit | BufferUsageFlags.ShaderDeviceAddressBit,
                 out var memory, out _);
             preparation.OverflowBuffers.Add((buffer, memory));
@@ -408,19 +520,29 @@ internal static unsafe partial class VulkanVideoPresenter
             return address;
         }
 
-        public void PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges) =>
-            _bufferCache.PrepareBufferAllocations(ranges);
-
         public ulong ObtainBufferDeviceAddress(ulong address, ulong size, bool isWritten)
         {
-            // Read-only indices normally use the transient stream fast path.
-            // Physical pointers require a cache allocation created with BDA usage.
+            if (_worker)
+                throw Serial("tessellation device addresses");
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, isWritten, requiresDeviceAddress: true);
             return checked(buffer.DeviceAddress + offset);
         }
 
+        public void PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges)
+        {
+            if (_worker)
+                throw Serial("tessellation device addresses");
+            _bufferCache.PrepareBufferAllocations(ranges);
+        }
+
         public BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten)
         {
+            if (_worker)
+            {
+                var (sliceBuffer, sliceOffset) = ObtainBufferForSlice(address, size, isWritten, isTexelBuffer: false);
+                return new BufferBinding(sliceBuffer.Handle.Handle, sliceOffset);
+            }
+
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, isWritten);
             return new BufferBinding(buffer.Handle.Handle, offset);
         }
@@ -428,6 +550,11 @@ internal static unsafe partial class VulkanVideoPresenter
         // The ring takes the bytes unless it would wrap over a prepared binding; then a host buffer of the draw takes them.
         public BufferBinding UploadTransient(ReadOnlySpan<byte> data, uint alignment)
         {
+            if (_worker)
+            {
+                return _arena!.TryUpload(data, alignment, out var arenaBuffer, out var arenaOffset) ? new BufferBinding(arenaBuffer.Handle, arenaOffset) : throw Serial("arena", resumable: true);
+            }
+
             var preparation = RequirePreparation();
             var stream = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream);
             if (stream.TryMap((ulong)data.Length, out var offset, alignment))
@@ -438,7 +565,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             // Transient uploads also back storage-buffer descriptors, so match the ring's usage.
-            var buffer = CreateHostBuffer(data, GpuBuffer.AllFlags, out var memory, out _);
+            var buffer = _presenter.CreateHostBuffer(data, GpuBuffer.AllFlags, out var memory, out _);
             preparation.OverflowBuffers.Add((buffer, memory));
             if (RenderTrace.Enabled)
             {
@@ -465,7 +592,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 offsets[index] = bindings[index].Offset;
             }
 
-            _vk.CmdBindVertexBuffers(command, 0, (uint)bindings.Length, buffers, offsets);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdBindVertexBuffers(command, 0, (uint)bindings.Length, buffers, offsets);
+            }
         }
 
         public void BindIndexBuffer(BufferBinding binding, IndexType type)
@@ -473,7 +603,10 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             if (!IndexBufferAlreadyBound(command, new VkBuffer(binding.Handle), binding.Offset, type))
             {
-                _vk.CmdBindIndexBuffer(command, new VkBuffer(binding.Handle), binding.Offset, type);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdBindIndexBuffer(command, new VkBuffer(binding.Handle), binding.Offset, type);
+                }
             }
         }
 
@@ -484,10 +617,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal("A resource preparation is already open.");
             }
 
-            // Acquire the decoded frame before any stage selects its movie texture planes.
-            PumpHostMovieFrame();
+            if (_worker)
+            {
+                _preparation = (_sparePreparation ??= new RenderPreparation(this)).Open(null);
+                return _preparation;
+            }
 
-            if (_batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
+            // Acquire the decoded frame before any stage selects its movie texture planes.
+            _presenter.PumpHostMovieFrame();
+
+            if (_presenter._batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
             {
                 if (GpuSyncProfile.Enabled)
                 {
@@ -495,7 +634,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 EndRendering();
-                FlushGuestCommandsForReason(SubmitReason.DrawCap);
+                _presenter.FlushGuestCommandsForReason(SubmitReason.DrawCap);
             }
             else if (ShouldSubmitForIdleGpu())
             {
@@ -505,28 +644,29 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 EndRendering();
-                FlushGuestCommandsForReason(SubmitReason.IdleKick);
+                _presenter.FlushGuestCommandsForReason(SubmitReason.IdleKick);
             }
 
             EnsureGuestSubmissionCapacity();
-            _ = BeginBatchedGuestCommands();
-            _preparation = new RenderPreparation(this, _bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream).RetainUpcomingAllocations());
+            EnsureBatchedGuestCommands();
+            _preparation = (_sparePreparation ??= new RenderPreparation(this)).Open(_bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream).RetainUpcomingAllocations());
             return _preparation;
         }
 
         private int _nextIdleFlushCheck;
-        private long _lastBatchSubmit;
+        private ulong _idleFlushTick;
 
         private bool ShouldSubmitForIdleGpu()
         {
+            if (_idleFlushTick != _scheduler.CurrentTick) { _idleFlushTick = _scheduler.CurrentTick; _nextIdleFlushCheck = 0; }
             var threshold = _renderingActive ? IdleFlushDrawsInRenderPass : IdleFlushDraws;
-            if (!_batchOpen || threshold == 0 || _batchDrawCount < Math.Max(threshold, _nextIdleFlushCheck))
+            if (!_presenter._batchOpen || threshold == 0 || _presenter._batchDrawCount < Math.Max(threshold, _nextIdleFlushCheck))
             {
                 return false;
             }
 
-            _nextIdleFlushCheck = _batchDrawCount + IdleFlushCheckInterval;
-            return System.Diagnostics.Stopwatch.GetTimestamp() - _lastBatchSubmit >= IdleFlushMinimumGapTicks &&
+            _nextIdleFlushCheck = _presenter._batchDrawCount + IdleFlushCheckInterval;
+            return System.Diagnostics.Stopwatch.GetTimestamp() - _presenter._lastBatchSubmit >= IdleFlushMinimumGapTicks &&
                 _scheduler.IsTickComplete(_scheduler.CurrentTick - 1);
         }
 
@@ -534,7 +674,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _preparation ?? throw SubmissionScheduler.Fatal("The resource preparation is not open.");
 
         private RenderPipelineEntry RequirePipelineEntry(in PipelineHandle pipeline) =>
-            _pipelineEntries.TryGetValue(pipeline.Pipeline, out var entry)
+            _presenter._pipelineEntries.TryGetValue(pipeline.Pipeline, out var entry)
                 ? entry
                 : throw SubmissionScheduler.Fatal($"The pipeline handle is unknown: pipeline={pipeline.Pipeline} layout={pipeline.Layout}.");
 
@@ -547,7 +687,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            var depthImage = _imageCache.GetImage(_boundDepth.Image);
+            var depthImage = Image(_boundDepth.Image);
             var attachmentView = _boundDepth.Target.Target.Request.View;
             var writes = _boundDepthLoadState.AttachmentWriteAspects(_boundDepth.Target.Target.Format);
             if ((writes & ImageAspectFlags.StencilBit) == 0)
@@ -565,6 +705,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var storage = AcquireStencilStorage(binding, image, writeBack: false);
+                binding.Preparation?.Invalidate();
                 binding.CachedImage = storage;
                 binding.Image = storage.Backing.Handle;
                 binding.View = storage.GetOrCreateView(binding.Request.View with { Aspect = ImageAspectFlags.ColorBit });
@@ -581,7 +722,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var depthFormat = Format.Undefined;
             if (_hasBoundDepth)
             {
-                depthImage = _imageCache.GetImage(_boundDepth.Image);
+                depthImage = Image(_boundDepth.Image);
                 var depthView = _boundDepth.Target.Target.Request.View;
                 depthFormat = _boundDepth.Target.Target.Format;
                 if (_boundDepthLoadState.DepthClearEnabled || _boundDepthLoadState.StencilClearEnabled)
@@ -593,17 +734,20 @@ internal static unsafe partial class VulkanVideoPresenter
                             continue;
                         }
 
+                        if (_worker)
+                        {
+                            throw Serial("sampled depth clear");
+                        }
+
                         // Complete the load clears before the shader reads, then restore the attachment for the draw.
                         RecordSampledDepthClear(depthImage, depthView, depthFormat);
                         _boundDepthLoadState = _boundDepthLoadState with { DepthClearEnabled = false, StencilClearEnabled = false };
                         _depthClearRecordedSeparately = true;
                         var remainingWrites = _boundDepthLoadState.AttachmentWriteAspects(depthFormat);
-                        _boundDepthLayout = _boundDepthLoadState.AttachmentLayout(depthFormat);
-                        depthImage.Transition(
-                            _boundDepthLayout,
+                        TransitionImage(depthImage,
                             AccessFlags.DepthStencilAttachmentReadBit | (remainingWrites != 0 ? AccessFlags.DepthStencilAttachmentWriteBit : 0),
                             new SubresourceRange(depthView.BaseLevel, depthView.LevelCount, depthView.BaseLayer, depthView.LayerCount),
-                            BeginBatchedGuestCommands());
+                            BeginBatchedGuestTransferCommands());
                         break;
                     }
                 }
@@ -616,7 +760,7 @@ internal static unsafe partial class VulkanVideoPresenter
             PrepareDepthFeedback(bindings);
             PrepareStencilFeedback(bindings);
 
-            var command = BeginBatchedGuestCommands();
+            var command = BeginBatchedGuestTransferCommands();
             foreach (var binding in bindings)
             {
                 if (binding.IsHostMovie || binding.CachedImage is not { } image)
@@ -629,8 +773,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var storage = binding.IsStorage;
                 if (ImageDescription.IsEmptyRange(image.Description.Data))
                 {
-                    binding.Layout = ImageLayout.General;
-                    image.Transition(binding.Layout, storage || image.Binding.ShaderWrite ? AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit : AccessFlags.ShaderReadBit, range, command);
+                    TransitionImage(image, storage || image.Binding.ShaderWrite ? AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit : AccessFlags.ShaderReadBit, range, command);
                 }
                 else if (depthImage is not null && ReferenceEquals(image, depthImage))
                 {
@@ -648,32 +791,26 @@ internal static unsafe partial class VulkanVideoPresenter
                             $"clearDepth={_boundDepthLoadState.DepthClearEnabled} clearStencil={_boundDepthLoadState.StencilClearEnabled} depthState={_boundDepthLoadState}.");
                     }
 
-                    // Keep the sampled view and the attachment in the same layout.
-                    binding.Layout = overlaps ? _boundDepthLayout : ImageLayout.DepthStencilReadOnlyOptimal;
                     var attachmentAccess = overlaps
                         ? AccessFlags.DepthStencilAttachmentReadBit | (writes != 0 ? AccessFlags.DepthStencilAttachmentWriteBit : 0)
                         : 0;
-                    image.Transition(binding.Layout, AccessFlags.ShaderReadBit | attachmentAccess, range, command);
+                    TransitionImage(image, AccessFlags.ShaderReadBit | attachmentAccess, range, command);
                 }
                 else if ((image.Binding.ForceGeneral || image.Binding.IsTarget) && !image.Description.IsDepth)
                 {
                     var storageAccess = image.Binding.ShaderWrite ? AccessFlags.ShaderWriteBit : 0;
-                    binding.Layout = ImageLayout.General;
-                    image.Transition(
-                        binding.Layout,
+                    TransitionImage(image,
                         AccessFlags.ShaderReadBit | storageAccess | AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit,
                         null,
                         command);
                 }
                 else if (storage)
                 {
-                    binding.Layout = ImageLayout.General;
-                    image.Transition(binding.Layout, AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit, range, command);
+                    TransitionImage(image, ImageAccessState.GuestStorageAccess, range, command, guest: true);
                 }
                 else
                 {
-                    binding.Layout = image.Description.IsDepth ? ImageLayout.DepthStencilReadOnlyOptimal : ImageLayout.ShaderReadOnlyOptimal;
-                    image.Transition(binding.Layout, AccessFlags.ShaderReadBit, range, command);
+                    TransitionImage(image, AccessFlags.ShaderReadBit, range, command);
                 }
             }
         }
@@ -723,12 +860,21 @@ internal static unsafe partial class VulkanVideoPresenter
                         continue;
                     }
 
+                    if (_worker)
+                    {
+                        throw Serial("sampled dcc clear");
+                    }
+
                     EndRendering();
                     var command = BeginBatchedGuestCommands();
                     var range = new SubresourceRange(0, 1, layer, 1);
-                    image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
+                    TransitionImage(image, AccessFlags.TransferWriteBit, range, command);
                     var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, layer, 1);
-                    _vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange);
+                    using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                    {
+                        _vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.General, &clearValue, 1, &vkRange);
+                    }
+
                     if (ImageClearTrace.Enabled) _imageCache.TraceVolumeClear("sampled-clear-recorded", binding.Request, image,
                         $"layer={layer} tracked={tracked} rgbaBits={clearValue.Uint32_0:X8},{clearValue.Uint32_1:X8},{clearValue.Uint32_2:X8},{clearValue.Uint32_3:X8} scope=whole-mip-for-volume");
                     if (!tracked)
@@ -769,17 +915,20 @@ internal static unsafe partial class VulkanVideoPresenter
             EndRendering();
             var command = BeginBatchedGuestCommands();
             var range = new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
-            image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
+            TransitionImage(image, AccessFlags.TransferWriteBit, range, command);
             var vkRange = new ImageSubresourceRange(aspects, view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
             var value = new ClearDepthStencilValue(_boundDepthLoadState.DepthClearValue, _boundDepthLoadState.StencilClearValue);
-            _vk.CmdClearDepthStencilImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &value, 1, &vkRange);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdClearDepthStencilImage(command, image.Backing.Handle, ImageLayout.General, &value, 1, &vkRange);
+            }
         }
 
         // The dynamic state the last guest draw set, and where it holds: the command buffer and its
         // tick (a new command buffer starts without state), and no other graphics pipeline since.
         private DynamicDrawState _lastDynamicState;
         private CommandBuffer _lastDynamicStateBuffer;
-        private ulong _lastDynamicStateTick;
+        private long _lastDynamicStateTick;
         private long _lastDynamicStateEpoch = -1;
 
         public void SetDynamicState(in DynamicDrawState state)
@@ -795,7 +944,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             // Every guest pipeline keeps these states dynamic, so they persist across its binds;
             // only what changed since the last draw in this command buffer is set again.
-            var known = command.Handle == _lastDynamicStateBuffer.Handle && _scheduler.CurrentTick == _lastDynamicStateTick &&
+            var known = command.Handle == _lastDynamicStateBuffer.Handle && CurrentRecording().Generation == _lastDynamicStateTick &&
                 GraphicsDynamicStateEpoch.Value == _lastDynamicStateEpoch;
             ref readonly var last = ref _lastDynamicState;
             if (!known || state.ViewportX != last.ViewportX || state.ViewportY != last.ViewportY ||
@@ -803,7 +952,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 state.ViewportMinDepth != last.ViewportMinDepth || state.ViewportMaxDepth != last.ViewportMaxDepth)
             {
                 var viewport = new Viewport(state.ViewportX, state.ViewportY, state.ViewportWidth, state.ViewportHeight, state.ViewportMinDepth, state.ViewportMaxDepth);
-                _vk.CmdSetViewport(command, 0, 1, &viewport);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetViewport(command, 0, 1, &viewport);
+                }
             }
 
             if (!known || state.Scissor != last.Scissor)
@@ -811,39 +963,60 @@ internal static unsafe partial class VulkanVideoPresenter
                 var scissor = new Rect2D(
                     new Offset2D(state.Scissor.Left, state.Scissor.Top),
                     new Extent2D((uint)(state.Scissor.Right - state.Scissor.Left), (uint)(state.Scissor.Bottom - state.Scissor.Top)));
-                _vk.CmdSetScissor(command, 0, 1, &scissor);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetScissor(command, 0, 1, &scissor);
+                }
             }
 
             if (!known || state.LineWidth != last.LineWidth)
             {
-                _vk.CmdSetLineWidth(command, state.LineWidth);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetLineWidth(command, state.LineWidth);
+                }
             }
 
             if (!known || state.BlendRed != last.BlendRed || state.BlendGreen != last.BlendGreen ||
                 state.BlendBlue != last.BlendBlue || state.BlendAlpha != last.BlendAlpha)
             {
                 var blendConstants = stackalloc float[4] { state.BlendRed, state.BlendGreen, state.BlendBlue, state.BlendAlpha };
-                _vk.CmdSetBlendConstants(command, blendConstants);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetBlendConstants(command, blendConstants);
+                }
             }
 
             if (!known || state.DepthTestEnabled != last.DepthTestEnabled)
             {
-                _vk.CmdSetDepthTestEnable(command, state.DepthTestEnabled);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetDepthTestEnable(command, state.DepthTestEnabled);
+                }
             }
 
             if (!known || state.DepthWriteEnabled != last.DepthWriteEnabled)
             {
-                _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
+                }
             }
 
             if (!known || state.DepthCompare != last.DepthCompare)
             {
-                _vk.CmdSetDepthCompareOp(command, state.DepthCompare);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetDepthCompareOp(command, state.DepthCompare);
+                }
             }
 
             if (!known || state.DepthBiasEnabled != last.DepthBiasEnabled)
             {
-                _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
+                }
             }
 
             // The factors only matter while the bias is on; they are set when it turns on or changes.
@@ -851,28 +1024,51 @@ internal static unsafe partial class VulkanVideoPresenter
                 state.DepthBiasConstantFactor != last.DepthBiasConstantFactor || state.DepthBiasClamp != last.DepthBiasClamp ||
                 state.DepthBiasSlopeFactor != last.DepthBiasSlopeFactor))
             {
-                _vk.CmdSetDepthBias(command, state.DepthBiasConstantFactor, _supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetDepthBias(command, state.DepthBiasConstantFactor, _presenter._supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor);
+                }
             }
 
             if (state.StencilTestEnabled && (!known || !last.StencilTestEnabled ||
                 state.FrontStencil != last.FrontStencil || state.BackStencil != last.BackStencil))
             {
-                _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.CompareMask);
-                _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceBackBit, state.BackStencil.CompareMask);
-                _vk.CmdSetStencilWriteMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.WriteMask);
-                _vk.CmdSetStencilWriteMask(command, StencilFaceFlags.FaceBackBit, state.BackStencil.WriteMask);
-                _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.Reference);
-                _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceBackBit, state.BackStencil.Reference);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.CompareMask);
+                }
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceBackBit, state.BackStencil.CompareMask);
+                }
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetStencilWriteMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.WriteMask);
+                }
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetStencilWriteMask(command, StencilFaceFlags.FaceBackBit, state.BackStencil.WriteMask);
+                }
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.Reference);
+                }
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceBackBit, state.BackStencil.Reference);
+                }
             }
 
-            // The bounds only matter while the test is on; they are set when it turns on or they change.
-            if (_supportsDepthBounds && state.DepthBoundsTestEnabled && (!known || !last.DepthBoundsTestEnabled ||
+            if (state.DepthBoundsTestEnabled && _presenter._supportsDepthBounds && (!known || !last.DepthBoundsTestEnabled ||
                 state.DepthMinBounds != last.DepthMinBounds || state.DepthMaxBounds != last.DepthMaxBounds))
             {
-                _vk.CmdSetDepthBounds(command, state.DepthMinBounds, state.DepthMaxBounds);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdSetDepthBounds(command, state.DepthMinBounds, state.DepthMaxBounds);
+                }
             }
 
-            if (_colorWriteEnableApi is { } colorWriteEnable && state.ColorWriteCount != 0)
+            if (_presenter._colorWriteEnableApi is { } colorWriteEnable && state.ColorWriteCount != 0)
             {
                 var enables = stackalloc Bool32[RenderingState.ColorAttachmentCapacity];
                 for (var index = 0; index < state.ColorWriteCount; index++)
@@ -880,18 +1076,21 @@ internal static unsafe partial class VulkanVideoPresenter
                     enables[index] = ((state.ColorWriteEnableMask >> index) & 1) != 0;
                 }
 
-                colorWriteEnable.CmdSetColorWriteEnable(command, state.ColorWriteCount, enables);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    colorWriteEnable.CmdSetColorWriteEnable(command, state.ColorWriteCount, enables);
+                }
             }
 
             _lastDynamicState = state;
             _lastDynamicStateBuffer = command;
-            _lastDynamicStateTick = _scheduler.CurrentTick;
+            _lastDynamicStateTick = CurrentRecording().Generation;
             _lastDynamicStateEpoch = GraphicsDynamicStateEpoch.Value;
         }
 
 
 
-        private static BlendFactor ToVkBlendFactor(uint factor) =>
+        internal static BlendFactor ToVkBlendFactor(uint factor) =>
             factor switch
             {
                 0 => BlendFactor.Zero,
@@ -917,7 +1116,7 @@ internal static unsafe partial class VulkanVideoPresenter
             };
 
 
-        private static BlendOp ToVkBlendOp(uint function) =>
+        internal static BlendOp ToVkBlendOp(uint function) =>
             function switch
             {
                 0 => BlendOp.Add,
@@ -929,7 +1128,7 @@ internal static unsafe partial class VulkanVideoPresenter
             };
 
 
-        private static ColorComponentFlags ToVkColorWriteMask(uint mask)
+        internal static ColorComponentFlags ToVkColorWriteMask(uint mask)
         {
             var flags = default(ColorComponentFlags);
             if ((mask & 1u) != 0)
@@ -955,28 +1154,6 @@ internal static unsafe partial class VulkanVideoPresenter
             return flags;
         }
 
-        public bool TryResolveColorOutput(
-            uint dataFormat,
-            uint numberType,
-            uint componentSwap,
-            out Gen5PixelOutputKind outputKind,
-            out Gen5ColorComponentMapping componentMapping)
-        {
-            if (VulkanVideoPresenter.TryDecodeRenderTargetFormat(
-                    dataFormat,
-                    numberType,
-                    componentSwap,
-                    out var format))
-            {
-                outputKind = format.OutputKind;
-                componentMapping = format.ExportMapping;
-                return true;
-            }
-
-            outputKind = default;
-            componentMapping = default;
-            return false;
-        }
         public void BeginRendering(in RenderingState state)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRenderingSetup);
@@ -984,6 +1161,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _renderingWritesMemory |= _nextDrawWritesMemory;
                 _nextDrawWritesMemory = false;
+                KeepCommittedTextureSets();
                 return;
             }
 
@@ -999,7 +1177,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _commandBuffer = command;
             if (DeferGlobalBarriers && !BatchBarriers)
             {
-                RecordGlobalBarrier(command);
+                _presenter.RecordGlobalBarrier(command);
             }
 
             _renderingWritesMemory = _nextDrawWritesMemory;
@@ -1012,7 +1190,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     SType = StructureType.RenderingAttachmentInfo,
                     ImageView = attachment.View,
-                    ImageLayout = attachment.Layout,
+                    ImageLayout = ImageLayout.General,
                     LoadOp = attachment.IsClear ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
                     StoreOp = AttachmentStoreOp.Store,
                     ClearValue = new ClearValue
@@ -1029,12 +1207,10 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var depthStencil = state.DepthStencilAttachment;
-            var depthLayout = depthStencil.Layout;
             var depthClear = depthStencil.DepthClear;
             var stencilClear = depthStencil.StencilClear;
             if (_depthClearRecordedSeparately)
             {
-                depthLayout = _boundDepthLayout;
                 depthClear = false;
                 stencilClear = false;
             }
@@ -1043,7 +1219,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SType = StructureType.RenderingAttachmentInfo,
                 ImageView = depthStencil.View,
-                ImageLayout = depthLayout,
+                ImageLayout = ImageLayout.General,
                 LoadOp = depthClear ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
                 StoreOp = AttachmentStoreOp.Store,
                 ClearValue = new ClearValue { DepthStencil = new ClearDepthStencilValue(BitConverter.UInt32BitsToSingle(depthStencil.ClearWord0), 0) },
@@ -1052,7 +1228,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SType = StructureType.RenderingAttachmentInfo,
                 ImageView = depthStencil.View,
-                ImageLayout = depthLayout,
+                ImageLayout = ImageLayout.General,
                 LoadOp = stencilClear ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
                 StoreOp = AttachmentStoreOp.Store,
                 ClearValue = new ClearValue { DepthStencil = new ClearDepthStencilValue(0f, depthStencil.ClearWord1) },
@@ -1067,11 +1243,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 PDepthAttachment = depthStencil.HasDepth ? &depth : null,
                 PStencilAttachment = depthStencil.HasStencil ? &stencil : null,
             };
-            if (_occlusionCounting)
-                _occlusionQueries?.Begin(command, _occlusionQueueId,
-                    _commandStream.GetInterpreter(_occlusionQueueId).TypedRegisters.Context.DepthCountControl);
-            _vk.CmdBeginRendering(command, &rendering);
+            if (_occlusionCounting && _worker)
+                BeginWorkerQuery(command);
+            else if (_occlusionCounting)
+                _presenter._occlusionQueries?.Begin(command, _presenter._occlusionQueueId, Gpu.GpuCommands.VisibilityResultTrace.Enabled
+                    ? _presenter.CommandStream.GetInterpreter(_presenter._occlusionQueueId).TypedRegisters.Context.DepthCountControl : 0);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdBeginRendering(command, &rendering);
+            }
             _renderingScopesBegun++;
+            _keptTextureSets[0] = null;
+            _keptTextureSets[1] = null;
             if (GpuSyncProfile.Enabled)
             {
                 GpuSyncProfile.CountRenderingScope();
@@ -1079,6 +1262,16 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _renderingActive = true;
             _renderingState = state;
+            KeepCommittedTextureSets();
+        }
+
+        private void KeepCommittedTextureSets()
+        {
+            _keptTextureSets[0] = _committedTextureSets[0];
+            _keptTextureSets[1] = _committedTextureSets[1];
+            _committedTextureSets[0] = null;
+            _committedTextureSets[1] = null;
+            _keptTextureScope = DrawScope;
         }
 
         public void EndRendering()
@@ -1090,38 +1283,87 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _renderingActive = false;
             _renderingState = default;
-            var command = new CommandBuffer(_scheduler.Current.Handle);
-            _vk.CmdEndRendering(command);
-            _occlusionQueries?.End(command);
-            foreach (var (sourceStages, destinationStages, barriers) in _barriersAfterRendering)
+            var command = new CommandBuffer(CurrentRecording().Handle);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
             {
-                fixed (ImageMemoryBarrier2* pointer = barriers)
-                {
-                    VulkanSynchronization.PipelineBarrier(_vk,
-                        command, sourceStages, destinationStages, DependencyFlags.ByRegionBit,
-                        0, null, 0, null, (uint)barriers.Length, pointer);
-                }
+                _vk.CmdEndRendering(command);
+            }
+            if (_worker)
+            {
+                EndWorkerQuery(command);
+            }
+            else
+            {
+                _presenter._occlusionQueries?.End(command);
             }
 
-            _barriersAfterRendering.Clear();
+            if (_barriersAfterRendering.Count != 0)
+            {
+                if (GpuSyncProfile.Enabled)
+                {
+                    BarrierTally.ScopeEnds.Increment();
+                    BarrierTally.ScopeEndCalls.Increment();
+                    BarrierTally.ScopeEndImages.Add(_barriersAfterRendering.Count);
+                }
+
+                fixed (ImageMemoryBarrier2* pointer = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_barriersAfterRendering))
+                {
+                    VulkanSynchronization.PipelineBarrier(_vk,
+                        command, _afterRenderingSourceStages, _afterRenderingDestinationStages, DependencyFlags.ByRegionBit,
+                        0, null, 0, null, (uint)_barriersAfterRendering.Count, pointer, BarrierSource.ScopeEnd);
+                }
+
+                _barriersAfterRendering.Clear();
+                _afterRenderingSourceStages = 0;
+                _afterRenderingDestinationStages = 0;
+            }
+
             if (_globalBarrierAfterRendering)
             {
                 _globalBarrierAfterRendering = false;
-                RecordGlobalBarrier(command);
+                if (BatchBarriers)
+                {
+                    RequestGuestMemoryBarrier(GlobalMemoryBarrier);
+                }
+                else
+                {
+                    _presenter.RecordGlobalBarrier(command);
+                }
             }
 
             _renderingWritesMemory = false;
         }
+
+        internal void EndRendering(ScopeBreak reason)
+        {
+            if (_renderingActive)
+            {
+                BarrierTally.CountScopeBreak(reason);
+            }
+
+            EndRendering();
+        }
+
+        void IRenderHost.EndRendering(ScopeBreak reason) => EndRendering(reason);
 
         void IRenderHost.PrepareMemoryWritingDraw()
         {
             // The store must not move ahead of a cache flush deferred inside this scope.
             if (_globalBarrierAfterRendering)
             {
-                EndRendering();
+                EndRendering(ScopeBreak.DeferredFlush);
             }
 
             _nextDrawWritesMemory = true;
+            NoteShaderMayWriteMappedMemory();
+        }
+
+        private void NoteShaderMayWriteMappedMemory()
+        {
+            if (_bufferCache.HasMappedBuffers)
+            {
+                CurrentRecording().NoteMappedMemoryWrite();
+            }
         }
 
         public void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline)
@@ -1149,7 +1391,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 preparation.CommandsRecorded = true;
             Interlocked.Increment(ref _perfDrawCount);
             PerfOverlay.RecordDraw();
-            _batchDrawCount++;
+            if (_worker)
+            {
+                _sliceDrawCount++;
+                return;
+            }
+
+            if (_presenter._batchDrawCount++ == 0)
+            {
+                _presenter._batchOpenedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
         }
 
         // Existing strip compatibility path when native rectangle fill cannot be used.
@@ -1157,10 +1408,16 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void BindRectangleListVariant(RenderPipelineEntry entry, bool strip, CommandBuffer command)
         {
-            ref var variant = ref strip ? ref entry.StripVariant : ref entry.ListVariant;
-            if (variant.Handle == 0)
+            Pipeline variant;
+            lock (entry)
             {
-                variant = CreateRenderPipeline(entry.Description!, strip ? PrimitiveTopology.TriangleStrip : PrimitiveTopology.TriangleList, entry.Layout);
+                ref var slot = ref strip ? ref entry.StripVariant : ref entry.ListVariant;
+                if (slot.Handle == 0)
+                {
+                    slot = _presenter.CreateRenderPipeline(entry.Description!, strip ? PrimitiveTopology.TriangleStrip : PrimitiveTopology.TriangleList, entry.Layout);
+                }
+
+                variant = slot;
             }
 
             BindPipelineShadowed(command, PipelineBindPoint.Graphics, variant);
@@ -1168,18 +1425,24 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void BindNativeRectangleList(RenderPipelineEntry entry, CommandBuffer command)
         {
-            if (entry.RectangleVariant.Handle == 0)
+            Pipeline variant;
+            lock (entry)
             {
-                entry.RectangleVariant = CreateRenderPipeline(entry.Description!, PrimitiveTopology.TriangleList,
-                    entry.Layout, _supportsFillRectangle ? PolygonMode.FillRectangleNV : PolygonMode.Fill,
-                    expandRectangles: !_supportsFillRectangle);
+                if (entry.RectangleVariant.Handle == 0)
+                {
+                    entry.RectangleVariant = _presenter.CreateRenderPipeline(entry.Description!, PrimitiveTopology.TriangleList,
+                        entry.Layout, _presenter._supportsFillRectangle ? PolygonMode.FillRectangleNV : PolygonMode.Fill,
+                        expandRectangles: !_presenter._supportsFillRectangle);
+                }
+
+                variant = entry.RectangleVariant;
             }
 
-            BindPipelineShadowed(command, PipelineBindPoint.Graphics, entry.RectangleVariant);
+            BindPipelineShadowed(command, PipelineBindPoint.Graphics, variant);
         }
 
         // Rectangle assembly consumes groups of three and discards incomplete trailing groups.
-        private bool CanDrawNativeRectangles => _supportsFillRectangle || _supportsRectangleGeometry;
+        private bool CanDrawNativeRectangles => _presenter._supportsFillRectangle || _presenter._supportsRectangleGeometry;
 
         public void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
         {
@@ -1205,8 +1468,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            _vk.CmdDraw(command, count, instanceCount, firstVertex, firstInstance);
-            _occlusionQueries?.TraceDraw();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdDraw(command, count, instanceCount, firstVertex, firstInstance);
+            }
+            TraceOcclusionDraw();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
                 _boundGraphicsPipeline?.Id ?? 0, count, instanceCount, 0,
                 _profileMeshDrawState with { Width = _renderingState.Width, Height = _renderingState.Height });
@@ -1216,7 +1482,7 @@ internal static unsafe partial class VulkanVideoPresenter
         void IRenderHost.InsertDrawTraceMarker(string label)
         {
             var command = BeginBatchedGuestCommands();
-            InsertDebugLabel(command, label);
+            _presenter.InsertDebugLabel(command, label);
         }
 
         void IRenderHost.DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance)
@@ -1237,8 +1503,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            _vk.CmdDrawIndexed(command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
-            _occlusionQueries?.TraceDraw(indexCount);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdDrawIndexed(command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+            }
+            TraceOcclusionDraw(indexCount);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount, 0,
                 _profileMeshDrawState with { Width = _renderingState.Width, Height = _renderingState.Height });
@@ -1264,7 +1533,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // count itself predicates the draw.
         private bool BeginZeroCountPredicate(CommandBuffer command, BufferBinding arguments)
         {
-            if (!_supportsConditionalRendering || (arguments.Offset & 3) != 0)
+            if (!_presenter._supportsConditionalRendering || (arguments.Offset & 3) != 0)
             {
                 return false;
             }
@@ -1275,7 +1544,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Buffer = new VkBuffer(arguments.Handle),
                 Offset = arguments.Offset,
             };
-            _cmdBeginConditionalRendering(command, &begin);
+            _presenter._cmdBeginConditionalRendering(command, &begin);
             return true;
         }
 
@@ -1297,13 +1566,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            var predicated = BeginZeroCountPredicate(command, arguments);
-            _vk.CmdDrawIndexedIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20);
-            if (predicated)
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
             {
-                _cmdEndConditionalRendering(command);
+                var predicated = BeginZeroCountPredicate(command, arguments);
+                _vk.CmdDrawIndexedIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20);
+                if (predicated) _presenter._cmdEndConditionalRendering(command);
             }
-            _occlusionQueries?.TraceDraw();
+            TraceOcclusionDraw();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
@@ -1311,23 +1580,28 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawIndirect(BufferBinding arguments)
         {
-            if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
-            // The executor sends rectangle lists here only when the device fills them natively.
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
             {
-                BindNativeRectangleList(entry, command);
+                if (CanDrawNativeRectangles)
+                {
+                    BindNativeRectangleList(entry, command);
+                }
+                else
+                {
+                    BindRectangleListVariant(entry, strip: false, command);
+                }
             }
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            var predicated = BeginZeroCountPredicate(command, arguments);
-            _vk.CmdDrawIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 16);
-            if (predicated)
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
             {
-                _cmdEndConditionalRendering(command);
+                var predicated = BeginZeroCountPredicate(command, arguments);
+                _vk.CmdDrawIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 16);
+                if (predicated) _presenter._cmdEndConditionalRendering(command);
             }
-            _occlusionQueries?.TraceDraw();
+            TraceOcclusionDraw();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
                 _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
@@ -1335,8 +1609,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawMeshTasks(uint groupCountX, uint groupCountY, uint groupCountZ)
         {
-            if (FrameTimeline.Enabled) FrameTimeline.Draw(false);
-            if (_cmdDrawMeshTasks is null)
+            if (_presenter._cmdDrawMeshTasks is null)
             {
                 throw SubmissionScheduler.Fatal("The Vulkan device has no mesh shader draw command.");
             }
@@ -1344,8 +1617,8 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            _cmdDrawMeshTasks(command, groupCountX, groupCountY, groupCountZ);
-            _occlusionQueries?.TraceDraw();
+            _presenter._cmdDrawMeshTasks(command, groupCountX, groupCountY, groupCountZ);
+            TraceOcclusionDraw();
             if (MeshDrawTrace.Active) MeshDrawTrace.RecordedCommand((ulong)command.Handle);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.MeshDraw,
                 _boundGraphicsPipeline?.Id ?? 0, groupCountX, groupCountY, groupCountZ,
@@ -1359,39 +1632,79 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
+            }
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch,
                 _profileComputePipeline, groupsX, groupsY, groupsZ);
             CountDraw();
+            NoteShaderMayWriteMappedMemory();
         }
 
-        public bool TryDispatchIndirect(ulong argumentsAddress)
+        public bool TryDispatchIndirect(ulong argumentsAddress, ReadOnlySpan<int> physicalAxisOfLogical)
         {
             if (FrameTimeline.Enabled) FrameTimeline.Draw(true);
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
-            var (buffer, offset) = _bufferCache.ObtainBuffer(argumentsAddress, 3u * sizeof(uint), false);
+            var permuted = physicalAxisOfLogical is not [0, 1, 2];
+            if (permuted && _worker)
+            {
+                throw Serial("permuted indirect dispatch");
+            }
+
+            var (obtainedBuffer, offset) = _worker
+                ? ObtainBufferForSlice(argumentsAddress, 3u * sizeof(uint), isWritten: false, isTexelBuffer: false)
+                : _bufferCache.ObtainBuffer(argumentsAddress, 3u * sizeof(uint), false);
+            var buffer = obtainedBuffer.Handle;
+            var permutedArguments = permuted ? UploadTransient(stackalloc byte[3 * sizeof(uint)], 16) : default;
             var command = BeginBatchedGuestCommands();
             var barrier = new BufferMemoryBarrier2
             {
                 SType = StructureType.BufferMemoryBarrier2,
                 SrcAccessMask = AccessFlags2.ShaderWriteBit | AccessFlags2.TransferWriteBit | AccessFlags2.MemoryWriteBit,
-                DstAccessMask = AccessFlags2.IndirectCommandReadBit,
+                DstAccessMask = permuted ? AccessFlags2.TransferReadBit : AccessFlags2.IndirectCommandReadBit,
                 SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                 DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                Buffer = buffer.Handle,
+                Buffer = buffer,
                 Offset = offset,
                 Size = 3u * sizeof(uint),
             };
-            VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null);
-            _vk.CmdDispatchIndirect(command, buffer.Handle, offset);
+            VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit,
+                permuted ? PipelineStageFlags.TransferBit : PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null, BarrierSource.IndirectDispatch);
+            if (permuted)
+            {
+                var permutedBuffer = new VkBuffer(permutedArguments.Handle);
+                var regions = stackalloc BufferCopy[3];
+                for (var axis = 0; axis < 3; axis++)
+                {
+                    regions[axis] = new BufferCopy(offset + (ulong)axis * sizeof(uint),
+                        permutedArguments.Offset + (ulong)physicalAxisOfLogical[axis] * sizeof(uint), sizeof(uint));
+                }
+
+                _vk.CmdCopyBuffer(command, buffer, permutedBuffer, 3, regions);
+                barrier.SrcAccessMask = AccessFlags2.TransferWriteBit;
+                barrier.DstAccessMask = AccessFlags2.IndirectCommandReadBit;
+                barrier.Buffer = permutedBuffer;
+                barrier.Offset = permutedArguments.Offset;
+                VulkanSynchronization.PipelineBarrier(_vk, command, PipelineStageFlags.TransferBit, PipelineStageFlags.DrawIndirectBit,
+                    0, 0, null, 1, &barrier, 0, null, BarrierSource.IndirectDispatch);
+                buffer = permutedBuffer;
+                offset = permutedArguments.Offset;
+            }
+
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _vk.CmdDispatchIndirect(command, buffer, offset);
+            }
             CountDraw();
+            NoteShaderMayWriteMappedMemory();
             return true;
         }
 
-        private static readonly bool BatchBarriers =
+        internal static readonly bool BatchBarriers =
             Environment.GetEnvironmentVariable("SHARPEMU_BATCH_BARRIERS") != "0";
 
-        private static readonly MemoryBarrierRequest GlobalMemoryBarrier = new(
+        internal static readonly MemoryBarrierRequest GlobalMemoryBarrier = new(
             PipelineStageFlags.AllCommandsBit,
             PipelineStageFlags.AllCommandsBit,
             AccessFlags.MemoryWriteBit,
@@ -1413,27 +1726,44 @@ internal static unsafe partial class VulkanVideoPresenter
                 SrcAccessMask = VulkanSynchronization.Access(sourceAccess),
                 DstAccessMask = VulkanSynchronization.Access(destinationAccess),
             };
-            VulkanSynchronization.PipelineBarrier(_vk,command, sourceStages, destinationStages, 0, 1, &barrier, 0, null, 0, null);
+            VulkanSynchronization.PipelineBarrier(_vk,command, sourceStages, destinationStages, 0, 1, &barrier, 0, null, 0, null, BarrierSource.Requested);
         }
 
-        public void ShaderWriteBarrier(PipelineStageFlags sourceStages) =>
+        public void ShaderWriteBarrier(PipelineStageFlags sourceStages)
+        {
+            NoteShaderMayWriteMappedMemory();
             RecordMemoryBarrier(
                 sourceStages,
                 PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.VertexInputBit | PipelineStageFlags.VertexShaderBit |
                 PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.TransferBit | PipelineStageFlags.ColorAttachmentOutputBit |
-                (_supportsMeshShader ? PipelineStageFlags.MeshShaderBitExt : PipelineStageFlags.None),
+                (_presenter._supportsMeshShader ? PipelineStageFlags.MeshShaderBitExt : PipelineStageFlags.None),
                 AccessFlags.ShaderWriteBit,
                 AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit | AccessFlags.VertexAttributeReadBit | AccessFlags.IndexReadBit |
                 AccessFlags.UniformReadBit | AccessFlags.TransferReadBit | AccessFlags.TransferWriteBit |
-                AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit | AccessFlags.IndirectCommandReadBit |
-                (_supportsConditionalRendering ? AccessFlags.ConditionalRenderingReadBitExt : AccessFlags.None));
+                AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit);
+        }
 
-        public void ShaderWriteHazardBarrier() =>
-            RecordMemoryBarrier(
-                PipelineStageFlags.AllCommandsBit,
-                PipelineStageFlags.ComputeShaderBit,
-                AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
-                AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit);
+        private static readonly MemoryBarrierRequest ShaderWriteHazardRequest = new(
+            PipelineStageFlags.AllCommandsBit,
+            PipelineStageFlags.ComputeShaderBit,
+            AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
+            AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit);
+
+        public void ShaderWriteHazardBarrier()
+        {
+            if (!BatchBarriers)
+            {
+                RecordMemoryBarrier(
+                    PipelineStageFlags.AllCommandsBit,
+                    PipelineStageFlags.ComputeShaderBit,
+                    AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
+                    AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit);
+                return;
+            }
+
+            EndRendering();
+            RequestGuestMemoryBarrier(ShaderWriteHazardRequest);
+        }
 
         public void ShaderAccessBarrier() =>
             RecordMemoryBarrier(
@@ -1442,9 +1772,46 @@ internal static unsafe partial class VulkanVideoPresenter
                 AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
                 AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit);
 
+        private static readonly MemoryBarrierRequest ShaderAccessRequest = new(
+            PipelineStageFlags.ComputeShaderBit,
+            PipelineStageFlags.AllCommandsBit,
+            AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+            AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit);
+
+        public bool TryDeferShaderAccessBarrier()
+        {
+            EndRendering();
+            if (!BatchBarriers)
+            {
+                ShaderAccessBarrier();
+                return false;
+            }
+
+            var recording = CurrentRecording();
+            if (!_worker)
+            {
+                _presenter.OpenGuestBatch();
+            }
+
+            _scheduler.MemoryBarrierRecorder ??= _presenter.RecordRequestedMemoryBarrier;
+            recording.DeferMemoryBarrier(ShaderAccessRequest);
+            return true;
+        }
+
+        public void BeginCheckedDispatch() => CurrentRecording().EnterCheckedWindow();
+
+        public void EndCheckedDispatch() => CurrentRecording().ExitCheckedWindow();
+
+        public long DeferredBarrierPromotions => CurrentRecording().DeferredPromotions;
+
         // Clears the bound targets on the GPU in place of the draw; the store owns the result.
         public void ClearColorTargets(ReadOnlySpan<ColorTargetState> targets, SolidColorClear clear)
         {
+            if (_worker)
+            {
+                throw Serial("clear color targets");
+            }
+
             EndRendering();
             var logicalClear = stackalloc float[4] { clear.Red, clear.Green, clear.Blue, clear.Alpha };
             foreach (ref readonly var target in targets)
@@ -1462,29 +1829,55 @@ internal static unsafe partial class VulkanVideoPresenter
                     logicalClear[mapping.Map(0)], logicalClear[mapping.Map(1)], logicalClear[mapping.Map(2)], logicalClear[mapping.Map(3)]);
                 var view = attachment.Request.View;
                 var range = new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
-                attachment.Image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
+                TransitionImage(attachment.Image, AccessFlags.TransferWriteBit, range, command);
                 var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
-                _vk.CmdClearColorImage(command, attachment.Image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange);
+                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+                {
+                    _vk.CmdClearColorImage(command, attachment.Image.Backing.Handle, ImageLayout.General, &clearValue, 1, &vkRange);
+                }
             }
 
             CountDraw();
-            if (_traceVulkanShaderEnabled)
+            if (Presenter._traceVulkanShaderEnabled)
             {
-                TraceVulkanShader($"vk.offscreen_color_clear mrt={targets.Length} rgba=({clear.Red:0.###},{clear.Green:0.###},{clear.Blue:0.###},{clear.Alpha:0.###})");
+                Presenter.TraceVulkanShader($"vk.offscreen_color_clear mrt={targets.Length} rgba=({clear.Red:0.###},{clear.Green:0.###},{clear.Blue:0.###},{clear.Alpha:0.###})");
             }
         }
 
         public bool TryRetainTargetlessDraw(RegisterBanks banks, GraphicsPrograms programs, in TargetlessDrawArguments arguments)
         {
             _ = programs;
-            _translation.RetainTargetlessDraw(banks, in arguments);
-            return true;
+            return _presenter._translation.TryRetainTargetlessDraw(banks, in arguments);
         }
 
-        public void MarkGpuWritten(ResourceSlotIdentifier image) => _imageCache.MarkGpuWritten(image);
+        public void MarkGpuWritten(ResourceSlotIdentifier image)
+        {
+            if (_worker)
+            {
+                throw Serial("mark gpu written");
+            }
+
+            _imageCache.MarkGpuWritten(image);
+        }
+
+        public void NoteKnownGpuContents(ulong address, ReadOnlySpan<uint> words)
+        {
+            if (_worker)
+            {
+                Requests.KnownWrites.Add((address, words.ToArray()));
+                return;
+            }
+
+            _bufferCache.NoteKnownGpuContents(address, words);
+        }
 
         public void ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer)
         {
+            if (_worker)
+            {
+                throw Serial("resolve image");
+            }
+
             EndRendering();
             var sourceImage = _imageCache.GetImage(source);
             var destinationImage = _imageCache.GetImage(destination);
@@ -1492,18 +1885,23 @@ internal static unsafe partial class VulkanVideoPresenter
                 sourceImage,
                 new SubresourceRange(sourceMip, 1, sourceLayer, 1),
                 new SubresourceRange(destinationMip, 1, destinationLayer, 1));
-            _ = BeginBatchedGuestCommands();
+            EnsureBatchedGuestCommands();
         }
 
         public void CopyDepthStencilImage(ResourceSlotIdentifier source, ResourceSlotIdentifier destination, in SubresourceRange range, in Extent3D extent, ImageAspectFlags aspects)
         {
+            if (_worker)
+            {
+                throw Serial("depth copy");
+            }
+
             EndRendering();
             _imageCache.RefreshImage(source);
             _imageCache.RefreshImage(destination);
             var sourceImage = _imageCache.GetImage(source);
             var destinationImage = _imageCache.GetImage(destination);
             destinationImage.CopyDepthStencilFrom(sourceImage, in range, in extent, aspects);
-            _ = BeginBatchedGuestCommands();
+            EnsureBatchedGuestCommands();
         }
 
         public bool IsMetadata(ulong address) => _imageCache.IsMetadata(address);
@@ -1512,27 +1910,54 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool ClearMetadata(ulong address)
         {
-            _ = BeginBatchedGuestCommands();
+            if (_worker)
+            {
+                return _imageCache.PeekSurfaceMetadataKind(address) is null or SurfaceMetadataKind.PendingDcc or SurfaceMetadataKind.Dcc ? false : throw Serial("metadata clear");
+            }
+
+            EnsureBatchedGuestCommands();
             return _imageCache.ClearMetadata(address);
         }
 
         public bool ExpandMetadata(ulong address) => _imageCache.ExpandMetadata(address);
 
-        public bool MarkHtileRewritten(ulong address) => _imageCache.MarkHtileRewritten(address);
+        public bool MarkHtileRewritten(ulong address)
+        {
+            if (_worker) throw Serial("HTile rewrite");
+            return _imageCache.MarkHtileRewritten(address);
+        }
 
         public bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear)
         {
-            _ = BeginBatchedGuestCommands();
+            if (_worker)
+            {
+                return _imageCache.WouldClearImageFromBuffer(address, size, packedClear) ? throw Serial("image clear") : false;
+            }
+
+            EnsureBatchedGuestCommands();
             return _imageCache.TryClearImageFromBuffer(address, size, packedClear);
         }
 
-        public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue) => _imageCache.TryAbsorbDccFill(address, size, fillValue);
+        public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
+        {
+            if (_worker)
+            {
+                return _imageCache.PeekSurfaceMetadataKind(address) is null or SurfaceMetadataKind.PendingDcc or SurfaceMetadataKind.Dcc ? throw Serial("dcc fill") : false;
+            }
+
+            return _imageCache.TryAbsorbDccFill(address, size, fillValue);
+        }
 
         public bool TryFillDccMetadata(ulong address, ulong size, uint fillValue)
         {
             if (!_imageCache.OverlapsDccMetadata(address, size) && !IsMetadataShapedFill(address, size, fillValue))
             {
                 return false;
+            }
+
+            if (_worker)
+            {
+                throw Serial("metadata fill");
             }
 
             _bufferCache.FillDccMetadata(address, size, fillValue);
@@ -1549,7 +1974,14 @@ internal static unsafe partial class VulkanVideoPresenter
                    !_imageCache.QueryRegion(address, size).ImageBytes;
         }
 
-        public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words) =>
-            _bufferCache.TryCopyWordsOnHost(destination, source, sourceWords, words);
+        public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words)
+        {
+            if (_worker)
+            {
+                return _bufferCache.WouldCopyWordsOnHost(destination, source, sourceWords, words) ? throw Serial("host copy", resumable: true) : false;
+            }
+
+            return _bufferCache.TryCopyWordsOnHost(destination, source, sourceWords, words);
+        }
     }
 }

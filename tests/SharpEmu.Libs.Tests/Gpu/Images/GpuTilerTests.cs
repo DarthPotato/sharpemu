@@ -203,7 +203,8 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
     public void CpuTwinCases_CoverEveryKindAndElementSize()
     {
         var cases = TilerCases.All().ToList();
-        Assert.Equal((44 + 39 + 9) + 15, cases.Count);
+        Assert.Equal((44 + 39 + 9) + 15 + 10, cases.Count);
+        Assert.Equal(10, cases.Count(tilerCase => tilerCase.Transfer.Kind == TileBlockKind.GcnThin1D));
         Assert.All(cases, tilerCase => Assert.True(tilerCase.Transfer.SurfaceZ != 0 || tilerCase.Tiled.Length == (int)tilerCase.Transfer.TiledSize));
     }
 
@@ -483,5 +484,24 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
         harness.Run(() => Assert.Throws<SchedulerFatalException>(() => harness.Tiler.SwapBgra16(new TilerBufferSpan(input.Handle, 0, 12))));
         Assert.Contains(fatal.Messages, message => message.Contains("swap input size is invalid"));
         harness.AssertNoValidationMessages();
+    }
+    [Fact]
+    public void ReclamationReleasesIdleScratchButKeepsUnsubmittedLeases()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new ImageTestHarness(_vulkan);
+        var baseline = harness.Device.LiveAllocations;
+        harness.Run(() =>
+        {
+            harness.Tiler.GetScratchBuffer(64);
+            Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
+            harness.Tiler.ReleaseUnusedScratch();
+            Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
+            harness.Scheduler.Finish();
+            Assert.True(harness.Tiler.ScratchPooledBytes > 0);
+            harness.Tiler.ReleaseUnusedScratch();
+            Assert.Equal(0UL, harness.Tiler.ScratchPooledBytes);
+            Assert.Equal(baseline, harness.Device.LiveAllocations);
+        });
     }
 }

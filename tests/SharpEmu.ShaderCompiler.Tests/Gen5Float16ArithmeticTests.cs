@@ -15,18 +15,17 @@ public sealed class Gen5Float16ArithmeticTests
     private const uint SEndpgm = 0xBF810000;
 
     [Fact]
-    public void LogicalLeftShift64DecodesAndCompilesBothBackends()
+    public void LogicalLeftShift64DecodesAndCompiles()
     {
         var program = Decode([0xD6FF0021u, 0x00010303u, SEndpgm]);
         Assert.Equal("VLshlrevB64", program.Instructions[0].Opcode);
         Assert.Equal(2u, program.Instructions[0].DestinationWidth);
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
-        Assert.True(SharpEmu.ShaderCompiler.Metal.Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
 
     [Fact]
-    public void ScalarLeadingZeroCountDecodesAndCompilesBothBackends()
+    public void ScalarLeadingZeroCountDecodesAndCompiles()
     {
         var program = Decode([0xBEEA156Au, SEndpgm]);
         var instruction = program.Instructions[0];
@@ -36,11 +35,10 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.Equal(106u, instruction.Sources[0].Value);
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
-        Assert.True(SharpEmu.ShaderCompiler.Metal.Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
 
     [Fact]
-    public void ScalarBitReplicationDecodesLiteralAndCompilesBothBackends()
+    public void ScalarBitReplicationDecodesLiteralAndCompiles()
     {
         var program = Decode([0xBEEA3BFFu, 0x80010001u, SEndpgm]);
         var instruction = program.Instructions[0];
@@ -51,11 +49,10 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.Equal(8u, program.Instructions[1].Pc);
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
-        Assert.True(SharpEmu.ShaderCompiler.Metal.Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
 
     [Fact]
-    public void ScalarQuadMaskDecodesAndCompilesBothBackends()
+    public void ScalarQuadMaskDecodesAndCompiles()
     {
         var program = Decode([0xBEEA2D6Au, SEndpgm]);
         var instruction = program.Instructions[0];
@@ -65,7 +62,6 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.Equal(106u, instruction.Sources[0].Value);
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
-        Assert.True(SharpEmu.ShaderCompiler.Metal.Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
 
     [Fact]
@@ -80,7 +76,6 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.Equal(8u, program.Instructions[1].Pc);
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
-        Assert.True(SharpEmu.ShaderCompiler.Metal.Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
 
     [Fact]
@@ -91,7 +86,6 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.Equal(5u, Assert.IsType<Gen5Vop3Control>(program.Instructions[0].Control).OperandSelect);
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
-        Assert.True(SharpEmu.ShaderCompiler.Metal.Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
 
     [Theory]
@@ -112,7 +106,6 @@ public sealed class Gen5Float16ArithmeticTests
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
-        Assert.True(SharpEmu.ShaderCompiler.Metal.Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
 
     [Fact]
@@ -177,6 +170,31 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.Equal([name, name, "SEndpgm"], program.Instructions.Select(instruction => instruction.Opcode));
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
+    }
+
+    [Theory]
+    [InlineData(0x50u, "VCvtF16U16", SpirvOp.ConvertUToF)]
+    [InlineData(0x51u, "VCvtF16I16", SpirvOp.ConvertSToF)]
+    [InlineData(0x53u, "VCvtI16F16", SpirvOp.ConvertFToS)]
+    public void Float16IntegerConversionsDecodeAndCompileInBothEncodings(
+        uint opcode,
+        string name,
+        SpirvOp conversion)
+    {
+        // VOP1 v0, v1, then the VOP3 form v2, v3.
+        var program = Decode(
+        [
+            0x7E000000u | (opcode << 9) | 257u,
+            (0x35u << 26) | ((0x180u + opcode) << 16) | 2u,
+            259u,
+            SEndpgm,
+        ]);
+
+        Assert.Equal([name, name, "SEndpgm"], program.Instructions.Select(instruction => instruction.Opcode));
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.Contains((ushort)conversion, ReadOpcodes(shader.Spirv));
         Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
     }
 

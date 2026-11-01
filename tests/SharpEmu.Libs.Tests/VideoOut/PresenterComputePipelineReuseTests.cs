@@ -63,7 +63,7 @@ public sealed class PresenterComputePipelineReuseTests(HeadlessVulkanFixture fix
     : IClassFixture<HeadlessVulkanFixture>
 {
     [Fact]
-    public void ProgramsWithTheSameModuleAndLayoutShareOnePipeline()
+    public void SpecializationsKeepIndependentPipelinesInTheParallelCompiler()
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
@@ -97,25 +97,21 @@ public sealed class PresenterComputePipelineReuseTests(HeadlessVulkanFixture fix
             var second = new ShaderProgram(2, host.CreateShaderModule(new VulkanCompiledGuestShader(shader.Spirv), ShaderStage.Compute, Hash, 2));
             Assert.NotEqual(first.Module, second.Module);
 
-            // Both programs ask while the first compile is in flight: the second must wait on it, not start its own.
+            // Upstream tracks independent asynchronous compiles by program specialization.
             Assert.False(host.TryCreateComputePipeline(new ComputePipelineDescription { Program = first, Stage = stageInfo, Input = input }, out _));
             Assert.False(host.TryCreateComputePipeline(new ComputePipelineDescription { Program = second, Stage = stageInfo, Input = input }, out _));
-            Assert.Single(presenter.GetField<IDictionary>("_pendingComputeByContent"));
+            Assert.Equal(2, presenter.GetField<IDictionary>("_pendingComputePipelines").Count);
 
             var a = Create(host, first);
             var b = Create(host, second);
             Assert.NotEqual(a.Pipeline, b.Pipeline);
-            Assert.Equal(a.Layout, b.Layout);
+            Assert.NotEqual(a.Layout, b.Layout);
 
             var entries = presenter.GetField<IDictionary>("_pipelineEntries");
             var entryA = entries[a.Pipeline]!;
             var entryB = entries[b.Pipeline]!;
             var pipelineField = entryA.GetType().GetField("Pipeline")!;
-            var sharesField = entryA.GetType().GetField("SharesNativeObjects")!;
-            Assert.Equal(((Pipeline)pipelineField.GetValue(entryA)!).Handle, ((Pipeline)pipelineField.GetValue(entryB)!).Handle);
-            Assert.False((bool)sharesField.GetValue(entryA)!);
-            Assert.True((bool)sharesField.GetValue(entryB)!);
-            Assert.Single(presenter.GetField<IDictionary>("_computePipelinesByContent"));
+            Assert.NotEqual(((Pipeline)pipelineField.GetValue(entryA)!).Handle, ((Pipeline)pipelineField.GetValue(entryB)!).Handle);
 
             PipelineHandle Create(IShaderPipelineHost target, ShaderProgram program)
             {

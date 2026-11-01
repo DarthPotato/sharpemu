@@ -12,6 +12,32 @@ namespace SharpEmu.ShaderCompiler.Tests;
 public sealed class Gen5VertexSystemRegisterTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void VertexSystemInputsFollowTheFrontendRegisterLayout(bool customLayout)
+    {
+        var program = ResourceTestProgram.Program(ResourceTestProgram.EndProgram(0));
+        if (customLayout)
+            program = program with { VertexIndexRegister = 0, InstanceIndexRegisters = [1, 2, 3] };
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Vertex);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout),
+            out var shader, out var error), error);
+        var instructions = Decode(shader.Spirv);
+        void AssertInput(uint builtIn, uint register)
+        {
+            var input = Assert.Single(instructions, item => item.Opcode == SpirvOp.Decorate &&
+                item.Operands.Length == 3 && item.Operands[1] == (uint)SpirvDecoration.BuiltIn && item.Operands[2] == builtIn).Operands[0];
+            var loads = instructions.Where(item => item.Opcode == SpirvOp.Load && item.Operands[2] == input)
+                .Select(item => item.Operands[1]).ToHashSet();
+            var target = Register(instructions, $"v{register}");
+            Assert.Contains(instructions, item => item.Opcode == SpirvOp.Store && item.Operands[0] == target && loads.Contains(item.Operands[1]));
+        }
+        AssertInput((uint)SpirvBuiltIn.VertexIndex, program.VertexIndexRegister);
+        foreach (var register in program.InstanceIndexRegisters)
+            AssertInput((uint)SpirvBuiltIn.InstanceIndex, register);
+    }
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public void VertexCapacityIsInitializedBeforeThePackedCountRead(bool subgroups)
@@ -46,6 +72,30 @@ public sealed class Gen5VertexSystemRegisterTests
             item.Operands[0] == register && capacity.Contains(item.Operands[1]));
     }
 
+    [Theory]
+    [InlineData(32u, 32u)]
+    [InlineData(64u, 32u)]
+    [InlineData(64u, 64u)]
+    public void MeshThreadGroupCountsAreInitializedBeforeThePackedCountRead(uint waveSize, uint subgroupSize)
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.Sop2(0, "SBfeU32", 10, Gen5Operand.Scalar(2), ResourceTestProgram.Operand((9u << 16) | 12)),
+            ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Mesh);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = waveSize,
+            LocalSizeX = 64,
+            Mesh = new MeshShaderConfiguration(64, 16, 0, 8, 24, 0, false, subgroupSize),
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Decode(shader.Spirv);
+        var register = Register(instructions, "s2");
+        var read = instructions.FindIndex(item => item.Opcode == SpirvOp.Load && item.Operands[2] == register);
+        var store = instructions.FindIndex(item => item.Opcode == SpirvOp.Store && item.Operands[0] == register);
+        Assert.True(store >= 0 && store < read, "The thread group counts must be initialized before their first read.");
+    }
+
     private static List<Instruction> Compile(ShaderStage stage, uint userDataBase, bool subgroups)
     {
         var program = ResourceTestProgram.Program(
@@ -58,8 +108,13 @@ public sealed class Gen5VertexSystemRegisterTests
             EnableGraphicsSubgroupOperations = subgroups,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
-        var words = new uint[shader.Spirv.Length / sizeof(uint)];
-        Buffer.BlockCopy(shader.Spirv, 0, words, 0, shader.Spirv.Length);
+        return Decode(shader.Spirv);
+    }
+
+    private static List<Instruction> Decode(byte[] spirv)
+    {
+        var words = new uint[spirv.Length / sizeof(uint)];
+        Buffer.BlockCopy(spirv, 0, words, 0, spirv.Length);
         var result = new List<Instruction>();
         for (var offset = 5; offset < words.Length;)
         {

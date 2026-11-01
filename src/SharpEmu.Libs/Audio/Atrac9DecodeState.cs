@@ -241,7 +241,8 @@ internal sealed class Atrac9DecodeState
         Span<byte> output,
         Atrac9PcmEncoding encoding,
         int requestedChannels,
-        bool multipleFrames)
+        bool multipleFrames,
+        bool reportCodecErrors = false)
     {
         lock (_gate)
         {
@@ -349,6 +350,8 @@ internal sealed class Atrac9DecodeState
                 var decoded = TryDecodeSuperframeNoLock(channels, encoding, superframe);
                 if (!decoded)
                 {
+                    // AJM conceals malformed frames; NGS needs the decoder failure for voice state.
+                    if (reportCodecErrors) status |= ResultCodecError;
                     if (!_decodeErrorLogged)
                     {
                         Trace(

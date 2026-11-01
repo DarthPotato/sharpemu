@@ -6,6 +6,7 @@ namespace SharpEmu.Libs.VideoOut;
 using System.Diagnostics;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu;
+using SharpEmu.Libs.Gpu.GpuCommands;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
@@ -22,8 +23,31 @@ internal static unsafe partial class VulkanVideoPresenter
 {
     private const string PushDescriptorExtensionName = "VK_KHR_push_descriptor";
 
+    // One created pipeline with the layout it binds and the description its rectangle-list variants derive from.
+    private sealed class RenderPipelineEntry
+    {
+        public ulong Id;
+        public Pipeline Pipeline;
+        public PipelineLayout Layout;
+        public DescriptorSetLayout SetLayout;
+        public DescriptorSetDemand Demand;
+        public bool UsesPushDescriptors;
+        public bool UsesBindlessHeap;
+        public bool UsesRuntimeHeap;
+        public GraphicsPipelineDescription? Description;
+        public Pipeline StripVariant;
+        public Pipeline ListVariant;
+        public Pipeline RectangleVariant;
+        public ulong ProfileVertexHash;
+        public ulong ProfilePixelHash;
+        public ulong ProfileComputeHash;
+
+        public bool RectangleList => Description is { Tessellation: null, StaticParameters.Topology: PrimitiveTopology.PatchList };
+    }
+
     private sealed partial class Presenter : IShaderPipelineHost
     {
+        internal bool _supportsTessellation;
         private const string FullscreenBarycentricVertexSpirv =
             "AwIjBwAAAQALAAgAMgAAAAAAAAARAAIAAQAAAAsABgABAAAAR0xTTC5zdGQuNDUwAAAAAA4AAwAAAAAAAQAAAA8ACAAAAAAABAAAAG1haW4AAAAADQAAABoAAAApAAAAAwADAAIAAADCAQAABQAEAAQAAABtYWluAAAAAAUABgALAAAAZ2xfUGVyVmVydGV4AAAAAAYABgALAAAAAAAAAGdsX1Bvc2l0aW9uAAYABwALAAAAAQAAAGdsX1BvaW50U2l6ZQAAAAAGAAcACwAAAAIAAABnbF9DbGlwRGlzdGFuY2UABgAHAAsAAAADAAAAZ2xfQ3VsbERpc3RhbmNlAAUAAwANAAAAAAAAAAUABgAaAAAAZ2xfVmVydGV4SW5kZXgAAAUABQAdAAAAaW5kZXhhYmxlAAAABQAFACkAAABiYXJ5Y2VudHJpYwAFAAUALwAAAGluZGV4YWJsZQAAAEcAAwALAAAAAgAAAEgABQALAAAAAAAAAAsAAAAAAAAASAAFAAsAAAABAAAACwAAAAEAAABIAAUACwAAAAIAAAALAAAAAwAAAEgABQALAAAAAwAAAAsAAAAEAAAARwAEABoAAAALAAAAKgAAAEcABAApAAAAHgAAAAAAAAATAAIAAgAAACEAAwADAAAAAgAAABYAAwAGAAAAIAAAABcABAAHAAAABgAAAAQAAAAVAAQACAAAACAAAAAAAAAAKwAEAAgAAAAJAAAAAQAAABwABAAKAAAABgAAAAkAAAAeAAYACwAAAAcAAAAGAAAACgAAAAoAAAAgAAQADAAAAAMAAAALAAAAOwAEAAwAAAANAAAAAwAAABUABAAOAAAAIAAAAAEAAAArAAQADgAAAA8AAAAAAAAAFwAEABAAAAAGAAAAAgAAACsABAAIAAAAEQAAAAMAAAAcAAQAEgAAABAAAAARAAAAKwAEAAYAAAATAAAAAACAvywABQAQAAAAFAAAABMAAAATAAAAKwAEAAYAAAAVAAAAAABAQCwABQAQAAAAFgAAABUAAAATAAAALAAFABAAAAAXAAAAEwAAABUAAAAsAAYAEgAAABgAAAAUAAAAFgAAABcAAAAgAAQAGQAAAAEAAAAOAAAAOwAEABkAAAAaAAAAAQAAACAABAAcAAAABwAAABIAAAAgAAQAHgAAAAcAAAAQAAAAKwAEAAYAAAAhAAAAAAAAACsABAAGAAAAIgAAAAAAgD8gAAQAJgAAAAMAAAAHAAAAIAAEACgAAAADAAAAEAAAADsABAAoAAAAKQAAAAMAAAAsAAUAEAAAACoAAAAiAAAAIQAAACwABQAQAAAAKwAAACEAAAAiAAAALAAFABAAAAAsAAAAIQAAACEAAAAsAAYAEgAAAC0AAAAqAAAAKwAAACwAAAA2AAUAAgAAAAQAAAAAAAAAAwAAAPgAAgAFAAAAOwAEABwAAAAdAAAABwAAADsABAAcAAAALwAAAAcAAAA9AAQADgAAABsAAAAaAAAAPgADAB0AAAAYAAAAQQAFAB4AAAAfAAAAHQAAABsAAAA9AAQAEAAAACAAAAAfAAAAUQAFAAYAAAAjAAAAIAAAAAAAAABRAAUABgAAACQAAAAgAAAAAQAAAFAABwAHAAAAJQAAACMAAAAkAAAAIQAAACIAAABBAAUAJgAAACcAAAANAAAADwAAAD4AAwAnAAAAJQAAAD0ABAAOAAAALgAAABoAAAA+AAMALwAAAC0AAABBAAUAHgAAADAAAAAvAAAALgAAAD0ABAAQAAAAMQAAADAAAAA+AAMAKQAAADEAAAD9AAEAOAABAA==";
 
@@ -35,49 +59,35 @@ internal static unsafe partial class VulkanVideoPresenter
         private static int _vertexSwizzleLines;
         private static int _vertexOutOfBoundsLines;
 
-        // One created pipeline with the layout it binds and the description its rectangle-list variants derive from.
-        private sealed class RenderPipelineEntry
-        {
-            public ulong Id;
-            public Pipeline Pipeline;
-            public PipelineLayout Layout;
-            public DescriptorSetLayout SetLayout;
-            public DescriptorSetDemand Demand;
-            public bool UsesPushDescriptors;
-            public GraphicsPipelineDescription? Description;
-            public Pipeline StripVariant;
-            public Pipeline ListVariant;
-            public Pipeline RectangleVariant;
-            public ulong ProfileVertexHash;
-            public ulong ProfilePixelHash;
-            public ulong ProfileComputeHash;
-            // The pipeline and layouts belong to another entry of the same content, which destroys them.
-            public bool SharesNativeObjects;
-
-            public bool RectangleList => Description is { Tessellation: null, StaticParameters.Topology: PrimitiveTopology.PatchList };
-        }
-
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
-        private readonly Dictionary<ulong, int> _shaderModuleSpirvBytes = new();
-        private readonly Dictionary<ulong, byte[]> _rectangleStageCode = new();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, int> _shaderModuleSpirvBytes = new();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte[]> _rectangleStageCode = new();
         private readonly Dictionary<ulong, string> _shaderModuleCacheIdentities = new();
-        // The four module dictionaries above: program resolution publishes modules on the prefetch
-        // worker while the render thread reads them for pipelines; every access holds this lock, and
-        // nothing native runs under it.
-        private readonly object _shaderModuleLock = new();
         private long _pipelineCreationMilliseconds;
-        private KhrPushDescriptor _pushDescriptorApi = null!;
+        internal KhrPushDescriptor _pushDescriptorApi = null!;
         private uint _maxPushDescriptors;
         private SampleCountFlags _noAttachmentSampleCounts;
-        private DescriptorHeap _descriptorHeap = null!;
+        internal DescriptorHeap _descriptorHeap = null!;
+        internal SharpEmu.Libs.Gpu.Buffers.ContentUploadArena _contentUploads = null!;
 
         uint IShaderPipelineHost.MaxPushDescriptors => _maxPushDescriptors;
 
+        private bool TryGetShaderModuleCacheIdentity(ulong moduleHandle, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? identity)
+        {
+            lock (_shaderModules)
+            {
+                return _shaderModuleCacheIdentities.TryGetValue(moduleHandle, out identity);
+            }
+        }
+
+
+        bool IShaderPipelineHost.ExactFloat16ConversionSupported => _supportsExactFloat16Conversion;
+        bool IShaderPipelineHost.RuntimeDescriptorResolutionRequiresSerial => OnResolveWorker;
         bool IShaderPipelineHost.RuntimeImageDescriptorsSupported => _supportsRuntimeDescriptors;
 
         private bool _supportsRuntimeDescriptors;
         private RuntimeDescriptorHeap.Limits _runtimeDescriptorLimits;
-        private RuntimeDescriptorHeap? _runtimeDescriptorHeap;
+        internal RuntimeDescriptorHeap? _runtimeDescriptorHeap;
 
         private static bool UsesRuntimeHeap(ShaderProgramInfo program) =>
             program.Bindings?.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null;
@@ -89,6 +99,44 @@ internal static unsafe partial class VulkanVideoPresenter
             _imageCache.ViewsRetired = heap.InvalidateViews;
             _runtimeDescriptorHeap = heap;
         }
+
+        bool IShaderPipelineHost.TryCopyImage(in ImageRequest source, in ImageRequest destination) =>
+            _imageCache.TryCopyImage(source, destination);
+        // SHARPEMU_TABLE_BLOCKS=0 keeps one descriptor per buffer instead of the device-addressed table block.
+        private static readonly bool _tableBlocks = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_BLOCKS") != "0";
+        bool IShaderPipelineHost.TableBlocks => _tableBlocks;
+
+        uint[] IShaderPipelineHost.NormalizeImageDescriptor(IShaderFrontend frontend, ReadOnlySpan<uint> words,
+            ShaderStage stage, ulong shaderHash, string source)
+        {
+            if (OnResolveWorker)
+            {
+                return frontend.NormalizeImageForResolution(words, stage, shaderHash, source, false);
+            }
+
+            if (OnCommandThread)
+            {
+                return NormalizeImageOnCommandThread(frontend, words, stage, shaderHash, source);
+            }
+
+            return frontend.NormalizeImageForResolution(words, stage, shaderHash, source, true);
+        }
+
+        private uint[] NormalizeImageOnCommandThread(IShaderFrontend frontend, ReadOnlySpan<uint> words,
+            ShaderStage stage, ulong shaderHash, string source)
+        {
+            try
+            {
+                return frontend.NormalizeImageForResolution(words, stage, shaderHash, source, false);
+            }
+            catch (SerialResolveRequiredException)
+            {
+            }
+            return NormalizeImageOnRenderThread(frontend, words.ToArray(), stage, shaderHash, source);
+        }
+
+        private uint[] NormalizeImageOnRenderThread(IShaderFrontend frontend, uint[] words, ShaderStage stage, ulong shaderHash, string source) =>
+            _commandThread!.Run(() => frontend.NormalizeImageForResolution(words, stage, shaderHash, source, true), nameof(IShaderPipelineHost.NormalizeImageDescriptor));
 
         // Wave64 compute runs natively when the device's subgroup is that wide; smaller devices emulate it.
         bool IShaderPipelineHost.ComputeWave64SubgroupNative =>
@@ -135,9 +183,9 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
         bool IShaderPipelineHost.SharedInt64AtomicsEnabled => SharedInt64AtomicsEnabled;
+        bool IShaderPipelineHost.ImageInt64AtomicsEnabled => ImageInt64AtomicsEnabled;
         bool IShaderPipelineHost.ShaderSignedZeroInfNanPreserveFloat32Supported =>
             _supportsShaderSignedZeroInfNanPreserveFloat32;
-        bool IShaderPipelineHost.ExactFloat16ConversionSupported => _supportsExactFloat16Conversion;
         // NVIDIA's compiler rejects the elided-EXEC wave64 compute module with NVVM error 3.
         bool IShaderPipelineHost.ExecGuardElisionEnabled => _physicalDeviceVendorId != NvidiaVendorId;
         bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
@@ -148,6 +196,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         MeshShaderLimits IShaderPipelineHost.MeshLimits => _meshShaderLimits;
         uint IShaderPipelineHost.MeshSubgroupSize => checked((uint)Volatile.Read(ref _nativeSubgroupSize));
+        bool IShaderPipelineHost.ShaderDrawParametersSupported => _supportsShaderDrawParameters;
 
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;
 
@@ -156,13 +205,27 @@ internal static unsafe partial class VulkanVideoPresenter
         // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
         public bool TryReadGuestWord(ulong address, out uint word)
         {
-            if (_concurrentAssumptions is { } assumptions)
+            // Resource planning can inspect a dynamic descriptor before the draw has supplied a valid
+            // guest address; the page tracker treats an invalid range as fatal, so refuse it on every thread.
+            if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
-                return TryReadGuestWordConcurrent(address, out word, assumptions);
+                word = 0;
+                return false;
+            }
+
+            if (OnResolveWorker)
+            {
+                return ReadWordOnResolveWorker(address, out word);
+            }
+
+            if (OnCommandThread)
+            {
+                return ReadWordOnCommandThread(address, out word);
             }
 
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
+            CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint)))
             {
@@ -192,11 +255,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Diagnostics.GpuReadTrace.Record(address, ResourceMaterializationCache.ReadingTable);
                     }
 
-                    var syncStarted = Diagnostics.ShaderSyncProfile.Start();
-                    var readable = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
-                        SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
-                    Diagnostics.ShaderSyncProfile.Record(syncStarted);
-                    if (!readable)
+                    if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
+                            SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
                     {
                         return false;
                     }
@@ -224,46 +284,57 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        // A held-back command write or label lands in guest memory only when its publication runs; a resource
+        // read behind it in the command stream must see it, as the command processor's own reads do.
+        private void CompletePendingPublicationsForResourceRead(ulong address, ulong size)
+        {
+            if (!HasPendingMemoryPublication(address, size)) return;
+            if (OnResolveWorker)
+                throw new Gpu.GpuCommands.SerialResolveRequiredException("pending publication read");
+            CompleteOverlappingPublications(address, size);
+        }
+
+        public string DescribeCleanRead(ulong address) =>
+            $"readable={_guestMemory.CanRead(address, sizeof(uint))} gpu_dirty_bytes={_bufferCache.HasGpuDirtyBytes(address, sizeof(uint))} " +
+            $"gpu_dirty_pages={_bufferCache.HasGpuDirtyPages(address, sizeof(uint))} image_modified={_imageCache.HasGpuModifiedImageBytes(address, sizeof(uint))} " +
+            $"pending_publication={HasPendingMemoryPublication(address, sizeof(uint))} buffer={_bufferCache.IsRegionRegistered(address, sizeof(uint))}";
+
         // Refused while a GPU buffer or image write may still own the range.
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
+            CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 return false;
             }
 
-            var owned = IsGpuOwnedForCleanRead(address, sizeof(uint));
-            _concurrentAssumptions?.Record(ConcurrentQuery.CleanWord, address, sizeof(uint), owned);
-            if (owned && _concurrentAssumptions is null && _scheduler.Active && _imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
+            if (OnResolveWorker)
             {
-                // A word a previous GPU pass wrote into an image is read once that pass's bytes are back in guest
-                // memory, as the command processor would see them: an image's contents go through
-                // its buffer view first, then the buffer comes back to guest memory.
-                foreach (var (imageAddress, imageSize) in _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)))
+                if (IsGpuOwnedForWorkerCleanRead(address, sizeof(uint)) || IsPendingForWorker(address, sizeof(uint)))
                 {
-                    _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
+                    return false;
                 }
 
-                if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) || _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
+                Span<byte> cleanBytes = stackalloc byte[sizeof(uint)];
+                if (!_commandThread!.ReadOverlayBefore(address, cleanBytes, _resolveWorker!.Sequence))
                 {
-                    _ = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint));
+                    return false;
                 }
 
-                owned = IsGpuOwnedForCleanRead(address, sizeof(uint));
+                _resolveWorker.Reads.Add(address, cleanBytes);
+                word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cleanBytes);
+                return true;
             }
 
-            if (owned)
+            if (IsGpuOwnedForCleanRead(address, sizeof(uint)) || (OnCommandThread && IsPendingOnCommandThread(address, sizeof(uint))))
             {
-                // The render thread would have synchronized this image and read the word.
-                if (_concurrentAssumptions is { } concurrent && _scheduler.Active && _imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
-                    concurrent.Refused = true;
                 return false;
             }
 
             Span<byte> bytes = stackalloc byte[sizeof(uint)];
-            if (!_guestMemory.TryRead(address, bytes))
+            if (!(OnCommandThread ? _commandThread!.ReadOverlay(address, bytes) : _guestMemory.TryRead(address, bytes)))
             {
                 return false;
             }
@@ -272,18 +343,227 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
-        bool IRenderHost.TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
-            TryReadResidentGuestBytes(address, destination, clean: true);
+
+        public bool CpuWriteNeedsGpuData(ulong address, ulong size) =>
+            address != 0 && size != 0 && new SharpEmu.HLE.GpuMemory.GuestSpan(address, size).IsValid &&
+            ((OnCommandThread && IsPendingOnCommandThread(address, size)) ||
+             (_bufferCache.MayHaveGpuDirtyPages(address, size) && _bufferCache.HasGpuDirtyPages(address, size)) ||
+             _imageCache.HasGpuModifiedImageBytes(address, size));
+
+        private bool IsGpuOwnedForCleanRead(ulong address, ulong size) =>
+            (_bufferCache.MayHaveGpuDirtyPages(address, size) && _bufferCache.HasGpuDirtyPages(address, size)) ||
+            _bufferCache.HasGpuDirtyBytes(address, size) ||
+            _imageCache.HasGpuModifiedImageBytes(address, size);
+
+        private bool IsGpuOwnedForResidentRead(ulong address, ulong size, bool clean) =>
+            _bufferCache.HasGpuDirtyBytes(address, size) ||
+            (clean && (_bufferCache.HasGpuDirtyPages(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size)));
+
+        private bool ReadWordOnResolveWorker(ulong address, out uint word)
+        {
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (!ReadOnResolveWorker(address, bytes))
+            {
+                word = 0;
+                return false;
+            }
+
+            word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            return true;
+        }
+
+        private bool ReadResidentBytesOnResolveWorker(ulong address, Span<byte> destination, bool clean)
+        {
+            var size = (ulong)destination.Length;
+            CompletePendingPublicationsForResourceRead(address, size);
+            var worker = _resolveWorker!;
+            if (!clean && IsCleanReadPage(address, size) && TryReadAliasBytes(address, destination))
+            {
+                worker.Reads.Add(address, destination);
+                return true;
+            }
+
+            if (!_guestMemory.CanRead(address, size))
+            {
+                return false;
+            }
+
+            if (!clean && _commandThread!.TryReadShadowBefore(address, destination, worker.Sequence, out var shadowSequence, out var shadowSource))
+            {
+                if ((_translation.PendingWrites is { } pending && pending.HasPendingBetween(address, size, shadowSequence, worker.Sequence)) ||
+                    _commandThread.HasPendingRangeBetween(address, size, shadowSequence, worker.Sequence))
+                {
+                    return false;
+                }
+
+                SharpEmu.Libs.Agc.AgcExports.NoteWorkerShadowRead((int)shadowSource);
+                return true;
+            }
+
+            if ((clean ? IsGpuOwnedForWorkerCleanRead(address, size) : IsGpuOwnedForWorkerRead(address, size)) || IsPendingForWorker(address, size))
+            {
+                return false;
+            }
+
+            if (!_commandThread!.ReadOverlayBefore(address, destination, worker.Sequence))
+            {
+                return false;
+            }
+
+            worker.Reads.Add(address, destination);
+            if (!clean)
+            {
+                NoteCleanReadPage(address, size);
+            }
+
+            return true;
+        }
+
+        internal static readonly SharpEmu.HLE.Diagnostics.ThreadCounter[] CommandReadCounts =
+            Enumerable.Range(0, 12).Select(_ => new SharpEmu.HLE.Diagnostics.ThreadCounter()).ToArray();
+
+        internal static string TakeCommandReadReport()
+        {
+            var counts = new long[CommandReadCounts.Length];
+            for (var index = 0; index < counts.Length; index++)
+            {
+                counts[index] = CommandReadCounts[index].Take();
+            }
+
+            return FormattableString.Invariant($"cmd_reads=resident:{counts[0]}/fast:{counts[1]}/slow:{counts[0] - counts[1]},") +
+                FormattableString.Invariant($"word:{counts[3]}/fast:{counts[4]}/slow:{counts[3] - counts[4]} ") +
+                FormattableString.Invariant($"unclean=untagged:{counts[6]},gpu_dirty:{counts[7]},stores:{counts[8]},pending:{counts[9]},shadow:{counts[10]},alias:{counts[11]}");
+        }
+
+        private void NoteUncleanRead(ulong address, ulong size)
+        {
+            if (Reads is not { } pages || !TryGetCleanReadPage(address, size, out var page, out var slot) || pages.Tags[slot] != page + 1)
+            {
+                CommandReadCounts[6].Increment();
+                return;
+            }
+
+            var thread = _commandThread!;
+            var reason = _bufferCache.MayHaveGpuDirtyPages(page, CleanReadPageBytes) ? 7 :
+                thread.HasPendingStores(page, CleanReadPageBytes) ? 8 :
+                _translation.PendingWrites is { } pending && pending.MayHavePending(page, CleanReadPageBytes) ? 9 :
+                thread.HasShadow(page, CleanReadPageBytes) ? 10 : 11;
+            CommandReadCounts[reason].Increment();
+        }
+
+        private bool ReadWordOnCommandThread(ulong address, out uint word)
+        {
+            CommandReadCounts[3].Increment();
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (!HasPendingMemoryPublication(address, sizeof(uint)) && IsCleanReadPage(address, sizeof(uint)) && TryReadAliasBytes(address, bytes))
+            {
+                CommandReadCounts[4].Increment();
+                word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+                return true;
+            }
+
+            NoteUncleanRead(address, sizeof(uint));
+            if (!ReadOnCommandThread(address, bytes, RenderReadSource.Word))
+            {
+                word = 0;
+                return false;
+            }
+
+            word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            return true;
+        }
+
+        // Without waiting, a range with pending command-thread work is refused instead.
+        private bool ReadResidentBytesOnCommandThread(ulong address, Span<byte> destination, bool clean, bool wait = true)
+        {
+            CommandReadCounts[0].Increment();
+            var size = (ulong)destination.Length;
+            if (wait)
+            {
+                CompletePendingPublicationsForResourceRead(address, size);
+            }
+
+            if (!clean && IsCleanReadPage(address, size) && TryReadAliasBytes(address, destination))
+            {
+                CommandReadCounts[1].Increment();
+                return true;
+            }
+
+            if (!clean)
+            {
+                NoteUncleanRead(address, size);
+            }
+
+            if (!_guestMemory.CanRead(address, size))
+            {
+                return false;
+            }
+
+            var thread = _commandThread!;
+            if (!clean && thread.TryReadShadow(address, destination, out var shadowSequence, out var shadowSource) &&
+                !NewerPendingWrite(address, size, shadowSequence) && !thread.HasPendingRangeAfter(address, size, shadowSequence))
+            {
+                Diagnostics.CommandThreadTally.NoteShadowRead((int)shadowSource);
+                return true;
+            }
+
+            if (wait)
+            {
+                thread.WaitForPendingRange(address, size);
+            }
+            else if (thread.HasPendingRange(address, size))
+            {
+                return false;
+            }
+
+            if (IsPendingOnCommandThread(address, size) || IsGpuOwnedForResidentRead(address, size, clean) || !thread.ReadOverlay(address, destination))
+            {
+                return false;
+            }
+
+            if (!clean)
+            {
+                NoteCleanReadPage(address, size);
+            }
+
+            return true;
+        }
+
+        public bool TryPeekResidentGuestBytes(ulong address, Span<byte> destination)
+        {
+            if (HasPendingMemoryPublication(address, (ulong)destination.Length))
+            {
+                return false;
+            }
+
+            if (OnResolveWorker)
+            {
+                return ReadResidentBytesOnResolveWorker(address, destination, clean: false);
+            }
+
+            return OnCommandThread ? ReadResidentBytesOnCommandThread(address, destination, clean: false, wait: false) : TryReadResidentGuestBytes(address, destination, clean: false);
+        }
 
         // The same ownership rules as the two word readers, checked once for a whole range.
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
-            if (_concurrentAssumptions is { } assumptions)
+            if (destination.IsEmpty || !_guestMemory.CanRead(address, (ulong)destination.Length))
             {
-                return TryReadResidentGuestBytesConcurrent(address, destination, clean, assumptions);
+                return false;
+            }
+
+            if (OnResolveWorker)
+            {
+                return ReadResidentBytesOnResolveWorker(address, destination, clean);
+            }
+
+            if (OnCommandThread)
+            {
+                return ReadResidentBytesOnCommandThread(address, destination, clean);
             }
 
             var size = (ulong)destination.Length;
+            CompletePendingPublicationsForResourceRead(address, size);
             if (clean || !IsCleanReadPage(address, size))
             {
                 if (!_guestMemory.CanRead(address, size) ||
@@ -305,13 +585,15 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private const ulong CleanReadPageBytes = 0x1000;
-        private const int CleanReadPageSlots = 64;
-        private CleanReadPages? _cleanReadPages;
+        private const int CleanReadPageSlots = 16384;
+        private CleanReadPages? _renderReads;
+        private CleanReadPages? _commandReads;
+
+        private CleanReadPages? Reads => OnResolveWorker ? _resolveWorker!.CleanReads ??= new CleanReadPages() : OnCommandThread ? _commandReads : _renderReads;
 
         private sealed class CleanReadPages
         {
             public readonly ulong[] Tags = new ulong[CleanReadPageSlots];
-            public readonly long[] Versions = new long[CleanReadPageSlots];
             public readonly ulong[] Aliases = new ulong[CleanReadPageSlots];
             public readonly object?[] Snapshots = new object?[CleanReadPageSlots];
         }
@@ -335,7 +617,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool TryGetAliasPointer(ulong address, ulong size, out byte* pointer)
         {
             pointer = null;
-            if (_cleanReadPages is not { } pages ||
+            if (Reads is not { } pages ||
                 !TryGetCleanReadPage(address, size, out var page, out var slot) || pages.Tags[slot] != page + 1 ||
                 _guestBacking.BackingAliasSnapshot is not { } snapshot)
             {
@@ -364,11 +646,31 @@ internal static unsafe partial class VulkanVideoPresenter
             return size != 0 && address + size > address && ((address + size - 1) & ~(CleanReadPageBytes - 1)) == page;
         }
 
-        private bool IsCleanReadPage(ulong address, ulong size) =>
-            _cleanReadPages is { } pages &&
-            TryGetCleanReadPage(address, size, out var page, out var slot) &&
-            pages.Tags[slot] == page + 1 &&
-            pages.Versions[slot] == _bufferCache.GpuModifiedVersion;
+        private bool IsCleanReadPage(ulong address, ulong size)
+        {
+            if (Reads is not { } pages ||
+                !TryGetCleanReadPage(address, size, out var page, out var slot) ||
+                pages.Tags[slot] != page + 1 ||
+                _bufferCache.MayHaveGpuDirtyPages(page, CleanReadPageBytes))
+            {
+                return false;
+            }
+
+            if (!OnCommandThread && !OnResolveWorker)
+            {
+                return true;
+            }
+
+            return MayBeCleanReadPage(page);
+        }
+
+        private bool MayBeCleanReadPage(ulong page)
+        {
+            var thread = _commandThread!;
+            return !_bufferCache.MayHaveGpuDirtyPages(page, CleanReadPageBytes) && !thread.HasPendingStores(page, CleanReadPageBytes) &&
+                (_translation.PendingWrites is not { } pending || !pending.MayHavePending(page, CleanReadPageBytes)) &&
+                !thread.HasShadow(page, CleanReadPageBytes);
+        }
 
         private void NoteCleanReadPage(ulong address, ulong size)
         {
@@ -377,21 +679,28 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            var version = _bufferCache.GpuModifiedVersion;
-            if (!_guestMemory.CanRead(page, CleanReadPageBytes) || _bufferCache.HasGpuDirtyBytes(page, CleanReadPageBytes))
+            var command = OnCommandThread;
+            var worker = OnResolveWorker;
+            if ((command || worker) && !MayBeCleanReadPage(page))
             {
                 return;
             }
 
-            var pages = _cleanReadPages ??= new CleanReadPages();
+            if (!_guestMemory.CanRead(page, CleanReadPageBytes) || _bufferCache.HasGpuDirtyBytes(page, CleanReadPageBytes) ||
+                (command && IsPendingOnCommandThread(page, CleanReadPageBytes)) || (worker && IsPendingForWorker(page, CleanReadPageBytes)))
+            {
+                return;
+            }
+
+            var pages = worker
+                ? _resolveWorker!.CleanReads ??= new CleanReadPages()
+                : command ? _commandReads ??= new CleanReadPages() : _renderReads ??= new CleanReadPages();
             if (pages.Tags[slot] != page + 1)
             {
                 pages.Tags[slot] = page + 1;
                 pages.Aliases[slot] = 0;
                 pages.Snapshots[slot] = null;
             }
-
-            pages.Versions[slot] = version;
         }
 
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
@@ -399,16 +708,12 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCompile);
             var module = CreateShaderModule(shader.Payload);
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
+            lock (_shaderModules) _shaderModules.Add(programId, module);
+            _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
+            if (stage is ShaderStage.Vertex or ShaderStage.Pixel)
+                _rectangleStageCode[module.Handle] = shader.Payload;
             var identity = VulkanPipelineCacheStorage.CompiledShaderIdentity(shader.Payload);
-            lock (_shaderModuleLock)
-            {
-                _shaderModules.Add(programId, module);
-                _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
-                if (stage is ShaderStage.Vertex or ShaderStage.Pixel)
-                    _rectangleStageCode[module.Handle] = shader.Payload;
-                _shaderModuleCacheIdentities[module.Handle] = identity;
-            }
-
+            lock (_shaderModules) _shaderModuleCacheIdentities[module.Handle] = identity;
             if (stage == ShaderStage.Compute)
             {
                 NoteRuntimeComputeModule(identity);
@@ -422,29 +727,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // the SPIR-V size that produced it.
         private const long SlowPipelineCreationMilliseconds = 250;
 
-        private int SpirvBytesOf(ulong moduleHandle)
-        {
-            lock (_shaderModuleLock)
-            {
-                return _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
-            }
-        }
-
-        private byte[] RectangleStageCodeOf(ulong moduleHandle)
-        {
-            lock (_shaderModuleLock)
-            {
-                return _rectangleStageCode[moduleHandle];
-            }
-        }
-
-        private bool TryGetShaderModuleCacheIdentity(ulong moduleHandle, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? identity)
-        {
-            lock (_shaderModuleLock)
-            {
-                return _shaderModuleCacheIdentities.TryGetValue(moduleHandle, out identity);
-            }
-        }
+        private int SpirvBytesOf(ulong moduleHandle) =>
+            _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
 
         private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
         {
@@ -644,6 +928,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 program.Bindings ?? throw SubmissionScheduler.Fatal($"The program has no binding layout: hash=0x{program.Hash:X16}."),
                 stage);
 
+        private static bool UsesBindlessHeap(ShaderProgramInfo program) => program.Bindings?.UsesBindlessHeap == true;
+
         private static void CollectLayoutBindings(List<DescriptorSetLayoutBinding> bindings, BindingLayout layout, ShaderStage stage)
         {
             foreach (var binding in layout.Descriptors)
@@ -688,23 +974,20 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private PipelineLayout CreatePipelineLayout(DescriptorSetLayout setLayout, ShaderStageFlags pushStages, bool runtimeHeap = false)
+        // Runtime descriptors use set 1; call-record bindless resources use set 2.
+        private PipelineLayout CreatePipelineLayout(DescriptorSetLayout setLayout, ShaderStageFlags pushStages, bool bindlessHeap = false, bool runtimeHeap = false)
         {
             var pushConstants = new PushConstantRange { StageFlags = pushStages, Offset = 0, Size = PushConstantBytes };
-            // Set 0 holds the stage's own bindings; set 1, when a stage reads its image descriptors at run
-            // time, is the persistent heap those descriptors are looked up in.
-            var setLayouts = stackalloc DescriptorSetLayout[2];
+            var setLayouts = stackalloc DescriptorSetLayout[3];
             setLayouts[0] = setLayout;
-            if (runtimeHeap)
-            {
-                setLayouts[1] = (_runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal(
-                    "A shader reads its image descriptors at run time, but this device cannot serve them.")).Layout;
-            }
-
+            setLayouts[1] = runtimeHeap
+                ? (_runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal("Runtime descriptor heap is unavailable.")).Layout
+                : bindlessHeap ? RequireEmptyHeapSetLayout() : default;
+            setLayouts[2] = bindlessHeap ? RequireHeapSetLayout() : default;
             var create = new PipelineLayoutCreateInfo
             {
                 SType = StructureType.PipelineLayoutCreateInfo,
-                SetLayoutCount = runtimeHeap ? 2u : 1u,
+                SetLayoutCount = bindlessHeap ? 3u : runtimeHeap ? 2u : 1u,
                 PSetLayouts = setLayouts,
                 PushConstantRangeCount = 1,
                 PPushConstantRanges = &pushConstants,
@@ -715,8 +998,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private PipelineHandle RegisterPipeline(RenderPipelineEntry entry, Action? transferOwnership = null)
         {
-            entry.Id = ++_nextPipelineId;
-            _pipelineEntries.Add(entry.Id, entry);
+            entry.Id = Interlocked.Increment(ref _nextPipelineId);
+            _pipelineEntries.TryAdd(entry.Id, entry);
             transferOwnership?.Invoke();
             if (_gpuCommandProfile is not null)
             {
@@ -763,16 +1046,21 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
+            var runtimeHeap = UsesRuntimeHeap(description.VertexStage) || (description.PixelStage is { } runtimePixel && UsesRuntimeHeap(runtimePixel));
+            var bindlessHeap = UsesBindlessHeap(description.VertexStage) ||
+                (description.PixelStage is { } heapPixelStage && UsesBindlessHeap(heapPixelStage));
             var entry = new RenderPipelineEntry
             {
                 SetLayout = setLayout,
                 Demand = demand,
                 Layout = CreatePipelineLayout(setLayout,
                     (description.VertexStage.Stage == ShaderStageKind.Mesh
-                        ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) | ShaderStageFlags.FragmentBit |
-                    (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit),
-                    UsesRuntimeHeap(description.VertexStage) || (description.PixelStage is { } runtimePixel && UsesRuntimeHeap(runtimePixel))),
+                        ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
+                    ShaderStageFlags.FragmentBit |
+                    (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit), bindlessHeap, runtimeHeap),
                 UsesPushDescriptors = usesPushDescriptors,
+                UsesBindlessHeap = bindlessHeap,
+                UsesRuntimeHeap = runtimeHeap,
                 Description = description,
                 ProfileVertexHash = description.VertexStage.Hash,
                 ProfilePixelHash = description.PixelStage?.Hash ?? 0,
@@ -911,8 +1199,8 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // One graphics pipeline for dynamic rendering: the attachment formats travel in the create info.
-        private Pipeline CreateRenderPipeline(GraphicsPipelineDescription description, PrimitiveTopology topology, PipelineLayout layout,
-            PolygonMode polygonMode = PolygonMode.Fill, bool expandRectangles = false)
+        internal Pipeline CreateRenderPipeline(GraphicsPipelineDescription description, PrimitiveTopology topology, PipelineLayout layout,
+            PolygonMode polygonMode = PolygonMode.Fill, bool expandRectangles = false, bool prewarm = false)
         {
             var parameters = description.StaticParameters;
             var rendering = description.Rendering;
@@ -931,8 +1219,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (expandRectangles)
                 {
-                    var geometryCode = RectangleGeometryShader.Create(RectangleStageCodeOf(vertexModule.Handle),
-                        pixelModule.Handle == 0 ? null : RectangleStageCodeOf(pixelModule.Handle), out var vertexCode, out var pixelCode);
+                    var geometryCode = RectangleGeometryShader.Create(_rectangleStageCode[vertexModule.Handle],
+                        pixelModule.Handle == 0 ? null : _rectangleStageCode[pixelModule.Handle], out var vertexCode, out var pixelCode);
                     rectangleModule = CreateShaderModule(geometryCode);
                     rectangleVertexModule = CreateShaderModule(vertexCode);
                     if (pixelCode is not null) rectanglePixelModule = CreateShaderModule(pixelCode);
@@ -1025,14 +1313,14 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                     blends[index] = new PipelineColorBlendAttachmentState
                     {
-                        ColorWriteMask = ToVkColorWriteMask(mask),
+                        ColorWriteMask = RecordingHost.ToVkColorWriteMask(mask),
                         BlendEnable = parameters.GetBlendEnable(index) && !parameters.GetBlendBypass(index),
-                        SrcColorBlendFactor = ToVkBlendFactor(parameters.GetColorSourceBlend(index)),
-                        DstColorBlendFactor = ToVkBlendFactor(parameters.GetColorDestinationBlend(index)),
-                        ColorBlendOp = ToVkBlendOp(parameters.GetColorBlendFunction(index)),
-                        SrcAlphaBlendFactor = ToVkBlendFactor(separateAlpha ? parameters.GetAlphaSourceBlend(index) : parameters.GetColorSourceBlend(index)),
-                        DstAlphaBlendFactor = ToVkBlendFactor(separateAlpha ? parameters.GetAlphaDestinationBlend(index) : parameters.GetColorDestinationBlend(index)),
-                        AlphaBlendOp = ToVkBlendOp(separateAlpha ? parameters.GetAlphaBlendFunction(index) : parameters.GetColorBlendFunction(index)),
+                        SrcColorBlendFactor = RecordingHost.ToVkBlendFactor(parameters.GetColorSourceBlend(index)),
+                        DstColorBlendFactor = RecordingHost.ToVkBlendFactor(parameters.GetColorDestinationBlend(index)),
+                        ColorBlendOp = RecordingHost.ToVkBlendOp(parameters.GetColorBlendFunction(index)),
+                        SrcAlphaBlendFactor = RecordingHost.ToVkBlendFactor(separateAlpha ? parameters.GetAlphaSourceBlend(index) : parameters.GetColorSourceBlend(index)),
+                        DstAlphaBlendFactor = RecordingHost.ToVkBlendFactor(separateAlpha ? parameters.GetAlphaDestinationBlend(index) : parameters.GetColorDestinationBlend(index)),
+                        AlphaBlendOp = RecordingHost.ToVkBlendOp(separateAlpha ? parameters.GetAlphaBlendFunction(index) : parameters.GetColorBlendFunction(index)),
                     };
                 }
 
@@ -1115,6 +1403,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         StencilTestEnable = parameters.StencilTestEnable,
                         Front = ToVkStencilOpState(parameters.StencilFront),
                         Back = ToVkStencilOpState(parameters.StencilBack),
+                        MinDepthBounds = 0f,
                         MaxDepthBounds = 1f,
                     };
                     var dynamicStates = stackalloc DynamicState[14];
@@ -1174,7 +1463,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         Layout = layout,
                     };
                     var reportStart = Stopwatch.GetTimestamp();
-                    var cache = GetGuestPipelineCache(GraphicsCacheKey(description.VertexStage.Hash,
+                    var cache = prewarm ? _pipelineCache : GetGuestPipelineCache(GraphicsCacheKey(description.VertexStage.Hash,
                         description.PixelStage?.Hash ?? 0, vertexModule.Handle, pixelModule.Handle));
                     var creationStart = RenderPhaseProfile.Enabled ? Stopwatch.GetTimestamp() : 0;
                     Result creationResult;
@@ -1183,13 +1472,18 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         creationResult = _vk.CreateGraphicsPipelines(_device, cache, 1, &pipelineInfo, null, out pipeline);
                     }
-                    if (RenderPhaseProfile.Enabled)
+                    if (RenderPhaseProfile.Enabled && !prewarm)
                     {
                         var creationMilliseconds = Stopwatch.GetElapsedTime(creationStart).TotalMilliseconds;
                         Console.Error.WriteLine($"[PERF][PIPELINE_DRIVER] kind=graphics stage={description.VertexStage.Stage} vertex=0x{description.VertexStage.Hash:X16} pixel=0x{description.PixelStage?.Hash ?? 0:X16} topology={topology} driver_ms={creationMilliseconds:F3} result={creationResult}");
                     }
                     Check(creationResult,
                         $"vkCreateGraphicsPipelines(rendering vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16})");
+                    if (prewarm)
+                    {
+                        return pipeline;
+                    }
+
                     ReportPipelineCreation(
                         (long)Stopwatch.GetElapsedTime(reportStart).TotalMilliseconds,
                         "graphics",
@@ -1222,14 +1516,10 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
-            var contentKey = CreateComputeContentKey(description, bindings);
-            if (contentKey is { } existingKey && _computePipelinesByContent.TryGetValue(existingKey, out var existing))
-            {
-                return RegisterSharedComputePipeline(existing, description.Stage.Hash);
-            }
-
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, UsesRuntimeHeap(description.Stage));
+            var runtimeHeap = UsesRuntimeHeap(description.Stage);
+            var bindlessHeap = UsesBindlessHeap(description.Stage);
+            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, bindlessHeap, runtimeHeap);
             var computeModule = new ShaderModule(description.Program.Module);
             if (computeModule.Handle == 0)
             {
@@ -1295,62 +1585,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 SetLayout = setLayout,
                 Demand = demand,
                 UsesPushDescriptors = usesPushDescriptors,
+                UsesBindlessHeap = bindlessHeap,
+                UsesRuntimeHeap = runtimeHeap,
                 ProfileComputeHash = description.Stage.Hash,
             };
-            if (contentKey is { } key)
-            {
-                _computePipelinesByContent[key] = new SharedComputePipeline(pipeline, layout, setLayout, demand, usesPushDescriptors);
-            }
-
             return RegisterPipeline(entry);
         }
-
-        // Compute pipelines by what vkCreateComputePipelines consumes. Programs are specialized per
-        // draw, and a new program id often names a module and layout that already have a pipeline.
-        private sealed record SharedComputePipeline(
-            Pipeline Pipeline,
-            PipelineLayout Layout,
-            DescriptorSetLayout SetLayout,
-            DescriptorSetDemand Demand,
-            bool UsesPushDescriptors);
-
-        private readonly Dictionary<ComputePipelineContentKey, SharedComputePipeline> _computePipelinesByContent = new();
-        private readonly Dictionary<ComputePipelineContentKey, PendingComputePipeline> _pendingComputeByContent = new();
-
-        private ComputePipelineContentKey? CreateComputeContentKey(ComputePipelineDescription description, List<DescriptorSetLayoutBinding> bindings)
-        {
-            if (!TryGetShaderModuleCacheIdentity(description.Program.Module, out var identity))
-            {
-                return null;
-            }
-
-            var descriptorCount = 0u;
-            foreach (var binding in bindings)
-            {
-                descriptorCount += binding.DescriptorCount;
-            }
-
-            return ComputePipelineContentKey.Create(
-                identity,
-                bindings,
-                descriptorCount <= _maxPushDescriptors,
-                ShaderStageFlags.ComputeBit,
-                PushConstantBytes,
-                ComputeRequiredSubgroupSize(description.Input));
-        }
-
-        // The entry only references the shared native objects; the entry that created them destroys them.
-        private PipelineHandle RegisterSharedComputePipeline(SharedComputePipeline shared, ulong guestHash) =>
-            RegisterPipeline(new RenderPipelineEntry
-            {
-                Pipeline = shared.Pipeline,
-                Layout = shared.Layout,
-                SetLayout = shared.SetLayout,
-                Demand = shared.Demand,
-                UsesPushDescriptors = shared.UsesPushDescriptors,
-                ProfileComputeHash = guestHash,
-                SharesNativeObjects = true,
-            });
 
         // One compute pipeline whose vkCreateComputePipelines call runs on a worker
         // thread. Everything the command stream owns (descriptor and pipeline layout,
@@ -1362,18 +1602,23 @@ internal static unsafe partial class VulkanVideoPresenter
             public required PipelineLayout Layout;
             public required DescriptorSetDemand Demand;
             public required bool UsesPushDescriptors;
+            public required bool UsesBindlessHeap;
+            public required bool UsesRuntimeHeap;
             public required ulong Hash;
             public required int SpirvBytes;
             public Task<Pipeline> Compile = Task.FromResult(default(Pipeline));
             public long StartTimestamp;
             public long CompileMilliseconds;
-            public ComputePipelineContentKey? ContentKey;
-            // Set once an entry owns the compiled pipeline; later programs that wait on the same compile share it.
-            public SharedComputePipeline? Finished;
             public long CompletedTimestamp;
+
+            // A linked program's own pipeline cache (CreateLinkedPipelineCache), written once its pipeline is registered.
+            public DriverCacheShard? LinkedCache;
         }
 
         private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
+
+        // The compile in flight for each linked guest program (Bindings.CallTargetCount != 0), by program hash.
+        private readonly Dictionary<ulong, Task> _linkedComputeCompiles = new();
 
         public Task? GetComputePipelineCompletion(ShaderProgram program) =>
             _pendingComputePipelines.TryGetValue(program.Id, out var pending) ? pending.Compile : null;
@@ -1392,6 +1637,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryCreateComputePipeline(ComputePipelineDescription description, out PipelineHandle handle)
         {
+            lock (_pendingComputePipelines)
+            {
+                return TryCreateComputePipelineCore(description, out handle);
+            }
+        }
+
+        private bool TryCreateComputePipelineCore(ComputePipelineDescription description, out PipelineHandle handle)
+        {
             if (!_asyncComputePipelines)
             {
                 handle = CreateComputePipeline(description);
@@ -1402,16 +1655,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var key = description.Program.Id;
             if (_pendingComputePipelines.TryGetValue(key, out var pending))
             {
-                if (!pending.Compile.IsCompleted)
+                if (!pending.Compile.IsCompleted && description.Stage.Bindings is { CallTargetCount: not 0 })
                 {
                     return false;
-                }
-
-                if (pending.Finished is { } finished)
-                {
-                    handle = RegisterSharedComputePipeline(finished, description.Stage.Hash);
-                    _pendingComputePipelines.Remove(key);
-                    return true;
                 }
 
                 var compiled = pending.Compile.GetAwaiter().GetResult();
@@ -1419,19 +1665,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 ReportPipelineCreation(
                     Interlocked.Read(ref pending.CompileMilliseconds),
                     "compute-async",
-                    $"cs=0x{pending.Hash:X16} module={pending.ContentKey?.ModuleIdentity[..12]} waited_ms={(long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds}",
+                    $"cs=0x{pending.Hash:X16} waited_ms={(long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds}",
                     pending.SpirvBytes.ToString());
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, compiled.Handle, $"SharpEmu compute cs=0x{pending.Hash:X16}");
-                pending.Finished = new SharedComputePipeline(
-                    compiled, pending.Layout, pending.SetLayout, pending.Demand, pending.UsesPushDescriptors);
-                if (pending.ContentKey is { } finishedKey)
-                {
-                    _computePipelinesByContent[finishedKey] = pending.Finished;
-                    _pendingComputeByContent.Remove(finishedKey);
-                }
-
                 handle = RegisterPipeline(new RenderPipelineEntry
                 {
                     Pipeline = compiled,
@@ -1439,33 +1677,32 @@ internal static unsafe partial class VulkanVideoPresenter
                     SetLayout = pending.SetLayout,
                     Demand = pending.Demand,
                     UsesPushDescriptors = pending.UsesPushDescriptors,
+                    UsesBindlessHeap = pending.UsesBindlessHeap,
+                    UsesRuntimeHeap = pending.UsesRuntimeHeap,
                     ProfileComputeHash = pending.Hash,
                 }, () => _pendingComputePipelines.Remove(key));
+                ReleaseLinkedPipelineCache(pending.LinkedCache, pending.Hash, save: true);
+
                 return true;
+            }
+
+            // A linked program's module can keep the driver busy for minutes, and a game that streams callees relinks
+            // the program before an earlier module is done. Each linked program compiles one module at a time, so the
+            // modules of tables the game has already replaced cannot take every compiler slot from the programs its
+            // queues wait for.
+            var linked = description.Stage.Bindings is { CallTargetCount: not 0 };
+            if (linked && _linkedComputeCompiles.TryGetValue(description.Stage.Hash, out var running) && !running.IsCompleted)
+            {
+                return false;
             }
 
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
-            var contentKey = CreateComputeContentKey(description, bindings);
-            if (contentKey is { } existingKey)
-            {
-                if (_computePipelinesByContent.TryGetValue(existingKey, out var existing))
-                {
-                    handle = RegisterSharedComputePipeline(existing, description.Stage.Hash);
-                    return true;
-                }
-
-                if (_pendingComputeByContent.TryGetValue(existingKey, out var inFlight))
-                {
-                    // The same module and layout are compiling for another program.
-                    _pendingComputePipelines.Add(key, inFlight);
-                    return false;
-                }
-            }
-
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, UsesRuntimeHeap(description.Stage));
+            var runtimeHeap = UsesRuntimeHeap(description.Stage);
+            var bindlessHeap = UsesBindlessHeap(description.Stage);
+            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, bindlessHeap, runtimeHeap);
             var computeModule = new ShaderModule(description.Program.Module);
             if (computeModule.Handle == 0)
             {
@@ -1473,7 +1710,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var device = _device;
-            var cacheSource = GetGuestPipelineCacheSource(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
+            var linkedCache = linked ? CreateLinkedPipelineCache(description.Stage.Hash) : null;
+            var cacheSource = linkedCache?.Cache ?? GetGuestPipelineCacheSource(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
             var vk = _vk;
             var requiredSubgroupSize = ComputeRequiredSubgroupSize(description.Input);
             var started = new PendingComputePipeline
@@ -1482,10 +1720,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 Layout = layout,
                 Demand = demand,
                 UsesPushDescriptors = usesPushDescriptors,
+                UsesBindlessHeap = bindlessHeap,
+                UsesRuntimeHeap = runtimeHeap,
                 Hash = description.Stage.Hash,
                 SpirvBytes = SpirvBytesOf(computeModule.Handle),
                 StartTimestamp = Stopwatch.GetTimestamp(),
-                ContentKey = contentKey,
+                LinkedCache = linkedCache,
             };
             started.Compile = Task.Factory.StartNew(
                 () =>
@@ -1523,9 +1763,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default);
             _pendingComputePipelines.Add(key, started);
-            if (contentKey is { } startedKey)
+            if (linked)
             {
-                _pendingComputeByContent[startedKey] = started;
+                _linkedComputeCompiles[description.Stage.Hash] = started.Compile;
             }
 
             return false;
@@ -1579,14 +1819,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DrainPendingComputePipelines()
         {
-            // Programs that wait on the same compile share one pending object.
-            foreach (var pending in _pendingComputePipelines.Values.Distinct())
+            foreach (var pending in _pendingComputePipelines.Values)
             {
-                if (pending.Finished is not null)
-                {
-                    continue;
-                }
-
                 try
                 {
                     var pipeline = pending.Compile.GetAwaiter().GetResult();
@@ -1596,12 +1830,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     Console.Error.WriteLine($"[LOADER][WARN] Pending compute pipeline failed during shutdown: {exception.Message}");
                 }
+                ReleaseLinkedPipelineCache(pending.LinkedCache, pending.Hash, save: false);
                 _vk.DestroyPipelineLayout(_device, pending.Layout, null);
                 _vk.DestroyDescriptorSetLayout(_device, pending.SetLayout, null);
             }
             _pendingComputePipelines.Clear();
-            _pendingComputeByContent.Clear();
-            _computePipelinesByContent.Clear();
+            _linkedComputeCompiles.Clear();
         }
 
         private void DestroyRenderPipelines()
@@ -1610,11 +1844,6 @@ internal static unsafe partial class VulkanVideoPresenter
             _meshIndirectPipeline = null;
             foreach (var entry in _pipelineEntries.Values)
             {
-                if (entry.SharesNativeObjects)
-                {
-                    continue;
-                }
-
                 foreach (var pipeline in new[] { entry.Pipeline, entry.StripVariant, entry.ListVariant, entry.RectangleVariant })
                 {
                     if (pipeline.Handle != 0)
@@ -1628,20 +1857,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _pipelineEntries.Clear();
-            ShaderModule[] modules;
-            lock (_shaderModuleLock)
-            {
-                modules = [.. _shaderModules.Values];
-                _shaderModules.Clear();
-                _shaderModuleSpirvBytes.Clear();
-                _rectangleStageCode.Clear();
-                _shaderModuleCacheIdentities.Clear();
-            }
-
-            foreach (var module in modules)
+            foreach (var module in _shaderModules.Values)
             {
                 _vk.DestroyShaderModule(_device, module, null);
             }
+
+            _shaderModules.Clear();
+            _rectangleStageCode.Clear();
+            _shaderModuleCacheIdentities.Clear();
         }
     }
 }

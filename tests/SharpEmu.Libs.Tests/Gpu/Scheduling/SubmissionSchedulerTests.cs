@@ -46,6 +46,80 @@ public sealed class SubmissionSchedulerTests
     }
 
     [Fact]
+    public void TrailingBuffersSubmitAfterTheCurrentBufferUnderOneTick()
+    {
+        _device.CompleteOnSubmit = true;
+        using var scheduler = NewActiveScheduler(_device, _rendering);
+        var worker = scheduler.CreateRecordingBuffer(new RecordingRenderingState());
+        scheduler.BeginRecording(worker);
+        _ = worker.Handle;
+        scheduler.EndRecording(worker);
+        Assert.True(worker.Ended);
+
+        Assert.Equal(1UL, scheduler.Flush(new SubmitBundle(), [worker]));
+
+        var submit = Assert.Single(_device.Submits);
+        Assert.Equal(new[] { "b0", "b4" }, submit.Buffers.Select(_device.Name));
+        Assert.Equal(1UL, submit.Tick);
+        Assert.True(worker.IsInvalid);
+        Assert.False(worker.Ended);
+        Assert.Equal("b1", _device.Name(scheduler.Current.Buffer));
+
+        var names = new List<string>();
+        for (var cycle = 0; cycle < 4; cycle++)
+        {
+            scheduler.BeginRecording(worker);
+            names.Add(_device.Name(worker.Buffer));
+            scheduler.EndRecording(worker);
+            scheduler.Flush(new SubmitBundle(), [worker]);
+        }
+
+        Assert.Equal(new[] { "b5", "b6", "b7", "b4" }, names);
+        Assert.Equal(5, _device.Submits.Count);
+        Assert.All(_device.Submits, entry => Assert.Equal(2, entry.Buffers.Length));
+    }
+
+    [Fact]
+    public void DeferredFlushesJoinTheNextSubmissionInOrderAndAWaitSubmitsThem()
+    {
+        _device.CompleteOnSubmit = true;
+        using var scheduler = NewActiveScheduler(_device, _rendering);
+        var worker = scheduler.CreateRecordingBuffer(new RecordingRenderingState());
+        scheduler.BeginRecording(worker);
+        scheduler.EndRecording(worker);
+
+        Assert.Equal(1UL, scheduler.FlushDeferred([worker]));
+        Assert.Empty(_device.Submits);
+        Assert.Equal(2UL, scheduler.FlushDeferred([]));
+        Assert.Empty(_device.Submits);
+
+        Assert.Equal(3UL, scheduler.Flush());
+        var submit = Assert.Single(_device.Submits);
+        Assert.Equal(new[] { "b0", "b4", "b1", "b2" }, submit.Buffers.Select(_device.Name));
+        Assert.Equal(3UL, submit.Tick);
+
+        Assert.Equal(4UL, scheduler.FlushDeferred([]));
+        scheduler.Wait(4UL);
+        Assert.Equal(2, _device.Submits.Count);
+        Assert.Equal(new[] { "b3" }, _device.Submits[1].Buffers.Select(_device.Name));
+        Assert.Equal(4UL, _device.Submits[1].Tick);
+    }
+
+    [Fact]
+    public void AnUnendedTrailingBufferIsFatal()
+    {
+        _device.CompleteOnSubmit = true;
+        using var fatal = new FatalScope();
+        using var scheduler = NewActiveScheduler(_device, _rendering);
+        var worker = scheduler.CreateRecordingBuffer(new RecordingRenderingState());
+        scheduler.BeginRecording(worker);
+        Assert.Throws<SchedulerFatalException>(() => scheduler.Submit(null, [worker]));
+        Assert.False(scheduler.Current.Ended);
+        scheduler.EndRecording(worker);
+        Assert.Equal(1UL, scheduler.Flush(new SubmitBundle(), [worker]));
+    }
+
+    [Fact]
     public void SubmitRejectsAFullSignalListAndAMissingBuffer()
     {
         using var fatal = new FatalScope();
@@ -78,6 +152,50 @@ public sealed class SubmissionSchedulerTests
         scheduler.Wait(1);
         Assert.Equal(7, _device.Log.Length);
         Assert.Throws<SchedulerFatalException>(() => scheduler.Wait(5));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ACompletedDeferredTickCannotBeBlockedByAnUnsubmittedPriorityTick(bool earlierPriority)
+    {
+        var notifications = new System.Collections.Concurrent.ConcurrentQueue<ulong>();
+        using var scheduler = new SubmissionScheduler(_device, _rendering, completed: notifications.Enqueue);
+        scheduler.Begin(new SubmissionContext { QueueName = "priority.reorder", SubmissionId = 1 });
+        var firstPriority = 0;
+        var futurePriority = 0;
+        var publication = 0;
+        if (earlierPriority) scheduler.QueuePriorityCompletionAction(() => Interlocked.Increment(ref firstPriority));
+        scheduler.QueueCompletionAction(() => Interlocked.Increment(ref publication));
+        Assert.Equal(1UL, scheduler.FlushDeferred([]));
+        var readsBeforeFuture = _device.Log.Count(entry => entry == "read");
+        scheduler.QueuePriorityCompletionAction(() => Interlocked.Increment(ref futurePriority));
+        // Submission appends tick 1's notification after tick 2's queued priority action.
+        Task? poll = null;
+        try
+        {
+            // Without tick-1 priority work, let the worker observe tick 2 before appending
+            // tick 1's notification: sorting alone cannot fix an already blocked GPU wait.
+            if (!earlierPriority)
+                Assert.True(WaitUntil(() => _device.Log.Count(entry => entry == "read") > readsBeforeFuture));
+            scheduler.EnsureSubmitted(1);
+            _device.Complete(1);
+            poll = Task.Run(scheduler.RunCompletedOperations);
+            Assert.True(await CompletesWithin(poll, 5000), "Completed tick 1 must not wait for the unsubmitted tick 2.");
+            Assert.Equal(earlierPriority ? 1 : 0, Volatile.Read(ref firstPriority));
+            Assert.Equal(1, Volatile.Read(ref publication));
+            Assert.Contains(1UL, notifications);
+            Assert.Equal(0, Volatile.Read(ref futurePriority));
+            Assert.Single(_device.Submits);
+            Assert.Equal(2UL, scheduler.CurrentTick);
+        }
+        finally
+        {
+            // Also lets the old implementation unwind on failure rather than hanging the suite.
+            _device.CompleteOnSubmit = true;
+            _device.Complete(2);
+            if (poll is not null) await poll.WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     [Fact]
@@ -422,6 +540,7 @@ public sealed class SubmissionSchedulerTests
             using var memory = new GuestGpuMemory(new RecordingAddressSpace());
             memory.AttachStores(stores, stores);
             memory.Register(0x10000, 0x1000, GuestPageProtection.Read | GuestPageProtection.Write);
+            stores.Order.Clear();
             memory.AttachGpuQueue(new InlineRelay(), scheduler);
             scheduler.QueuePriorityCompletionAction(() =>
             {

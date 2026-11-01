@@ -28,8 +28,8 @@ public sealed class BufferMappedRangeValidationTests
 
     private static IRenderHost Create(Memory memory)
     {
-        var presenter = RuntimeHelpers.GetUninitializedObject(PresenterUnderTest.PresenterType);
-        PresenterUnderTest.PresenterType.GetField("_guestMemory", PresenterUnderTest.InstanceMembers)!.SetValue(presenter, memory);
+        var presenter = RuntimeHelpers.GetUninitializedObject(PresenterUnderTest.RecordingHostType);
+        PresenterUnderTest.RecordingHostType.GetField("_guestMemory", PresenterUnderTest.InstanceMembers)!.SetValue(presenter, memory);
         return (IRenderHost)presenter;
     }
 

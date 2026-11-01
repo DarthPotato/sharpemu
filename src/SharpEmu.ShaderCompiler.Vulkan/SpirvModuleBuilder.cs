@@ -188,12 +188,13 @@ public enum SpirvOp : ushort
 public enum SpirvCapability : uint
 {
     Shader = 1,
+    Tessellation = 3,
     ShaderLayer = 69,
     InterpolationFunction = 52,
     FragmentBarycentricKhr = 5284,
     ClipDistance = 32,
     CullDistance = 33,
-    Tessellation = 3,
+
     SampledImageArrayDynamicIndexing = 29,
     StorageImageArrayDynamicIndexing = 31,
     SampleRateShading = 35,
@@ -203,6 +204,7 @@ public enum SpirvCapability : uint
     Float64 = 10,
     Int64 = 11,
     Int64Atomics = 12,
+    Int64ImageExt = 5016,
     Int16 = 22,
     ImageGatherExtended = 25,
     StorageImageExtendedFormats = 49,
@@ -215,6 +217,7 @@ public enum SpirvCapability : uint
     GroupNonUniformBallot = 64,
     GroupNonUniformShuffle = 65,
     ShaderViewportIndex = 70,
+    DrawParameters = 4427,
     ShaderViewportIndexLayerExt = 5254,
     ShaderNonUniform = 5301,
     RuntimeDescriptorArray = 5302,
@@ -298,6 +301,8 @@ public enum SpirvDecoration : uint
     DescriptorSet = 34,
     Offset = 35,
     NoContraction = 42,
+    Aliased = 20,
+    Coherent = 23,
     NonWritable = 24,
     PerPrimitiveExt = 5271,
     NonUniform = 5300,
@@ -309,6 +314,7 @@ public enum SpirvBuiltIn : uint
     PointSize = 1,
     ClipDistance = 3,
     CullDistance = 4,
+    PrimitiveId = 7,
     Layer = 9,
     ViewportIndex = 10,
     InvocationId = 8,
@@ -318,6 +324,7 @@ public enum SpirvBuiltIn : uint
     PatchVertices = 14,
     VertexIndex = 42,
     InstanceIndex = 43,
+    BaseInstance = 4425,
     FragCoord = 15,
     BaryCoordKhr = 5286,
     BaryCoordNoPerspKhr = 5287,
@@ -335,7 +342,7 @@ public enum SpirvBuiltIn : uint
     FragDepth = 22,
     PrimitiveTriangleIndicesExt = 5296,
     CullPrimitiveExt = 5299,
-    PrimitiveId = 7,
+
 }
 
 public enum SpirvImageDim : uint
@@ -389,6 +396,7 @@ public enum SpirvImageFormat : uint
     Rg8ui = 37,
     R16ui = 38,
     R8ui = 39,
+    R64ui = 40,
 }
 
 public sealed class SpirvModuleBuilder
@@ -851,8 +859,11 @@ public sealed class SpirvModuleBuilder
         => BeginFunction(returnType, functionType, 0);
 
     public uint BeginFunction(uint returnType, uint functionType, uint functionControl)
+        => BeginFunction(returnType, functionType, functionControl, AllocateId());
+
+    // A function whose id was allocated before its callers were emitted.
+    public uint BeginFunction(uint returnType, uint functionType, uint functionControl, uint id)
     {
-        var id = AllocateId();
         Emit(_functions, SpirvOp.Function, returnType, id, functionControl, functionType);
         return id;
     }

@@ -16,7 +16,7 @@ public sealed partial class RenderExecutor
     private const float ClipSpaceTolerance = 0.001f;
 
     // False when the draw does not record: no programs, a solid clear, a metadata-only quad or a retained draw.
-    private bool ApplyProgramAdaptations(RegisterBanks banks, in DrawCall draw, ref DrawState state, in TargetlessDrawArguments arguments)
+    private bool ApplyProgramAdaptations(RegisterBanks banks, in DrawCall draw, ref DrawState state, in TargetlessDrawArguments arguments, ResolvedDraw record)
     {
         var programs = state.Programs;
         if (!programs.Available)
@@ -32,7 +32,8 @@ public sealed partial class RenderExecutor
         if (programs.SolidClear is { } clear && state.ColorCount != 0)
         {
             TraceDrawDisposition(banks, in draw, "color-clear");
-            _host.ClearColorTargets(BoundColors(ref state), clear);
+            record.Kind = ResolvedDrawKind.ClearColorTargets;
+            record.Clear = clear;
             return false;
         }
 
@@ -63,7 +64,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        ref readonly var viewport = ref banks.Context.ScreenViewport.Viewports[0];
+        ref readonly var viewport = ref banks.Context.ScreenViewport.Primary;
         RenderTrace.Write(
             $"DrawDisposition name={draw.Name} reason={reason} count={draw.Count} " +
             $"export=0x{banks.Shader.Vertex.ExportAddress:X16} pixel=0x{banks.Shader.Pixel.Address:X16} " +
@@ -115,7 +116,7 @@ public sealed partial class RenderExecutor
             return false;
         }
 
-        foreach (ref readonly var target in BoundColors(ref state))
+        foreach (ref readonly var target in DrawState.BoundColors(ref state))
         {
             if (!IsPremultipliedFillBlend(in context.BlendControls[target.Slot]))
             {

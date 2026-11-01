@@ -47,6 +47,7 @@ public sealed class TextureTransferLayout
     public ulong SliceStride;
     public ulong SourceSliceStride;
     public TiledSurfaceLayout Surface = new();
+    public TileElementLayout Element;
     public readonly TransferMipLayout[] Mips = new TransferMipLayout[TiledSurfaceLayout.MaxLevels];
 
     private static readonly ColorComponentMap[][] RenderTargetColorMappings =
@@ -183,7 +184,8 @@ public sealed class TextureTransferLayout
         ulong uploadSize,
         bool allowDepthTile,
         bool volume,
-        string owner)
+        string owner,
+        uint rowPitch = 0)
     {
         var layout = new TextureTransferLayout();
         var description = new TiledSurfaceDescription(
@@ -245,6 +247,14 @@ public sealed class TextureTransferLayout
                     ImageHeight = paddedSizes[level].Height,
                 };
             }
+
+            if (levels == 1 && rowPitch >= width && rowPitch != layout.Pitch)
+            {
+                layout.Pitch = rowPitch;
+                layout.Mips[0].RowLength = rowPitch;
+                layout.Mips[0].Size = (rowPitch + (ulong)element.TexelWidth - 1) / element.TexelWidth *
+                    ((height + (ulong)element.TexelHeight - 1) / element.TexelHeight) * element.Bytes;
+            }
         }
         else if (volume)
         {
@@ -266,14 +276,12 @@ public sealed class TextureTransferLayout
             layout.SliceStride = SliceStrideOf(layout.Mips, levels, uploadSize, depth);
         }
 
+        layout.Element = element;
         return layout;
     }
 
-    private static Exception UnsupportedTiledUpload(string owner, GuestPixelFormat format, GuestTileMode tile, ulong uploadSize, uint width, uint height, uint levels) =>
-        SubmissionScheduler.Fatal($"{owner}: the tiled texture upload is not supported: format={(uint)format} tile={(uint)tile} size={uploadSize} extent={width}x{height} levels={levels}.");
-
-    // The last byte a copy reaches in its buffer, plus one, following Vulkan's buffer
-    // addressing: rows advance by BufferRowLength and slices by BufferImageHeight.
+    // The last byte a copy reaches in its buffer, plus one, following Vulkan's buffer addressing: rows advance
+    // by BufferRowLength and slices by BufferImageHeight.
     public static ulong CopyFootprint(IReadOnlyList<BufferImageCopy> regions, TileElementLayout element)
     {
         static ulong Blocks(uint texels, uint block) => (texels + (ulong)block - 1) / block;
@@ -297,6 +305,11 @@ public sealed class TextureTransferLayout
         return end;
     }
 
+    private static Exception UnsupportedTiledUpload(string owner, GuestPixelFormat format, GuestTileMode tile, ulong uploadSize, uint width, uint height, uint levels) =>
+        SubmissionScheduler.Fatal($"{owner}: the tiled texture upload is not supported: format={(uint)format} tile={(uint)tile} size={uploadSize} extent={width}x{height} levels={levels}.");
+
+    // The last byte a copy reaches in its buffer, plus one, following Vulkan's buffer
+    // addressing: rows advance by BufferRowLength and slices by BufferImageHeight.
     public List<BufferImageCopy> BuildCopies()
     {
         var description = Surface.Description;

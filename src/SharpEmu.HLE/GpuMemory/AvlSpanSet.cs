@@ -3,18 +3,9 @@
 
 namespace SharpEmu.HLE.GpuMemory;
 
-// The program prefetch worker asks whether bytes are GPU-modified while the render thread and
-// completion callbacks change the set. Changes hold the set's own lock and make the version odd
-// while they run. Contains and Overlaps read without the lock: a read that saw the version change,
-// or walked further than a balanced tree is deep (a rotation seen half done), is repeated under the
-// lock. The tree does not change range ownership.
+// Callers serialize access. The tree does not change range ownership or locking.
 public sealed class AvlSpanSet
 {
-    private readonly object _gate = new();
-    private int _version;
-    // Deeper than any balanced tree of 2^64 spans (height <= 1.44 log2 n).
-    private const int MaxReadSteps = 128;
-
     private sealed class Node(ulong start, ulong end)
     {
         public ulong Start = start;
@@ -22,122 +13,19 @@ public sealed class AvlSpanSet
         public Node? Left;
         public Node? Right;
         public int Height = 1;
+        public int Count = 1;
     }
 
     private Node? _root;
-    public bool IsEmpty => Volatile.Read(ref _root) is null;
-
+    private SpanSnapshot? _snapshot = SpanSnapshot.Empty;
+    public bool IsEmpty => _root is null;
     public void Clear()
     {
-        lock (_gate)
-        {
-            BeginChange();
-            _root = null;
-            EndChange();
-        }
+        _root = null;
+        _snapshot = SpanSnapshot.Empty;
     }
 
     public void Add(ulong address, ulong size)
-    {
-        lock (_gate)
-        {
-            BeginChange();
-            try
-            {
-                AddCore(address, size);
-            }
-            finally
-            {
-                EndChange();
-            }
-        }
-    }
-
-    public void Remove(ulong address, ulong size)
-    {
-        lock (_gate)
-        {
-            BeginChange();
-            try
-            {
-                RemoveCore(address, size);
-            }
-            finally
-            {
-                EndChange();
-            }
-        }
-    }
-
-    // Odd while a change runs; the increments are full fences, so a reader that sees the same even
-    // version before and after its walk saw no part of a change.
-    private void BeginChange() => Interlocked.Increment(ref _version);
-
-    private void EndChange() => Interlocked.Increment(ref _version);
-
-    public bool Contains(ulong address, ulong size)
-    {
-        ValidateRange(address, size);
-        var version = Volatile.Read(ref _version);
-        if ((version & 1) == 0 && TryFindAtOrBelowUnlocked(address, out var node))
-        {
-            var contains = node is not null && node.End >= address + size;
-            Interlocked.MemoryBarrier();
-            if (Volatile.Read(ref _version) == version) return contains;
-        }
-
-        lock (_gate) return ContainsCore(address, size);
-    }
-
-    public bool Overlaps(ulong address, ulong size)
-    {
-        ValidateRange(address, size);
-        var version = Volatile.Read(ref _version);
-        if ((version & 1) == 0 && TryOverlapsUnlocked(address, address + size, out var overlaps))
-        {
-            Interlocked.MemoryBarrier();
-            if (Volatile.Read(ref _version) == version) return overlaps;
-        }
-
-        lock (_gate) return OverlapsCore(address, size);
-    }
-
-    private bool TryFindAtOrBelowUnlocked(ulong address, out Node? result)
-    {
-        result = null;
-        var steps = 0;
-        for (var node = Volatile.Read(ref _root); node is not null; steps++)
-        {
-            if (steps == MaxReadSteps) return false;
-            if (node.Start <= address) { result = node; node = node.Right; }
-            else node = node.Left;
-        }
-
-        return true;
-    }
-
-    private bool TryOverlapsUnlocked(ulong address, ulong end, out bool overlaps)
-    {
-        overlaps = false;
-        var steps = 0;
-        for (var node = Volatile.Read(ref _root); node is not null; steps++)
-        {
-            if (steps == MaxReadSteps) return false;
-            if (node.Start >= end) node = node.Left;
-            else if (node.End <= address) node = node.Right;
-            else
-            {
-                overlaps = true;
-                return true;
-            }
-        }
-
-        return true;
-    }
-
-    public List<GuestSpan> GetOverlappingRanges(ulong address, ulong size) { lock (_gate) return GetOverlappingRangesCore(address, size); }
-
-    private void AddCore(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var start = address;
@@ -149,6 +37,7 @@ public sealed class AvlSpanSet
             start = previous.Start;
             _root = Delete(_root, start);
         }
+        _snapshot = null;
         for (var next = FindAtOrAbove(start); next is not null && next.Start <= end; next = FindAtOrAbove(start))
         {
             end = Math.Max(end, next.End);
@@ -157,12 +46,14 @@ public sealed class AvlSpanSet
         _root = Insert(_root, start, end);
     }
 
-    private void RemoveCore(ulong address, ulong size)
+    public void Remove(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var end = address + size;
         var current = FindAtOrBelow(address);
         if (current is null || current.End <= address) current = FindAtOrAbove(address);
+        if (current is null || current.Start >= end) return;
+        _snapshot = null;
         while (current is not null && current.Start < end)
         {
             var spanStart = current.Start;
@@ -178,14 +69,14 @@ public sealed class AvlSpanSet
         }
     }
 
-    private bool ContainsCore(ulong address, ulong size)
+    public bool Contains(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var node = FindAtOrBelow(address);
         return node is not null && node.End >= address + size;
     }
 
-    private bool OverlapsCore(ulong address, ulong size)
+    public bool Overlaps(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var end = address + size;
@@ -199,7 +90,18 @@ public sealed class AvlSpanSet
         return false;
     }
 
-    private List<GuestSpan> GetOverlappingRangesCore(ulong address, ulong size)
+    public SpanSnapshot Snapshot()
+    {
+        if (_snapshot is { } snapshot) return snapshot;
+        if (_root is null) return _snapshot = SpanSnapshot.Empty;
+        var starts = new ulong[_root.Count];
+        var ends = new ulong[starts.Length];
+        var index = 0;
+        Collect(_root, starts, ends, ref index);
+        return _snapshot = new SpanSnapshot(starts, ends);
+    }
+
+    public List<GuestSpan> GetOverlappingRanges(ulong address, ulong size)
     {
         ValidateRange(address, size);
         var result = new List<GuestSpan>();
@@ -227,6 +129,15 @@ public sealed class AvlSpanSet
         VisitOverlaps(node.Right, start, end, result);
     }
 
+    private static void Collect(Node? node, ulong[] starts, ulong[] ends, ref int index)
+    {
+        if (node is null) return;
+        Collect(node.Left, starts, ends, ref index);
+        starts[index] = node.Start;
+        ends[index++] = node.End;
+        Collect(node.Right, starts, ends, ref index);
+    }
+
     private Node? FindAtOrBelow(ulong address)
     {
         Node? result = null;
@@ -250,7 +161,11 @@ public sealed class AvlSpanSet
     }
 
     private static int Height(Node? node) => node?.Height ?? 0;
-    private static void UpdateHeight(Node node) => node.Height = Math.Max(Height(node.Left), Height(node.Right)) + 1;
+    private static void UpdateHeight(Node node)
+    {
+        node.Height = Math.Max(Height(node.Left), Height(node.Right)) + 1;
+        node.Count = (node.Left?.Count ?? 0) + (node.Right?.Count ?? 0) + 1;
+    }
 
     private static Node RotateRight(Node node)
     {

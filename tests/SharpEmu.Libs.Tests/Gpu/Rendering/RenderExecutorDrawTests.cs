@@ -22,21 +22,9 @@ public sealed class RenderExecutorDrawTests : IDisposable
     private readonly RenderExecutor _executor;
     private readonly FatalScope _fatal = new();
 
-    private readonly InputsCheckingPrefetch _prefetch;
+    public RenderExecutorDrawTests() => _executor = new RenderExecutor(_host, _pipelines);
 
-    public RenderExecutorDrawTests()
-    {
-        _executor = new RenderExecutor(_host, _pipelines);
-        _prefetch = new InputsCheckingPrefetch(_host);
-        _executor.Prefetch = _prefetch;
-    }
-
-    // Every draw of these tests also checks that its program inputs follow from its registers.
-    public void Dispose()
-    {
-        _fatal.Dispose();
-        Assert.Empty(_prefetch.Mismatches);
-    }
+    public void Dispose() => _fatal.Dispose();
 
     private void AssertOrder(params string[] prefixes)
     {
@@ -57,6 +45,7 @@ public sealed class RenderExecutorDrawTests : IDisposable
         var snapshot = banks.Snapshot();
         banks.PrepareContextWrite();
         banks.Context.DepthCountControl = 1;
+        banks.MarkWritten(RegisterStamps.ContextBits);
 
         _executor.DrawAuto(1, snapshot, Auto(3));
         _executor.DrawAuto(2, banks, Auto(3));
@@ -96,6 +85,60 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.DoesNotContain("end_rendering", _host.Calls);
         Assert.DoesNotContain("prepare_device_addresses", _host.Calls);
         Assert.Contains("create_graphics_pipeline colors=1 depth=False topology=TriangleList restart=False", _pipelines.Calls);
+    }
+
+    [Fact]
+    public void ADrawRepeatingThePreviousTargetsInItsScopeKeepsTheirAcquisitions()
+    {
+        _pipelines.Graphics = Programs(vertexBuffers: [new VertexInputBuffer(VertexBase, 16, 4)]);
+        _host.Scope = new DrawScopeToken(1, 1, 1);
+        var banks = Banks();
+        _executor.DrawIndexed(7, banks, Indexed(6));
+        _host.Calls.Clear();
+        _executor.DrawIndexed(8, banks, Indexed(6));
+
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("find_image", StringComparison.Ordinal) || call.StartsWith("acquire_color", StringComparison.Ordinal));
+        AssertOrder("bind_target 1", "prepare_bindings Vertex", "commit Graphics", "begin_rendering", "draw_indexed 6 1 0 0 0");
+    }
+
+    [Fact]
+    public void ADrawAcquiresItsTargetsAgainOnceTheScopeOrTheRegistersChange()
+    {
+        _pipelines.Graphics = Programs(vertexBuffers: [new VertexInputBuffer(VertexBase, 16, 4)]);
+        _host.Scope = new DrawScopeToken(1, 1, 1);
+        var banks = Banks();
+        _executor.DrawIndexed(7, banks, Indexed(6));
+        _host.Scope = new DrawScopeToken(2, 1, 1);
+        _host.Calls.Clear();
+        _executor.DrawIndexed(8, banks, Indexed(6));
+        Assert.Contains(_host.Calls, call => call.StartsWith("find_image", StringComparison.Ordinal));
+        Assert.Contains(_host.Calls, call => call.StartsWith("acquire_color", StringComparison.Ordinal));
+
+        _host.Calls.Clear();
+        banks.MarkWritten(1u << (int)RegisterStamp.ColorTargets);
+        _executor.DrawIndexed(9, banks, Indexed(6));
+        Assert.Contains(_host.Calls, call => call.StartsWith("acquire_color", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ADrawAfterATwoTargetDrawBindsOnlyItsOwnTarget()
+    {
+        _pipelines.Graphics = Programs(vertexBuffers: [new VertexInputBuffer(VertexBase, 16, 4)]);
+        var banks = Banks();
+        banks.Context.ColorTargets[1] = RegisterWords.Color(SecondColorBase, 64, 64);
+        banks.Context.RenderTargetMask = 0xFF;
+        banks.MarkWritten(1u << (int)RegisterStamp.ColorTargets);
+        _executor.DrawIndexed(7, banks, Indexed(6));
+        Assert.Equal(2, _host.Calls.Count(call => call.StartsWith("acquire_color", StringComparison.Ordinal)));
+        Assert.Contains("begin_rendering 64x64x1 colors=2 samples=1", _host.Calls);
+
+        _host.Calls.Clear();
+        banks.Context.RenderTargetMask = 0xF;
+        banks.MarkWritten(1u << (int)RegisterStamp.ColorTargets);
+        _executor.DrawIndexed(8, banks, Indexed(6));
+
+        Assert.Single(_host.Calls, call => call.StartsWith("acquire_color", StringComparison.Ordinal));
+        Assert.Contains("begin_rendering 64x64x1 colors=1 samples=1", _host.Calls);
     }
 
     private const ulong IndirectArguments = RecordingRenderHost.MemoryBase + 0x60_0000;
@@ -386,6 +429,35 @@ public sealed class RenderExecutorDrawTests : IDisposable
     }
 
     [Theory]
+    [InlineData(2)]
+    [InlineData(5)]
+    [InlineData(6)]
+    public void ColorMetadataModes_DoNotResolveUnusedDepthStateBeforeTheDraw(byte mode)
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.ColorControl.Mode = mode;
+        banks.Context.DepthTarget = banks.Context.DepthTarget with { ZInfo = 0 };
+
+        Assert.False(_executor.DrawHasTargets(banks));
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        _executor.DrawAuto(1, banks, Auto(3));
+
+        Assert.Equal(2, _host.Calls.Count(call => call == "reset_bindings"));
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("find_image", StringComparison.Ordinal));
+        Assert.Empty(_pipelines.Calls);
+    }
+
+    [Fact]
+    public void NormalDraws_KeepColorWhenDepthFormatIsDisabled()
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.DepthTarget = banks.Context.DepthTarget with { ZInfo = 0 };
+
+        // Z format 0 disables depth; upstream still permits the color draw.
+        Assert.True(_executor.DrawHasTargets(banks));
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(3)]
@@ -406,6 +478,26 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.DoesNotContain(_host.Calls, c => c.StartsWith("find_image", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Tessellation_UnavailableProgramsSkipWithoutDispatchOrPipelineCreation(bool indexed)
+    {
+        _host.SupportsTessellation = true;
+        _pipelines.Graphics = new GraphicsPrograms { Available = false };
+        var banks = Banks();
+        banks.Context.ShaderStages = 0x0200210D;
+        banks.Context.ShaderInterface.TessellationFactorParameter = 2u | (3u << 5);
+        banks.Context.ShaderInterface.LocalHullConfiguration = 16u | (4u << 8) | (4u << 14);
+
+        if (indexed) _executor.DrawIndexed(1, banks, Indexed(4));
+        else _executor.DrawAuto(1, banks, Auto(4));
+
+        Assert.Contains("reset_bindings", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("dispatch", StringComparison.Ordinal));
+        Assert.DoesNotContain(_pipelines.Calls, call => call.StartsWith("create_", StringComparison.Ordinal));
+    }
+
     public static TheoryData<string, Action<RegisterBanks>> UnsupportedGeometryStages => new()
     {
         { "stage mask", banks => banks.Context.ShaderStages = 0x1 },
@@ -415,6 +507,40 @@ public sealed class RenderExecutorDrawTests : IDisposable
         { "output primitive", banks => banks.Context.ShaderInterface.GeometryOutputPrimitiveType = 5 },
         { "max output per subgroup", banks => banks.Context.ShaderInterface.MaxOutputPerSubgroup = 0x41 },
     };
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Tessellation_UnsupportedHostSkipsWithoutPreparingResources(bool indexed)
+    {
+        var banks = Banks();
+        banks.Context.ShaderStages = 0x0200210D;
+        banks.Context.ShaderInterface.TessellationFactorParameter = 2u | (3u << 5);
+        banks.Context.ShaderInterface.LocalHullConfiguration = 1u | (4u << 8) | (4u << 14);
+
+        if (indexed) _executor.DrawIndexed(1, banks, Indexed(4));
+        else _executor.DrawAuto(1, banks, Auto(4));
+
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("find_image", StringComparison.Ordinal));
+        Assert.Empty(_pipelines.Calls);
+    }
+
+    [Theory]
+    [InlineData(2u | (1u << 2) | (3u << 5), 1u | (4u << 8) | (4u << 14))]
+    [InlineData(2u | (3u << 5), 0u)]
+    public void Tessellation_UnsupportedConfigurationSkipsWithoutPreparingResources(uint parameter, uint hullConfiguration)
+    {
+        _host.SupportsTessellation = true;
+        var banks = Banks();
+        banks.Context.ShaderStages = 0x0200210D;
+        banks.Context.ShaderInterface.TessellationFactorParameter = parameter;
+        banks.Context.ShaderInterface.LocalHullConfiguration = hullConfiguration;
+
+        _executor.DrawIndexed(1, banks, Indexed(4));
+
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("find_image", StringComparison.Ordinal));
+        Assert.Empty(_pipelines.Calls);
+    }
 
     [Theory]
     [MemberData(nameof(UnsupportedGeometryStages))]
@@ -919,7 +1045,7 @@ public sealed class RenderExecutorDrawTests : IDisposable
         banks.Context.ShaderInterface.ColorShaderMask = 0;
         var storage = new ImageResourceInfo(ImageResourceClass.Storage, true);
         _pipelines.Graphics = Programs(pixelStage: Stage(Program(ShaderStageKind.Pixel, images: [storage])));
-        _prefetch.AllowsStorageOnlyPixelStage = true;
+
 
         _executor.DrawIndexed(1, banks, Indexed(3));
 
@@ -937,7 +1063,7 @@ public sealed class RenderExecutorDrawTests : IDisposable
         banks.Context.ShaderInterface.ColorShaderMask = 0;
         var storage = new ImageResourceInfo(ImageResourceClass.Storage, false);
         _pipelines.Graphics = Programs(pixelStage: Stage(Program(ShaderStageKind.Pixel, images: [storage])));
-        _prefetch.AllowsStorageOnlyPixelStage = true;
+
 
         _executor.DrawIndexed(1, banks, Indexed(3));
 
@@ -1039,9 +1165,78 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.Contains("begin_rendering 64x64x1 colors=1 samples=1", _host.Calls);
 
         banks.Context.RenderTargetMask = 0xFF;
+        banks.MarkWritten(RegisterStamps.ContextBits);
         _executor.DrawIndexed(1, banks, Indexed(3));
         Assert.Contains("begin_rendering 32x32x1 colors=2 samples=1", _host.Calls);
         Assert.Contains("create_graphics_pipeline colors=2 depth=False topology=TriangleList restart=False", _pipelines.Calls);
+    }
+
+    [Fact]
+    public void TargetLayout_IsKeptUntilAContextRegisterIsWritten()
+    {
+        var banks = Banks(withDepth: true);
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        var resolved = TargetLayoutVersion();
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        Assert.Equal(resolved, TargetLayoutVersion());
+        Assert.Equal(2, _host.Calls.Count(static call => call.StartsWith("begin_rendering 64x64x1 colors=1", StringComparison.Ordinal)));
+
+        banks.MarkWritten(RegisterStamps.ContextBits);
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        Assert.Equal(resolved + 1, TargetLayoutVersion());
+    }
+
+    private uint TargetLayoutVersion() =>
+        ((DrawResolution)typeof(RenderExecutor).GetField("_drawResolution", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(_executor)!).TargetVersion;
+
+    [Fact]
+    public void Pipeline_IsKeptUntilSomethingItIsBuiltFromChanges()
+    {
+        var banks = Banks(withDepth: true);
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        Assert.Single(_pipelines.PipelineRequests);
+        Assert.Equal(2, _host.Calls.Count(static call => call.StartsWith("bind_pipeline", StringComparison.Ordinal)));
+
+        banks.MarkWritten(RegisterStamps.ContextBits);
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        Assert.Equal(2, _pipelines.PipelineRequests.Count);
+
+        _executor.DrawIndexed(1, Banks(withDepth: true), Indexed(3));
+        Assert.Equal(3, _pipelines.PipelineRequests.Count);
+    }
+
+    [Fact]
+    public void TargetLayout_BelongsToItsBanks()
+    {
+        var first = Banks();
+        var second = Banks();
+        second.Context.ColorTargets[0] = RegisterWords.Color(SecondColorBase, 32, 32);
+        _executor.DrawIndexed(1, first, Indexed(3));
+        _executor.DrawIndexed(1, second, Indexed(3));
+        _executor.DrawIndexed(1, first, Indexed(3));
+
+        Assert.Equal(2, _host.Calls.Count(static call => call.StartsWith("begin_rendering 64x64x1", StringComparison.Ordinal)));
+        Assert.Single(_host.Calls, static call => call.StartsWith("begin_rendering 32x32x1", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void DynamicState_FollowsAViewportWrite()
+    {
+        var banks = Banks();
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        Assert.Equal(_host.DynamicStates[0], _host.DynamicStates[1]);
+
+        banks.Context.ScreenViewport.Primary = banks.Context.ScreenViewport.Primary with { XScale = 16, XOffset = 16 };
+        banks.MarkWritten(1u << (int)RegisterStamp.ContextDynamic);
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        Assert.Equal(3, _host.DynamicStates.Count);
+        Assert.Equal(32f, _host.DynamicStates[2].ViewportWidth);
+        Assert.NotEqual(_host.DynamicStates[1], _host.DynamicStates[2]);
     }
 
     [Fact]

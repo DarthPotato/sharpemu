@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
+using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Libs.Gpu.GpuCommands;
@@ -64,6 +65,12 @@ public sealed partial class GpuCommandInterpreter
         }
 
         var consumed = RegisterWriteTable.WriteContextPacket(TypedRegisters, in packet, offset, payload.Slice(1, (int)count));
+        if (ScissorTrace.Instance is { Active: true } trace)
+        {
+            for (var index = 0u; index < consumed && index < count; index++)
+                trace.RegisterWrite(TypedRegisters, SubmitId, QueueId, in packet,
+                    offset + index, payload[1 + (int)index], entry: index, count: count);
+        }
         if (offset == ContextRegisterOffset.PaScAaSampleLocations0 && count == SampleLocationRegisters.LocationCount)
         {
             RequireCentroidPriorityPacket(in packet);
@@ -134,17 +141,14 @@ public sealed partial class GpuCommandInterpreter
         }
 
         var count = packet.Length - 2;
-        for (var index = 0u; index < count; index++)
+        if (count > RegisterBankLayout.ShaderRegisterCount - offset)
         {
-            if (offset + index >= RegisterBankLayout.ShaderRegisterCount)
-            {
-                throw _host.Fatal($"The shader register range leaves the bank: offset=0x{offset:X8} count={count} address=0x{packet.PacketAddress:X16}.");
-            }
-
-            Registers.Shader[offset + index] = payload[1 + (int)index];
+            throw _host.Fatal($"The shader register range leaves the bank: offset=0x{offset:X8} count={count} address=0x{packet.PacketAddress:X16}.");
         }
 
-        return RegisterWriteTable.WriteShaderPacket(TypedRegisters, in packet, offset, payload.Slice(1, (int)count)) + 1;
+        var values = payload.Slice(1, (int)count);
+        Registers.Shader.SetRange(offset, values);
+        return RegisterWriteTable.WriteShaderPacket(TypedRegisters, in packet, offset, values) + 1;
     }
 
     internal uint SetUserConfigRegisterPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
@@ -226,8 +230,16 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal($"The register table range exceeds the address space: address=0x{tableAddress:X16} count={count}.");
         }
 
+        if (bank == RegisterBank.Context && ScissorTrace.Instance is { Active: true } scissorTrace)
+            scissorTrace.RegisterTable(TypedRegisters, SubmitId, QueueId, in packet, tableAddress, count);
+
         Span<byte> tableBlock = stackalloc byte[entriesPerBlock * entryBytes];
         Span<byte> beforeSynchronization = stackalloc byte[entriesPerBlock * entryBytes];
+        var gpuWritten = !_submittedCommands.IsEmpty && _host.HasGpuWrittenCommandData(tableAddress, (ulong)count * entryBytes);
+        byte[]? retained = null;
+        if (_submittedRegisterTables is { } tables && tables.TryGetValue(packet.PacketAddress, out var submitted) &&
+            (ulong)submitted.Length == (ulong)count * entryBytes && !gpuWritten)
+            retained = submitted;
         for (var index = 0u; index < count; index++)
         {
             var blockEntry = (int)(index % entriesPerBlock);
@@ -238,7 +250,13 @@ public sealed partial class GpuCommandInterpreter
                 RenderPhaseProfile.RecordCommandRead(RenderPhaseProfile.CommandReadKind.RegisterTable, blockBytes);
                 var capturedBeforeSynchronization = TraceRegisterTables &&
                     _host.Memory.TryRead(blockAddress, beforeSynchronization[..blockBytes]);
-                if (!_host.TryReadGuest(blockAddress, tableBlock[..blockBytes]))
+                if (retained is not null)
+                {
+                    retained.AsSpan((int)index * entryBytes, blockBytes).CopyTo(tableBlock);
+                }
+                else if (!(gpuWritten
+                    ? _host.TryReadGuest(blockAddress, tableBlock[..blockBytes])
+                    : TryReadCommand(blockAddress, tableBlock[..blockBytes])))
                 {
                     throw _host.Fatal($"The register table cannot be read: address=0x{blockAddress:X16} size={blockBytes}.");
                 }
@@ -284,6 +302,8 @@ public sealed partial class GpuCommandInterpreter
 
                     ClearCompositeDepthExtent(offset);
                     RegisterWriteTable.WriteContextEntry(TypedRegisters, offset, value, tableAddress);
+                    if (ScissorTrace.Instance is { Active: true } trace)
+                        trace.RegisterWrite(TypedRegisters, SubmitId, QueueId, in packet, offset, value, tableAddress, index, count);
                     break;
                 case RegisterBank.Shader:
                     if (offset == RegisterBankLayout.ShaderRegisterNop || rawOffset == RegisterTableSentinel)

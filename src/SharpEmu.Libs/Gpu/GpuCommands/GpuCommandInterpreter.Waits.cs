@@ -7,6 +7,8 @@ namespace SharpEmu.Libs.Gpu.GpuCommands;
 
 public sealed partial class GpuCommandInterpreter
 {
+    internal static long RelaxedWaitHits;
+    internal static long RelaxedWaitFallbacks;
     private const uint RewindValidBit = 1u << 31;
     private const uint RewindKnownBits = 0x8100_0000u;
 
@@ -34,10 +36,25 @@ public sealed partial class GpuCommandInterpreter
             Suspend();
             return;
         }
-        if (!deferred) value = ReadWaitOperand(address, is64Bit);
+        var stale = false;
+        if (!deferred) value = ReadWaitOperand(address, is64Bit, allowStale: true, out stale);
         if (!WaitOperation.TryCompare(value, reference, mask, compareFunction, out var satisfied))
         {
             throw _host.Fatal($"The wait compare function is unknown: function={compareFunction} address=0x{address:X16}.");
+        }
+
+        if (stale)
+        {
+            if (satisfied)
+            {
+                Interlocked.Increment(ref RelaxedWaitHits);
+            }
+            else
+            {
+                Interlocked.Increment(ref RelaxedWaitFallbacks);
+                value = ReadWaitOperand(address, is64Bit, allowStale: false, out _);
+                _ = WaitOperation.TryCompare(value, reference, mask, compareFunction, out satisfied);
+            }
         }
 
         if (!satisfied && TryReadOwnWrite(address, is64Bit, out var ownValue))
@@ -65,6 +82,7 @@ public sealed partial class GpuCommandInterpreter
             case 0:
                 // Clearing predication reads no memory, so no GPU result can be outstanding.
                 PredicateSkip = false;
+                Interlocked.Increment(ref _predicationClears);
                 break;
             case 3:
             {
@@ -78,9 +96,11 @@ public sealed partial class GpuCommandInterpreter
                     // The results are outstanding while work is queued behind this packet, and
                     // the game asked for the packets to run unpredicated in that case.
                     PredicateSkip = false;
+                    Interlocked.Increment(ref _predicationBoolUnpredicated);
                     break;
                 }
 
+                Interlocked.Increment(ref _predicationBoolWaiting);
                 _host.FlushAndWait();
                 var value = ReadQword(address);
                 PredicateSkip = condition switch
@@ -176,6 +196,7 @@ public sealed partial class GpuCommandInterpreter
 
     private uint WaitRegisterMemoryPacket(in PacketContext packet, ReadOnlySpan<uint> payload, bool is64Bit)
     {
+        Diagnostics.DispatchRunTally.NoteWait();
         var valueDwords = is64Bit ? 2u : 1u;
         var payloadDwords = 4u + (valueDwords * 2u);
         var opcode = is64Bit ? PacketOpcode.WaitRegisterMemory64 : PacketOpcode.WaitRegisterMemory;

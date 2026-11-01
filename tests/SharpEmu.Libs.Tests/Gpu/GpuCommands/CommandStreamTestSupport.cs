@@ -31,6 +31,9 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
 
     public Func<int, bool>? PendingPublications { get; set; }
 
+    public Func<ulong, ulong, bool>? GpuWrittenCommandData { get; set; }
+    public bool HasGpuWrittenCommandData(ulong address, ulong size) => GpuWrittenCommandData?.Invoke(address, size) == true;
+
     public Func<int, EndOfPipeWrite, bool>? DeferredEndOfPipe { get; set; }
     public Func<ulong, ulong, bool>? PendingMemoryPublication { get; set; }
     public bool TryDeferEndOfPipe(int queueId, in EndOfPipeWrite write) => DeferredEndOfPipe?.Invoke(queueId, write) == true;
@@ -94,6 +97,8 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
 
     public int PendingCommandRuns { get; private set; }
 
+    public PendingCommandSignal CommandSignal { get; set; } = PendingCommandSignal.AlwaysRaised;
+
     public bool FlipSlot { get; set; } = true;
 
     public bool FlipDone { get; set; } = true;
@@ -104,6 +109,19 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
 
     // Qword values the GPU owns; the synchronized read lands them in memory first, as a download would.
     public Dictionary<ulong, ulong> PendingGpuValues { get; } = new();
+
+    // Addresses read through the operand reader, which a host runs behind the work before the packet.
+    public List<ulong> OperandReads { get; } = new();
+
+    // The work before the packet, completed by an operand read (a GPU pass that writes a buffer).
+    public Action<ulong>? BeforeOperandRead { get; set; }
+
+    public bool TryReadGuestOperand(ulong address, Span<byte> destination)
+    {
+        OperandReads.Add(address);
+        BeforeOperandRead?.Invoke(address);
+        return TryReadGuest(address, destination);
+    }
 
     public bool TryReadGuest(ulong address, Span<byte> destination)
     {

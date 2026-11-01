@@ -114,7 +114,8 @@ public sealed unsafe partial class GuestImageCache
 
         // The layout covers the whole guest chain; the levels before FirstLevel are dropped below.
         var guestLevels = info.FirstLevel + info.Resources.Levels;
-        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
+        var rowPitch = direction == TransferDirection.Upload && role == ImageRole.Texture ? info.Pitch : 0u;
+        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner, rowPitch);
         plan.Regions = plan.Layout.BuildCopies();
         if (info.IsDepth)
         {
@@ -146,6 +147,9 @@ public sealed unsafe partial class GuestImageCache
             KeepResidentLevels(plan, info.FirstLevel);
         }
 
+        // Guest levels past the host mip chain (CachedImage.MipChainLevels) have no host level to move:
+        // an upload leaves them out, a download leaves their guest bytes as they are.
+        DropLevelsWithoutHostLevel(plan, image.Backing.MipLevels);
         if (plan.Tiled)
         {
             plan.LinearSize = LinearSizeOf(plan.Tiles);
@@ -184,6 +188,36 @@ public sealed unsafe partial class GuestImageCache
         {
             plan.Tiles.RemoveRange(kept, plan.Tiles.Count - kept);
         }
+    }
+
+    // The regions run level by level, so the levels to drop are the last ones. A tile starts at the linear
+    // offset of its first region (a volume tile spans several slices of one level).
+    private static void DropLevelsWithoutHostLevel(ColorTransferPlan plan, uint hostLevels)
+    {
+        var kept = plan.Regions.Count;
+        while (kept > 0 && plan.Regions[kept - 1].ImageSubresource.MipLevel >= hostLevels)
+        {
+            kept--;
+        }
+
+        if (kept == plan.Regions.Count)
+        {
+            return;
+        }
+
+        plan.Regions.RemoveRange(kept, plan.Regions.Count - kept);
+        if (!plan.Tiled)
+        {
+            return;
+        }
+
+        var offsets = new HashSet<ulong>(plan.Regions.Count);
+        foreach (var region in plan.Regions)
+        {
+            offsets.Add(region.BufferOffset);
+        }
+
+        plan.Tiles.RemoveAll(tile => !offsets.Contains(tile.LinearOffset));
     }
 
     private static Exception InvalidAttachmentUpload(in ImageDescription info, CachedImage image) =>
@@ -386,7 +420,6 @@ public sealed unsafe partial class GuestImageCache
             try
             {
                 download.Invalidate(offset, plane.Size);
-                using var writebackScope = GpuWritebackEpoch.BeginWrite(plane.Address, plane.Size);
                 if (!backing.TryWriteBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
                 {
                     throw SubmissionScheduler.Fatal($"The stencil plane could not be written to guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
@@ -429,19 +462,18 @@ public sealed unsafe partial class GuestImageCache
             throw SubmissionScheduler.Fatal($"An image upload cannot wait for a pending readback from a completion callback: address=0x{range.Address:X16} size=0x{range.Size:X}.");
         }
 
-        _lock.Exit();
+        _lock.ExitWrite();
         try
         {
             _scheduler.Wait(tick);
             _scheduler.WaitForPriorityOperations(tick);
         }
-        finally { _lock.Enter(); }
+        finally { _lock.EnterWrite(); }
     }
 
-    private void UploadStencilPlane(CachedImage association, GpuBuffer source, ulong sourceOffset)
+    private static ImageDescription StencilPlaneDescription(CachedImage association, CachedImage destination)
     {
-        var destination = _slots[association.DepthOwner];
-        var info = StencilPlaneLayout(destination, association.Description.Data, "upload");
+        var info = StencilPlaneLayout(destination, association.Description.Data, "transfer");
         var fullSliceSize = info.Data.Size / info.Resources.Layers;
         var rowHeight = info.IsTiled ? DepthBlock(info).BlockHeight : 1u;
         var rowBytes = (ulong)info.Pitch * rowHeight;
@@ -457,6 +489,14 @@ public sealed unsafe partial class GuestImageCache
             info.Extent.Height = (uint)fittingHeight;
         }
 
+        return info;
+    }
+
+    private void UploadStencilPlane(CachedImage association, GpuBuffer source, ulong sourceOffset)
+    {
+        var destination = _slots[association.DepthOwner];
+        var info = StencilPlaneDescription(association, destination);
+        var fullSliceSize = info.Data.Size / info.Resources.Layers;
         var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
         var linear = new TilerBufferSpan(source.Handle, sourceOffset, source.Size - sourceOffset);
         if (info.IsTiled)
@@ -466,6 +506,34 @@ public sealed unsafe partial class GuestImageCache
         }
 
         UploadRegions(destination, copies.ToList(), linear);
+    }
+
+    private bool TryDownloadStencilToBuffer(CachedImage association, GpuBuffer buffer)
+    {
+        var depth = _slots.TryGet(association.DepthOwner);
+        if (depth == null || !depth.Backing.Exists || depth.Description.Metadata.StencilCompressed ||
+            depth.Description.Samples != 1 || depth.Backing.Samples != 1 ||
+            !buffer.IsInBounds(association.Description.Data.Address, association.Description.Data.Size))
+            return false;
+
+        var info = StencilPlaneDescription(association, depth);
+        var fullSliceSize = info.Data.Size / info.Resources.Layers;
+        var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
+        var offset = buffer.Offset(info.Data.Address);
+        if (info.IsTiled)
+        {
+            var tiles = DepthTileTransfers(info, DepthBlock(info), fullSliceSize);
+            _tiler.TileImage(depth, copies, buffer.Handle, offset, info.Data.Size, info.Data.Size,
+                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tiles));
+        }
+        else
+        {
+            for (var index = 0; index < copies.Length; index++) copies[index].BufferOffset += offset;
+            depth.DownloadToBuffer(copies, buffer.Handle, offset, info.Data.Size);
+        }
+
+        association.MarkBufferHoldsGpuContents();
+        return true;
     }
 
     private void UploadFromBuffer(CachedImage image, in ImageRequest request, GpuBuffer source, ulong sourceOffset, byte[]? backingBytes = null, uint firstLayer = 0)
@@ -874,8 +942,15 @@ public sealed unsafe partial class GuestImageCache
     };
 
     // Copies image data into the buffer without transferring GPU ownership to the buffer.
+    public bool MayHaveImageBytes(ulong address, ulong size) => _pageOwners.MayHaveOwners(address, size);
+
     public bool TrySynchronizeBufferFromImage(GpuBuffer buffer, ulong address, ulong size)
     {
+        if (!_pageOwners.MayHaveOwners(address, size))
+        {
+            return false;
+        }
+
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDownload);
         using var held = _lock.Hold();
         var matches = new List<ResourceSlotIdentifier>();
@@ -885,11 +960,6 @@ public sealed unsafe partial class GuestImageCache
             if (owner == null || owner.Description.Data.Address != address)
             {
                 continue;
-            }
-
-            if (owner.DepthOwner.IsValid)
-            {
-                owner = _slots.TryGet(owner.DepthOwner);
             }
 
             if (owner != null && CanReadBack(owner))
@@ -915,17 +985,8 @@ public sealed unsafe partial class GuestImageCache
             }
         }
 
-        var synchronized = false;
-        if (selected.IsValid)
-        {
-            var target = selected;
-            if (_slots.TryGet(target) is { DepthOwner.IsValid: true } proxy)
-            {
-                target = proxy.DepthOwner;
-            }
-
-            synchronized = TryDownloadImageToBuffer(_slots[target], buffer);
-        }
+        // A stencil proxy is downloaded by TryDownloadImageToBuffer itself (TryDownloadStencilToBuffer).
+        var synchronized = selected.IsValid && TryDownloadImageToBuffer(_slots[selected], buffer);
 
         // Every other image the view covers is memory the shader can read or partly
         // rewrite: its GPU-only contents move into the buffer before the bind hands
@@ -958,8 +1019,12 @@ public sealed unsafe partial class GuestImageCache
         return synchronized;
     }
 
+    // Copies the levels of an image that fit into the buffer over the image's own range.
     private bool TryDownloadImageToBuffer(CachedImage image, GpuBuffer buffer)
     {
+        if (image.DepthOwner.IsValid)
+            return TryDownloadStencilToBuffer(image, buffer);
+
         ref readonly var info = ref image.Description;
         if (!buffer.IsInBounds(info.Data.Address, 1))
         {
@@ -1027,11 +1092,37 @@ public sealed unsafe partial class GuestImageCache
             }
         }
 
-        // The kept levels must fit the bytes the buffer covers, as in a full readback.
-        if (!plan.Depth && !plan.Color.Tiled &&
-            TextureTransferLayout.CopyFootprint(plan.Color.Regions, plan.Color.Element) > copySize)
+        // A linear array's copy regions follow its slice stride and can end past the mip layout as well: cover
+        // them when the buffer holds them; otherwise keep the guest bytes.
+        if (!plan.Depth && !plan.Color.Tiled)
         {
-            return false;
+            var linearEnd = TextureTransferLayout.CopyFootprint(plan.Color.Regions, plan.Color.Layout.Element);
+            if (linearEnd > copySize)
+            {
+                if (linearEnd > available)
+                {
+                    return false;
+                }
+
+                copySize = linearEnd;
+            }
+        }
+
+        // The mip layout can end before the tile plan does (Silent Hill: a 128x128 slice planned at
+        // the exact end of the mip chain aborted the process). Cover the whole plan when the buffer
+        // holds it; otherwise keep the guest bytes instead of copying a partial image.
+        if (!plan.Depth && plan.Color.Tiled)
+        {
+            var tiledEnd = TiledEndOf(plan.Color.Tiles);
+            if (tiledEnd > copySize)
+            {
+                if (tiledEnd > available)
+                {
+                    return false;
+                }
+
+                copySize = tiledEnd;
+            }
         }
 
         DownloadToBuffer(image, buffer, bufferOffset, copySize, plan);
@@ -1039,7 +1130,19 @@ public sealed unsafe partial class GuestImageCache
         return true;
     }
 
+    private static ulong TiledEndOf(List<TileTransfer> tiles)
+    {
+        var end = 0UL;
+        foreach (var tile in tiles)
+        {
+            end = Math.Max(end, tile.TiledOffset + tile.TiledSize);
+        }
+
+        return end;
+    }
+
     // Publishes a GPU-owned image to guest memory after its tick completes; false when it cannot.
+    // A guest store into the range before then is newer than the readback and keeps its page.
     private bool TryDownloadToGuest(ResourceSlotIdentifier imageIdentifier)
     {
         using var readbackSource = SharpEmu.Libs.Gpu.Scheduling.ReadbackSourceProfile.Begin("ImagePublication");
@@ -1075,7 +1178,7 @@ public sealed unsafe partial class GuestImageCache
             return false;
         }
 
-        _scheduler.ProfileReadback(range.Size, "ImagePublication");
+        var landing = _readbackLandings.Queue(range.Address, download.Mapped.Slice((int)offset, (int)range.Size));
         download.Flush(offset, range.Size);
         DownloadToBuffer(image, download, offset, range.Size, plan);
         var barrier = new BufferMemoryBarrier2
@@ -1090,14 +1193,16 @@ public sealed unsafe partial class GuestImageCache
             Size = range.Size,
         };
         _scheduler.EndRendering();
-        VulkanSynchronization.PipelineBarrier(_device.Vk,new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
+        VulkanSynchronization.PipelineBarrier(_device.Vk,new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null, BarrierSource.Download);
         var backing = _backing;
+        var landingDecided = LandingDecidedForTest;
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             download.Invalidate(offset, range.Size);
-            using var writebackScope = GpuWritebackEpoch.BeginWrite(range.Address, range.Size);
             var published = download.Mapped.Slice((int)offset, (int)range.Size);
-            if (!backing.TryWriteBacking(range.Address, published) &&
+            // A range that lost resident pages since it was queued cannot be compared page by page; its resident pages
+            // take the readback whole, as before the landing.
+            if (!landing.TryLand(backing, published, landingDecided) &&
                 !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
             {
                 throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
@@ -1112,6 +1217,11 @@ public sealed unsafe partial class GuestImageCache
     // Clears the one image that owns exactly this range; false when no single owner or clear value fits.
     public bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("image clear");
+        }
+
         var command = _scheduler.Current;
         if (command.IsInvalid || !IsValidRange(address, size))
         {
@@ -1121,7 +1231,9 @@ public sealed unsafe partial class GuestImageCache
         using var held = _lock.Hold();
         var selected = ResourceSlotIdentifier.Invalid;
         ImageAspectFlags aspect = 0;
-        foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: false))
+        uint firstLayer = 0;
+        uint layerCount = 0;
+        foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: false, includeParked: true))
         {
             var owner = _slots.TryGet(imageIdentifier);
             if (owner == null)
@@ -1131,6 +1243,8 @@ public sealed unsafe partial class GuestImageCache
 
             ImageAspectFlags candidate = 0;
             var candidateId = imageIdentifier;
+            uint candidateFirstLayer = 0;
+            uint candidateLayerCount = 0;
             if (owner.DepthOwner.IsValid && owner.Description.Data.Address == address && owner.Description.Data.Size == size)
             {
                 candidate = ImageAspectFlags.StencilBit;
@@ -1145,6 +1259,10 @@ public sealed unsafe partial class GuestImageCache
             {
                 candidate = owner.Description.IsDepth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit;
             }
+            else if (TryFindClearedLayers(owner, address, size, out candidateFirstLayer, out candidateLayerCount))
+            {
+                candidate = ImageAspectFlags.ColorBit;
+            }
 
             if (candidate == 0)
             {
@@ -1158,6 +1276,8 @@ public sealed unsafe partial class GuestImageCache
 
             selected = candidateId;
             aspect = candidate;
+            firstLayer = candidateFirstLayer;
+            layerCount = candidateLayerCount;
         }
 
         if (!selected.IsValid)
@@ -1182,7 +1302,7 @@ public sealed unsafe partial class GuestImageCache
             return false;
         }
 
-        if (aspect == ImageAspectFlags.ColorBit)
+        if (aspect == ImageAspectFlags.ColorBit && layerCount == 0)
         {
             // The full color clear replaces all texels. Keep the watch without copying old data.
             WatchImage(selected);
@@ -1198,18 +1318,24 @@ public sealed unsafe partial class GuestImageCache
 
         command.EndRendering();
         var native = new CommandBuffer(command.Handle);
-        image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, native);
-        var range = new ImageSubresourceRange(aspect, 0, Vk.RemainingMipLevels, 0, image.Backing.Layers);
+        image.Transition(AccessFlags.TransferWriteBit, null, native);
+        var range = layerCount == 0
+            ? new ImageSubresourceRange(aspect, 0, Vk.RemainingMipLevels, 0, image.Backing.Layers)
+            : new ImageSubresourceRange(aspect, 0, 1, firstLayer, layerCount);
         if (aspect == ImageAspectFlags.ColorBit)
         {
-            _device.Vk.CmdClearColorImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &colorClear, 1, &range);
-            VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.Clear);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _device.Vk.CmdClearColorImage(native, image.Backing.Handle, ImageLayout.General, &colorClear, 1, &range);
+            }
         }
         else
         {
             var clear = new ClearDepthStencilValue(depthClear, stencilClear);
-            _device.Vk.CmdClearDepthStencilImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &range);
-            VulkanCommandProfile.Current?.WriteMarker(native, VulkanCommandProfile.IntervalKind.Clear);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                _device.Vk.CmdClearDepthStencilImage(native, image.Backing.Handle, ImageLayout.General, &clear, 1, &range);
+            }
         }
 
         TakeGpuOwnership(image);
@@ -1218,6 +1344,31 @@ public sealed unsafe partial class GuestImageCache
             TakeStencilOwnership(selected, image);
         }
 
+        return true;
+    }
+
+    private static bool TryFindClearedLayers(CachedImage image, ulong address, ulong size, out uint firstLayer, out uint layerCount)
+    {
+        firstLayer = 0;
+        layerCount = 0;
+        ref readonly var description = ref image.Description;
+        var layers = description.Resources.Layers;
+        if (image.DepthOwner.IsValid || description.IsDepth || description.IsVolume || description.HasMetadata ||
+            description.Resources.Levels != 1 || description.Samples != 1 || layers < 2 || description.Data.Size % layers != 0 ||
+            address < description.Data.Address || size > description.Data.End - address)
+        {
+            return false;
+        }
+
+        var layerSize = description.Data.Size / layers;
+        var offset = address - description.Data.Address;
+        if (offset % layerSize != 0 || size % layerSize != 0 || size == description.Data.Size)
+        {
+            return false;
+        }
+
+        firstLayer = (uint)(offset / layerSize);
+        layerCount = (uint)(size / layerSize);
         return true;
     }
 }

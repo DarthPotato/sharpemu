@@ -8,64 +8,115 @@ namespace SharpEmu.Libs.Tests.Gpu.Buffers;
 
 public sealed class WriteTickMapTests
 {
+    private const ulong Chunk = 4UL * 1024 * 1024;
+
     [Fact]
-    public void ARangeReportsOnlyTheWritesThatReachIt()
+    public void ARangeReportsOnlyTheWritesThatReachItsGranules()
     {
         var map = new WriteTickMap();
-        map.Assign(0x000, 0x100, 5);
-        map.Assign(0x800, 0x100, 9);
+        map.Assign(0x0000, 0x1000, 5);
+        map.Assign(0x8000, 0x1000, 9);
 
-        Assert.Equal(5UL, map.MaxTick(0x000, 0x100));
-        Assert.Equal(9UL, map.MaxTick(0x880, 0x10));
-        Assert.Equal(0UL, map.MaxTick(0x200, 0x400));
-        Assert.Equal(9UL, map.MaxTick(0x000, 0x1000));
+        Assert.Equal(5UL, map.MaxTick(0x0000, 0x1000));
+        Assert.Equal(9UL, map.MaxTick(0x8800, 0x10));
+        Assert.Equal(0UL, map.MaxTick(0x2000, 0x4000));
+        Assert.Equal(9UL, map.MaxTick(0x0000, 0x10000));
     }
 
     [Fact]
-    public void ANewerWriteSplitsTheOlderRange()
+    public void AWriteElsewhereInTheSameGranuleReachesTheWholeGranule()
     {
         var map = new WriteTickMap();
-        map.Assign(0x000, 0x300, 3);
-        map.Assign(0x100, 0x100, 7);
+        map.Assign(0x000, 0x100, 3);
+        map.Assign(0x800, 0x10, 7);
 
-        Assert.Equal(3, map.Count);
-        Assert.Equal(3UL, map.MaxTick(0x000, 0x100));
-        Assert.Equal(7UL, map.MaxTick(0x180, 0x8));
-        Assert.Equal(3UL, map.MaxTick(0x200, 0x100));
+        Assert.Equal(7UL, map.MaxTick(0x000, 0x100));
+        Assert.Equal(0UL, map.MaxTick(0x1000, 0x100));
     }
 
     [Fact]
-    public void AdjacentWritesOfOneTickMerge()
+    public void AWholeChunkWriteCoversItsEarlierPartialWrites()
     {
         var map = new WriteTickMap();
-        map.Assign(0x000, 0x100, 4);
-        map.Assign(0x200, 0x100, 4);
-        map.Assign(0x100, 0x100, 4);
+        map.Assign(0x1000, 0x1000, 4);
+        map.Assign(0, Chunk, 6);
+        Assert.Equal(6UL, map.MaxTick(0x1000, 1));
+        Assert.Equal(6UL, map.MaxTick(0x5000, 1));
 
+        map.Assign(0x3000, 0x1000, 8);
+        Assert.Equal(6UL, map.MaxTick(0x1000, 1));
+        Assert.Equal(8UL, map.MaxTick(0x3000, 1));
+        Assert.Equal(8UL, map.MaxTick(0, Chunk));
         Assert.Equal(1, map.Count);
-        Assert.Equal(4UL, map.MaxTick(0x2FF, 1));
     }
 
     [Fact]
-    public void PrunedWritesReadAsTheFloor()
+    public void AnOlderPartialWriteDoesNotLowerAUniformChunk()
     {
         var map = new WriteTickMap();
-        map.Assign(0x000, 0x100, 2);
-        map.Assign(0x100, 0x100, 6);
+        map.Assign(0, Chunk, 9);
+        map.Assign(0x1000, 0x1000, 4);
+
+        Assert.Equal(9UL, map.MaxTick(0x1000, 1));
+        Assert.Equal(9UL, map.MaxTick(0x2000, 1));
+    }
+
+    [Fact]
+    public void AnOlderPartialWriteKeepsTheNewerGranules()
+    {
+        var map = new WriteTickMap();
+        map.Assign(0x1000, 0x2000, 9);
+        map.Assign(0x0000, 0x4000, 4);
+
+        Assert.Equal(4UL, map.MaxTick(0x0000, 1));
+        Assert.Equal(9UL, map.MaxTick(0x1000, 1));
+        Assert.Equal(9UL, map.MaxTick(0x2000, 1));
+        Assert.Equal(4UL, map.MaxTick(0x3000, 1));
+    }
+
+    [Fact]
+    public void ReadsAndWritesCrossChunkBoundaries()
+    {
+        var map = new WriteTickMap();
+        map.Assign(Chunk - 0x1000, 0x2000, 5);
+        Assert.Equal(5UL, map.MaxTick(Chunk + 0x800, 1));
+        Assert.Equal(5UL, map.MaxTick(Chunk - 0x10, 0x20));
+        Assert.Equal(0UL, map.MaxTick(0, Chunk - 0x1000));
+        Assert.Equal(2, map.Count);
+
+        map.Assign(2 * Chunk + 0x10000, 0x1000, 9);
+        Assert.Equal(9UL, map.MaxTick(0, 4 * Chunk));
+        Assert.Equal(5UL, map.MaxTick(0, 2 * Chunk));
+        Assert.Equal(0UL, map.MaxTick(8 * Chunk, Chunk));
+        Assert.Equal(3, map.Count);
+
+        map.Assign(0, 3 * Chunk, 11);
+        Assert.Equal(11UL, map.MaxTick(2 * Chunk + 0x10000, 1));
+        Assert.Equal(11UL, map.MaxTick(Chunk + Chunk / 2, 1));
+    }
+
+    [Fact]
+    public void PrunedChunksReadAsTheFloor()
+    {
+        var map = new WriteTickMap();
+        map.Assign(0x0000, 0x1000, 2);
+        map.Assign(Chunk, 0x1000, 6);
         map.Prune(5);
 
         Assert.Equal(1, map.Count);
         Assert.Equal(2UL, map.Floor);
-        Assert.Equal(2UL, map.MaxTick(0x400, 0x100));
-        Assert.Equal(6UL, map.MaxTick(0x100, 0x100));
+        Assert.Equal(2UL, map.MaxTick(0x0000, 0x1000));
+        Assert.Equal(2UL, map.MaxTick(Chunk + 0x4000, 0x100));
+        Assert.Equal(6UL, map.MaxTick(Chunk, 0x1000));
+        Assert.Equal(2UL, map.MaxTick(16 * Chunk, 0x100));
     }
 
     // Random overlapping writes against a per-byte model: every range query must see the latest
     // tick of every byte it covers, whatever splits and merges the assignments caused.
     [Fact]
-    public void RandomWritesMatchAPerByteModel()
+    public void RandomWritesMatchAMonotonicGranuleModel()
     {
-        const int Bytes = 512;
+        const int Bytes = 32 * 4096;
         var random = new System.Random(5);
         for (var trial = 0; trial < 50; trial++)
         {
@@ -78,7 +129,9 @@ public sealed class WriteTickMapTests
                 // Ticks repeat sometimes, so neighbours with equal ticks merge.
                 var tick = (ulong)(step / (1 + random.Next(3)));
                 map.Assign((ulong)begin, (ulong)size, tick);
-                Array.Fill(model, tick, begin, size);
+                // Upstream records a conservative maximum per 4 KiB granule.
+                for (var at = begin & ~4095; at < Math.Min(Bytes, (begin + size + 4095) & ~4095); at++)
+                    model[at] = Math.Max(model[at], tick);
 
                 var queryBegin = random.Next(Bytes);
                 var querySize = 1 + random.Next(Bytes - queryBegin);

@@ -146,11 +146,6 @@ internal static class FrameTimeline
         FrameTimelineAccumulator.Metric? metric = phase switch
         {
             RenderPhaseProfile.Phase.GpuCompletionWait or RenderPhaseProfile.Phase.FrameSlotWait => FrameTimelineAccumulator.Metric.GpuWait,
-            RenderPhaseProfile.Phase.ProgramPrefetchWait or RenderPhaseProfile.Phase.ProgramPrefetchOrderWait or
-            RenderPhaseProfile.Phase.ProgramPrefetchDrainWait or RenderPhaseProfile.Phase.ProgramPrefetchPauseWait => FrameTimelineAccumulator.Metric.Prefetch,
-            RenderPhaseProfile.Phase.GraphicsResolveLockWait or RenderPhaseProfile.Phase.ComputeResolveLockWait or
-            RenderPhaseProfile.Phase.ProgramSharedGateWait or RenderPhaseProfile.Phase.PipelineSharedGateWait or
-            RenderPhaseProfile.Phase.ComputePipelineWait => FrameTimelineAccumulator.Metric.OtherWait,
             _ => null,
         };
         return metric is { } value ? new(value) : default;

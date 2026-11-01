@@ -37,6 +37,7 @@ internal static class GameLibraryCache
         public long SizeBytes { get; set; }
         public string? CoverPath { get; set; }
         public string? BackgroundPath { get; set; }
+        public bool CompatibilityMode { get; set; }
     }
 
     internal sealed class CacheDocument
@@ -88,7 +89,8 @@ internal static class GameLibraryCache
                     cached.Path,
                     cached.SizeBytes,
                     Existing(cached.CoverPath),
-                    Existing(cached.BackgroundPath)));
+                    Existing(cached.BackgroundPath),
+                    cached.CompatibilityMode));
             }
         }
         catch (Exception exception)
@@ -128,6 +130,7 @@ internal static class GameLibraryCache
                     SizeBytes = game.SizeBytes,
                     CoverPath = game.CoverPath,
                     BackgroundPath = game.BackgroundPath,
+                    CompatibilityMode = game.CompatibilityMode,
                 });
             }
 

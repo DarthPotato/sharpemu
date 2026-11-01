@@ -119,7 +119,7 @@ public readonly record struct Gen5ColorComponentMapping
     }
 }
 
-// SPI_SHADER_COL_FORMAT selects the representation carried by a compressed EXP.
+// SPI_SHADER_COL_FORMAT: what a compressed EXP of a color target carries in each half of a register.
 public enum Gen5PixelExportFormat : byte
 {
     Float16 = 4,
@@ -284,6 +284,7 @@ public sealed record Gen5BufferMemoryControl(
 {
     // Memory components a formatted access transfers. Packed D16 pairs two of them per
     // register, so it differs from DwordCount; every other access has one per register.
+    public bool SplitDescriptorFormat { get; init; }
     public uint ComponentCount => FormatComponentCount == 0 ? DwordCount : FormatComponentCount;
 }
 
@@ -379,10 +380,13 @@ public sealed record Gen5ShaderProgram(
     ulong Address,
     IReadOnlyList<Gen5ShaderInstruction> Instructions)
 {
+    public uint VertexIndexRegister { get; init; } = 5;
+    public IReadOnlyList<uint> InstanceIndexRegisters { get; init; } = [8];
     public IReadOnlySet<uint> FunctionBufferAccesses { get; init; } = new HashSet<uint>();
     public bool IsFusedProgram { get; init; }
     // First pc of the continuation half of a fused program (the HS of a merged LS/HS).
     public uint? FusedContinuationPc { get; init; }
+    public Gen5TessellationRegisters TessellationRegisters { get; init; } = Gen5TessellationRegisters.Merged;
 
     private const uint PixelColorTargetCount = 8;
     private const int PixelColorMaskBits = 4;

@@ -56,17 +56,89 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         Slabs = new GpuMemorySlabs(this);
         Images.GuestPixelFormats.UseNativeNarrowSrgb(
             SupportsRenderTarget(Format.R8Srgb) && SupportsRenderTarget(Format.R8G8Srgb));
+        MappedDeviceLocalBudget = PlanMappedDeviceLocalBudget();
     }
 
-    // Colour attachments that blend, sample with filtering and copy both ways: what a guest
-    // render target that is later sampled and uploaded or read back needs.
     private bool SupportsRenderTarget(Format format)
     {
-        const FormatFeatureFlags Required =
-            FormatFeatureFlags.ColorAttachmentBit | FormatFeatureFlags.ColorAttachmentBlendBit |
+        const FormatFeatureFlags required = FormatFeatureFlags.ColorAttachmentBit | FormatFeatureFlags.ColorAttachmentBlendBit |
             FormatFeatureFlags.SampledImageBit | FormatFeatureFlags.SampledImageFilterLinearBit |
             FormatFeatureFlags.TransferSrcBit | FormatFeatureFlags.TransferDstBit;
-        return (GetFormatProperties(format).OptimalTilingFeatures & Required) == Required;
+        return (GetFormatProperties(format).OptimalTilingFeatures & required) == required;
+    }
+
+    private const ulong MiB = 1024 * 1024;
+    private const ulong ResizableBarHeapBytes = 2048 * MiB;
+    private const ulong MaxMappedDeviceLocalBudget = 1024 * MiB;
+    private const ulong SmallBarReserve = 32 * MiB;
+    private static readonly SharpEmu.Logging.SharpEmuLogger Log = SharpEmu.Logging.SharpEmuLog.For("GPU");
+    private static int _loggedMappedDeviceLocalBudget;
+
+    public ulong MappedDeviceLocalBudget { get; }
+
+    public bool ResizableBar { get; private set; }
+
+    public uint MemoryHeapCount => _memoryProperties.MemoryHeapCount;
+
+    public uint GetMemoryHeapIndex(uint memoryType)
+    {
+        fixed (PhysicalDeviceMemoryProperties* properties = &_memoryProperties)
+        {
+            return (&properties->MemoryTypes.Element0)[memoryType].HeapIndex;
+        }
+    }
+
+    public ulong GetMemoryHeapSize(uint heap)
+    {
+        fixed (PhysicalDeviceMemoryProperties* properties = &_memoryProperties)
+        {
+            return (&properties->MemoryHeaps.Element0)[heap].Size;
+        }
+    }
+
+    public bool IsDeviceLocalHeap(uint heap)
+    {
+        fixed (PhysicalDeviceMemoryProperties* properties = &_memoryProperties)
+        {
+            return ((&properties->MemoryHeaps.Element0)[heap].Flags & MemoryHeapFlags.DeviceLocalBit) != 0;
+        }
+    }
+
+    private ulong PlanMappedDeviceLocalBudget()
+    {
+        var mappedTypes = GpuBuffer.RankMemoryTypes(this, uint.MaxValue, GpuBufferUsage.MappedDeviceLocal).ToArray();
+        var largestDeviceLocalHeap = 0UL;
+        for (uint heap = 0; heap < MemoryHeapCount; heap++)
+        {
+            if (IsDeviceLocalHeap(heap))
+            {
+                largestDeviceLocalHeap = Math.Max(largestDeviceLocalHeap, GetMemoryHeapSize(heap));
+            }
+        }
+
+        if (mappedTypes.Length == 0)
+        {
+            NoteMappedDeviceLocalBudget(FormattableString.Invariant($"Mapped device-local buffers are unavailable: no memory type is both device-local and host-visible (largest device-local heap {largestDeviceLocalHeap / MiB} MiB)"));
+            return 0;
+        }
+
+        var memoryType = mappedTypes[0];
+        var mappedHeap = GetMemoryHeapIndex(memoryType);
+        var heapSize = GetMemoryHeapSize(mappedHeap);
+        ResizableBar = heapSize >= largestDeviceLocalHeap / 2 || heapSize >= ResizableBarHeapBytes;
+        var budget = ResizableBar
+            ? Math.Min(heapSize / 4, MaxMappedDeviceLocalBudget)
+            : heapSize / 4 > SmallBarReserve ? heapSize / 4 - SmallBarReserve : 0;
+        NoteMappedDeviceLocalBudget(FormattableString.Invariant($"Mapped device-local buffers use memory type {memoryType} ({GetMemoryTypeFlags(memoryType)}) on heap {mappedHeap} of {heapSize / MiB} MiB (largest device-local heap {largestDeviceLocalHeap / MiB} MiB, resizable BAR {ResizableBar}): budget {budget / MiB} MiB"));
+        return budget;
+    }
+
+    private static void NoteMappedDeviceLocalBudget(string message)
+    {
+        if (Interlocked.Exchange(ref _loggedMappedDeviceLocalBudget, 1) == 0)
+        {
+            Log.Info(message);
+        }
     }
 
     // Shared chunks the small buffers are carved from; freed at device teardown.
@@ -171,6 +243,10 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         return (totalBudget, totalUsage, totalAvailable);
     }
 
+    public (ulong Budget, ulong Usage, ulong Available) ReadDeviceLocalMemory() =>
+        HasMemoryBudget ? QueryDeviceLocalMemory(DeviceLocalHeaps())
+            : (DeviceLocalBudgetBytes, DeviceLocalUsageBytes, DeviceLocalAvailableBytes);
+
     internal static ulong CalculateAvailableBytes(ulong budget, ulong usage) =>
         budget > usage ? budget - usage : 0;
 
@@ -226,6 +302,7 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
             }
             else
             {
+                if (VramTrace) TraceAllocation(memory, info.AllocationSize, info.MemoryTypeIndex);
                 var live = Interlocked.Increment(ref _liveAllocations);
                 int peak;
                 while ((peak = Volatile.Read(ref _peakAllocations)) < live &&
@@ -246,6 +323,36 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         }
 
         Vk.FreeMemory(Device, memory, null);
+        if (VramTrace) _traced.TryRemove(memory.Handle, out _);
         Interlocked.Decrement(ref _liveAllocations);
+    }
+
+    // SHARPEMU_VRAM_TRACE=1: live device memory grouped by the code that allocated it.
+    internal static readonly bool VramTrace = Environment.GetEnvironmentVariable("SHARPEMU_VRAM_TRACE") == "1";
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, (ulong Size, uint Type, string Site)> _traced = new();
+
+    private void TraceAllocation(DeviceMemory memory, ulong size, uint type)
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var parts = new List<string>(3);
+        foreach (var frame in frames)
+        {
+            var method = frame.GetMethod();
+            var owner = method?.DeclaringType?.Name ?? "?";
+            if (owner is "GpuDeviceInfo" or "OptimalImageMemoryPool" or "GpuMemorySlabs" || owner.StartsWith('<')) continue;
+            parts.Add(owner + "." + method!.Name);
+            if (parts.Count == 3) break;
+        }
+        _traced[memory.Handle] = (size, type, string.Join("<", parts));
+    }
+
+    internal string DescribeTracedMemory()
+    {
+        var values = _traced.Values.ToArray();
+        var groups = values.GroupBy(entry => (entry.Site, entry.Type))
+            .Select(group => (group.Key.Site, group.Key.Type, Bytes: group.Sum(entry => (long)entry.Size), Count: group.Count()))
+            .OrderByDescending(group => group.Bytes).Take(12);
+        var total = values.Sum(entry => (long)entry.Size);
+        return $"total_mb={total >> 20} " + string.Join(" | ", groups.Select(group => $"{group.Bytes >> 20}MB/{group.Count} t{group.Type} {group.Site}"));
     }
 }

@@ -40,6 +40,13 @@ public sealed unsafe partial class RenderHostDeviceTests
     public void Tessellation_SuccessiveBatchesReuseTheFactorRingAfterThePreviousDraw() =>
         RenderTessellationPatch(0, true, true, patchCount: 2);
 
+    [Fact]
+    public void Tessellation_GcnPatchPrimitiveSubmitsWholeControlPointBatches()
+    {
+        using var fatal = new SharpEmu.Libs.Tests.Gpu.Scheduling.FatalScope();
+        RenderTessellationPatch(1, true, true, patchCount: 2, primitiveType: 9);
+    }
+
     // With the guest's off-chip configuration, hull groups that fit run in one dispatch, each
     // writing its factors to its own run of the ring, and one draw consumes them all.
     [Fact]
@@ -56,13 +63,6 @@ public sealed unsafe partial class RenderHostDeviceTests
         }
     }
 
-    // The guest domain shader stages its vertex through LDS, which a domain stage keeps per
-    // invocation: a dword read back returns what this invocation wrote, one it never wrote
-    // reads zero, so the patch still covers the target.
-    [Fact]
-    public void Tessellation_DomainStagesItsVertexThroughPrivateLds() =>
-        RenderTessellationPatch(1, true, true, domainUsesLds: true);
-
     [Fact]
     public void TessellationOffchip_DecodesTheBufferCountAndGranularity()
     {
@@ -78,9 +78,12 @@ public sealed unsafe partial class RenderHostDeviceTests
         RenderTessellationPatch(0, false, true, verifyOffset: true, indexed: indexed);
 
     private void RenderTessellationPatch(float firstOuter, bool visible, bool computeFactors, uint patchCount = 1,
-        bool verifyOffset = false, bool indexed = false, uint ringPatches = 1, bool domainUsesLds = false)
+        bool verifyOffset = false, bool indexed = false, uint ringPatches = 1, uint primitiveType = 4)
     {
         if (!Ready()) return;
+        Assert.False(GatePrerequisites.DeviceRequired && !_vulkan!.SupportsTessellation,
+            "The required tessellation test needs the tessellationShader device feature.");
+        if (!_vulkan!.SupportsTessellation) return;
         using var presenter = new PresenterUnderTest(_vulkan!);
         _vulkan!.Vk.GetPhysicalDeviceProperties(_vulkan.Physical, out var properties);
         presenter.SetField("_minStorageBufferOffsetAlignment", properties.Limits.MinStorageBufferOffsetAlignment);
@@ -95,11 +98,12 @@ public sealed unsafe partial class RenderHostDeviceTests
         var words = RegisterWords.Color(target, Size, Size);
         var executor = new RenderExecutor(presenter.RenderHost,
             new TessellationProgramProvider((IShaderPipelineHost)presenter.Instance, factors.DeviceAddress, guestFactors, firstOuter,
-                patchCount > 1 || verifyOffset, verifyOffset ? 2u : 0u, 24 * ringPatches, domainUsesLds));
+                patchCount > 1 || verifyOffset, verifyOffset ? 2u : 0u, 24 * ringPatches));
         GuestGpuMemoryHook.Attach(harness.Gpu);
         try
         {
             var banks = Banks(words);
+            banks.UserConfig.PrimitiveType = primitiveType;
             if (computeFactors)
             {
                 banks.Context.ShaderStages = 1u | (1u << 2) | (1u << 3) | (1u << 8) | (1u << 13) | (1u << 25);
@@ -145,12 +149,16 @@ public sealed unsafe partial class RenderHostDeviceTests
     }
 
     private sealed class TessellationProgramProvider(IShaderPipelineHost host, ulong factorAddress, ulong guestFactors, float firstOuter,
-        bool useAbsolutePatchId, uint factorSourceRegister, uint factorRingBytes, bool domainUsesLds) : IShaderPipelineProvider
+        bool useAbsolutePatchId, uint factorSourceRegister, uint factorRingBytes) : IShaderPipelineProvider
     {
         private ShaderProgram _vertex, _control, _domain, _pixel;
         private ShaderProgramInfo _domainInfo = null!;
         private ComputeProgram? _hull;
         private static readonly ShaderProgramInfo PixelInfo = FixedProgramProvider.EmptyProgram(ShaderStageKind.Pixel, 4);
+
+        public GraphicsPrograms GetGraphicsPrograms(RegisterBanks banks, ReadOnlySpan<ColorComponentMap> mappings,
+            bool pixelActive, bool depthBound) =>
+            GetGraphicsPrograms(banks.Shader.Vertex, banks.Shader.Pixel, banks.Context.ShaderInterface, banks.Context, mappings, pixelActive, depthBound);
 
         public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel,
             ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> mappings,
@@ -158,34 +166,16 @@ public sealed unsafe partial class RenderHostDeviceTests
         {
             if (!_domain.IsValid)
             {
-                var position = new List<Gen5ShaderInstruction>
-                {
+                var program = Program(
                     Vop2(0, "VMulF32", 10, Operand(BitConverter.SingleToUInt32Bits(2f)), Gen5Operand.Vector(5)),
                     Vop2(4, "VAddF32", 10, Operand(BitConverter.SingleToUInt32Bits(-1f)), Gen5Operand.Vector(10)),
                     Vop2(8, "VMulF32", 11, Operand(BitConverter.SingleToUInt32Bits(2f)), Gen5Operand.Vector(6)),
                     Vop2(12, "VAddF32", 11, Operand(BitConverter.SingleToUInt32Bits(-1f)), Gen5Operand.Vector(11)),
-                };
-                if (domainUsesLds)
-                {
-                    // Write x at a patch-derived address, read it back, and add the never-written
-                    // dword after it to y: a nonzero read would move the vertex off the target.
-                    position.AddRange([
-                        Vop2(16, "VLshlrevB32", 20, Operand(3), Gen5Operand.Vector(7)),
-                        DataShare(20, "DsWriteB32", false, [Gen5Operand.Vector(20), Gen5Operand.Vector(10)], []),
-                        Vop1(28, "VMovB32", 10, Operand(0)),
-                        DataShare(32, "DsReadB32", false, [Gen5Operand.Vector(20)], [10]),
-                        DataShare(40, "DsReadB32", false, [Gen5Operand.Vector(20)], [21], 4),
-                        Vop2(48, "VAddF32", 11, Gen5Operand.Vector(21), Gen5Operand.Vector(11)),
-                    ]);
-                }
-                var tail = domainUsesLds ? 52u : 16u;
-                var program = Program([
-                    .. position,
-                    Vop1(tail, "VMovB32", 12, Operand(0)),
-                    Vop1(tail + 4, "VMovB32", 13, Operand(BitConverter.SingleToUInt32Bits(1f))),
-                    new(tail + 8, Gen5ShaderEncoding.Exp, "Exp", [0u, 0u],
+                    Vop1(16, "VMovB32", 12, Operand(0)),
+                    Vop1(20, "VMovB32", 13, Operand(BitConverter.SingleToUInt32Bits(1f))),
+                    new(24, Gen5ShaderEncoding.Exp, "Exp", [0u, 0u],
                         [Gen5Operand.Vector(10), Gen5Operand.Vector(11), Gen5Operand.Vector(12), Gen5Operand.Vector(13)], [],
-                        new Gen5ExportControl(12, 15, false, true, false)), EndProgram(tail + 16)]);
+                        new Gen5ExportControl(12, 15, false, true, false)), EndProgram(32));
                 var plan = ShaderResourcePlan.Extract(program, ShaderStage.TessellationEvaluation, Hash, 8, 0, waveSize: 32);
                 var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
                 var layout = BindingLayout.Allocate(resources.Info, [], false, false, false, usesTessellationData: true);

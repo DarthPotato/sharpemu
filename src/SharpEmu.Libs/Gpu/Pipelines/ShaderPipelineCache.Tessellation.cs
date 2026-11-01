@@ -17,7 +17,7 @@ internal sealed partial class ShaderPipelineCache
         // Carry the architectural s0:s1 pair independently of s8 and above.
         // Lowering copies these appended inputs before executing guest code.
         var data = new uint[front.Length + 2];
-        front.CopyTo(data, 0);
+        front.CopyTo(data);
         data[front.Length] = (uint)backAddress;
         data[front.Length + 1] = (uint)(backAddress >> 32);
         return data;
@@ -31,65 +31,51 @@ internal sealed partial class ShaderPipelineCache
         return (stages & ~((1u << 22) | (1u << 23))) == mask;
     }
 
-    // The merged local/hull program of a tessellated draw, read from its registers and guest headers
-    // before any cache is touched. A header it cannot read is kept as Error and raised only when the
-    // hull is resolved, as before: a draw whose other stages are unavailable never reaches it.
-    private sealed record HullSource(ShaderSource? Source, RegisteredShader? Registered, string? Error);
-
-    private HullSource PrepareHullSource(VertexStageRegisters vertex)
+    private TessellationDrawPrograms PrepareTessellationHull(VertexStageRegisters vertex,
+        ShaderInterfaceRegisters shaderInterface, Gen5TessellationInfo tessellation)
     {
-        var outer = SubmissionScheduler.ThrowOnFatal;
-        SubmissionScheduler.ThrowOnFatal = true;
-        try
+        if (_registry.RequireMergedHull(vertex.LocalAddress, vertex.HullAddress, vertex.HullUserScalars.Values) is { } joined)
         {
-            return PrepareHullSourceCore(vertex);
+            var joinedHeader = new ShaderHeaderEntry(joined, ShaderHeaderRegistry.Registrations);
+            var joinedUserData = UserData(vertex.HullUserScalars, vertex.HullResource2.UserScalarCount, false, joined.CodeAddress, "merged-hull").ToArray();
+            var joinedSource = SourceOf(joinedHeader, IdentityOf(joinedHeader, joined.CodeAddress, "merged-hull"),
+                ShaderStage.Compute, joinedUserData, VertexUserDataBase, 0);
+            if (_programs.Decode(joinedSource).FusedContinuationPc is not { } joinedEntry)
+                throw SubmissionScheduler.Fatal("The joined hull program has no hull entry.");
+            return CompileTessellationHull(joinedSource, joined, vertex, shaderInterface, tessellation, joinedEntry);
         }
-        catch (SubmissionScheduler.AbandonedWorkException error)
-        {
-            return new HullSource(null, null, error.Message);
-        }
-        finally
-        {
-            SubmissionScheduler.ThrowOnFatal = outer;
-        }
-    }
-
-    private HullSource PrepareHullSourceCore(VertexStageRegisters vertex)
-    {
         var address = vertex.LocalAddress != 0 ? vertex.LocalAddress : vertex.HullAddress;
-        var registered = _registry.Require(address, "merged-hull");
+        var registered = _registry.Require(address, "merged-hull", vertex.HullUserScalars.Values);
         if (!registered.IsFused)
-            return new HullSource(null, null, "The tessellation path requires a registered merged local/hull program.");
+            throw SubmissionScheduler.Fatal("The tessellation path requires a registered merged local/hull program.");
         var count = vertex.HullResource2.UserScalarCount;
         // A merged front may consume more user data than the back's RSRC2.
         // Reading its own declared count preserves the guest's AGC header.
         if (!Gen5ShaderTranslator.TryGetFusedProgramParts(_context, address, out var frontHeader, out _, out _) ||
             !_context.TryReadUInt64(frontHeader + 0x20, out var shRegisters) ||
             !_context.TryReadUInt32(frontHeader + 0x5C, out var shCount))
-            return new HullSource(null, null, "The merged hull front has an unreadable register header.");
+            throw SubmissionScheduler.Fatal("The merged hull front has an unreadable register header.");
         for (uint index = 0; index < (shCount & 0xFF); index++)
         {
             if (!_context.TryReadUInt32(shRegisters + index * 8, out var offset) ||
                 !_context.TryReadUInt32(shRegisters + index * 8 + 4, out var value))
-                return new HullSource(null, null, "The merged hull front has an unreadable register entry.");
+                throw SubmissionScheduler.Fatal("The merged hull front has an unreadable register entry.");
             if (offset == ShaderRegisterOffset.SpiShaderPgmRsrc2Hs)
                 count = Math.Max(count, HullResource2.Decode(value).UserScalarCount);
         }
-        var source = PrepareSource(address, ShaderStage.Compute, "merged-hull", vertex.HullUserScalars,
-            count, false, VertexUserDataBase);
-        return new HullSource(source with { UserData = MergedHullUserData(vertex.HullUserScalars, count, vertex.HullUserDataAddress) },
-            registered, null);
+        var source = PrepareSource(address, ShaderStage.Compute, "merged-hull",
+            UserData(vertex.HullUserScalars, count, false, address, "merged-hull").ToArray(), VertexUserDataBase, out _);
+        source = source with { UserData = MergedHullUserData(vertex.HullUserScalars, count, vertex.HullUserDataAddress) };
+        var decoded = _programs.Decode(source);
+        if (decoded.FusedContinuationPc is not { } entry)
+            throw SubmissionScheduler.Fatal("The merged hull has an invalid continuation or workgroup configuration.");
+        return CompileTessellationHull(source, registered, vertex, shaderInterface, tessellation, entry + 8);
     }
 
-    private TessellationDrawPrograms PrepareTessellationHull(HullSource hullSource, VertexStageRegisters vertex,
-        ShaderInterfaceRegisters shaderInterface, Gen5TessellationInfo tessellation)
+    private TessellationDrawPrograms CompileTessellationHull(ShaderSource source, RegisteredShader registered,
+        VertexStageRegisters vertex, ShaderInterfaceRegisters shaderInterface, Gen5TessellationInfo tessellation, uint hullEntryPc)
     {
-        if (hullSource.Error is { } hullError) throw SubmissionScheduler.Fatal(hullError);
-        var source = hullSource.Source!;
-        var registered = hullSource.Registered!;
-        var decoded = _graphicsPrograms.Decode(source);
-        if (decoded.FusedContinuationPc is not { } entry ||
-            !Gen5TessellationHullInfo.TryDecode(shaderInterface.LocalHullConfiguration, entry + 8, out var hull, out var error))
+        if (!Gen5TessellationHullInfo.TryDecode(shaderInterface.LocalHullConfiguration, hullEntryPc, out var hull, out _))
             throw SubmissionScheduler.Fatal("The merged hull has an invalid continuation or workgroup configuration.");
         var threads = (hull.PatchesPerGroup * Math.Max(hull.InputControlPoints, hull.OutputControlPoints) + 63) & ~63u;
         var input = new ComputeInputInfo
@@ -99,7 +85,7 @@ internal sealed partial class ShaderPipelineCache
             ScratchDwords = registered.ScratchDwords, NeedsLocalDataShareBarriers = true,
         };
         var cursor = 0u;
-        var handle = _graphicsPrograms.GetOrCompile(source, new StageCompileOptions
+        var handle = _programs.GetOrCompile(source, new StageCompileOptions
             { ComputeInfo = input, TessellationHull = hull }, ref cursor, out var stage);
         input.Stage = stage;
         return new(tessellation, hull, new ComputeProgram { Program = handle, Input = input });

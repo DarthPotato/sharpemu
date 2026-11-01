@@ -10,6 +10,43 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
 public sealed class BindingLayoutTests
 {
+    [Fact]
+    public void TableBlocksAndTessellationKeepTheirShaderDataRangesSeparate()
+    {
+        var info = new ShaderResourceInfo { Buffers = Enumerable.Range(0, 5).Select(_ => new BufferResource { Read = true }).ToList() };
+        var layout = BindingLayout.Allocate(info, [0u], false, false, true,
+            usesDispatchThreadLimits: true, callArgumentCount: 2, callTargetCount: 1,
+            tableBlock: true, usesBufferLengths: true, usesTessellationData: true);
+        Assert.True(layout.UsesTableBlock);
+        Assert.False(layout.UsesBufferLengths);
+        Assert.Equal(0u, layout.MemoryOffsetCount);
+        Assert.Equal(5u, layout.DispatchThreadLimitsDword);
+        Assert.Equal(8u, layout.TessellationDataDword);
+        Assert.Equal(8u + Gen5TessellationData.DwordCount, layout.MipStatisticsDword);
+        Assert.Equal(14u + Gen5TessellationData.DwordCount, layout.ShaderDataDwordCount);
+        BindingLayoutValidator.Validate(layout, info, [0u], false, false, true, Hash, ShaderStage.Compute);
+    }
+
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(30u)]
+    public void ExplicitBufferLengthsHaveTheirOwnShaderDataAndLeaveTheDefaultLayoutUnchanged(uint cursor)
+    {
+        var info = new ShaderResourceInfo { Buffers = Enumerable.Range(0, 5).Select(_ => new BufferResource { Read = true }).ToList() };
+        var plain = BindingLayout.Allocate(info, [0u], false, false, true, cursor, usesDispatchThreadLimits: true);
+        var explicitLengths = BindingLayout.Allocate(info, [0u], false, false, true, cursor,
+            usesDispatchThreadLimits: true, usesBufferLengths: true);
+        Assert.False(plain.UsesBufferLengths);
+        Assert.Equal(8u, plain.ShaderDataDwordCount);
+        Assert.True(explicitLengths.UsesBufferLengths);
+        Assert.Equal(5u, explicitLengths.BufferLengthsDword);
+        Assert.Equal(10u, explicitLengths.DispatchThreadLimitsDword);
+        Assert.Equal(13u, explicitLengths.ShaderDataDwordCount);
+        Assert.Equal(cursor == 0, explicitLengths.UsesPushData);
+        Assert.NotEqual(plain, explicitLengths);
+        BindingLayoutValidator.Validate(explicitLengths, info, [0u], false, false, true, Hash, ShaderStage.Compute);
+    }
+
     [Theory]
     [InlineData(0u)]
     [InlineData(30u)]
@@ -165,18 +202,18 @@ public sealed class BindingLayoutTests
     [Fact]
     public void ImageBindingAbi()
     {
-        Assert.Equal(51u, BindingLayout.ImageBindingCount);
+        Assert.Equal(56u, BindingLayout.ImageBindingCount);
         Assert.Equal(0u, (uint)DescriptorBindingKind.Buffers);
-        Assert.Equal(52u, (uint)DescriptorBindingKind.Samplers);
-        Assert.Equal(53u, (uint)DescriptorBindingKind.GlobalDataShare);
-        Assert.Equal(54u, (uint)DescriptorBindingKind.DeviceAddressPageTable);
-        Assert.Equal(55u, (uint)DescriptorBindingKind.FaultBuffer);
-        Assert.Equal(56u, (uint)DescriptorBindingKind.FlattenedResourceTable);
-        Assert.Equal(57u, (uint)DescriptorBindingKind.ShaderData);
-        Assert.Equal(58u, (uint)DescriptorBindingKind.MipStatistics);
-        Assert.Equal(59u, (uint)DescriptorBindingKind.RuntimeDescriptorTable);
-        Assert.Equal(60u, (uint)DescriptorBindingKind.RuntimeDescriptorMisses);
-        Assert.Equal(61u, (uint)DescriptorBindingKind.Count);
+        Assert.Equal(57u, (uint)DescriptorBindingKind.Samplers);
+        Assert.Equal(58u, (uint)DescriptorBindingKind.GlobalDataShare);
+        Assert.Equal(59u, (uint)DescriptorBindingKind.DeviceAddressPageTable);
+        Assert.Equal(60u, (uint)DescriptorBindingKind.FaultBuffer);
+        Assert.Equal(61u, (uint)DescriptorBindingKind.FlattenedResourceTable);
+        Assert.Equal(62u, (uint)DescriptorBindingKind.ShaderData);
+        Assert.Equal(63u, (uint)DescriptorBindingKind.MipStatistics);
+        Assert.Equal(64u, (uint)DescriptorBindingKind.RuntimeDescriptorTable);
+        Assert.Equal(65u, (uint)DescriptorBindingKind.RuntimeDescriptorMisses);
+        Assert.Equal(66u, (uint)DescriptorBindingKind.Count);
 
         ImageDimension[] sampledDimensions =
         [
@@ -231,6 +268,11 @@ public sealed class BindingLayoutTests
         CheckBinding(ImageResourceClass.Sampled, ImageNumericClass.Float, ImageDimension.Dim2D, false, depthCompare: true);
         CheckBinding(ImageResourceClass.Sampled, ImageNumericClass.Float, ImageDimension.Dim2DArray, false, depthCompare: true);
         CheckBinding(ImageResourceClass.Sampled, ImageNumericClass.Float, ImageDimension.Dim2D, false, cube: true, depthCompare: true);
+        // An atomic on 64-bit texels declares its images with another format, so it has arrays of its own.
+        foreach (var dimension in storageDimensions)
+        {
+            CheckBinding(ImageResourceClass.Storage, ImageNumericClass.Uint64, dimension, true);
+        }
 
         // Signed-integer storage images follow the depth-reference arrays.
         foreach (var dimension in storageDimensions)
@@ -241,6 +283,14 @@ public sealed class BindingLayoutTests
         CheckBinding(ImageResourceClass.Storage, ImageNumericClass.Sint, ImageDimension.Dim2D, false, cube: true);
 
         Assert.Equal(BindingLayout.ImageBindingCount, index);
+        foreach (var dimension in storageDimensions)
+        {
+            var kind = ImageDescriptorBinding.ForImage(new ImageResource
+            {
+                ResourceClass = ImageResourceClass.Storage, NumericClass = ImageNumericClass.Uint64, Dimension = dimension, Atomic = true,
+            })!.Value;
+            Assert.Equal((ImageResourceClass.Storage, ImageNumericClass.Uint64, dimension, true), ImageDescriptorBinding.Describe(kind));
+        }
 
         static bool Invalid(ImageResource image) => ImageDescriptorBinding.ForImage(image) is null;
         var invalid = new ImageResource();

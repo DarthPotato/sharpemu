@@ -41,7 +41,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 InitialLayout = ImageLayout.Undefined,
             };
             Check(
-                _vk.CreateImage(_device, &imageInfo, null, out _presentationImages[index]),
+                CreateImageWithRecovery(imageInfo, out _presentationImages[index]),
                 "vkCreateImage(HDR presentation source)");
             _vk.GetImageMemoryRequirements(
                 _device,
@@ -56,7 +56,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     MemoryPropertyFlags.DeviceLocalBit),
             };
             Check(
-                _deviceInfo.AllocateMemory(allocationInfo, out _presentationImageMemory[index]),
+                AllocateMemoryWithRecovery(allocationInfo, out _presentationImageMemory[index]),
                 "vkAllocateMemory(HDR presentation source)");
             Check(
                 _vk.BindImageMemory(

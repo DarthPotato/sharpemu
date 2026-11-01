@@ -24,6 +24,13 @@ public interface IGuestImageCache
 
     void InvalidateMemoryFromGpu(ulong address, ulong size);
 
+    void PublishImagesUnderRead(ulong address, ulong size) { }
+    void PublishImagesUnderRawWrite(ulong address, ulong size) { }
+    void PublishImagesUnderFormattedWrite(ulong address, ulong size) { }
+
+    bool TryDetileMemory(ulong tiledAddress, ulong tiledSize, ulong linearAddress, ulong linearSize,
+        ReadOnlySpan<SharpEmu.Libs.Gpu.Images.TileTransfer> transfers) => false;
+
     // A possible shader write through a raw buffer: only images that copy memory become stale.
     void InvalidateMemoryCopiesFromGpu(ulong address, ulong size) { }
 
@@ -31,4 +38,7 @@ public interface IGuestImageCache
 
     // Frees every image that can go and waits for retired ones, after an allocation failed.
     void ReclaimForAllocation();
+    bool MayHaveImageBytes(ulong address, ulong size);
+
+    bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear);
 }

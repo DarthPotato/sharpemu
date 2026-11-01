@@ -39,12 +39,14 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         StorageImageExtendedFormats = features.ShaderStorageImageExtendedFormats;
         ShaderInt64 = features.ShaderInt64;
         SupportsClipDistance = features.ShaderClipDistance;
+        SupportsTessellation = features.TessellationShader;
         SupportsDynamicRendering = dynamicRendering;
     }
 
     // Dynamic rendering support required by the presenter's render host.
     public bool SupportsDynamicRendering { get; }
     public bool SupportsClipDistance { get; }
+    public bool SupportsTessellation { get; }
     public bool SupportsFragmentShaderBarycentric { get; private init; }
     public bool SupportsTessellationShader { get; private init; }
     public bool SupportsFillRectangle { get; private init; }
@@ -63,6 +65,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             return subgroup.SubgroupSize;
         }
     }
+    public bool SupportsImageInt64Atomics { get; private init; }
 
     // The device was created with the descriptor indexing and null descriptor features the runtime
     // descriptor heap needs (see RuntimeDescriptorHeap).
@@ -92,7 +95,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         "VK_KHR_push_descriptor",
     ];
 
-    // The push descriptor limit the render host may use on this device (none on MoltenVK).
+    // The push descriptor limit the render host may use on this device.
     public uint MaxPushDescriptors
     {
         get
@@ -100,7 +103,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             var pushDescriptors = new PhysicalDevicePushDescriptorPropertiesKHR { SType = StructureType.PhysicalDevicePushDescriptorPropertiesKhr };
             var properties = new PhysicalDeviceProperties2 { SType = StructureType.PhysicalDeviceProperties2, PNext = &pushDescriptors };
             Vk.GetPhysicalDeviceProperties2(Physical, &properties);
-            return SharpEmu.Libs.Gpu.Vulkan.VulkanPushDescriptorPolicy.UsableCount(Vk, Physical, pushDescriptors.MaxPushDescriptors);
+            return pushDescriptors.MaxPushDescriptors;
         }
     }
 
@@ -372,6 +375,22 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             indexingFeatures.ShaderSampledImageArrayNonUniformIndexing && indexingFeatures.DescriptorBindingSampledImageUpdateAfterBind &&
             indexingFeatures.DescriptorBindingUpdateUnusedWhilePending && indexingFeatures.DescriptorBindingPartiallyBound;
 
+        const string imageAtomicInt64Extension = "VK_EXT_shader_image_atomic_int64";
+        var imageAtomicInt64Features = new PhysicalDeviceShaderImageAtomicInt64FeaturesEXT
+        {
+            SType = StructureType.PhysicalDeviceShaderImageAtomicInt64FeaturesExt,
+        };
+        if (HasDeviceExtensions(vk, physical, [imageAtomicInt64Extension]))
+        {
+            var query = new PhysicalDeviceFeatures2
+            {
+                SType = StructureType.PhysicalDeviceFeatures2,
+                PNext = &imageAtomicInt64Features,
+            };
+            vk.GetPhysicalDeviceFeatures2(physical, &query);
+        }
+        var imageAtomicInt64 = (bool)imageAtomicInt64Features.ShaderImageInt64Atomics;
+
         var vulkan13Features = new PhysicalDeviceVulkan13Features
         {
             SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -410,6 +429,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             sizeControlProperties.MinSubgroupSize <= 32 && sizeControlProperties.MaxSubgroupSize >= 32;
         var enabledFeatures = new PhysicalDeviceFeatures
         {
+            TessellationShader = baseFeatures.TessellationShader,
             GeometryShader = baseFeatures.GeometryShader,
             OcclusionQueryPrecise = baseFeatures.OcclusionQueryPrecise,
             SampleRateShading = baseFeatures.SampleRateShading,
@@ -418,7 +438,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             ShaderInt64 = baseFeatures.ShaderInt64,
             ShaderClipDistance = baseFeatures.ShaderClipDistance,
             ShaderCullDistance = baseFeatures.ShaderCullDistance,
-            TessellationShader = baseFeatures.TessellationShader,
+
             RobustBufferAccess = baseFeatures.RobustBufferAccess,
             VertexPipelineStoresAndAtomics = baseFeatures.VertexPipelineStoresAndAtomics,
         };
@@ -498,6 +518,14 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             timelineFeatures.PNext = &float16Features;
         }
 
+
+        imageAtomicInt64 &= baseFeatures.ShaderInt64;
+        if (imageAtomicInt64)
+        {
+            imageAtomicInt64Features.ShaderImageInt64Atomics = true;
+            imageAtomicInt64Features.PNext = vulkan13Features.PNext;
+            vulkan13Features.PNext = &imageAtomicInt64Features;
+        }
         var extensionNames = new List<string>();
         if (runtimeDescriptors) extensionNames.Add(robustness2Extension);
         if (meshShaders)
@@ -511,6 +539,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             vulkan13Features.PNext = &meshFeatures;
             extensionNames.Add(meshExtension);
         }
+        if (imageAtomicInt64) extensionNames.Add(imageAtomicInt64Extension);
         if (dynamicRendering) extensionNames.AddRange(RenderingExtensionNames);
         if (barycentric) extensionNames.Add(barycentricExtension);
         const string fillRectangleExtension = "VK_NV_fill_rectangle";
@@ -549,6 +578,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SupportsMeshShaders = meshShaders,
             ExactFloat16Conversion = exactFloat16,
             CanRequireComputeSubgroup32 = computeSubgroup32,
+            SupportsImageInt64Atomics = imageAtomicInt64,
         };
         if (validation)
         {
@@ -636,9 +666,11 @@ internal sealed class LoggingTickDevice : IGpuTickDevice
 
     public void BeginBuffer(nint buffer) => _inner.BeginBuffer(buffer);
 
-    public void EndBuffer(nint buffer) => _inner.EndBuffer(buffer);
+    public void EndBuffer(nint buffer, bool hostRead) => _inner.EndBuffer(buffer, hostRead);
 
-    public bool TrySubmit(nint buffer, SubmitBundle bundle, out string failure)
+    public IGpuCommandBufferSource CreateBufferSource() => _inner.CreateBufferSource();
+
+    public bool TrySubmit(ReadOnlySpan<nint> buffers, SubmitBundle bundle, out string failure)
     {
         for (var i = 0; i < bundle.SignalCount; i++)
         {
@@ -648,7 +680,7 @@ internal sealed class LoggingTickDevice : IGpuTickDevice
             }
         }
 
-        return _inner.TrySubmit(buffer, bundle, out failure);
+        return _inner.TrySubmit(buffers, bundle, out failure);
     }
 
     public void Dispose() => _inner.Dispose();

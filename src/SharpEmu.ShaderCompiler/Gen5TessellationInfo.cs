@@ -41,6 +41,27 @@ public readonly record struct Gen5TessellationHullInfo(
     }
 }
 
+public sealed record Gen5TessellationRegisters
+{
+    public static Gen5TessellationRegisters Merged { get; } = new();
+
+    public uint? HullOffchipScalar { get; init; } = 2;
+    public uint? HullWaveCountScalar { get; init; } = 3;
+    public uint HullFactorScalar { get; init; } = 4;
+    public uint HullFactorStoreScalar { get; init; } = 4;
+    public bool HullEntrySetsFactor { get; init; }
+    public uint HullPatchVector { get; init; }
+    public uint HullRelativeIdVector { get; init; } = 1;
+    public uint HullVertexVector { get; init; } = 2;
+    public uint HullLocalVector { get; init; } = 3;
+    public IReadOnlyList<uint> HullInstanceVectors { get; init; } = [5];
+    public uint DomainCoordinateVector { get; init; } = 5;
+    public uint DomainRelativePatchVector { get; init; } = 7;
+    public uint DomainPatchVector { get; init; } = 8;
+    public uint? DomainOffchipScalar { get; init; } = 4;
+    public bool LocalDataRing { get; init; }
+}
+
 // VGT_TF_PARAM describes the fixed-function tessellator, independently of
 // where the guest stores control points and tessellation factors.
 public readonly record struct Gen5TessellationInfo(

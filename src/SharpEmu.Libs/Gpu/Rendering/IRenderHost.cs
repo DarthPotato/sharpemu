@@ -20,7 +20,6 @@ public readonly record struct RenderHostLimits(uint MaxFramebufferWidth, uint Ma
 public readonly record struct ColorAttachmentAcquisition(
     ResourceSlotIdentifier Image,
     ImageView View,
-    ImageLayout Layout,
     uint Samples,
     bool MetadataClear,
     ClearColorValue MetadataClearValue);
@@ -81,9 +80,15 @@ public interface IResourcePreparation : IDisposable
 {
 }
 
+public readonly record struct DrawScopeToken(long Scope, ulong Lookups, long Metadata)
+{
+    public bool IsActive => Scope != 0;
+}
+
 // Everything the executor needs from the renderer, the caches and the pipeline objects.
 public interface IRenderHost
 {
+    bool TryCopyImage(in ImageRequest source, in ImageRequest destination) => false;
     int BeginImageSnapshot(IPreparedBindings? pixelBindings) => 0;
 
     int BeginComputeImageSnapshot(IPreparedBindings bindings) => 0;
@@ -95,9 +100,17 @@ public interface IRenderHost
     // Records a draw's color-target base for the image-clear trace; see docs/image-clear-tracing.md.
     void TraceDrawTarget(string disposition, ulong address, ulong pixelShaderAddress, ulong vertexShaderAddress) { }
 
+    DrawScopeToken DrawScope => default;
+
+    void KeepDepthAttachment(in DepthAttachmentState depth)
+    {
+    }
+
     RenderHostLimits Limits { get; }
 
     bool SupportsNativeRectangles => false;
+
+    bool SupportsTessellation => false;
 
     IImageFormatSupport FormatSupport { get; }
 
@@ -122,20 +135,23 @@ public interface IRenderHost
 
     void ResetBindings();
 
-    // Finds the image again when it changed, makes the view, sets the layout and resolves a metadata clear.
+    // Finds the image again when it changed, makes the view and resolves a metadata clear.
     ColorAttachmentAcquisition AcquireColorAttachment(in ColorTargetState target);
 
-    // Makes the view and consumes the metadata clear state; the layout follows in a second call.
+    // Makes the view and consumes the metadata clear state; the transition follows in a second call.
     DepthAttachmentAcquisition AcquireDepthAttachment(in DepthAttachmentState depth);
 
-    void TransitionDepthAttachment(in DepthAttachmentState depth, ImageLayout layout, ImageAspectFlags writeAspects);
+    void TransitionDepthAttachment(in DepthAttachmentState depth, ImageAspectFlags writeAspects);
 
     BufferBinding NullBuffer { get; }
 
     // Finishes the buffer allocation merges these ranges can trigger, before any of them is obtained.
-    void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges);
+
 
     BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten);
+
+    void PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges) =>
+        throw new NotSupportedException("The render host does not support tessellation buffer preparation.");
 
     // The device address of a guest range's cached buffer, for shaders that read it through a physical pointer.
     ulong ObtainBufferDeviceAddress(ulong address, ulong size, bool isWritten) =>
@@ -179,8 +195,7 @@ public interface IRenderHost
 
     void EndRendering();
 
-    // Whether a texture bound for the draw being prepared reads the depth attachment's subresources.
-    bool SamplesDepthAttachment(in DepthAttachmentState depth) => true;
+    void EndRendering(Vulkan.ScopeBreak reason) => EndRendering();
 
     // The next draw stores to buffers or storage images; called before its BeginRendering.
     void PrepareMemoryWritingDraw() { }
@@ -200,7 +215,6 @@ public interface IRenderHost
     void DrawIndexedIndirect(BufferBinding arguments) =>
         throw new NotSupportedException("The render host does not draw from indirect arguments.");
 
-    // One draw whose counts the GPU reads from the buffer (VkDrawIndirectCommand layout).
     void DrawIndirect(BufferBinding arguments) =>
         throw new NotSupportedException("The render host does not draw from indirect arguments.");
 
@@ -213,7 +227,7 @@ public interface IRenderHost
 
     // Executes a dispatch from three uint32 group counts in guest memory when the backend can
     // consume the guest buffer directly. Backends without native indirect dispatch return false.
-    bool TryDispatchIndirect(ulong argumentsAddress);
+    bool TryDispatchIndirect(ulong argumentsAddress, ReadOnlySpan<int> physicalAxisOfLogical);
 
     // Orders the buffer writes of the given shader stages before every later access.
     void ShaderWriteBarrier(PipelineStageFlags sourceStages);
@@ -221,6 +235,28 @@ public interface IRenderHost
     void ShaderWriteHazardBarrier();
 
     void ShaderAccessBarrier();
+
+    // False when the host recorded the barrier at once; true when it waits for the next native
+    // command outside a checked dispatch or the next barrier request.
+    bool TryDeferShaderAccessBarrier()
+    {
+        ShaderAccessBarrier();
+        return false;
+    }
+
+    void BeginCheckedDispatch()
+    {
+    }
+
+    void EndCheckedDispatch()
+    {
+    }
+
+    long DeferredBarrierPromotions => 0;
+
+    void NoteKnownGpuContents(ulong address, ReadOnlySpan<uint> words)
+    {
+    }
 
     // Clears the bound color targets to one colour in place of the draw.
     void ClearColorTargets(ReadOnlySpan<ColorTargetState> targets, SolidColorClear clear);

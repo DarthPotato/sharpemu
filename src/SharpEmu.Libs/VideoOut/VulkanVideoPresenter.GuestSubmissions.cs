@@ -15,12 +15,13 @@ internal static unsafe partial class VulkanVideoPresenter
         // This partial owns guest GPU submission execution and lifetime.
 
         // Batched submissions each carry up to a frame's worth of work, so a cap of
-        // 8 made draw preparation wait on the GPU once per frame; 32 keeps the CPU
-        // ahead. SHARPEMU_MAX_INFLIGHT_SUBMISSIONS overrides it.
+        // 8 made draw preparation wait on the GPU once per frame; at 32 a title that
+        // submits a few hundred times a frame still waited about twice a frame, so
+        // the cap is 64. SHARPEMU_MAX_INFLIGHT_SUBMISSIONS overrides it.
         private static readonly int MaxInFlightGuestSubmissions =
             int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MAX_INFLIGHT_SUBMISSIONS"), out var inFlight) && inFlight > 0
                 ? inFlight
-                : 32;
+                : 64;
         // Scheduler ticks: the last submitted tick and the highest tick known retired.
         private ulong _submitTimeline;
         private ulong _completedTimeline;
@@ -39,26 +40,54 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // Translated draws are recorded into the scheduler's current buffer and
         // submitted once per drained work batch (one vkQueueSubmit per batch).
-        private bool _batchOpen;
-        private int _batchDrawCount;
-        private readonly List<SubmissionUploadResources> _batchResources = new();
+        internal bool _batchOpen;
+        internal const int MinimumFlushDraws = 32;
+        private static readonly long BatchGraceTicks = System.Diagnostics.Stopwatch.Frequency * 3 / 1000;
+        internal int _batchDrawCount;
+        internal long _batchOpenedAt;
+
+        private bool ProducerActive => _commandThread is { IsAlive: true } thread && (thread.HasWork || _commandStream.HasPending);
+
+        private bool BatchShouldFlush =>
+            _batchDrawCount >= MinimumFlushDraws ||
+            _commandThread is null || _window.IsMinimized || _commandStream.BlockedQueueCount != 0 ||
+            (_pendingGuestSubmissions.Count == 0 &&
+             (!ProducerActive || System.Diagnostics.Stopwatch.GetTimestamp() - _batchOpenedAt >= BatchGraceTicks));
+        internal readonly List<SubmissionUploadResources> _batchResources = new();
+        private const int MaxSpareSubmissionResources = 4096;
+        internal Stack<SubmissionUploadResources>? _spareSubmissionResources;
 
 
-        private CommandBuffer BeginBatchedGuestCommands()
+        internal CommandBuffer BeginBatchedGuestCommands()
         {
             var commandBuffer = CurrentRecordingBuffer();
             OpenGuestBatch();
             return commandBuffer;
         }
 
-        private CommandBuffer BeginBatchedGuestStateCommands()
+        // Opens the batch without asking for the native handle, so a deferred barrier stays deferred
+        // until a command is actually recorded.
+        internal void EnsureBatchedGuestCommands()
+        {
+            _ = CurrentRecording();
+            OpenGuestBatch();
+        }
+
+        internal CommandBuffer BeginBatchedGuestStateCommands()
         {
             var recording = CurrentRecording();
             OpenGuestBatch();
             return new CommandBuffer(recording.StateHandle);
         }
 
-        private void RequestGuestMemoryBarrier(in MemoryBarrierRequest request)
+        internal CommandBuffer BeginBatchedGuestTransferCommands()
+        {
+            var recording = CurrentRecording();
+            OpenGuestBatch();
+            return new CommandBuffer(recording.TransferHandle);
+        }
+
+        internal void RequestGuestMemoryBarrier(in MemoryBarrierRequest request)
         {
             var recording = CurrentRecording();
             OpenGuestBatch();
@@ -66,13 +95,13 @@ internal static unsafe partial class VulkanVideoPresenter
             recording.RequestMemoryBarrier(request);
         }
 
-        private void OpenGuestBatch()
+        internal void OpenGuestBatch()
         {
             if (!_batchOpen)
             {
                 _batchOpen = true;
                 _batchDrawCount = 0;
-                _nextIdleFlushCheck = 0;
+
             }
         }
 
@@ -80,9 +109,11 @@ internal static unsafe partial class VulkanVideoPresenter
         // Returns the timeline tick that contains the commands this call submitted, so a
         // caller that must wait for its own recording does not read the shared
         // _submitTimeline field, which the presenter thread also writes.
-        private ulong FlushBatchedGuestCommands() => FlushGuestCommandsForReason(SubmitReason.Other);
+        internal long _lastBatchSubmit;
 
-        private ulong FlushGuestCommandsForReason(SubmitReason reason)
+        internal ulong FlushBatchedGuestCommands() => FlushGuestCommandsForReason(SubmitReason.Other);
+
+        internal ulong FlushGuestCommandsForReason(SubmitReason reason)
         {
             if (!_batchOpen)
             {
@@ -91,7 +122,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using var profile = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueueSubmit);
             var tick = _scheduler.Flush(reason);
-            _lastBatchSubmit = System.Diagnostics.Stopwatch.GetTimestamp();
+
             _bufferCache?.OnBatchSubmitted();
             return tick;
         }
@@ -99,8 +130,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private void PrepareGuestSubmission(SubmitBundle bundle)
         {
             _ = bundle;
-            EndRendering();
-            RecordRuntimeMissCopies();
+            _recording?.EndRendering();
+            _recording?.RecordRuntimeMissCopies();
             _occlusionQueries?.Submit(_scheduler);
             if (!_batchOpen)
             {
@@ -114,6 +145,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void CompleteGuestSubmission(ulong tick)
         {
+            _lastBatchSubmit = System.Diagnostics.Stopwatch.GetTimestamp();
             _submitTimeline = tick;
             if (!_batchOpen)
             {
@@ -140,7 +172,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly long CollectIntervalTicks = System.Diagnostics.Stopwatch.Frequency / 4000;
         private long _lastCollectTicks;
 
-        private void EnsureGuestSubmissionCapacity(bool collectNow = false)
+        internal void EnsureGuestSubmissionCapacity(bool collectNow = false)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.SubmissionCapacity);
             var now = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -170,6 +202,7 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CompletedSubmissionCleanup);
             if (waitForOldest && _pendingGuestSubmissions.TryPeek(out var oldest))
             {
+                using var waitProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CompletedSubmissionWait);
                 _scheduler.Wait(oldest.Tick);
             }
 
@@ -177,6 +210,7 @@ internal static unsafe partial class VulkanVideoPresenter
                    _scheduler.IsTickComplete(submission.Tick))
             {
                 _pendingGuestSubmissions.Dequeue();
+                using var retireProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CompletedSubmissionRetire);
                 RetireGuestSubmission(submission);
             }
 
@@ -187,10 +221,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 _scheduler.RunCompletedOperations();
             }
 
-            _commandStream.NotifyCompletedGpuTick(_scheduler.Timeline.CompletedTick);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CompletedGpuNotification))
+                _commandStream.NotifyCompletedGpuTick(_scheduler.Timeline.CompletedTick);
             PublishLodStatistics();
 
-            ProcessDeferredTextureDestroys();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DeferredTextureDestroy))
+                ProcessDeferredTextureDestroys();
         }
 
         private void RetireGuestSubmission(PendingGuestSubmission submission)
@@ -203,6 +239,13 @@ internal static unsafe partial class VulkanVideoPresenter
             foreach (var resources in submission.Resources)
             {
                 RecycleSubmissionUploads(resources);
+                resources.FeedbackSnapshots = [];
+                resources.OverflowBuffers = null;
+                var spare = _spareSubmissionResources ??= new Stack<SubmissionUploadResources>();
+                if (spare.Count < MaxSpareSubmissionResources)
+                {
+                    spare.Push(resources);
+                }
             }
 
             foreach (var (buffer, memory) in submission.RetireBuffers)

@@ -114,7 +114,7 @@ public sealed class RegisterWriteTableTests
     public void DepthCountControl_PreservesDirectIndirectAndSavedContextValues()
     {
         var banks = NewBanks();
-        Assert.Equal(0u, banks.Context.DepthCountControl);
+        Assert.Equal(0x1100_0100u, banks.Context.DepthCountControl);
         WriteContext(banks, DbCountControl, 0x1103);
         Assert.Equal(0x1103u, banks.Context.DepthCountControl);
         var copy = banks.Context.Copy();
@@ -125,6 +125,26 @@ public sealed class RegisterWriteTableTests
         WriteContext(banks, DbCountControl, 1);
         banks.ApplyContextState(ContextStateOperation.Pop);
         Assert.Equal(0u, banks.Context.DepthCountControl);
+    }
+
+    [Fact]
+    public void DepthCountControl_ClearAndResetRestoreAgcDefaultWithoutChangingSnapshots()
+    {
+        var banks = NewBanks();
+        WriteContext(banks, DbCountControl, 1);
+        var snapshot = banks.Snapshot();
+
+        banks.ApplyContextState(ContextStateOperation.PushClear);
+        Assert.Equal(0x1100_0100u, banks.Context.DepthCountControl);
+        WriteContext(banks, DbCountControl, 0);
+        banks.ApplyContextState(ContextStateOperation.Clear);
+        Assert.Equal(0x1100_0100u, banks.Context.DepthCountControl);
+
+        banks.ApplyContextState(ContextStateOperation.Pop);
+        Assert.Equal(1u, banks.Context.DepthCountControl);
+        banks.Reset();
+        Assert.Equal(0x1100_0100u, banks.Context.DepthCountControl);
+        Assert.Equal(1u, snapshot.Context.DepthCountControl);
     }
 
     [Fact]
@@ -216,17 +236,17 @@ public sealed class RegisterWriteTableTests
         WriteContext(banks, PaScViewportScissor0Tl + 4, 0x8000_0001);
         WriteContext(banks, PaScViewportZMin0 + 6, Float(0.25f), Float(0.75f));
 
-        var viewports = banks.Context.ScreenViewport.Viewports;
-        Assert.Equal(2f, viewports[2].XScale);
-        Assert.Equal(3f, viewports[2].XOffset);
-        Assert.Equal(5, viewports[1].ScissorLeft);
-        Assert.Equal(7, viewports[1].ScissorTop);
-        Assert.Equal(100, viewports[1].ScissorRight);
-        Assert.Equal(200, viewports[1].ScissorBottom);
-        Assert.True(viewports[1].ScissorWindowOffsetEnable);
-        Assert.False(viewports[2].ScissorWindowOffsetEnable);
-        Assert.Equal(0.25f, viewports[3].MinDepth);
-        Assert.Equal(0.75f, viewports[3].MaxDepth);
+        var viewport = banks.Context.ScreenViewport;
+        Assert.Equal(2f, viewport.Viewport(2).XScale);
+        Assert.Equal(3f, viewport.Viewport(2).XOffset);
+        Assert.Equal(5, viewport.Viewport(1).ScissorLeft);
+        Assert.Equal(7, viewport.Viewport(1).ScissorTop);
+        Assert.Equal(100, viewport.Viewport(1).ScissorRight);
+        Assert.Equal(200, viewport.Viewport(1).ScissorBottom);
+        Assert.True(viewport.Viewport(1).ScissorWindowOffsetEnable);
+        Assert.False(viewport.Viewport(2).ScissorWindowOffsetEnable);
+        Assert.Equal(0.25f, viewport.Viewport(3).MinDepth);
+        Assert.Equal(0.75f, viewport.Viewport(3).MaxDepth);
         Assert.Contains("outside its range", Assert.Throws<InvalidOperationException>(() => WriteContext(banks, PaScViewportScissor15Br, 1, 2)).Message);
     }
 

@@ -22,6 +22,8 @@ public enum ImageNumericClass : byte
     Float,
     Uint,
     Sint,
+    // A 64-bit unsigned view of a 64 bits per texel image; only image atomics use it.
+    Uint64,
 }
 
 public enum ImageMipMode : byte
@@ -84,6 +86,8 @@ public sealed class ImageResource
     public bool Read { get; set; }
     public bool Written { get; set; }
     public bool Atomic { get; set; }
+    // An atomic on two data dwords (compare-swap: four), which works on 64-bit texels.
+    public bool Atomic64 { get; set; }
     public bool DepthCompare { get; set; }
     // Guest compare function (0..7) evaluated in the shader for a depth-compare
     // image whose format has no Vulkan depth equivalent; -1 when not emulated.
@@ -192,9 +196,19 @@ public sealed class ShaderResourceInfo
     public bool HasBitwiseExclusiveOr { get; set; }
     public bool UsesDeviceAddresses { get; set; }
 
-    // Some image access reads its T# and S# from the shader registers at run time and resolves
-    // them through the host's runtime descriptor table (RuntimeDescriptorTable).
+    // Some image access reads its image or sampler from a bindless heap through descriptor set 1.
     public bool UsesRuntimeDescriptors { get; set; }
+
+    public bool UsesBindlessHeap { get; set; }
+
+    // Some image access reads its image or sampler through a linked callee's record argument (see CallRecordSelector).
+    public bool UsesCallRecords { get; set; }
+
+    // A call that reaches a callee the program does not hold marks it (CallMarks).
+    public bool UsesCallMarks { get; set; }
+
+    // The program has shader calls and reads device addresses: it binds DescriptorBindingKind.DeviceAddressFallback.
+    public bool UsesDeviceAddressFallback { get; set; }
 
     public ShaderResourceInfo Clone() => new()
     {
@@ -213,6 +227,10 @@ public sealed class ShaderResourceInfo
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
         UsesRuntimeDescriptors = UsesRuntimeDescriptors,
+        UsesBindlessHeap = UsesBindlessHeap,
+        UsesCallRecords = UsesCallRecords,
+        UsesCallMarks = UsesCallMarks,
+        UsesDeviceAddressFallback = UsesDeviceAddressFallback,
     };
 }
 
@@ -235,6 +253,10 @@ public sealed record IndirectImageSelector(
     public uint KeyBound { get; init; }
     public WaveIndexedImageSelector? WaveIndexed { get; init; }
 
+    // The key is selected by a value the whole wave shares (a loop counter), not by a lane's value. Such an image
+    // used to read as a null image, so a table the host cannot read stays null instead of failing the program.
+    public bool SharedSelector { get; init; }
+
     // The key read's immediate offset. The hardware adds it after the 32-bit selector offset, without wrapping.
     public uint MaterialImmediate { get; init; }
 }
@@ -253,6 +275,7 @@ public sealed class DescriptorSource
     public ScalarValue[] Dwords { get; init; } = [];
     public uint DwordCount => (uint)Dwords.Length;
     public IndirectImageSelector? IndirectImage { get; init; }
+    public CallRecordSelector? CallRecord { get; init; }
 }
 
 // One immediate-offset scalar read the host evaluates into the flattened table.

@@ -3,7 +3,6 @@
 
 using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
-using SharpEmu.ShaderCompiler.Metal;
 using Xunit;
 using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
 
@@ -106,7 +105,19 @@ public sealed class DescriptorBindingAliasTests
             BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 2), false, true, false);
         var request = new ShaderCompileRequest(plan, resources, layout);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var spirvError), spirvError);
-        Assert.True(Gen5MslTranslator.TryCompileProgram(request, out _, out var metalError), metalError);
+    }
+
+    // The images of an indirect table keep their own bindings, so equal words among them form no group: a table that
+    // pads its candidates with null images keeps its program's specialization.
+    [Fact]
+    public void IndirectTableImagesTakeNoPartInGroups()
+    {
+        uint[] padding = [0, 0, 0, 0, 0, 0, 0, 0];
+        uint[][] descriptors = [[1, 2, 3, 4, 5, 6, 7, 8], padding, padding];
+        var plain = default(ImageSpecialization) with { IndirectRoot = DescriptorConstants.NoIndex };
+        var member = plain with { IndirectRoot = 0 };
+        Assert.Empty(DescriptorBindingAliases.Group(descriptors, [plain, member, member]));
+        Assert.Equal(new uint[] { 0, 1, 1 }, DescriptorBindingAliases.Group(descriptors, [plain, plain, plain]));
     }
 
     [Fact]
