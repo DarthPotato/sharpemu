@@ -540,9 +540,20 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // Command memory and polled labels: GPU-written pages go through the render thread, the
         // rest is read here with the stream's queued stores applied.
+        private static readonly bool CoalesceProducerReads =
+            Environment.GetEnvironmentVariable("SHARPEMU_COALESCE_PRODUCER_READS") == "1";
+
         private bool ReadOnCommandThread(ulong address, Span<byte> destination, RenderReadSource source = RenderReadSource.Memory)
         {
             var size = (ulong)destination.Length;
+            if (Diagnostics.ProducerWaitProfile.TraceReads)
+            {
+                long sequence = 0;
+                _translation.PendingWrites?.TryGetPending(address, size, out sequence);
+                Diagnostics.ProducerWaitProfile.TraceRead(address, destination.Length, source.ToString(), sequence,
+                    _commandThread!.HasPendingRange(address, size), _bufferCache.HasGpuDirtyBytes(address, size),
+                    SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.ReadingTable);
+            }
             if (HasPendingMemoryPublication(address, size))
             {
                 return ReadOnRenderThread(address, destination, operand: false, source, publication: true);
@@ -561,6 +572,17 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 Diagnostics.CommandThreadTally.NoteShadowRead((int)shadowSource);
                 return true;
+            }
+
+            // Queue the actual read behind the writer now, rather than waking after recording
+            // only to queue a second request for its readback. Run is an observation boundary:
+            // preceding work (including stores and resolve fallbacks) completes before the read.
+            // Keep shadow/clean reads above this branch; neither needs a render-thread request.
+            if (CoalesceProducerReads &&
+                (thread.HasPendingRange(address, size) ||
+                 (_translation.PendingWrites is { } writes && writes.TryGetPending(address, size, out _))))
+            {
+                return ReadOnRenderThread(address, destination, operand: false, source, publication: false);
             }
 
             thread.WaitForPendingRange(address, size);
