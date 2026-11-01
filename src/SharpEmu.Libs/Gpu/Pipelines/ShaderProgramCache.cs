@@ -210,6 +210,12 @@ internal sealed class ShaderProgramCache
     // links a new layout on a worker and reports the program as not ready, so its dispatches are skipped as they are
     // while its module compiles; each program links one layout at a time.
     public bool DeferLinking { get; init; }
+
+    // Only an already selected runtime plan may resolve speculatively (on by default;
+    // SHARPEMU_RUNTIME_RESOLVE_WORKERS=0 keeps it serial). Feedback,
+    // heap slots and table buffers are still prepared in stream order by recording.
+    internal bool RuntimeResolveWorkers { get; init; } =
+        Environment.GetEnvironmentVariable("SHARPEMU_RUNTIME_RESOLVE_WORKERS") != "0";
     private readonly Dictionary<ulong, ((ProgramKey Key, string Library) LinkedKey, Task<ProgramSourceEntry?> Link)> _pendingLinks = new();
 
     // Callers whose callees cannot read their records at run time: they link a copy per record.
@@ -583,7 +589,7 @@ internal sealed class ShaderProgramCache
                     computeState.LocalDataShareDwords, computeState.ThreadIdCount)
                 : null,
         };
-        if (entry.Plan.Info.UsesRuntimeDescriptors && _host.RuntimeDescriptorResolutionRequiresSerial)
+        if (entry.Plan.Info.UsesRuntimeDescriptors && _host.RuntimeDescriptorResolutionRequiresSerial && !RuntimeResolveWorkers)
             throw new SerialResolveRequiredException("runtime image descriptors");
         var hasShaderCalls = entry.HasShaderCalls;
         if (hasShaderCalls && !_compiler.LinkedShaderCallsSupported)
@@ -1325,6 +1331,10 @@ internal sealed class ShaderProgramCache
         }
         catch (ResourcePlanException) { return false; }
         if (!plan.Info.UsesRuntimeDescriptors) return false;
+        // Do not publish a mode transition from a speculative resolve, even when
+        // already-runtime plans are allowed there. The stream thread retries it.
+        if (_host.RuntimeDescriptorResolutionRequiresSerial)
+            throw new SerialResolveRequiredException("runtime image descriptors");
         // Resolve workers may still hold the original entry and its immutable plan/permutations.
         entry = entry.WithPlan(plan);
         lock (_gate) _programs[KeyFor(source, options)] = entry;

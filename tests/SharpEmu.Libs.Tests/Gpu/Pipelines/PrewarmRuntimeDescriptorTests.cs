@@ -91,4 +91,83 @@ public sealed class PrewarmRuntimeDescriptorTests : IDisposable
         Assert.Equal(runtime.Resources.Info.Images.Count, prewarm.Resources.Info.Images.Count);
         Assert.NotNull(layout!.Find(DescriptorBindingKind.RuntimeDescriptorTable));
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AlreadyRuntimePlanResolvesOnWorkerOnlyWhenEnabled(bool enabled)
+    {
+        var guest = new PipelineTestGuest();
+        guest.Host.RuntimeImageDescriptorsSupported = true;
+        guest.RegisterProgram(Code, Header, CapturedShaders.MaterialTablePixelShader);
+        WriteScene(guest, 200);
+        var cache = new ShaderProgramCache(guest.Context, guest.Compiler, guest.Host) { RuntimeResolveWorkers = enabled };
+        var source = guest.Source(Code, ShaderStage.Compute, UserData());
+        var options = PipelineTestGuest.ComputeOptions();
+        var cursor = 0u;
+        var serial = cache.GetOrCompile(source, options, ref cursor, out var serialStage);
+        Assert.True(serialStage.Program!.Resources!.Info.UsesRuntimeDescriptors);
+        var serialCursor = cursor;
+        var compiled = guest.Compiler.Requests.Count;
+        guest.Host.RuntimeDescriptorResolutionRequiresSerial = true;
+        Exception? failure = null;
+        ShaderProgram worker = default;
+        ShaderStageResources workerStage = default;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                cursor = 0;
+                worker = cache.GetOrCompile(source, options, ref cursor, out workerStage);
+            }
+            catch (Exception exception) { failure = exception; }
+        });
+        thread.Start();
+        thread.Join();
+        if (!enabled)
+        {
+            Assert.IsType<SharpEmu.Libs.Gpu.GpuCommands.SerialResolveRequiredException>(failure);
+            return;
+        }
+        Assert.Null(failure);
+        Assert.Equal(serial, worker);
+        Assert.Same(serialStage.Program, workerStage.Program);
+        Assert.Equal(serialCursor, cursor);
+        Assert.Equal(serialStage.Resources.UserData, workerStage.Resources.UserData);
+        Assert.Equal(serialStage.Resources.FlattenedResourceTable, workerStage.Resources.FlattenedResourceTable);
+        Assert.Equal(serialStage.Resources.DeviceAddressRanges, workerStage.Resources.DeviceAddressRanges);
+        Assert.Equal(serialStage.Resources.Buffers, workerStage.Resources.Buffers);
+        Assert.Equal(serialStage.Resources.Images, workerStage.Resources.Images);
+        Assert.Equal(serialStage.Resources.Samplers, workerStage.Resources.Samplers);
+        Assert.Equal(compiled, guest.Compiler.Requests.Count);
+    }
+
+    [Fact]
+    public void RuntimeModeTransitionRemainsSerialAndDoesNotPublishOnWorker()
+    {
+        var guest = new PipelineTestGuest();
+        guest.Host.RuntimeImageDescriptorsSupported = true;
+        guest.RegisterProgram(Code, Header, CapturedShaders.MaterialTablePixelShader);
+        WriteScene(guest, 2);
+        var cache = new ShaderProgramCache(guest.Context, guest.Compiler, guest.Host) { RuntimeResolveWorkers = true };
+        var source = guest.Source(Code, ShaderStage.Compute, UserData());
+        var options = PipelineTestGuest.ComputeOptions();
+        var cursor = 0u;
+        cache.GetOrCompile(source, options, ref cursor, out var original);
+        Assert.False(original.Program!.Resources!.Info.UsesRuntimeDescriptors);
+        // A second view dimension makes the bounded table incompatible and requires a runtime plan.
+        guest.WriteWords(Heap + 32 + 12, 0xFAC | (10u << 28));
+        guest.Host.RuntimeDescriptorResolutionRequiresSerial = true;
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            cursor = 0;
+            Assert.Throws<SharpEmu.Libs.Gpu.GpuCommands.SerialResolveRequiredException>(() =>
+                cache.GetOrCompile(source, options, ref cursor, out _));
+            Assert.False(ShaderProgramCache.LastEntry!.Plan.Info.UsesRuntimeDescriptors);
+        }
+        guest.Host.RuntimeDescriptorResolutionRequiresSerial = false;
+        cursor = 0;
+        cache.GetOrCompile(source, options, ref cursor, out var transitioned);
+        Assert.True(transitioned.Program!.Resources!.Info.UsesRuntimeDescriptors);
+    }
 }

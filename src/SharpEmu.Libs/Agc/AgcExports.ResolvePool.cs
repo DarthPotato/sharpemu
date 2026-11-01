@@ -28,6 +28,8 @@ public static partial class AgcExports
         public ResolvedDraw? Record;
         public string? SerialReason;
         public Exception? Failure;
+        public bool RuntimeResolved;
+        private int _runtimeRejectionCounted;
         public readonly ResolveReadLog Reads = new();
         public readonly ManualResetEventSlim Done = new(false);
 
@@ -42,8 +44,24 @@ public static partial class AgcExports
             SerialReason = null;
             Failure = null;
             FrontendImageVersion = 0;
+            RuntimeResolved = false;
+            _runtimeRejectionCounted = 0;
             Reads.Clear();
             Done.Reset();
+        }
+
+        internal bool ValidateReads(long frontendImageVersion, ICommandStreamHost host, bool atJoin)
+        {
+            var frontendStale = FrontendImageVersion != frontendImageVersion;
+            var valid = !frontendStale && host.ValidateWorkerReads(Reads);
+            // A segment can be checked more than once before its serial replay.
+            if (!valid && atJoin && RuntimeResolved && Interlocked.Exchange(ref _runtimeRejectionCounted, 1) == 0)
+            {
+                Interlocked.Increment(ref _runtimeRejected);
+                if (frontendStale) Interlocked.Increment(ref _runtimeRejectedFrontend);
+                else Interlocked.Increment(ref _runtimeRejectedReads);
+            }
+            return valid;
         }
     }
 
@@ -58,6 +76,10 @@ public static partial class AgcExports
     private static long _recordWaits;
     private static long _recordWaitTicks;
     private static long _poolAllocated;
+    private static long _runtimeWorkers;
+    private static long _runtimeRejected;
+    private static long _runtimeRejectedFrontend;
+    private static long _runtimeRejectedReads;
     private static readonly ConcurrentDictionary<string, long> _deferredSerialReasons = new();
 
     private static readonly long[] _workerShadowSources = new long[3];
@@ -82,6 +104,7 @@ public static partial class AgcExports
             FormattableString.Invariant($"shadow_sources=dispatch:{Interlocked.Exchange(ref _workerShadowSources[0], 0)},fill:{Interlocked.Exchange(ref _workerShadowSources[1], 0)},copy:{Interlocked.Exchange(ref _workerShadowSources[2], 0)} ") +
             FormattableString.Invariant($"record_waits={Interlocked.Exchange(ref _recordWaits, 0)} record_wait_ms={Interlocked.Exchange(ref _recordWaitTicks, 0) * 1000.0 / Stopwatch.Frequency:F1} ") +
             FormattableString.Invariant($"alloc_mb={Interlocked.Exchange(ref _poolAllocated, 0) / 1048576.0:F0} ") +
+            FormattableString.Invariant($"runtime_workers={Interlocked.Exchange(ref _runtimeWorkers, 0)} runtime_rejected={Interlocked.Exchange(ref _runtimeRejected, 0)} runtime_reject=frontend:{Interlocked.Exchange(ref _runtimeRejectedFrontend, 0)},reads:{Interlocked.Exchange(ref _runtimeRejectedReads, 0)} ") +
             "serial=" + string.Join(",", reasons.OrderByDescending(reason => reason.Value)
                 .Select(reason => reason.Key.Replace(' ', '_') + ":" + reason.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     }
@@ -168,10 +191,10 @@ public static partial class AgcExports
         }
 
         // At the stream position of a slice segment: whether a worker-resolved draw it recorded still holds.
-        internal bool ValidateDeferred(DeferredWork work) => work is not DeferredDraw deferred || ValidateDeferredReads(deferred);
+        internal bool ValidateDeferred(DeferredWork work) => work is not DeferredDraw deferred || ValidateDeferredReads(deferred, atJoin: true);
 
-        private bool ValidateDeferredReads(DeferredDraw deferred) =>
-            deferred.FrontendImageVersion == _pipelines!.FrontendImageVersion && _host.ValidateWorkerReads(deferred.Reads);
+        private bool ValidateDeferredReads(DeferredDraw deferred, bool atJoin = false) =>
+            deferred.ValidateReads(_pipelines!.FrontendImageVersion, _host, atJoin);
 
         private void CompleteDeferredDraw(DeferredDraw deferred)
         {
@@ -203,7 +226,7 @@ public static partial class AgcExports
             {
                 throw _host.Fatal("A deferred draw resolved to nothing.");
             }
-            else if (!ValidateDeferredReads(deferred))
+            else if (!ValidateDeferredReads(deferred, atJoin: true))
             {
                 Interlocked.Increment(ref _deferredInvalid);
                 _pool!.Return(record);
@@ -379,6 +402,13 @@ public static partial class AgcExports
                     }
 
                     work.Record = worker.Sink.Draw;
+                    if (work.Record?.State.Programs is { } programs &&
+                        (programs.VertexInput.Stage.Program?.Resources?.Info.UsesRuntimeDescriptors == true ||
+                         programs.PixelInput.Stage.Program?.Resources?.Info.UsesRuntimeDescriptors == true))
+                    {
+                        work.RuntimeResolved = true;
+                        Interlocked.Increment(ref _runtimeWorkers);
+                    }
                 }
                 catch (SerialResolveRequiredException serial)
                 {

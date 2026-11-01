@@ -54,6 +54,7 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
     public uint MaxPushDescriptors => 32;
 
     public bool RuntimeImageDescriptorsSupported { get; set; }
+    public bool RuntimeDescriptorResolutionRequiresSerial { get; set; }
 
     public bool ComputeWave64Supported => true;
 
