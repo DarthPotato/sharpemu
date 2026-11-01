@@ -32,6 +32,25 @@ public sealed class RuntimeDescriptorRegistryTests
         [RuntimeDescriptorTable.ViewClass(dimension), address, 22u << 20, 0, 9u << 28, 0, 0, 0, 0];
 
     [Fact]
+    public void WorkerEpochRequiresIngestedMissesAssignedSlotsAndRebuiltTable()
+    {
+        var registry = new RuntimeDescriptorRegistry<object>();
+        Assert.False(registry.CanPublishWorkerEpoch);
+        registry.BuildTable();
+        Assert.True(registry.CanPublishWorkerEpoch);
+        registry.ReadMisses(MissBuffer([ImageKey(0x4000)], []));
+        Assert.False(registry.CanPublishWorkerEpoch);
+        registry.RegisterMisses(10, _ => true, _ => 5);
+        registry.BuildTable();
+        Assert.False(registry.CanPublishWorkerEpoch); // The new image still has no slot.
+        registry.Images.Values.Single().Slot = 7;
+        registry.TableDirty = true;
+        Assert.False(registry.CanPublishWorkerEpoch);
+        registry.BuildTable();
+        Assert.True(registry.CanPublishWorkerEpoch);
+    }
+
+    [Fact]
     public void MissRecordsBecomeEntriesAndTheTableNamesThemOnceTheyHaveSlots()
     {
         var registry = new RuntimeDescriptorRegistry<object>();

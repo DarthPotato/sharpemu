@@ -558,6 +558,31 @@ public unsafe class GpuBuffer : IDisposable
             0, null, 1, &after, 0, null, BarrierSource.Fill);
     }
 
+    internal void Fill(RecordingBuffer command, ulong offset, ulong size, uint value)
+    {
+        if (((offset | size) & 3) != 0)
+        {
+            throw SubmissionScheduler.Fatal("The buffer fill range must be aligned to four bytes.");
+        }
+
+        command.EndRendering();
+        NoteGpuWrite(offset, size);
+        var vk = _device.Vk;
+        var native = new CommandBuffer(command.TransferHandle);
+        var before = CreateBarrier(offset, size, MemoryAccess, AccessFlags.TransferWriteBit);
+        VulkanSynchronization.PipelineBarrier(vk,
+            native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
+            0, null, 1, &before, 0, null, BarrierSource.Fill);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            vk.CmdFillBuffer(native, Handle, offset, size, value);
+        }
+        var after = CreateBarrier(offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
+        VulkanSynchronization.PipelineBarrier(vk,
+            native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
+            0, null, 1, &after, 0, null, BarrierSource.Fill);
+    }
+
     private int _foreignReads;
     private int _disposeDeferred;
 

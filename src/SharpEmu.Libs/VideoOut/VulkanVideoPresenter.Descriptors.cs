@@ -127,6 +127,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _program = program;
                 RuntimeImages.Clear();
                 RuntimeEntries.Clear();
+                RuntimeEpoch = null;
                 Memoized = false;
                 TexturesKept = false;
                 Memo = null;
@@ -153,6 +154,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public DeviceAddressRange[] CallRecordRanges { get; set; } = [];
 
             public List<TextureResource> RuntimeImages { get; } = [];
+            public RuntimeEpoch? RuntimeEpoch { get; set; }
             public List<RuntimeImageEntry<TextureResource>> RuntimeEntries { get; } = [];
             public TextureResource[] Textures => RuntimeImages.Count == 0 ? Descriptors.Images : [.. Descriptors.Images, .. RuntimeImages];
 
@@ -792,7 +794,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (MeshDrawTrace.Active) MeshDrawTrace.Write("stage-binding", $"stage={stage.Program?.Stage} hash=0x{stage.Program?.Hash:X16} shaderBase=0x{stage.ShaderBase:X16} userData={string.Join(",", stage.Resources.UserData.Select(value => value.ToString("X8")))}");
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var program = RequireProgram(stage);
-            if (_worker && program.Resources!.Info.UsesRuntimeDescriptors) throw Serial("runtime image descriptors", resumable: true);
+            if (_worker && program.Resources!.Info.UsesRuntimeDescriptors && !RuntimeRecordWorkers) throw Serial("runtime image descriptors", resumable: true);
             if (_worker && program.Frontend is { RequiresOrderedImagePreparation: true } orderedFrontend)
             {
                 foreach (var words in stage.Resources.Images)
@@ -2144,7 +2146,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (entry.UsesRuntimeHeap)
                 {
-                    if (_worker) throw Serial("runtime image descriptors", resumable: true);
+                    if (_worker && !RuntimeRecordWorkers) throw Serial("runtime image descriptors", resumable: true);
                     var runtimeSet = (_presenter._runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal("Runtime heap unavailable.")).Set;
                     _vk.CmdBindDescriptorSets(command, bindPoint, entry.Layout, RuntimeDescriptorTable.HeapDescriptorSet, 1, &runtimeSet, 0, null);
                 }

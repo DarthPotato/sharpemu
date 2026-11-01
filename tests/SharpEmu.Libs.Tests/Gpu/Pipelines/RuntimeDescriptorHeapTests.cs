@@ -110,6 +110,78 @@ public sealed class RuntimeDescriptorHeapTests(HeadlessVulkanFixture fixture) : 
     }
 
     [Fact]
+    public void PinnedSlotIsNotReusedEvenAfterItsRetirementTickCompletes()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, runtimeDescriptors: true)) return;
+        using var harness = new ImageTestHarness(vulkan);
+        using var heap = harness.Run(() => new RuntimeDescriptorHeap(harness.Device, harness.Scheduler, vulkan.RuntimeDescriptorLimits, enableWorkerRecords: true));
+        var first = harness.CreateImage(Describe(0));
+        var view = ViewOf(first);
+        var slot = heap.GetOrCreateImageSlot(view, ImageLayout.General);
+        var pin = heap.TryPinImageSlot(view, slot);
+        Assert.NotNull(pin);
+        harness.Run(() => heap.InvalidateViews([view]));
+        Assert.Null(heap.TryPinImageSlot(view, slot));
+        harness.Finish();
+        var second = harness.CreateImage(Describe(0x1000));
+        Assert.NotEqual(slot, heap.GetOrCreateImageSlot(ViewOf(second), ImageLayout.General));
+        pin.Unpin();
+        var third = harness.CreateImage(Describe(0x2000));
+        Assert.Equal(slot, heap.GetOrCreateImageSlot(ViewOf(third), ImageLayout.General));
+        harness.AssertNoValidationMessages();
+    }
+
+    [Fact]
+    public void SlotGenerationChangesOnlyWhenThatSlotIsInvalidated()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, runtimeDescriptors: true)) return;
+        using var harness = new ImageTestHarness(vulkan);
+        using var heap = harness.Run(() => new RuntimeDescriptorHeap(harness.Device, harness.Scheduler,
+            vulkan.RuntimeDescriptorLimits, enableWorkerRecords: true));
+        var firstView = ViewOf(harness.CreateImage(Describe(0)));
+        var otherView = ViewOf(harness.CreateImage(Describe(0x1000)));
+        var slot = heap.GetOrCreateImageSlot(firstView, ImageLayout.General);
+        heap.GetOrCreateImageSlot(otherView, ImageLayout.General);
+        var lease = heap.ImageSlotLease(firstView, slot)!;
+        var generation = lease.Generation;
+        harness.Run(() => heap.InvalidateViews([otherView]));
+        Assert.Equal(generation, lease.Generation);
+        var pin = heap.TryPinImageSlot(firstView, slot, lease, generation);
+        Assert.Same(lease, pin);
+        pin!.Unpin();
+        harness.Run(() => heap.InvalidateViews([firstView]));
+        Assert.NotEqual(generation, lease.Generation);
+        Assert.Null(heap.TryPinImageSlot(firstView, slot, lease, generation));
+        harness.Finish();
+        // Reusing both the slot and the Vulkan view handle cannot resurrect the old epoch.
+        var replacement = heap.GetOrCreateImageSlot(firstView, ImageLayout.General);
+        Assert.Equal(slot, replacement);
+        Assert.NotSame(lease, heap.ImageSlotLease(firstView, replacement));
+        Assert.Null(heap.TryPinImageSlot(firstView, replacement, lease, generation));
+        harness.AssertNoValidationMessages();
+    }
+
+    [Fact]
+    public void DisabledHeapDoesNotAllocateSlotLeases()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, runtimeDescriptors: true)) return;
+        using var harness = new ImageTestHarness(vulkan);
+        using var heap = harness.Run(() => new RuntimeDescriptorHeap(harness.Device, harness.Scheduler,
+            vulkan.RuntimeDescriptorLimits, enableWorkerRecords: false));
+        var view = ViewOf(harness.CreateImage(Describe(0)));
+        var slot = heap.GetOrCreateImageSlot(view, ImageLayout.General);
+        Assert.Null(typeof(RuntimeDescriptorHeap).GetField("_imageLeases", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(heap));
+        Assert.Null(heap.ImageSlotLease(view, slot));
+        harness.Run(() => heap.InvalidateViews([view]));
+        harness.Finish();
+        Assert.Equal(slot, heap.GetOrCreateImageSlot(view, ImageLayout.General));
+        harness.AssertNoValidationMessages();
+    }
+
+    [Fact]
     public void SamplerSlotsAreStablePerSampler()
     {
         var vulkan = fixture.Vulkan;

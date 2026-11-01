@@ -103,6 +103,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // shader's registered images into the draw.
         private void PrepareRuntimeDescriptors(PreparedStageBindings prepared)
         {
+            if (_worker) { PrepareRuntimeWorker(prepared); return; }
             var descriptors = RuntimeDescriptorsFor(prepared.Program);
             var heap = _runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal(
                 $"The program reads its image descriptors at run time, but the device has no runtime descriptor heap: hash=0x{prepared.Program.Hash:X16}.");
@@ -194,6 +195,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Called with the stage's other images, once their views are acquired: acquires each registered view.
         private void BindRuntimeDescriptors(PreparedStageBindings prepared)
         {
+            if (_worker) { BindRuntimeWorker(prepared); return; }
             for (var index = 0; index < prepared.RuntimeImages.Count; index++)
             {
                 var entry = prepared.RuntimeEntries[index];
@@ -224,6 +226,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // final, so the heap slot, which carries that layout, can be taken. Binds the table and the miss buffer.
         private void CommitRuntimeDescriptors(PreparedStageBindings prepared)
         {
+            if (_worker) { CommitRuntimeWorker(prepared); return; }
             var descriptors = RuntimeDescriptorsFor(prepared.Program);
             var heap = _runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal("Runtime image descriptors need the runtime descriptor heap.");
             for (var index = 0; index < prepared.RuntimeImages.Count; index++)
@@ -244,10 +247,12 @@ internal static unsafe partial class VulkanVideoPresenter
             // The tick the draw records in is fixed by now, so the buffer is read when that tick completes.
             var misses = buffers.Misses(descriptors.Registry);
             prepared.Descriptors.RuntimeMisses = new BufferView(misses.Handle, 0, misses.Size);
+            if (RuntimeRecordWorkers) PublishRuntimeEpoch(prepared, descriptors, table);
         }
 
         internal void DestroyRuntimeDescriptors()
         {
+            if (RuntimeRecordWorkers) _presenter.DestroyRuntimeWorkerResources();
             foreach (var descriptors in _runtimeDescriptorSets.Values)
             {
                 descriptors.Buffers?.Dispose();

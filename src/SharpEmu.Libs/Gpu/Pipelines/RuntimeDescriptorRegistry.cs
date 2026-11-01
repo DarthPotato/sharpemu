@@ -74,7 +74,21 @@ internal sealed class RuntimeDescriptorRegistry<TResolved> where TResolved : cla
     public int PendingMisses => _misses.Count;
 
     // The table no longer matches the entries and must be built again.
-    public bool TableDirty { get; set; } = true;
+    private bool _tableDirty = true;
+    private long _version;
+    public long Version => Volatile.Read(ref _version);
+    public bool TableDirty
+    {
+        get => _tableDirty;
+        set
+        {
+            _tableDirty = value;
+            if (RuntimeDescriptorWorkerOptions.Enabled && value) Interlocked.Increment(ref _version);
+        }
+    }
+
+    // Ordered-only: workers use a published snapshot and must never enumerate this dictionary.
+    internal bool CanPublishWorkerEpoch => PendingMisses == 0 && !TableDirty && _images.Values.All(entry => entry.Slot != 0);
 
     // Reads the miss buffer of a completed tick (its dwords, as laid out by RuntimeDescriptorTable). Returns the
     // number of records taken.

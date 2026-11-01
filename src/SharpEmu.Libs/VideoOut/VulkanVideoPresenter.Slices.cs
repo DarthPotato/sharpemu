@@ -125,7 +125,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
     internal static string TakeSliceReport() =>
         FormattableString.Invariant($"[PERF][SLICES] slices={_slicesRecorded.Take()} segments={_segmentsRecorded.Take()} empty={_segmentsEmpty.Take()} uses_shared={_usesShared.Take()} attachments_kept={RecordingHost.TakeAttachmentsKept()} worker_queries={RecordingHost.TakeWorkerQueries()} native_rechecks_failed={_nativeColorRechecksFailed.Take()} ") +
-        SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
+        TakeRuntimeWorkerReport() + SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
         FormattableString.Invariant($"bda_sweeps={Interlocked.Exchange(ref GuestBufferCache.BdaSweeps, 0)}/skipped:{Interlocked.Exchange(ref GuestBufferCache.BdaSweepsSkipped, 0)} ") +
         FormattableString.Invariant($"serial_cuts={_slicesSerial.Take()} invalid={_slicesInvalid.Take()} frontend_textures_stale={_frontendTexturesStale.Take()} ") +
         FormattableString.Invariant($"slice_items={_sliceItems.Take()} serial_items={_serialItems.Take()} join_wait_ms={_sliceWaitTicks.Take() * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} ") +
@@ -213,6 +213,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
     private sealed class SliceRequests
     {
+        public List<RuntimeWorkerUse>? RuntimeUses;
         public readonly List<BufferSliceUse> Buffers = new();
         public readonly List<(ulong Address, ulong Size)> SyncRanges = new();
         public readonly List<ImageSliceUse> Images = new();
@@ -606,6 +607,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // False when the segment's items must run on this thread instead.
         internal bool JoinSegment(RenderSlice slice, SliceSegment segment)
         {
+            var runtimeAdopted = false;
             try
             {
                 if (segment.Count == 0)
@@ -628,6 +630,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 var prologueStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 RecordSlicePrologue(segment.Requests);
                 _prologueTicks.Add(System.Diagnostics.Stopwatch.GetTimestamp() - prologueStarted);
+                if (RuntimeRecordWorkers && !ValidateRuntimeUses(segment.Requests))
+                {
+                    _slicesInvalid.Increment();
+                    _scheduler.DiscardRecording(segment.Buffer!);
+                    return false;
+                }
                 var uploads = _spareSubmissionResources is { Count: not 0 } spare ? spare.Pop() : new SubmissionUploadResources();
                 uploads.DebugName = "SharpEmu slice";
                 _batchResources.Add(uploads);
@@ -646,6 +654,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     _ = _scheduler.FlushDeferred([segment.Buffer!]);
                 }
+
+                runtimeAdopted = true;
+                if (RuntimeRecordWorkers && segment.Requests.RuntimeUses is { } runtimeUses)
+                    foreach (var use in runtimeUses) use.Adopt(_scheduler);
 
                 if (segment.QueryBlocks is { } blocks)
                 {
@@ -672,6 +684,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
+                if (RuntimeRecordWorkers && !runtimeAdopted && segment.Requests.RuntimeUses is { } unusedRuntimeUses)
+                    foreach (var use in unusedRuntimeUses) use.Discard();
                 if (segment.QueryBlocks is { } unused)
                 {
                     segment.QueryBlocks = null;
@@ -689,6 +703,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool ValidateSegment(RenderSlice slice, SliceSegment segment)
         {
             var requests = segment.Requests;
+            if (RuntimeRecordWorkers && !ValidateRuntimeUses(requests)) return false;
             foreach (var (frontend, words) in requests.FrontendTextures)
             {
                 if (!frontend.IsTexturePrepared(words, ordered: true, out _, out _))
@@ -706,7 +721,6 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 return false;
             }
-
             if (requests.BufferSerial == _bufferCache.RegistrationSerial)
             {
                 _validateBuffersSkipped.Increment();
@@ -874,6 +888,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     var started = System.Diagnostics.Stopwatch.GetTimestamp();
                     try
                     {
+                        if (RuntimeRecordWorkers) _runtimeItemRecorded = false;
                         _itemSequence = slice.Items[index].Sequence;
                         if (slice.Items[index].Work is SharpEmu.Libs.Agc.AgcExports.GlobalBarrierWork)
                         {
@@ -884,6 +899,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             _presenter._translation.RunDeferred(slice.Items[index].Work!, _workerRecorder!);
                         }
 
+                        if (RuntimeRecordWorkers && _runtimeItemRecorded) _runtimeWorkerRecords.Increment();
                         segment!.Count++;
                         NoteReadsVersion(segment.Requests, slice.Items[index].Work!);
                     }

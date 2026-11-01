@@ -33,7 +33,7 @@ public sealed unsafe class RuntimeDescriptorHeap : IDisposable
         uint MaxUpdateAfterBindDescriptorsInAllPools);
 
     // Sampled images and samplers that fit the limits; zero when the device leaves no room for the heap.
-    public static (uint Images, uint Samplers) Capacities(in Limits limits)
+    public static (uint Images, uint Samplers) Capacities(in Limits limits, bool? enableWorkerRecords = null)
     {
         var samplers = Math.Min(Math.Min(Math.Min(limits.MaxPerStageSamplers, limits.MaxPerStageUpdateAfterBindSamplers),
             limits.MaxUpdateAfterBindSamplers), SamplerCeiling);
@@ -62,12 +62,15 @@ public sealed unsafe class RuntimeDescriptorHeap : IDisposable
     private readonly Stack<uint> _freeImageSlots = new();
     private readonly Dictionary<ulong, uint> _samplerSlots = new();
     private uint _nextImageSlot;
+    private readonly Dictionary<uint, RuntimeDescriptorLease>? _imageLeases;
+    private long _nextImageGeneration;
     private uint _nextSamplerSlot;
     private bool _imagesFullReported;
     private bool _samplersFullReported;
 
-    public RuntimeDescriptorHeap(GpuDeviceInfo device, SubmissionScheduler scheduler, in Limits limits)
+    public RuntimeDescriptorHeap(GpuDeviceInfo device, SubmissionScheduler scheduler, in Limits limits, bool? enableWorkerRecords = null)
     {
+        if (enableWorkerRecords ?? RuntimeDescriptorWorkerOptions.Enabled) _imageLeases = new();
         _device = device;
         _scheduler = scheduler;
         (_imageCapacity, _samplerCapacity) = Capacities(limits);
@@ -174,6 +177,7 @@ public sealed unsafe class RuntimeDescriptorHeap : IDisposable
                 return 0;
             }
 
+            if (_imageLeases is { } leases) leases.Add(slot, new RuntimeDescriptorLease(++_nextImageGeneration));
             WriteImage(slot, view, layout);
             _imageSlots.Add(key, slot);
             if (!_slotsByView.TryGetValue(view.Handle, out var keys))
@@ -183,6 +187,28 @@ public sealed unsafe class RuntimeDescriptorHeap : IDisposable
 
             keys.Add(key);
             return slot;
+        }
+    }
+
+    internal RuntimeDescriptorLease? ImageSlotLease(ImageView view, uint expected)
+    {
+        lock (_gate)
+        {
+            return _imageLeases is not null && _imageSlots.TryGetValue((view.Handle, ImageLayout.General), out var slot) && slot == expected
+                ? _imageLeases[slot] : null;
+        }
+    }
+
+    internal RuntimeDescriptorLease? TryPinImageSlot(ImageView view, uint expected,
+        RuntimeDescriptorLease? expectedLease = null, long? generation = null)
+    {
+        lock (_gate)
+        {
+            if (_imageLeases is null || !_imageSlots.TryGetValue((view.Handle, ImageLayout.General), out var slot) || slot != expected) return null;
+            var lease = _imageLeases[slot];
+            if ((expectedLease is not null && !ReferenceEquals(expectedLease, lease)) ||
+                (generation.HasValue && generation.Value != lease.Generation) || !lease.TryPin()) return null;
+            return lease;
         }
     }
 
@@ -236,6 +262,7 @@ public sealed unsafe class RuntimeDescriptorHeap : IDisposable
                 {
                     if (_imageSlots.Remove(key, out var slot))
                     {
+                        if (_imageLeases is { } leases) leases[slot].Invalidate();
                         (retired ??= []).Add(slot);
                     }
                 }
@@ -251,10 +278,26 @@ public sealed unsafe class RuntimeDescriptorHeap : IDisposable
         {
             lock (_gate)
             {
+                if (_imageLeases is null)
+                {
+                    foreach (var slot in retired)
+                    {
+                        WriteImage(slot, default, ImageLayout.Undefined);
+                        _freeImageSlots.Push(slot);
+                    }
+                    return;
+                }
                 foreach (var slot in retired)
                 {
-                    WriteImage(slot, default, ImageLayout.Undefined);
-                    _freeImageSlots.Push(slot);
+                    _imageLeases[slot].Retire(() =>
+                    {
+                        lock (_gate)
+                        {
+                            WriteImage(slot, default, ImageLayout.Undefined);
+                            _imageLeases.Remove(slot);
+                            _freeImageSlots.Push(slot);
+                        }
+                    });
                 }
             }
         }
