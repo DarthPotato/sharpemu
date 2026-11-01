@@ -72,6 +72,24 @@ public sealed class GpuCommandInterpreterDrawTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CpuIndirectZeroInstances_DoesNotUseThePersistentCount(bool indexed)
+    {
+        var runner = new StreamRunner();
+        runner.Host.WriteWords(Arguments, [3, 0, 0, 0, 0]);
+        runner.Run(SetBase(Arguments, false),
+            StreamRunner.Packet(PacketOpcode.NumInstances, 6),
+            StreamRunner.Packet(PacketOpcode.IndexBase, StreamRunner.Low(Indices), StreamRunner.High(Indices)),
+            StreamRunner.Packet(PacketOpcode.IndexBufferSize, 40),
+            StreamRunner.Packet(indexed ? PacketOpcode.DrawIndexIndirect : PacketOpcode.DrawIndirect, 0, 0, 0, 2));
+        Assert.Empty(runner.Host.IndexedDraws);
+        Assert.Empty(runner.Host.AutoDraws);
+        runner.Run(StreamRunner.Packet(PacketOpcode.DrawIndexAuto, 3, 0));
+        Assert.Equal(6u, Assert.Single(runner.Host.AutoDraws).InstanceCount);
+    }
+
+    [Theory]
     [InlineData(3u, 3u, 0x40000000u)]
     [InlineData(3u, 3u, 1u)]
     [InlineData(2u, 3u, 0u)]
@@ -125,10 +143,12 @@ public sealed class GpuCommandInterpreterDrawTests
         Assert.Contains((Arguments, indexed ? 20 : 16), runner.Host.GuestReadRanges);
     }
 
-    [Fact]
-    public void IndirectDraws_ReadArgumentsFromMemoryAndKeepTheInstanceCount()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void IndirectDraws_ReadArgumentsFromMemoryAndKeepTheInstanceCount(bool inherit)
     {
-        var runner = new StreamRunner();
+        var runner = new StreamRunner(indirectInstanceInherit: inherit);
         runner.Host.WriteWords(Arguments, new uint[] { 9, 3, 1, 2 });
         runner.Host.WriteWords(Arguments + 16, new uint[] { 50, 2, 4, 7, 1 });
 
@@ -147,16 +167,18 @@ public sealed class GpuCommandInterpreterDrawTests
         Assert.Equal(40u, indexed.IndexCount);
         Assert.Equal(Indices + 8, indexed.IndexAddress);
         Assert.Equal(7, indexed.BaseVertex);
-        Assert.Equal(2u, runner.Host.AutoDraws[1].InstanceCount);
+        Assert.Equal(inherit ? 2u : 1u, runner.Host.AutoDraws[1].InstanceCount);
 
         Assert.Contains("initiator is not supported", runner.RunExpectingFatal(StreamRunner.Packet(PacketOpcode.DrawIndirect, 0, 0, 0, 3)).Message);
         Assert.Contains("arguments base is zero", new StreamRunner().RunExpectingFatal(StreamRunner.Packet(PacketOpcode.DrawIndirect, 0, 0, 0, 2)).Message);
     }
 
-    [Fact]
-    public void IndexedIndirectDraws_LeaveArgumentsOnTheGpuWhenTheHostCan()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void IndexedIndirectDraws_LeaveArgumentsOnTheGpuWhenTheHostCan(bool inherit)
     {
-        var runner = new StreamRunner();
+        var runner = new StreamRunner(indirectInstanceInherit: inherit);
         runner.Host.ResolvesIndirectDrawOnGpu = true;
         runner.Host.WriteWords(Arguments + 16, new uint[] { 50, 2, 4, 7, 1 });
 
@@ -170,13 +192,13 @@ public sealed class GpuCommandInterpreterDrawTests
         var indexed = Assert.Single(runner.Host.IndexedDraws);
         Assert.Equal((40u, Indices, Arguments + 16, DrawOffsetSource.IndirectArguments),
             (indexed.IndexCount, indexed.IndexAddress, indexed.IndirectArgumentsAddress, indexed.OffsetSource));
-        Assert.Equal(GpuCommandInterpreter.GpuInstanceStateEnabled ? [] : new[] { (Arguments + 20, 4) }, runner.Host.GuestReadRanges.Where(r => r.Address >= Arguments + 16 && r.Address < Arguments + 36));
+        Assert.Equal(!inherit || GpuCommandInterpreter.GpuInstanceStateEnabled ? [] : new[] { (Arguments + 20, 4) }, runner.Host.GuestReadRanges.Where(r => r.Address >= Arguments + 16 && r.Address < Arguments + 36));
         runner.Host.WriteWords(Arguments + 16, new uint[] { 50, 1030888894, 4, 7, 1 });
 
         // Later guest reuse of the argument record cannot change the captured CP state.
         runner.Run(StreamRunner.Packet(PacketOpcode.DrawIndexAuto, 5, 0));
-        Assert.Equal(GpuCommandInterpreter.GpuInstanceStateEnabled ? 1u : 2u, runner.Host.AutoDraws[0].InstanceCount);
-        Assert.Equal(GpuCommandInterpreter.GpuInstanceStateEnabled, runner.Host.AutoDraws[0].GpuInstances.Inherit);
+        Assert.Equal(!inherit || GpuCommandInterpreter.GpuInstanceStateEnabled ? 1u : 2u, runner.Host.AutoDraws[0].InstanceCount);
+        Assert.Equal(inherit && GpuCommandInterpreter.GpuInstanceStateEnabled, runner.Host.AutoDraws[0].GpuInstances.Inherit);
 
         runner.Host.WriteWords(Arguments + 16, new uint[] { 50, 2, 4, 7, 1 });
         // 8-bit indices are expanded on the CPU, so their counts are read at once.
@@ -187,10 +209,12 @@ public sealed class GpuCommandInterpreterDrawTests
         Assert.Equal(40u, runner.Host.IndexedDraws[1].IndexCount);
     }
 
-    [Fact]
-    public void NonIndexedIndirectDraws_LeaveArgumentsOnTheGpuWhenTheHostCan()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NonIndexedIndirectDraws_LeaveArgumentsOnTheGpuWhenTheHostCan(bool inherit)
     {
-        var runner = new StreamRunner();
+        var runner = new StreamRunner(indirectInstanceInherit: inherit);
         runner.Host.ResolvesIndirectDrawOnGpu = true;
         runner.Host.WriteWords(Arguments, new uint[] { 9, 3, 1, 2 });
 
@@ -200,25 +224,28 @@ public sealed class GpuCommandInterpreterDrawTests
 
         var auto = Assert.Single(runner.Host.AutoDraws);
         Assert.Equal((Arguments, DrawOffsetSource.IndirectArguments), (auto.IndirectArgumentsAddress, auto.OffsetSource));
-        Assert.Equal(GpuCommandInterpreter.GpuInstanceStateEnabled ? [] : new[] { (Arguments + 4, 4) }, runner.Host.GuestReadRanges.Where(r => r.Address >= Arguments && r.Address < Arguments + 16));
+        Assert.Equal(!inherit || GpuCommandInterpreter.GpuInstanceStateEnabled ? [] : new[] { (Arguments + 4, 4) }, runner.Host.GuestReadRanges.Where(r => r.Address >= Arguments && r.Address < Arguments + 16));
         runner.Host.WriteWords(Arguments, new uint[] { 9, 2122219134, 1, 2 });
 
         // Later guest reuse of the argument record cannot change the captured CP state.
         runner.Run(StreamRunner.Packet(PacketOpcode.DrawIndexAuto, 5, 0));
-        Assert.Equal(GpuCommandInterpreter.GpuInstanceStateEnabled ? 1u : 3u, runner.Host.AutoDraws[1].InstanceCount);
-        Assert.Equal(GpuCommandInterpreter.GpuInstanceStateEnabled, runner.Host.AutoDraws[1].GpuInstances.Inherit);
+        Assert.Equal(!inherit || GpuCommandInterpreter.GpuInstanceStateEnabled ? 1u : 3u, runner.Host.AutoDraws[1].InstanceCount);
+        Assert.Equal(inherit && GpuCommandInterpreter.GpuInstanceStateEnabled, runner.Host.AutoDraws[1].GpuInstances.Inherit);
         Assert.Equal(0ul, runner.Host.AutoDraws[1].IndirectArgumentsAddress);
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void GpuIndirectState_ExplicitInstancesAndQueueResetWin(bool indexed)
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void GpuIndirectState_ExplicitInstancesAndQueueResetWin(bool indexed, bool inherit)
     {
-        var runner = new StreamRunner();
+        var runner = new StreamRunner(indirectInstanceInherit: inherit);
         runner.Host.ResolvesIndirectDrawOnGpu = true;
         runner.Host.WriteWords(Arguments, [3, 7, 0, 0, 0]);
         runner.Run(SetBase(Arguments, false),
+            StreamRunner.Packet(PacketOpcode.NumInstances, 6),
             StreamRunner.Packet(PacketOpcode.IndexBase, StreamRunner.Low(Indices), StreamRunner.High(Indices)),
             StreamRunner.Packet(PacketOpcode.IndexBufferSize, 40),
             StreamRunner.Packet(indexed ? PacketOpcode.DrawIndexIndirect : PacketOpcode.DrawIndirect, 0, 0, 0, 2),
@@ -226,7 +253,8 @@ public sealed class GpuCommandInterpreterDrawTests
             StreamRunner.Packet(PacketOpcode.NumInstances, 9),
             StreamRunner.Packet(PacketOpcode.DrawIndexAuto, 3, 0));
         var inherited = runner.Host.AutoDraws[indexed ? 0 : 1];
-        Assert.Equal(GpuCommandInterpreter.GpuInstanceStateEnabled, inherited.GpuInstances.Inherit);
+        Assert.Equal(inherit && GpuCommandInterpreter.GpuInstanceStateEnabled, inherited.GpuInstances.Inherit);
+        Assert.Equal(inherit ? (GpuCommandInterpreter.GpuInstanceStateEnabled ? 1u : 7u) : 6u, inherited.InstanceCount);
         var explicitDraw = runner.Host.AutoDraws.Last();
         Assert.Equal(9u, explicitDraw.InstanceCount);
         Assert.Null(explicitDraw.GpuInstances.Register);
@@ -237,16 +265,21 @@ public sealed class GpuCommandInterpreterDrawTests
     }
 
     [Theory]
-    [InlineData(false, false)]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    [InlineData(true, true)]
-    public void GpuMultiDraw_DoesNotReadCountOrRecordsAndSharesOneRegister(bool indexed, bool indirectCount)
+    [InlineData(false, false, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, false)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(true, true, true)]
+    public void GpuMultiDraw_DoesNotReadCountOrRecordsAndSharesOneRegister(bool indexed, bool indirectCount, bool inherit)
     {
         if (!GpuCommandInterpreter.GpuInstanceStateEnabled) return;
-        var runner = new StreamRunner();
+        var runner = new StreamRunner(indirectInstanceInherit: inherit);
         runner.Host.ResolvesIndirectDrawOnGpu = true;
         runner.Run(SetBase(Arguments, false),
+            StreamRunner.Packet(PacketOpcode.NumInstances, 6),
             StreamRunner.Packet(PacketOpcode.IndexBase, StreamRunner.Low(Indices), StreamRunner.High(Indices)),
             StreamRunner.Packet(PacketOpcode.IndexBufferSize, 40),
             StreamRunner.Packet(indexed ? PacketOpcode.DrawIndexIndirectMulti : PacketOpcode.DrawIndirectMulti,
@@ -255,15 +288,29 @@ public sealed class GpuCommandInterpreterDrawTests
         var states = indexed ? runner.Host.IndexedDraws.Select(d => d.GpuInstances).ToArray()
             : runner.Host.AutoDraws.Take(3).Select(d => d.GpuInstances).ToArray();
         Assert.Equal(3, states.Length);
+        // Each indirect draw keeps its own GPU record, independent of persistent instance state.
+        var addresses = indexed ? runner.Host.IndexedDraws.Select(d => d.IndirectArgumentsAddress)
+            : runner.Host.AutoDraws.Take(3).Select(d => d.IndirectArgumentsAddress);
+        Assert.Equal(new[] { Arguments, Arguments + 32, Arguments + 64 }, addresses);
         for (var i = 0; i < 3; i++)
         {
+            if (!inherit && !indirectCount)
+            {
+                Assert.Null(states[i].Register);
+                continue;
+            }
             Assert.Equal(Arguments + (ulong)i * 32, states[i].CaptureAddress);
             Assert.Equal(indirectCount ? StreamRunner.LabelAddress : 0ul, states[i].CountAddress);
             Assert.Equal((uint)i, states[i].RecordIndex);
-            Assert.Equal(i == 0, states[i].Initialize);
+            Assert.Equal(inherit && i == 0, states[i].Initialize);
             Assert.Same(states[0].Register, states[i].Register);
         }
-        Assert.Same(states[0].Register, runner.Host.AutoDraws.Last().GpuInstances.Register);
+        if (inherit) Assert.Same(states[0].Register, runner.Host.AutoDraws.Last().GpuInstances.Register);
+        else
+        {
+            Assert.Null(runner.Host.AutoDraws.Last().GpuInstances.Register);
+            Assert.Equal(6u, runner.Host.AutoDraws.Last().InstanceCount);
+        }
         Assert.DoesNotContain(runner.Host.GuestReadRanges, r => r.Address == StreamRunner.LabelAddress || (r.Address >= Arguments && r.Address < Arguments + 96));
     }
 

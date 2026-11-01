@@ -295,10 +295,10 @@ internal sealed class StreamRunner
     public const ulong TableAddress = RecordingCommandStreamHost.MemoryBase + 0x9000;
     public const ulong DataAddress = RecordingCommandStreamHost.MemoryBase + 0xA000;
 
-    public StreamRunner(int queueId = 0, RecordingCommandStreamHost? host = null)
+    public StreamRunner(int queueId = 0, RecordingCommandStreamHost? host = null, bool indirectInstanceInherit = false)
     {
         Host = host ?? new RecordingCommandStreamHost();
-        Interpreter = new GpuCommandInterpreter(Host, queueId, queueId == 0 ? 0 : GpuCommandInterpreter.ComputeQueueBase + queueId - 1);
+        Interpreter = new GpuCommandInterpreter(Host, queueId, queueId == 0 ? 0 : GpuCommandInterpreter.ComputeQueueBase + queueId - 1) { IndirectInstanceInherit = indirectInstanceInherit };
     }
 
     public RecordingCommandStreamHost Host { get; }

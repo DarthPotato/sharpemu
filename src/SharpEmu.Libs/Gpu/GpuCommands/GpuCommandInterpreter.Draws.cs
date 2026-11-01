@@ -14,10 +14,17 @@ public sealed partial class GpuCommandInterpreter
     private readonly GpuInstanceRegister _gpuInstanceRegister = new();
     private bool _gpuInstanceCount;
 
+    // Preserve explicit NUM_INSTANCES by default for compatibility with observed Gen5 draws.
+    // Generic AMD PAL treats indirect draws as clobbering this state; exact Gen5 persistence
+    // remains unverified. SHARPEMU_INDIRECT_INSTANCE_INHERIT=1 restores inheritance.
+    internal bool IndirectInstanceInherit { get; init; } = Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_INSTANCE_INHERIT") == "1";
+
     private GpuInstanceState CaptureGpuInstances(ulong address, ulong countAddress = 0, uint recordIndex = 0, GpuIndirectCount? countState = null)
     {
-        var initialize = !_gpuInstanceCount;
-        _gpuInstanceCount = true;
+        // Counted draws still need GPU argument filtering without persistent inheritance.
+        if (!IndirectInstanceInherit && countAddress == 0) return default;
+        var initialize = IndirectInstanceInherit && !_gpuInstanceCount;
+        _gpuInstanceCount = IndirectInstanceInherit;
         return new(_gpuInstanceRegister, address, CountAddress: countAddress, RecordIndex: recordIndex, Initialize: initialize, InitialCount: InstanceCount, DrawCount: countState);
     }
 
@@ -152,7 +159,7 @@ public sealed partial class GpuCommandInterpreter
             if (CommandThreadTally.Enabled) ProducerWaitProfile.Path(opcode.ToString("X2") + ".gpu_auto");
             // Capture persistent CP state before later packets/submissions can reuse this record.
             var gpuInstances = GpuInstanceStateEnabled && (argumentsAddress & 3) == 0 ? CaptureGpuInstances(argumentsAddress, countAddress, recordIndex, countState) : default;
-            if (gpuInstances.Register is null) SetIndirectInstanceCount(ReadDword(argumentsAddress + 4), packetAddress, opcode, argumentsAddress);
+            if (IndirectInstanceInherit && gpuInstances.Register is null) SetIndirectInstanceCount(ReadDword(argumentsAddress + 4), packetAddress, opcode, argumentsAddress);
             if (Rendering.ScissorTrace.Instance is { Active: true } gpuTrace)
                 gpuTrace.DrawIssued(TypedRegisters, SubmitId, QueueId, packetAddress);
             _host.DrawAuto(SubmitId, new DrawAutoArguments(packetAddress, opcode, uint.MaxValue, 1, 0, 0,
@@ -171,6 +178,7 @@ public sealed partial class GpuCommandInterpreter
             var startVertex = BinaryPrimitives.ReadUInt32LittleEndian(argumentBytes[8..]);
             var startInstance = BinaryPrimitives.ReadUInt32LittleEndian(argumentBytes[12..]);
             SetIndirectInstanceCount(instanceCount, packetAddress, opcode, argumentsAddress);
+            if (instanceCount == 0) return;
             DrawAuto(packetAddress, opcode, vertexCount, instanceCount, startVertex, startInstance, DrawOffsetSource.IndirectArguments, startInstanceUserData);
             return;
         }
@@ -183,7 +191,7 @@ public sealed partial class GpuCommandInterpreter
             // range; the arguments pick the indices. The host falls back to reading them
             // itself when the draw needs the counts; persistent CP state is captured now.
             var gpuInstances = GpuInstanceStateEnabled && (argumentsAddress & 3) == 0 ? CaptureGpuInstances(argumentsAddress, countAddress, recordIndex, countState) : default;
-            if (gpuInstances.Register is null) SetIndirectInstanceCount(ReadDword(argumentsAddress + 4), packetAddress, opcode, argumentsAddress);
+            if (IndirectInstanceInherit && gpuInstances.Register is null) SetIndirectInstanceCount(ReadDword(argumentsAddress + 4), packetAddress, opcode, argumentsAddress);
             if (Rendering.ScissorTrace.Instance is { Active: true } trace)
                 trace.DrawIssued(TypedRegisters, SubmitId, QueueId, packetAddress);
             _host.DrawIndexed(SubmitId, new DrawIndexedArguments(
@@ -207,11 +215,13 @@ public sealed partial class GpuCommandInterpreter
             LearnIndexExtent(startIndex, indexCountPerInstance);
         }
 
+        if (indexedInstanceCount == 0) return;
         DrawIndexed(packetAddress, opcode, indexCount, indexAddress, indexedInstanceCount, unchecked((int)baseVertex), indexedStartInstance, DrawOffsetSource.IndirectArguments, startInstanceUserData);
     }
 
     private void SetIndirectInstanceCount(uint count, ulong packet, uint opcode, ulong arguments)
     {
+        if (!IndirectInstanceInherit) return;
         _gpuInstanceCount = false;
         InstanceCount = count;
         _instanceSource = "indirect-argument-snapshot";
