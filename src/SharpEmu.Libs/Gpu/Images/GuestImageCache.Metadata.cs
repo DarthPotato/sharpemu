@@ -529,7 +529,7 @@ public sealed partial class GuestImageCache
 
     // A dispatch read and rewrote these HTile words in place. What it wrote is only known
     // once it ran, so the clear state is read from the words at the next depth bind.
-    public bool MarkHtileRewritten(ulong address)
+    public bool MarkHtileRewritten(ulong address, ulong program = 0)
     {
         using var held = _lock.Hold();
         if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind != SurfaceMetadataKind.HTile)
@@ -538,9 +538,28 @@ public sealed partial class GuestImageCache
         }
 
         found.RewrittenByGpu = true;
+        found.RewritingProgram = program;
         NoteMetadataChange(address);
         return true;
     }
+
+    // On by default (SHARPEMU_HTILE_PREDICT=0 turns it off): a dispatch that rewrote the same HTile with the same program the last
+    // PredictAfter times with one identical result is predicted to produce it again, without waiting
+    // for the GPU to read the words back. Every VerifyEvery-th prediction still reads them; a
+    // mismatch stops prediction for that HTile and program for good.
+    internal bool HtilePrediction { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_HTILE_PREDICT") != "0";
+    private const int HtilePredictAfter = 8;
+    private const int HtileVerifyEvery = 16;
+
+    private sealed class HtilePredictor
+    {
+        public bool[]? Pattern;
+        public int Streak;
+        public int SinceVerified;
+        public bool Disabled;
+    }
+
+    private readonly Dictionary<(ulong Address, ulong Program), HtilePredictor> _htilePredictors = [];
 
     // The hardware reads a depth tile as cleared when its HTile ZMask (bits 0-3) is 0. A slice
     // whose every tile says so is cleared; any other slice keeps the depth in memory.
@@ -549,6 +568,8 @@ public sealed partial class GuestImageCache
         using var readbackSource = SharpEmu.Libs.Gpu.Scheduling.ReadbackSourceProfile.Begin("HTile");
         ulong size;
         uint layers;
+        HtilePredictor? predictor = null;
+        var verifying = false;
         using (var held = _lock.Hold())
         {
             if (!_surfaceMetadata.TryGetValue(address, out var found) || !found.RewrittenByGpu)
@@ -559,6 +580,34 @@ public sealed partial class GuestImageCache
             found.RewrittenByGpu = false;
             size = found.Size;
             layers = found.Layers;
+            if (HtilePrediction && found.RewritingProgram != 0)
+            {
+                var key = (address, found.RewritingProgram);
+                if (!_htilePredictors.TryGetValue(key, out predictor))
+                {
+                    predictor = new HtilePredictor();
+                    _htilePredictors[key] = predictor;
+                }
+
+                if (!predictor.Disabled && predictor.Streak >= HtilePredictAfter && predictor.Pattern is { } pattern &&
+                    pattern.Length == layers)
+                {
+                    if (++predictor.SinceVerified < HtileVerifyEvery)
+                    {
+                        for (uint slice = 0; slice < layers; slice++)
+                        {
+                            found.SetSlice(slice, pattern[slice]);
+                        }
+
+                        NoteMetadataChange(address);
+                        if (RenderPhaseProfile.Enabled) HtileResolveTally.NotePredicted();
+                        return;
+                    }
+
+                    predictor.SinceVerified = 0;
+                    verifying = true;
+                }
+            }
         }
 
         if (size == 0 || layers == 0 || size % layers != 0 || (size / layers) % sizeof(uint) != 0 || !IsValidRange(address, size))
@@ -609,10 +658,35 @@ public sealed partial class GuestImageCache
                 return;
             }
 
+            var anyCleared = false;
+            var changed = false;
             for (uint slice = 0; slice < layers; slice++)
             {
+                anyCleared |= cleared[slice];
+                changed |= found.IsSliceClear(slice) != cleared[slice];
                 found.SetSlice(slice, cleared[slice]);
                 NoteMetadataChange(address);
+            }
+
+            if (RenderPhaseProfile.Enabled) HtileResolveTally.Note(address, layers, anyCleared, changed);
+            if (predictor is not null)
+            {
+                if (predictor.Pattern is { } previous && previous.AsSpan().SequenceEqual(cleared))
+                {
+                    predictor.Streak++;
+                }
+                else
+                {
+                    if (verifying)
+                    {
+                        predictor.Disabled = true;
+                        Console.Error.WriteLine(
+                            $"[GPU][WARN][HTILE_PREDICT] prediction mismatch: htile=0x{address:X16} program=0x{found.RewritingProgram:X16}; prediction disabled for it.");
+                    }
+
+                    predictor.Pattern = cleared;
+                    predictor.Streak = 1;
+                }
             }
         }
     }

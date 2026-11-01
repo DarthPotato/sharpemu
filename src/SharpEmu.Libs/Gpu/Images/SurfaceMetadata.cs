@@ -87,6 +87,8 @@ public sealed class SurfaceMetadata
     // A dispatch rewrote these HTile words in place; their clear state is read from the
     // words before the depth target is next bound.
     public bool RewrittenByGpu;
+    // The program whose dispatch last rewrote these HTile words (0 when unknown).
+    public ulong RewritingProgram;
 
     public ulong RangeSize;
     public bool NativeColorClear;

@@ -287,7 +287,7 @@ public interface IRenderHost
     bool ClearMetadata(ulong address);
 
     // A dispatch rewrote this HTile in place; its clear state is read from the words later.
-    bool MarkHtileRewritten(ulong address);
+    bool MarkHtileRewritten(ulong address, ulong program = 0);
 
     // Drops the pending clear of metadata a fill proved expanded (its words no longer say cleared).
     bool ExpandMetadata(ulong address);

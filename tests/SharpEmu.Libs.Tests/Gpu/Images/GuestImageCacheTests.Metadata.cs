@@ -308,6 +308,53 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // After eight identical results for one HTile and program, the result is predicted instead of
+    // read back; every sixteenth prediction is verified, and a mismatch stops prediction for good.
+    [Fact]
+    public void RewrittenHtile_PredictionIsVerifiedAndStopsOnMismatch()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        harness.Images.HtilePrediction = true;
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var htile = address + 0x4000;
+        const ulong size = 0x100;
+        const ulong program = 0x1234;
+        harness.Images.RegisterHtileMetadataForTest(htile, size, 1);
+        void WriteWords(uint word)
+        {
+            var words = new byte[size];
+            for (var offset = 0; offset < words.Length; offset += 4)
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(words.AsSpan(offset), word);
+            harness.Write(htile, words);
+        }
+
+        bool Resolve()
+        {
+            Assert.True(harness.Images.SetMetadataSlice(htile, 0, false));
+            Assert.True(harness.Images.MarkHtileRewritten(htile, program));
+            return harness.Images.IsMetadataCleared(htile, 0);
+        }
+
+        WriteWords(0xFFFF_FFF0u);
+        for (var round = 0; round < 8; round++) Assert.True(Resolve());
+
+        // The words now say "expanded": predictions still answer "cleared" until the verification read.
+        WriteWords(0x0000_000Fu);
+        var predicted = 0;
+        while (Resolve())
+        {
+            Assert.True(++predicted < 16, "the verification read never happened");
+        }
+
+        Assert.Equal(15, predicted);
+        // Disabled for good: every later resolve reads the words.
+        for (var round = 0; round < 20; round++) Assert.False(Resolve());
+        WriteWords(0xFFFF_FFF0u);
+        Assert.True(Resolve());
+        harness.Shutdown();
+    }
+
     [Fact]
     public void HtileTracksClearStateBeyond32Slices()
     {

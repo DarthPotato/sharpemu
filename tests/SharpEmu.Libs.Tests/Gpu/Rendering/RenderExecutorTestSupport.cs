@@ -496,7 +496,7 @@ internal sealed class RecordingRenderHost : IRenderHost
         return ClearableMetadata.Contains(address);
     }
 
-    public bool MarkHtileRewritten(ulong address)
+    public bool MarkHtileRewritten(ulong address, ulong program = 0)
     {
         Calls.Add($"htile_rewritten {address:X}");
         return HtileAddresses.Contains(address);

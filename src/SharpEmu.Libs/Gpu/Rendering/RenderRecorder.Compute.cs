@@ -89,7 +89,7 @@ internal sealed partial class RenderRecorder
         {
             var metadata = htileProbes.Where(probe => _host.IsMetadata(probe.Address)).ToArray();
             if (metadata.Length == 1 && metadata[0].Read && metadata[0].Written && _host.IsHtile(metadata[0].Address))
-                _host.MarkHtileRewritten(metadata[0].Address);
+                _host.MarkHtileRewritten(metadata[0].Address, computeProgram.Program.Id);
         }
 
         _host.EndRendering();

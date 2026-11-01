@@ -1971,10 +1971,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool ExpandMetadata(ulong address) => _imageCache.ExpandMetadata(address);
 
-        public bool MarkHtileRewritten(ulong address)
+        public bool MarkHtileRewritten(ulong address, ulong program = 0)
         {
             if (_worker) throw Serial("HTile rewrite");
-            return _imageCache.MarkHtileRewritten(address);
+            return _imageCache.MarkHtileRewritten(address, program);
         }
 
         public bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear)
