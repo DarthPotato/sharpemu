@@ -912,13 +912,39 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
         }
 
-        if (associations.Any(association => _slots[association].IsGpuModified))
+        // A plane image that can hold the values keeps them on the GPU as a standalone image (see DeleteImage).
+        var kept = new List<ResourceSlotIdentifier>();
+        if (KeepStencilPlaneOnGpu && CanWriteBackStencilPlane(depth))
+        {
+            foreach (var association in associations)
+            {
+                var associated = _slots[association];
+                if (!associated.IsGpuModified || !CanHoldStencilPlane(depth, associated))
+                {
+                    continue;
+                }
+
+                depth.CopyStencilStorage(associated, _bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: false);
+                associated.AssociateDepth(ResourceSlotIdentifier.Invalid);
+                WatchImage(association);
+                TakeGpuOwnership(associated);
+                Interlocked.Increment(ref _stencilPlanesKept);
+                kept.Add(association);
+            }
+        }
+
+        if (associations.Any(association => !kept.Contains(association) && _slots[association].IsGpuModified))
         {
             WriteBackStencilPlane(depth, plane);
         }
 
         foreach (var association in associations)
         {
+            if (kept.Contains(association))
+            {
+                continue;
+            }
+
             _slots[association].ClearGpuModified();
             DeleteImage(association);
         }
