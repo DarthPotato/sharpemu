@@ -146,13 +146,16 @@ internal static class GpuReadTrace
             : mark.Device ? $"device-page:0x{mark.Address:X}+0x{mark.Size:X}"
             : $"binding:0x{mark.Address:X}+0x{mark.Size:X}";
 
-    public static void RecordValue(ulong address, uint word)
+    private static readonly Dictionary<ulong, ulong> _bases = new();
+
+    public static void RecordValue(ulong address, uint word, ulong tableBase = 0)
     {
         lock (_values)
         {
             _values[address] = _values.TryGetValue(address, out var entry)
                 ? (entry.Reads + 1, entry.Changes + (entry.Last != word ? 1 : 0), word, entry.First, entry.Shader)
                 : (1, 0, word, word, CurrentShader);
+            if (tableBase != 0 && tableBase <= address) _bases[address] = tableBase;
             if (_marks.TryGetValue(address & ~0xFFFUL, out var mark))
             {
                 _origins[address] = mark;
@@ -168,7 +171,7 @@ internal static class GpuReadTrace
             foreach (var (key, value) in _values.OrderByDescending(pair => pair.Value.Reads).Take(16))
             {
                 Console.Error.WriteLine(
-                    $"[GPU][SYNC_READ_VALUE] address=0x{key:X16} reads={value.Reads} changes={value.Changes} first=0x{value.First:X8} last=0x{value.Last:X8} shader=0x{value.Shader:X16} origin={Origin(key)} {WriteMaskReport(key)}");
+                    $"[GPU][SYNC_READ_VALUE] address=0x{key:X16} reads={value.Reads} changes={value.Changes} first=0x{value.First:X8} last=0x{value.Last:X8} shader=0x{value.Shader:X16} table=0x{_bases.GetValueOrDefault(key):X} offset={(_bases.TryGetValue(key, out var tableAt) ? (long)(key - tableAt) : -1)} origin={Origin(key)} {WriteMaskReport(key)}");
             }
         }
     }

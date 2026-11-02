@@ -783,7 +783,11 @@ internal sealed class MaterializationProgram
 
     private static void ReadWord(ResourceRuntimeInputs inputs, ulong address, ulong baseAddress, bool absolute, int target, ulong[] values, bool[] valid)
     {
-        if (inputs.ReadMemory is not null && inputs.ReadMemory(address, out var word))
+        MaterializationReadTrace.Base = baseAddress;
+        uint word = 0;
+        var read = inputs.ReadMemory is not null && inputs.ReadMemory(address, out word);
+        MaterializationReadTrace.Base = 0;
+        if (read)
         {
             values[target] = word;
             valid[target] = true;
@@ -793,4 +797,10 @@ internal sealed class MaterializationProgram
         values[target] = 0;
         valid[target] = (baseAddress & ~3ul) == 0 || (absolute && inputs.ReadMemory is not null && !inputs.ReadsClean);
     }
+}
+
+// The table base of the word a materialization is reading, for SHARPEMU_TRACE_GPU_READS.
+public static class MaterializationReadTrace
+{
+    [ThreadStatic] public static ulong Base;
 }

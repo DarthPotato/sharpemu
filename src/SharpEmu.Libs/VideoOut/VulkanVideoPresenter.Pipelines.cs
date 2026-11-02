@@ -463,6 +463,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             NoteUncleanRead(address, sizeof(uint));
+            var traced = Diagnostics.GpuReadTrace.Enabled && HasGpuWrittenCommandData(address, sizeof(uint));
             if (!ReadOnCommandThread(address, bytes, RenderReadSource.Word))
             {
                 word = 0;
@@ -470,6 +471,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            if (traced) Diagnostics.GpuReadTrace.RecordValue(address, word, SharpEmu.ShaderCompiler.Resources.MaterializationReadTrace.Base);
             return true;
         }
 
