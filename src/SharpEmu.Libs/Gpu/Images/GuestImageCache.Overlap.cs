@@ -590,9 +590,22 @@ public sealed partial class GuestImageCache
             Console.Error.WriteLine($"[GPU][WARN] An unequal-sample depth overlap copy is not supported: cachedSamples={cached.Backing.Samples} replacementSamples={replacement.Backing.Samples}.");
         }
 
+        if (TracePublishing && _depthReplaceTraces < 20 && cached.Description.HasStencil)
+        {
+            _depthReplaceTraces++;
+            var r = replacement.Description;
+            Console.Error.WriteLine($"[GPU][TRACE] DEPTH_REPLACE role={role} cached={cached.Backing.Format}/{cachedInfo.Extent.Width}x{cachedInfo.Extent.Height}x{cachedInfo.Resources.Layers} " +
+                $"stencil=0x{cachedInfo.Stencil.Address:X}+0x{cachedInfo.Stencil.Size:X} meta={cachedInfo.Metadata.Kind} data=0x{cachedInfo.Data.Address:X}+0x{cachedInfo.Data.Size:X} " +
+                $"replacement={replacement.Backing.Format}/{r.Extent.Width}x{r.Extent.Height}x{r.Resources.Layers} stencil=0x{r.Stencil.Address:X}+0x{r.Stencil.Size:X} " +
+                $"meta={r.Metadata.Kind} data=0x{r.Data.Address:X}+0x{r.Data.Size:X} requested_stencil=0x{requested.Stencil.Address:X}+0x{requested.Stencil.Size:X} " +
+                $"requested_format={requested.PixelFormat} samples={cached.Backing.Samples}/{replacement.Backing.Samples}");
+        }
+
         ReleaseImage(cachedImageIdentifier);
         return replacementImageIdentifier;
     }
+
+    private int _depthReplaceTraces;
 
     // Memory keeps its bytes when another image or a buffer write reuses part of it. An image
     // whose GPU contents never reached guest memory moves them into the buffer over its range

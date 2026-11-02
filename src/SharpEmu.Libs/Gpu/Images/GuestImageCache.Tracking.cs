@@ -83,6 +83,18 @@ public sealed partial class GuestImageCache
     // depth image over the plane loads it from there instead of stale bytes.
     // The number of images retired: the image and the stencil planes associated with it, or zero
     // when it was not registered.
+    // SHARPEMU_STENCIL_PLANE_ON_GPU=0: a deleted depth image's stencil goes back to guest memory as before.
+    private static readonly bool KeepStencilPlaneOnGpu = Environment.GetEnvironmentVariable("SHARPEMU_STENCIL_PLANE_ON_GPU") != "0";
+    private static long _stencilPlanesKept;
+
+    private static bool CanHoldStencilPlane(CachedImage depth, CachedImage plane) =>
+        plane.Backing.Exists && plane.Backing.Format is Silk.NET.Vulkan.Format.R8Uint or Silk.NET.Vulkan.Format.R8Unorm &&
+        plane.Backing.ImageType == Silk.NET.Vulkan.ImageType.Type2D &&
+        plane.Backing.Samples == 1 && plane.Backing.MipLevels == 1 && plane.Backing.Layers == depth.Backing.Layers &&
+        plane.Backing.Extent.Width <= depth.Backing.Extent.Width && plane.Backing.Extent.Height <= depth.Backing.Extent.Height &&
+        depth.Backing.ImageType == Silk.NET.Vulkan.ImageType.Type2D && depth.Backing.Samples == 1 && depth.Backing.MipLevels == 1 &&
+        !depth.Description.Metadata.StencilCompressed;
+
     private int DeleteImage(ResourceSlotIdentifier imageIdentifier, bool publishStencil = true)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDelete);
@@ -115,6 +127,19 @@ public sealed partial class GuestImageCache
                 ReportImageLifetime(associated, "delete-depth-association", deletion: true);
                 if (associated.IsGpuModified)
                 {
+                    if (publishStencil && CanWriteBackStencilPlane(image) && KeepStencilPlaneOnGpu && CanHoldStencilPlane(image, associated))
+                    {
+                        // The plane image keeps the values as a standalone image instead of a round trip through
+                        // guest memory; the next depth image over the plane takes them back on the GPU
+                        // (TakeStandaloneStencilPlane), and a CPU read publishes them like any GPU-written image.
+                        image.CopyStencilStorage(associated, _bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: false);
+                        associated.AssociateDepth(ResourceSlotIdentifier.Invalid);
+                        WatchImage(association);
+                        TakeGpuOwnership(associated);
+                        Interlocked.Increment(ref _stencilPlanesKept);
+                        continue;
+                    }
+
                     if (publishStencil && CanWriteBackStencilPlane(image))
                     {
                         WriteBackStencilPlane(image, associated.Description.Data);
