@@ -1115,9 +1115,10 @@ internal static partial class VulkanVideoPresenter
             }
         }
 
-        // SHARPEMU_STORES_OVER_GPU=1: every command-stream store into GPU-dirty pages lands on both copies
-        // (as kernel stores do) instead of first downloading the GPU bytes of those pages.
-        private static readonly bool StoresOverGpu = Environment.GetEnvironmentVariable("SHARPEMU_STORES_OVER_GPU") == "1";
+        // Every command-stream store into GPU-dirty pages lands on both copies (as kernel stores do)
+        // instead of first downloading the GPU bytes of those pages. SHARPEMU_STORES_OVER_GPU=0 restores
+        // the download for non-kernel stores.
+        private static readonly bool StoresOverGpu = Environment.GetEnvironmentVariable("SHARPEMU_STORES_OVER_GPU") != "0";
         private int _refusedStoreLogs;
 
         private void ApplyWrite(Item item)
