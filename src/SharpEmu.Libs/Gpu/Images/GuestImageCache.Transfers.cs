@@ -413,7 +413,9 @@ public sealed unsafe partial class GuestImageCache
         var backing = _backing;
         // Until the tick completes guest memory holds the plane this replaces; an upload of the
         // range waits for it (AwaitPublishingDownloads).
-        var publishing = new PublishingDownload(plane.Address, plane.Size, _scheduler.CurrentTick);
+        var publishing = new PublishingDownload(plane.Address, plane.Size, _scheduler.CurrentTick,
+            TracePublishing ? $"{depth.Backing.Format}/{depth.Backing.Extent.Width}x{depth.Backing.Extent.Height}<-" +
+                string.Join("<-", new System.Diagnostics.StackTrace(1, false).GetFrames().Take(4).Select(f => f.GetMethod()?.Name)) : null);
         lock (_publishingDownloads) _publishingDownloads.Add(publishing);
         _scheduler.QueuePriorityCompletionAction(() =>
         {
@@ -433,7 +435,11 @@ public sealed unsafe partial class GuestImageCache
         });
     }
 
-    private sealed record PublishingDownload(ulong Address, ulong Size, ulong Tick);
+    private sealed record PublishingDownload(ulong Address, ulong Size, ulong Tick, string? Source = null);
+
+    // SHARPEMU_TRACE_PUBLISHING=1: which writeback an upload waits for, and for what image.
+    private static readonly bool TracePublishing = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_PUBLISHING") == "1";
+    private static int _publishingTraces;
 
     // Readbacks whose guest bytes are written only when their tick completes. Until then guest
     // memory holds the contents they supersede.
@@ -653,6 +659,22 @@ public sealed unsafe partial class GuestImageCache
         if (ImageDescription.IsEmptyRange(image.Description.Data))
         {
             return;
+        }
+
+        if (TracePublishing && _publishingTraces < 40)
+        {
+            lock (_publishingDownloads)
+            {
+                foreach (var download in _publishingDownloads)
+                {
+                    var data = image.Description.Data;
+                    if (download.Address < data.Address + data.Size && data.Address < download.Address + download.Size &&
+                        Interlocked.Increment(ref _publishingTraces) <= 40)
+                        Console.Error.WriteLine($"[GPU][TRACE] PUBLISHING_WAIT image=0x{data.Address:X} size=0x{data.Size:X} format={image.Backing.Format} " +
+                            $"extent={image.Backing.Extent.Width}x{image.Backing.Extent.Height} levels={image.Backing.MipLevels} path={uploadPath} " +
+                            $"download=0x{download.Address:X}+0x{download.Size:X} source={download.Source}");
+                }
+            }
         }
 
         AwaitPublishingDownloads(image.Description.Data);
