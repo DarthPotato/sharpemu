@@ -155,7 +155,10 @@ public sealed partial class RenderExecutor
         if ((GuestPrimitiveType)banks.UserConfig.PrimitiveType == GuestPrimitiveType.TriangleStrip) return "strip_metadata";
         if ((banks.UserConfig.PrimitiveResetControl & 1) != 0) return "restart_conversion";
         if (banks.Shader.Vertex.GeometryAddress != 0) return "mesh_expansion";
-        return "primitive_or_capacity";
+        var primitive = (GuestPrimitiveType)banks.UserConfig.PrimitiveType;
+        return primitive is GuestPrimitiveType.PointList or GuestPrimitiveType.LineList or GuestPrimitiveType.LineStrip or
+            GuestPrimitiveType.TriangleList or GuestPrimitiveType.TriangleFan or GuestPrimitiveType.Polygon or GuestPrimitiveType.RectangleList
+            ? $"capacity_{(arguments.IndexCount >= 1u << 24 ? "huge" : "large")}" : $"primitive_{primitive}";
     }
 
     private const ulong MaxIndirectIndexBufferBytes = 64ul << 20;

@@ -196,7 +196,7 @@ public sealed partial class GpuCommandInterpreter
                 trace.DrawIssued(TypedRegisters, SubmitId, QueueId, packetAddress);
             _host.DrawIndexed(SubmitId, new DrawIndexedArguments(
                 packetAddress, opcode, gpuIndexCount, IndexBaseAddress, IndexTypeAndSize, 1, 0, 0,
-                DrawOffsetSource.IndirectArguments, argumentsAddress, UnboundedIndexBuffer: IndexBufferSize == 0, StartInstanceUserData: startInstanceUserData, GpuInstances: gpuInstances));
+                DrawOffsetSource.IndirectArguments, argumentsAddress, UnboundedIndexBuffer: !HasBindableIndexSize, StartInstanceUserData: startInstanceUserData, GpuInstances: gpuInstances));
             return;
         }
 
@@ -210,9 +210,9 @@ public sealed partial class GpuCommandInterpreter
         var indexAddress = IndexBaseAddress + (startIndex * IndexElementSize);
         var indexCount = IndexBufferSize != 0 ? Math.Min(indexCountPerInstance, IndexBufferSize) : indexCountPerInstance;
         SetIndirectInstanceCount(indexedInstanceCount, packetAddress, opcode, argumentsAddress);
-        if (IndexBufferSize == 0 && IndexTypeAndSize is 0 or 1)
+        if (!HasBindableIndexSize && IndexTypeAndSize is 0 or 1)
         {
-            LearnIndexExtent(startIndex, indexCountPerInstance);
+            LearnIndexExtent(startIndex, Math.Min(indexCountPerInstance, IndexBufferSize == 0 ? uint.MaxValue : IndexBufferSize));
         }
 
         if (indexedInstanceCount == 0) return;
@@ -254,9 +254,16 @@ public sealed partial class GpuCommandInterpreter
     private readonly Dictionary<ulong, ulong> _indexExtents = new();
     private uint _indexExtentDraws;
 
+    // A size larger than any bindable index range (games set it to "everything") bounds nothing,
+    // so it is treated like no size. SHARPEMU_OVERSIZED_INDEX_AS_UNSIZED=0 keeps it as a size.
+    private static readonly bool OversizedIndexAsUnsized = Environment.GetEnvironmentVariable("SHARPEMU_OVERSIZED_INDEX_AS_UNSIZED") != "0";
+
+    private bool HasBindableIndexSize => IndexBufferSize != 0 &&
+        (!OversizedIndexAsUnsized || (ulong)IndexBufferSize * IndexElementSize <= MaxIndexExtentBytes);
+
     private bool TryGetGpuIndexRange(out uint indexCount)
     {
-        if (IndexBufferSize != 0)
+        if (HasBindableIndexSize)
         {
             indexCount = IndexBufferSize;
             return true;

@@ -339,6 +339,31 @@ public sealed class GpuCommandInterpreterDrawTests
     }
 
     [Fact]
+    public void OversizedIndexedIndirectDraws_LearnTheIndexRangeLikeUnsizedOnes()
+    {
+        var runner = new StreamRunner();
+        runner.Host.ResolvesIndirectDrawOnGpu = true;
+        runner.Host.WriteWords(Arguments + 16, new uint[] { 3, 1, 2, 0, 0 });
+        var draw = new[]
+        {
+            SetBase(Arguments, dispatch: false),
+            StreamRunner.Packet(PacketOpcode.IndexBase, StreamRunner.Low(Indices), StreamRunner.High(Indices)),
+            StreamRunner.Packet(PacketOpcode.IndexType, 0),
+            StreamRunner.Packet(PacketOpcode.IndexBufferSize, uint.MaxValue),
+            StreamRunner.Packet(PacketOpcode.DrawIndexIndirect, 16, 0, 0, 0x22),
+        };
+
+        runner.Run(draw);
+        runner.Run(draw);
+
+        Assert.Equal(2, runner.Host.IndexedDraws.Count);
+        Assert.Equal((3u, Indices + 4, 0ul), (runner.Host.IndexedDraws[0].IndexCount, runner.Host.IndexedDraws[0].IndexAddress, runner.Host.IndexedDraws[0].IndirectArgumentsAddress));
+        var learned = runner.Host.IndexedDraws[1];
+        Assert.Equal((Arguments + 16, Indices, true), (learned.IndirectArgumentsAddress, learned.IndexAddress, learned.UnboundedIndexBuffer));
+        Assert.Equal((uint)(((Indices + 10 + 0x3FFF) & ~0x3FFFul) - Indices) / 2, learned.IndexCount);
+    }
+
+    [Fact]
     public void IndirectMulti_LoopsOverTheStrideAndTheCountAddress()
     {
         var runner = new StreamRunner();
