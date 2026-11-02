@@ -35,6 +35,7 @@ public sealed class ContentUploadArena : IDisposable
     private static readonly ThreadCounter _recycles = new();
     private static readonly ThreadCounter _refused = new();
     private static readonly ThreadCounter _collisions = new();
+    private static readonly ThreadCounter _waits = new();
 
     public ContentUploadArena(GpuDeviceInfo device, SubmissionScheduler scheduler)
     {
@@ -80,7 +81,7 @@ public sealed class ContentUploadArena : IDisposable
         return true;
     }
 
-    public bool TryUpload(ReadOnlySpan<byte> data, ulong alignment, out VkBuffer buffer, out ulong offset)
+    public bool TryUpload(ReadOnlySpan<byte> data, ulong alignment, out VkBuffer buffer, out ulong offset, bool wait = false)
     {
         buffer = default;
         offset = 0;
@@ -112,7 +113,7 @@ public sealed class ContentUploadArena : IDisposable
             return true;
         }
 
-        if (!TryStore(data, alignment, tick, out var stored, out buffer, out offset))
+        if (!TryStore(data, alignment, tick, out var stored, out buffer, out offset, wait))
         {
             return false;
         }
@@ -121,10 +122,12 @@ public sealed class ContentUploadArena : IDisposable
         return true;
     }
 
-    public bool TryUploadAddress(ReadOnlySpan<byte> data, ulong alignment, out ulong address)
+    // wait: when the active half is full and the other one is still in use by issued work, wait for
+    // that work instead of refusing. For callers that have no other place for the data.
+    public bool TryUploadAddress(ReadOnlySpan<byte> data, ulong alignment, out ulong address, bool wait = false)
     {
         address = 0;
-        if (!TryUpload(data, alignment, out var buffer, out var offset))
+        if (!TryUpload(data, alignment, out var buffer, out var offset, wait))
         {
             return false;
         }
@@ -141,13 +144,22 @@ public sealed class ContentUploadArena : IDisposable
         return false;
     }
 
-    private bool TryStore(ReadOnlySpan<byte> data, ulong alignment, ulong tick, out Arena stored, out VkBuffer buffer, out ulong offset)
+    private bool TryStore(ReadOnlySpan<byte> data, ulong alignment, ulong tick, out Arena stored, out VkBuffer buffer, out ulong offset, bool wait = false)
     {
         var active = _arenas[_active];
         var aligned = (active.Offset + alignment - 1) / alignment * alignment;
         if (aligned + (ulong)data.Length > ArenaBytes)
         {
             var other = _arenas[1 - _active];
+            // A use of the other half in the current (unsubmitted) tick, or a wait from a completion
+            // callback, still refuses.
+            if (wait && other.LastUseTick > _scheduler.CompletedTick && other.LastUseTick < _scheduler.CurrentTick &&
+                !_scheduler.InsideTickCallback && !SubmissionScheduler.ReadOnlyThread)
+            {
+                _waits.Increment();
+                _scheduler.Wait(other.LastUseTick);
+            }
+
             if (other.LastUseTick > _scheduler.CompletedTick)
             {
                 _refused.Increment();
@@ -179,7 +191,7 @@ public sealed class ContentUploadArena : IDisposable
 
     public static string TakeReport() =>
         FormattableString.Invariant($"[PERF][CONTENT_UPLOADS] hits={_hits.Take()} identity_hits={_identityHits.Take()} stores={_stores.Take()} recycles={_recycles.Take()} ") +
-        FormattableString.Invariant($"refused={_refused.Take()} collisions={_collisions.Take()}");
+        FormattableString.Invariant($"refused={_refused.Take()} collisions={_collisions.Take()} waits={_waits.Take()}");
 
     public void Dispose()
     {

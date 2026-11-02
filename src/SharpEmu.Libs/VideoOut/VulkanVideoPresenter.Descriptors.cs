@@ -1463,6 +1463,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 return stream.DeviceAddress + offset;
             }
 
+            // Both rings are full of work in flight: wait for the arena's older half to retire.
+            if (_contentUploads is { } waitingArena && waitingArena.TryUploadAddress(bytes, TableBlockAlignment, out address, wait: true))
+            {
+                return address;
+            }
+
             throw SubmissionScheduler.Fatal($"No upload ring could take a table block: bytes={bytes.Length} hash=0x{program.Hash:X16}.");
         }
 
