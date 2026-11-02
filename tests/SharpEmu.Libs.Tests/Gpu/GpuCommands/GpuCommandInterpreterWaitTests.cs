@@ -168,6 +168,40 @@ public sealed class GpuCommandInterpreterWaitTests
     }
 
     [Fact]
+    public void ConditionalExecute_PredictsAGpuWrittenZeroAndStopsOnMismatch()
+    {
+        var runner = new StreamRunner();
+        runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
+        var execute = StreamRunner.Packet(PacketOpcode.ConditionalExecute, StreamRunner.Low(Label), StreamRunner.High(Label), 0, 2);
+        var nop = StreamRunner.Packet(PacketOpcode.Nop, 0);
+        runner.Run(CreateInstanceCountPacket(3));
+        runner.Host.WriteDword(Label, 0);
+        for (var index = 0; index < GpuCommandInterpreter.ConditionPredictAfter; index++)
+        {
+            runner.Run(execute, CreateInstanceCountPacket(5), nop);
+            Assert.Equal(3u, runner.Interpreter.InstanceCount);
+        }
+
+        // Predicted: the block stays skipped although memory now says execute.
+        runner.Host.WriteDword(Label, 1);
+        for (var index = 1; index < GpuCommandInterpreter.ConditionVerifyEvery; index++)
+        {
+            runner.Run(execute, CreateInstanceCountPacket(7), nop);
+            Assert.Equal(3u, runner.Interpreter.InstanceCount);
+        }
+
+        // The verifying read sees the mismatch; from then on the predicate is read.
+        runner.Run(execute, CreateInstanceCountPacket(8), nop);
+        Assert.Equal(8u, runner.Interpreter.InstanceCount);
+        runner.Host.WriteDword(Label, 0);
+        runner.Run(execute, CreateInstanceCountPacket(9), nop);
+        Assert.Equal(8u, runner.Interpreter.InstanceCount);
+        runner.Host.WriteDword(Label, 1);
+        runner.Run(execute, CreateInstanceCountPacket(10), nop);
+        Assert.Equal(10u, runner.Interpreter.InstanceCount);
+    }
+
+    [Fact]
     public void SetPredication_BothLayoutsAndTheWaitFlag()
     {
         var runner = new StreamRunner();

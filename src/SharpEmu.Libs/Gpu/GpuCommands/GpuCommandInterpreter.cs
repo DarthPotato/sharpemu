@@ -675,8 +675,15 @@ public sealed partial class GpuCommandInterpreter
         {
             if (_decodedSkipTargets.Count >= 16 || !_decodedSkipTargets.Add(address)) return;
         }
+        if (DescribePackets(address, dwords) is { } packets)
+            Console.Error.WriteLine($"[GPU][TRACE] CommandSkipTarget target=0x{address:X16} dwords={dwords} packets={packets}");
+    }
+
+    // Opcode/length of each packet in a command range; register writes show their first register offset.
+    internal string? DescribePackets(ulong address, uint dwords)
+    {
         var buffer = new byte[Math.Min(dwords, 4096u) * sizeof(uint)];
-        if (buffer.Length == 0 || !_host.TryReadGuest(address, buffer)) return;
+        if (buffer.Length == 0 || !_host.TryReadGuest(address, buffer)) return null;
         var words = MemoryMarshal.Cast<byte, uint>(buffer);
         var packets = new List<string>();
         for (var offset = 0; offset < words.Length;)
@@ -697,11 +704,13 @@ public sealed partial class GpuCommandInterpreter
                 var end = text.IndexOf((byte)0);
                 marker = $"\"{System.Text.Encoding.ASCII.GetString(end < 0 ? text : text[..end])}\"";
             }
-            packets.Add($"0x{PacketHeader.Opcode(header):X2}/{length}{(PacketHeader.IsPredicated(header) ? "p" : "")}" +
-                (PacketHeader.Opcode(header) == PacketOpcode.Nop ? $"[r=0x{PacketHeader.CustomCode(header):X2}]" : "") + marker);
+            var opcode = PacketHeader.Opcode(header);
+            var register = opcode is >= 0x68 and <= 0x7F && offset + 1 < words.Length ? $"@0x{words[offset + 1] & 0xFFFFu:X}" : "";
+            packets.Add($"0x{opcode:X2}/{length}{(PacketHeader.IsPredicated(header) ? "p" : "")}{register}" +
+                (opcode == PacketOpcode.Nop ? $"[r=0x{PacketHeader.CustomCode(header):X2}]" : "") + marker);
             offset += Math.Max(length, 1);
         }
-        Console.Error.WriteLine($"[GPU][TRACE] CommandSkipTarget target=0x{address:X16} dwords={dwords} packets={string.Join(',', packets)}");
+        return string.Join(',', packets);
     }
 
     internal void WriteDword(ulong address, uint value, [CallerMemberName] string caller = "")

@@ -222,6 +222,56 @@ public sealed partial class GpuCommandInterpreter
     private static ulong ReadValue(ReadOnlySpan<uint> payload, int index, bool is64Bit) =>
         is64Bit ? payload[index] | ((ulong)payload[index + 1] << 32) : payload[index];
 
+    private static readonly bool TraceConditionalExecute = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COND_EXEC") == "1";
+    private static int _conditionalExecuteTraces;
+    private static long _conditionalExecuteEvents;
+
+    // A COND_EXEC predicate that earlier GPU work may still write costs the command thread a GPU round
+    // trip. One that read 0 ConditionPredictAfter times in a row is predicted 0 (block skipped) without
+    // waiting; every ConditionVerifyEvery-th use is read for real, and a mismatch stops prediction for
+    // that address. Only "skip" is predicted: a wrongly executed block could wait forever.
+    private static readonly bool PredictConditions =
+        Environment.GetEnvironmentVariable("SHARPEMU_PREDICT_COND_EXEC") != "0";
+    internal const int ConditionPredictAfter = 8;
+    internal const int ConditionVerifyEvery = 16;
+    private sealed class ConditionPredictor { public int ZeroStreak; public int SinceVerified; public bool Disabled; }
+    private Dictionary<ulong, ConditionPredictor>? _conditionPredictors;
+
+    private uint ReadCondition(ulong address)
+    {
+        if (!PredictConditions || !_host.HasGpuWrittenCommandData(address, sizeof(uint)))
+        {
+            return ReadDword(address);
+        }
+
+        var predictors = _conditionPredictors ??= new();
+        if (!predictors.TryGetValue(address, out var predictor))
+        {
+            predictors[address] = predictor = new ConditionPredictor();
+        }
+
+        var predicting = !predictor.Disabled && predictor.ZeroStreak >= ConditionPredictAfter;
+        if (predicting && ++predictor.SinceVerified < ConditionVerifyEvery)
+        {
+            SharpEmu.Libs.Diagnostics.ProducerWaitProfile.Path("cond_exec.predicted");
+            return 0;
+        }
+
+        var value = ReadDword(address);
+        if (predicting)
+        {
+            predictor.SinceVerified = 0;
+            if (value != 0)
+            {
+                predictor.Disabled = true;
+                Console.Error.WriteLine($"[GPU][WARN][COND_EXEC_PREDICT] predicate 0x{address:X16} read 0x{value:X8} after a predicted 0; prediction stops for it.");
+            }
+        }
+
+        predictor.ZeroStreak = value == 0 ? predictor.ZeroStreak + 1 : 0;
+        return value;
+    }
+
     internal uint ConditionalExecutePacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {
         var payloadDwords = packet.Length - 1;
@@ -240,7 +290,15 @@ public sealed partial class GpuCommandInterpreter
                 $"address=0x{address:X16} count={executeCount} remaining={packet.Remaining}.");
         }
 
-        if (ReadDword(address) != 0) return payloadDwords;
+        var predicate = ReadCondition(address);
+        if (TraceConditionalExecute && (predicate != 0 || ++_conditionalExecuteEvents % 50 == 1) &&
+            Interlocked.Increment(ref _conditionalExecuteTraces) <= 48)
+        {
+            var block = packet.PacketAddress + (payloadDwords + 1) * sizeof(uint);
+            Console.Error.WriteLine($"[GPU][TRACE] COND_EXEC n={_conditionalExecuteEvents} packet=0x{packet.PacketAddress:X16} predicate=0x{address:X16} value=0x{predicate:X8} " +
+                $"count={executeCount} queue={QueueId} block={DescribePackets(block, executeCount)}");
+        }
+        if (predicate != 0) return payloadDwords;
         TraceSkippedPackets("conditional-execute", packet.PacketAddress + (payloadDwords + 1) * sizeof(uint), executeCount, (uint)address);
         return payloadDwords + executeCount;
     }

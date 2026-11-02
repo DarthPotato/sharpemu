@@ -155,12 +155,22 @@ public sealed class PendingGpuWrites
 
     public long Generation => Volatile.Read(ref _generation);
 
+    // SHARPEMU_TRACE_PENDING_MARK=<hex address> logs the first marks covering that address.
+    private static readonly ulong TraceAddress =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_PENDING_MARK")?.Replace("0x", ""),
+            System.Globalization.NumberStyles.HexNumber, null, out var traced) ? traced : 0;
+    private static int _tracedMarks;
+    [ThreadStatic] internal static ulong TraceProgram;
+
     public void Mark(ulong address, ulong size, long sequence, PendingWriteKind kind = PendingWriteKind.Other)
     {
         if (size == 0)
         {
             return;
         }
+
+        if (TraceAddress != 0 && TraceAddress - address < size && Interlocked.Increment(ref _tracedMarks) <= 60)
+            Console.Error.WriteLine($"[GPU][TRACE] PENDING_MARK address=0x{address:X} size=0x{size:X} kind={kind} sequence={sequence} program=0x{TraceProgram:X16}");
 
         Interlocked.Increment(ref _generation);
         var coarseFirst = address >> CoarseShift;

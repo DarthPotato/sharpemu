@@ -124,6 +124,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        PendingGpuWrites.TraceProgram = program.Hash;
         var resources = stage.Resources;
         var buffers = resources.Buffers;
         for (var index = 0; index < program.Buffers.Length && index < buffers.Length; index++)
