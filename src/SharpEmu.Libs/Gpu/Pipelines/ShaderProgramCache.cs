@@ -658,6 +658,11 @@ internal sealed class ShaderProgramCache
             }
         }
 
+        if (DeviceDataReadsSync && entry.Plan.DeviceDataReads.Count != 0)
+        {
+            ReadDeviceDataOnHost(entry.Plan, snapshot);
+        }
+
         if (GpuWrittenDataReads.Enabled && GpuWrittenDataReads.Noted is { } gpuWrittenDataReads)
         {
             LearnDeviceDataReads(source, options, entry, gpuWrittenDataReads);
@@ -1376,6 +1381,31 @@ internal sealed class ShaderProgramCache
 
             return learning;
         });
+
+    // Diagnostic: SHARPEMU_DEVICE_DATA_READS_SYNC=1 still reads the device data loads' ranges on the host before the
+    // draw or dispatch (waiting for their writers, as a flattened load did) and discards the words: the shader then
+    // loads them after their writers completed.
+    private static readonly bool DeviceDataReadsSync = Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS_SYNC") == "1";
+
+    private void ReadDeviceDataOnHost(ShaderResourcePlan plan, ResourceSnapshot snapshot)
+    {
+        var planned = plan.DeviceAddressRanges;
+        var ranges = snapshot.DeviceAddressRanges;
+        for (var index = 0; index < planned.Count && index < ranges.Length; index++)
+        {
+            var range = ranges[index];
+            if (!range.Planned || range.Size == 0 || range.Size > 4096 ||
+                !planned[index].MemoryIndices.Any(memory => memory < plan.Memory.Count && plan.DeviceDataReads.Contains(plan.Memory[memory].Pc)))
+            {
+                continue;
+            }
+
+            for (var address = range.Base & ~3ul; address < range.Base + range.Size; address += sizeof(uint))
+            {
+                _readGuestWord(address, out _);
+            }
+        }
+    }
 
     // Diagnostic: SHARPEMU_DEVICE_DATA_READS_ONLY=<hex hash,...> applies learned loads to these programs only.
     private static readonly HashSet<ulong>? DeviceDataReadsOnly =
