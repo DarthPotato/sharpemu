@@ -35,6 +35,7 @@ public sealed partial class GpuCommandInterpreter
     private PacketHandler?[] _packetHandlers = PacketDispatchTable.Opcodes;
     private readonly List<uint[]> _payloadScratchByDepth = new();
     private readonly List<PacketWindow> _packetWindowsByDepth = new();
+    private readonly HashSet<ulong> _unreadableIndirectBuffers = new();
     private long _packetWindowGeneration;
     private PendingCommandSignal _pendingCommands = PendingCommandSignal.AlwaysRaised;
     private readonly uint[] _constantRam = new uint[ConstantRamDwords];
@@ -233,7 +234,7 @@ public sealed partial class GpuCommandInterpreter
         _host.CpuGpuVisibilityBoundary();
         var stopDepth = execution.Depth;
         ReadBehindEarlierWork(address);
-        execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address));
+        execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address) { IsIndirectBuffer = true });
         RunPackets(execution, stopDepth);
     }
 
@@ -247,7 +248,7 @@ public sealed partial class GpuCommandInterpreter
         }
 
         execution.Pop();
-        execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address, followedChunkAdvance));
+        execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address, followedChunkAdvance) { IsIndirectBuffer = true });
         _host.CpuGpuVisibilityBoundary();
         _chainRequested = true;
     }
@@ -259,6 +260,28 @@ public sealed partial class GpuCommandInterpreter
     {
         Span<byte> first = stackalloc byte[sizeof(uint)];
         _ = _host.TryReadGuestOperand(address, first);
+    }
+
+    // A called or chained buffer the host cannot read (Ghost of Yotei, new game: a 48-bit target past the
+    // tracked guest space) is skipped with one warning per address, as hardware would fault on it, instead
+    // of stopping the emulator.
+    private void WarnUnreadableIndirectBuffer(ulong address, uint dwordCount)
+    {
+        if (!_unreadableIndirectBuffers.Add(address)) return;
+        var execution = RequireExecution();
+        Console.Error.WriteLine($"[GPU][WARN][INDIRECT_BUFFER] Skipping unreadable buffer: opcode=0x{PacketOpcode.IndirectBuffer:X2} " +
+            $"address=0x{address:X16} dwords={dwordCount} queue={QueueId} depth={execution.Depth} ibDepth={execution.Depth - 1} " +
+            $"ring=0x{execution.Top.RingChunkBase:X16} packet=0x{execution.CurrentPacketAddress:X16}.");
+    }
+
+    // The mapping can disappear after entry. Drop the rest of this IB without reading more of it.
+    private bool SkipUnreadableIndirectBuffer(PacketCursorStack execution)
+    {
+        if (!execution.Top.IsIndirectBuffer) return false;
+        WarnUnreadableIndirectBuffer(execution.Top.Address, execution.Top.DwordCount);
+        execution.Pop();
+        execution.MadeProgress = true;
+        return true;
     }
 
     public void Suspend() => RequireExecution().Suspended = true;
@@ -321,9 +344,21 @@ public sealed partial class GpuCommandInterpreter
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandPacketRead))
             {
                 window = ObtainPacketWindow(cursorIndex, in cursor, packetAddress);
-                header = window is null
-                    ? ReadDword(packetAddress, RenderPhaseProfile.CommandReadKind.Header)
-                    : window.Words[window.IndexOf(packetAddress)];
+                if (window is null)
+                {
+                    Span<byte> word = stackalloc byte[sizeof(uint)];
+                    RenderPhaseProfile.RecordCommandRead(RenderPhaseProfile.CommandReadKind.Header, sizeof(uint));
+                    if (!TryReadCommand(packetAddress, word))
+                    {
+                        if (SkipUnreadableIndirectBuffer(execution)) continue;
+                        throw _host.Fatal($"The command stream cannot read guest memory: address=0x{packetAddress:X16} size=4.");
+                    }
+                    header = BinaryPrimitives.ReadUInt32LittleEndian(word);
+                }
+                else
+                {
+                    header = window.Words[window.IndexOf(packetAddress)];
+                }
             }
 
             _packetSerial++;
@@ -390,7 +425,11 @@ public sealed partial class GpuCommandInterpreter
             {
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandPacketRead))
                 {
-                    payload = ReadPayload(cursorIndex, packetAddress, length - 1);
+                    if (!TryReadPayload(cursorIndex, packetAddress, length - 1, out payload))
+                    {
+                        if (SkipUnreadableIndirectBuffer(execution)) continue;
+                        throw _host.Fatal($"The command stream cannot read a packet: address=0x{packetAddress:X16} dwords={length}.");
+                    }
                 }
             }
 
@@ -529,7 +568,7 @@ public sealed partial class GpuCommandInterpreter
     }
 
     // The payload lives in a per-depth scratch buffer for the handler call only.
-    private ReadOnlySpan<uint> ReadPayload(int depth, ulong packetAddress, uint payloadDwords)
+    private bool TryReadPayload(int depth, ulong packetAddress, uint payloadDwords, out ReadOnlySpan<uint> payload)
     {
         while (_payloadScratchByDepth.Count <= depth)
         {
@@ -543,10 +582,12 @@ public sealed partial class GpuCommandInterpreter
         }
         if (payloadDwords != 0 && !TryReadCommand(packetAddress + sizeof(uint), MemoryMarshal.AsBytes(scratch)))
         {
-            throw _host.Fatal($"The command stream cannot read a packet: address=0x{packetAddress:X16} dwords={payloadDwords + 1}.");
+            payload = default;
+            return false;
         }
 
-        return scratch;
+        payload = scratch;
+        return true;
     }
 
     private void DumpUnknownPacket(in PacketCursor cursor, uint offset)

@@ -30,6 +30,7 @@ public struct PacketCursor
     // Base of the ring chunk this buffer belongs to; the chunk-advance sentinel needs it.
     public ulong RingChunkBase;
     public bool FollowedChunkAdvance;
+    public bool IsIndirectBuffer;
 
     public PacketCursor(ulong address, uint dwordCount, ulong ringChunkBase = 0, bool followedChunkAdvance = false)
     {

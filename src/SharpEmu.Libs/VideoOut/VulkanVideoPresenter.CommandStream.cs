@@ -554,6 +554,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool ReadOnCommandThread(ulong address, Span<byte> destination, RenderReadSource source = RenderReadSource.Memory)
         {
+            if (!IsTrackedGuestRange(address, destination))
+            {
+                return false;
+            }
+
             var size = (ulong)destination.Length;
             if (Diagnostics.ProducerWaitProfile.TraceReads)
             {
@@ -658,6 +663,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryReadGuestOperand(ulong address, Span<byte> destination)
         {
+            if (!IsTrackedGuestRange(address, destination))
+            {
+                return false;
+            }
+
             if (OnResolveWorker)
             {
                 return ReadOnResolveWorker(address, destination);
@@ -670,8 +680,19 @@ internal static unsafe partial class VulkanVideoPresenter
             return TryReadGuest(address, destination);
         }
 
+        // The page tracker covers the guest's 40-bit address space. A command or operand address outside it (a
+        // stale or garbage 48-bit field, as in Ghost of Yotei's new game) is unreadable, not a reason for the
+        // tracker to stop the emulator.
+        private static bool IsTrackedGuestRange(ulong address, Span<byte> destination) =>
+            destination.Length == 0 || (address != 0 && new SharpEmu.HLE.GpuMemory.GuestSpan(address, (ulong)destination.Length).IsValid);
+
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
+            if (!IsTrackedGuestRange(address, destination))
+            {
+                return false;
+            }
+
             if (OnResolveWorker)
             {
                 return ReadOnResolveWorker(address, destination);
