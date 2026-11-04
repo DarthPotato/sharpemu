@@ -513,6 +513,13 @@ public sealed unsafe partial class GuestImageCache
         }
 
         UploadRegions(destination, copies.ToList(), linear);
+        if (ImageLifecycleTrace.Enabled && association.LifecycleCache != null && ImageLifecycleTrace.HasCapacity)
+        {
+            ulong bytes = 0;
+            foreach (var copy in copies)
+                bytes += (ulong)copy.ImageExtent.Width * copy.ImageExtent.Height * copy.ImageExtent.Depth * copy.ImageSubresource.LayerCount;
+            TraceLifecycle(association, "upload", $"reason={association.LifecycleUploadReason ?? "stencil-plane"} path={association.LifecycleUploadPath ?? "stencil-plane"} bytes={bytes} buffer_span_bytes={linear.Size} destination_id={association.DepthOwner.Index} destination_generation={association.DepthOwner.Generation}");
+        }
     }
 
     private bool TryDownloadStencilToBuffer(CachedImage association, GpuBuffer buffer)
@@ -712,6 +719,8 @@ public sealed unsafe partial class GuestImageCache
             var reason = image.IsBufferModified
                 ? (image.IsCpuDirty ? "buffer-and-cpu-dirty" : "buffer-dirty")
                 : (image.IsMaybeCpuDirty ? "maybe-cpu-dirty" : "cpu-dirty");
+            using var lifecycleUpload = ImageLifecycleTrace.Enabled && image.LifecycleCache != null
+                ? new CachedImage.LifecycleUploadScope(image, reason, uploadPath) : default;
             var sourceStarted = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             dataImported = true;
             long sourceFinished;

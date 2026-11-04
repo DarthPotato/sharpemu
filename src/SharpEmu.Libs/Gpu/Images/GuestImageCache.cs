@@ -371,6 +371,19 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         if (ImageClearTrace.Enabled) ImageTraceRange.NoteImageLookup(request.Description.Data.Address, request.Description.Data.Size);
         PrintResourceHistory(request);
         var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
+        // A replacement allocation can complete and erase a retired slot before lookup ends.
+        // Retain diagnostic references so the old generation can still be linked to the result.
+        List<(ResourceSlotIdentifier Identifier, CachedImage Image)>? lifecycleCandidates = null;
+        if (ImageLifecycleTrace.Enabled && ImageLifecycleTrace.HasCapacity)
+        {
+            var traceRequest = ImageLifecycleTrace.Matches(request.Description.Data.Address, request.Description.Data.Size);
+            foreach (var candidate in candidates)
+            {
+                var previous = _slots[candidate];
+                if (traceRequest || previous.LifecycleCache != null)
+                    (lifecycleCandidates ??= new()).Add((candidate, previous));
+            }
+        }
         if (ImageClearTrace.Enabled && request.TraceTextureMetadataAddress != 0)
         {
             ImageClearTrace.Write($"texture-owner-search image=0x{request.Description.Data.Address:X16} candidates={candidates.Count}");
@@ -513,6 +526,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
         }
 
+        if (ImageLifecycleTrace.Enabled && lifecycleCandidates != null)
+        {
+            foreach (var (candidate, previous) in lifecycleCandidates)
+            {
+                if (!previous.Registered || previous.Parked)
+                    TraceLifecycleReplacement(previous, candidate, result, "lookup-overlap");
+            }
+        }
         var image = _slots[result];
         if (viewMip >= 0)
         {
@@ -1006,7 +1027,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TakeGpuOwnership(_slots[association]);
     }
 
-    private static void TakeGpuOwnership(CachedImage image)
+    private static void TakeGpuOwnership(CachedImage image, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
         if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-take-ownership", image.Description.Data.Address, image.Description.Data.Size, $"cpuDirty={image.IsCpuDirty} bufferDirty={image.IsBufferModified} gpuDirty={image.IsGpuModified}", remember: true);
         if (!image.DepthOwner.IsValid && !image.Backing.Exists)
@@ -1020,7 +1041,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             image.RefreshComplete();
         }
 
-        image.MarkGpuModified();
+        image.MarkGpuModified(reason);
     }
 
     private void ValidateRequest(in ImageRequest request)
@@ -1171,6 +1192,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         var imageIdentifier = _slots.Insert(image);
+        if (ImageLifecycleTrace.Enabled && ImageLifecycleTrace.HasCapacity && ImageLifecycleTrace.Matches(description.Data.Address, description.Data.Size))
+        {
+            image.LifecycleCache = this;
+            image.LifecycleIdentifier = imageIdentifier;
+            TraceLifecycle(image, "create", $"path={creationPath} reason={(image.IsCpuDirty ? "initial-guest-memory" : "compressed-or-empty-native-image")}");
+        }
         _createdImageCount++;
         ReportLargeImageCreation(_slots[imageIdentifier], creationPath);
         ReportImageLifetime(_slots[imageIdentifier], "recreate");

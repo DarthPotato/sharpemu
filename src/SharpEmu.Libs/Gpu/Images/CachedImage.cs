@@ -423,14 +423,22 @@ public sealed unsafe partial class CachedImage : IDisposable
         return usage;
     }
 
-    public void AssociateDepth(ResourceSlotIdentifier depthImage) => DepthOwner = depthImage;
+    public void AssociateDepth(ResourceSlotIdentifier depthImage)
+    {
+        var changed = DepthOwner != depthImage;
+        DepthOwner = depthImage;
+        if (ImageLifecycleTrace.Enabled && LifecycleCache != null && changed && ImageLifecycleTrace.HasCapacity)
+            TraceLifecycleState("depth-owner", $"id={depthImage.Index},generation={depthImage.Generation}");
+    }
 
     internal ulong LastCpuWriteAddress { get; private set; }
     internal ulong LastCpuWriteSize { get; private set; }
 
     // A byte overlap makes the image definitely dirty; a page-only overlap makes it maybe dirty.
-    public void InvalidateCpuWrite(ulong address, ulong size)
+    public void InvalidateCpuWrite(ulong address, ulong size, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        var wasDirty = ImageLifecycleTrace.Enabled && _cpuDirty;
+        var wasMaybeDirty = ImageLifecycleTrace.Enabled && _maybeCpuDirty;
         if (GuestRangeOverlap.Bytes(Description.Data.Address, Description.Data.Size, address, size))
         {
             if (SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled)
@@ -451,6 +459,9 @@ public sealed unsafe partial class CachedImage : IDisposable
             return;
         }
 
+        if (ImageLifecycleTrace.Enabled && LifecycleCache != null && ImageLifecycleTrace.HasCapacity &&
+            (wasDirty != _cpuDirty || wasMaybeDirty != _maybeCpuDirty))
+            LifecycleCache.TraceLifecycle(this, "cpu-dirty", $"reason={reason} write_address=0x{address:X} write_bytes={size}");
         HeapChanged?.Invoke(this);
     }
 
@@ -460,11 +471,13 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public bool IsMaybeCpuDirty => _maybeCpuDirty;
 
-    public void MarkMaybeCpuDirty()
+    public void MarkMaybeCpuDirty([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
         if (!_cpuDirty)
         {
+            var changed = !_maybeCpuDirty;
             _maybeCpuDirty = true;
+            if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("maybe-cpu-dirty", reason);
         }
 
         HeapChanged?.Invoke(this);
@@ -481,6 +494,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
         _maybeCpuHash = hash;
         _maybeHashValid = true;
+        if (ImageLifecycleTrace.Enabled && LifecycleCache != null && ImageLifecycleTrace.HasCapacity) TraceLifecycleState("edge-hash-baseline", $"hash=0x{hash:X}");
     }
 
     public bool ResolveMaybeCpuHash(ulong hash)
@@ -493,6 +507,7 @@ public sealed unsafe partial class CachedImage : IDisposable
         _maybeCpuDirty = false;
         _maybeHashValid = false;
         _cpuDirty |= hash != _maybeCpuHash;
+        if (ImageLifecycleTrace.Enabled && LifecycleCache != null && ImageLifecycleTrace.HasCapacity) TraceLifecycleState("cpu-dirty-resolve", $"edge-hash previous=0x{_maybeCpuHash:X} current=0x{hash:X}");
         return _cpuDirty;
     }
 
@@ -508,6 +523,7 @@ public sealed unsafe partial class CachedImage : IDisposable
         _maybeHashValid = false;
         LastCpuWriteAddress = 0;
         LastCpuWriteSize = 0;
+        if (ImageLifecycleTrace.Enabled) TraceLifecycleState("cpu-clean", "refresh-complete");
     }
 
     // Guest-byte hashes of each tile transfer piece at the last upload from guest memory; null
@@ -537,14 +553,21 @@ public sealed unsafe partial class CachedImage : IDisposable
     // The image keeps its contents, but they are no longer known to be newer than the buffer's.
     public bool RawWriteAfterGpuWrite { get; private set; }
 
-    public void MarkRawWriteAfterGpuWrite() => RawWriteAfterGpuWrite = true;
+    public void MarkRawWriteAfterGpuWrite([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
+    {
+        var changed = !RawWriteAfterGpuWrite;
+        RawWriteAfterGpuWrite = true;
+        if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("raw-buffer-write", reason);
+    }
 
-    public void MarkGpuModified()
+    public void MarkGpuModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
         InspectionWrite?.Invoke(Description.Data.Address, Description.Data.Size);
         RawWriteAfterGpuWrite = false;
+        var ownershipChanged = !_gpuModified || _bufferHoldsGpuContents;
         _gpuModified = true;
         _bufferHoldsGpuContents = false;
+        if (ImageLifecycleTrace.Enabled && ownershipChanged) TraceLifecycleState("gpu-owner-acquire", reason);
         GpuWriteSequence = Interlocked.Increment(ref _gpuWriteCounter);
         ContentSequence = GpuWriteSequence;
         _guestPieceHashes = null;
@@ -557,18 +580,38 @@ public sealed unsafe partial class CachedImage : IDisposable
     // source's sequence, so the alias is not copied back while neither image is written again.
     public long ContentSequence { get; set; }
 
-    public void ClearGpuModified() => _gpuModified = false;
+    public void ClearGpuModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
+    {
+        var changed = _gpuModified;
+        _gpuModified = false;
+        if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("gpu-owner-release", reason);
+    }
 
     public bool IsBufferModified => _bufferModified;
 
     // The guest buffer cache holds this image's current GPU contents.
     public bool BufferHoldsGpuContents => _bufferHoldsGpuContents;
 
-    public void MarkBufferHoldsGpuContents() => _bufferHoldsGpuContents = true;
+    public void MarkBufferHoldsGpuContents([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
+    {
+        var changed = !_bufferHoldsGpuContents;
+        _bufferHoldsGpuContents = true;
+        if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("buffer-holds-gpu", reason);
+    }
 
-    public void MarkBufferModified() => _bufferModified = true;
+    public void MarkBufferModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
+    {
+        var changed = !_bufferModified;
+        _bufferModified = true;
+        if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("buffer-dirty", reason);
+    }
 
-    public void ClearBufferModified() => _bufferModified = false;
+    public void ClearBufferModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
+    {
+        var changed = _bufferModified;
+        _bufferModified = false;
+        if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("buffer-clean", reason);
+    }
 
     public bool Overlaps(ulong address, ulong size, bool pages = false) => pages
         ? GuestRangeOverlap.Pages(Description.Data.Address, Description.Data.Size, address, size)
@@ -810,6 +853,8 @@ public sealed unsafe partial class CachedImage : IDisposable
     // Immediate destruction; the owner waits for GPU work before disposing.
     public void Dispose()
     {
+        if (ImageLifecycleTrace.Enabled && LifecycleCache != null && ImageLifecycleTrace.HasCapacity)
+            LifecycleCache.TraceLifecycle(this, "destroy", $"reason={LifecycleRetirementReason ?? "cache-dispose"} last_use_frame={LifecycleLastUseFrame}");
         foreach (var storage in _stencilStorageImages.Values)
         {
             storage.Dispose();

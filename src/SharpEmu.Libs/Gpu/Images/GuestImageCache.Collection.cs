@@ -343,6 +343,11 @@ public sealed partial class GuestImageCache
 
                 if (profile) _collectionCandidates++;
                 var owner = _slots.TryGet(imageIdentifier);
+                if (ImageLifecycleTrace.Enabled && owner?.LifecycleCache != null && ImageLifecycleTrace.HasCapacity)
+                    TraceLifecycleRetirement(owner, "collect-candidate",
+                        $"recency evaluation_frame={tick} age_threshold={age} pressured={pressured} aggressive={aggressive} " +
+                        $"reclaim={reclaim} mid_frame={midFrame} pinned={_lookupPins.ContainsKey(imageIdentifier)} " +
+                        $"bound={owner.Binding.IsBound} target={owner.Binding.IsTarget} depth_owner={owner.DepthOwner.IsValid}");
                 if (owner == null || !owner.Registered || owner.DepthOwner.IsValid || _lookupPins.ContainsKey(imageIdentifier))
                 {
                     if (profile && owner?.DepthOwner.IsValid == true) _collectionAssociations++;
@@ -399,7 +404,7 @@ public sealed partial class GuestImageCache
                     ReportImageLifetime(owner, "collect-no-gpu-ownership", deletion: true);
                 }
 
-                deletions -= DeleteImage(imageIdentifier);
+                deletions -= DeleteImage(imageIdentifier, reason: reclaim ? "allocation-reclaim" : aggressive ? "collection-aggressive" : "collection-recency");
                 if (profile) _collectionDeletions++;
                 if (reclaim)
                 {

@@ -300,7 +300,8 @@ public sealed unsafe partial class CachedImage
         return sanitized;
     }
 
-    public void UploadFromBuffer(ReadOnlySpan<BufferImageCopy> copies, VkBuffer buffer, ulong offset, ulong size)
+    public void UploadFromBuffer(ReadOnlySpan<BufferImageCopy> copies, VkBuffer buffer, ulong offset, ulong size,
+        [System.Runtime.CompilerServices.CallerMemberName] string path = "")
     {
         var command = BeginTransfer(copies, buffer, size);
         var sanitized = SanitizeUploadCopies(copies);
@@ -316,6 +317,8 @@ public sealed unsafe partial class CachedImage
             }
         }
 
+        if (ImageLifecycleTrace.Enabled && LifecycleCache != null && ImageLifecycleTrace.HasCapacity)
+            LifecycleCache.TraceLifecycle(this, "upload", $"reason={LifecycleUploadReason ?? path} path={LifecycleUploadPath ?? path} bytes={LifecycleUploadBytes(uploadCopies)} buffer_span_bytes={size} regions={uploadCopies.Length}");
         bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.TransferReadBit, MemoryAccess);
         VulkanSynchronization.PipelineBarrier(_device.Vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit, 0, null, 1, &bufferBarrier, 0, null);
         Transition(ReadyAccess, null, command);
@@ -668,6 +671,8 @@ public sealed unsafe partial class CachedImage
                     {
                         _device.Vk.CmdCopyBufferToImage(command, buffer.Handle, Backing.Handle, ImageLayout.General, 1, &destinationCopy);
                     }
+                    if (ImageLifecycleTrace.Enabled && LifecycleCache != null && ImageLifecycleTrace.HasCapacity)
+                        LifecycleCache.TraceLifecycle(this, "upload", $"reason=image-copy path=staging bytes={copySize} source_address=0x{source.Description.Data.Address:X}");
                 }
             }
         }

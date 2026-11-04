@@ -408,8 +408,9 @@ public sealed partial class GuestImageCache
 
     public long MetadataGeneration => Volatile.Read(ref _metadataGeneration);
 
-    private void NoteMetadataChange(ulong address)
+    private void NoteMetadataChange(ulong address, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (ImageLifecycleTrace.Enabled) TraceLifecycleMetadataChange(address, reason);
         var generation = _metadataGeneration + 1;
         _metadataEvents[generation & (MetadataEventSlots - 1)] = (generation, address);
         Volatile.Write(ref _metadataGeneration, generation);

@@ -31,6 +31,7 @@ public sealed partial class GuestImageCache
         }
 
         image.Registered = true;
+        if (ImageLifecycleTrace.Enabled) TraceLifecycle(image, "register", "reason=AddToIndex");
         if (DccNonclearMemo)
         {
             image.InspectionWrite = _bufferCache.NoteExternalWriteForInspection;
@@ -42,7 +43,7 @@ public sealed partial class GuestImageCache
         _totalUsedMemory += image.AccountedSize;
     }
 
-    private void RemoveFromIndex(ResourceSlotIdentifier imageIdentifier)
+    private void RemoveFromIndex(ResourceSlotIdentifier imageIdentifier, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
         var image = _slots[imageIdentifier];
         if (!image.Registered)
@@ -50,6 +51,7 @@ public sealed partial class GuestImageCache
             return;
         }
 
+        if (ImageLifecycleTrace.Enabled) TraceLifecycleRetirement(image, "unregister", reason);
         UnwatchImage(imageIdentifier);
         if (!ImagePageOwnerTable.TryGetPageRange(image.Description.Data.Address, image.Description.Data.Size, out var first, out var lastExclusive))
         {
@@ -95,7 +97,8 @@ public sealed partial class GuestImageCache
         depth.Backing.ImageType == Silk.NET.Vulkan.ImageType.Type2D && depth.Backing.Samples == 1 && depth.Backing.MipLevels == 1 &&
         !depth.Description.Metadata.StencilCompressed;
 
-    private int DeleteImage(ResourceSlotIdentifier imageIdentifier, bool publishStencil = true)
+    private int DeleteImage(ResourceSlotIdentifier imageIdentifier, bool publishStencil = true,
+        [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDelete);
         var image = _slots.TryGet(imageIdentifier);
@@ -104,6 +107,11 @@ public sealed partial class GuestImageCache
             return 0;
         }
 
+        if (ImageLifecycleTrace.Enabled)
+        {
+            image.LifecycleRetirementReason = reason;
+            TraceLifecycleRetirement(image, "retire", reason);
+        }
         var retiredImages = 1;
         if (image.Parked)
         {
@@ -148,7 +156,7 @@ public sealed partial class GuestImageCache
                     associated.ClearGpuModified();
                 }
 
-                retiredImages += DeleteImage(association, publishStencil);
+                retiredImages += DeleteImage(association, publishStencil, ImageLifecycleTrace.Enabled ? "depth-association:" + reason : "");
             }
         }
 
@@ -178,7 +186,7 @@ public sealed partial class GuestImageCache
         }
 
         var retiredBytes = checked((long)image.AccountedSize);
-        RemoveFromIndex(imageIdentifier);
+        RemoveFromIndex(imageIdentifier, reason);
         if (_scheduler.Active)
         {
             var bytes = retiredBytes;
@@ -200,7 +208,7 @@ public sealed partial class GuestImageCache
         return retiredImages;
     }
 
-    private void ReleaseImage(ResourceSlotIdentifier imageIdentifier)
+    private void ReleaseImage(ResourceSlotIdentifier imageIdentifier, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
         var image = _slots[imageIdentifier];
         TraceVolumeState("release", image, ImageRequest.Refresh(image.Description, ImageRole.Texture));
@@ -209,10 +217,10 @@ public sealed partial class GuestImageCache
             image.ClearGpuModified();
         }
 
-        DeleteImage(imageIdentifier);
+        DeleteImage(imageIdentifier, reason: reason);
     }
 
-    private void ParkOrReleaseImage(ResourceSlotIdentifier imageIdentifier)
+    private void ParkOrReleaseImage(ResourceSlotIdentifier imageIdentifier, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
         var image = _slots[imageIdentifier];
         var park = !image.Parked && !image.DepthOwner.IsValid && image.Description.Samples <= 1;
@@ -220,12 +228,13 @@ public sealed partial class GuestImageCache
         {
             Interlocked.Increment(ref _parkReleases);
             PublishBeforeDrop(imageIdentifier);
-            ReleaseImage(imageIdentifier);
+            ReleaseImage(imageIdentifier, reason);
             return;
         }
 
         Interlocked.Increment(ref _parks);
         image.Parked = true;
+        if (ImageLifecycleTrace.Enabled) TraceLifecycleRetirement(image, "park", reason);
         image.ParkedTick = _collectionTick;
         _parked.Add(imageIdentifier);
     }
@@ -253,6 +262,7 @@ public sealed partial class GuestImageCache
             Interlocked.Increment(ref _unparks);
             image.Parked = false;
             image.LastAccessTick = _scheduler.CurrentTick;
+            if (ImageLifecycleTrace.Enabled) TraceLifecycle(image, "unpark", "reason=exact-backing-reuse");
             TouchImage(image);
             InvalidateLookups(image.Description.Data.Address, image.Description.Data.End);
             result = imageIdentifier;
@@ -294,9 +304,10 @@ public sealed partial class GuestImageCache
         }
     }
 
-    private void MarkMaybeCpuDirty(ResourceSlotIdentifier imageIdentifier, CachedImage image)
+    private void MarkMaybeCpuDirty(ResourceSlotIdentifier imageIdentifier, CachedImage image,
+        [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
-        image.MarkMaybeCpuDirty();
+        image.MarkMaybeCpuDirty(reason);
         if (image.NeedsMaybeCpuHash)
         {
             image.SetMaybeCpuHash(image.HashGuestEdges());
@@ -408,7 +419,7 @@ public sealed partial class GuestImageCache
         }
     }
 
-    private void UnwatchImageHead(ResourceSlotIdentifier imageIdentifier)
+    private void UnwatchImageHead(ResourceSlotIdentifier imageIdentifier, string reason)
     {
         var image = _slots[imageIdentifier];
         var begin = image.Description.Data.Address;
@@ -422,7 +433,7 @@ public sealed partial class GuestImageCache
         image.WatchBegin = address;
         if (image.WatchBegin == image.WatchEnd)
         {
-            MarkMaybeCpuDirty(imageIdentifier, image);
+            MarkMaybeCpuDirty(imageIdentifier, image, reason);
         }
 
         if (size != 0)
@@ -431,7 +442,7 @@ public sealed partial class GuestImageCache
         }
     }
 
-    private void UnwatchImageTail(ResourceSlotIdentifier imageIdentifier)
+    private void UnwatchImageTail(ResourceSlotIdentifier imageIdentifier, string reason)
     {
         var image = _slots[imageIdentifier];
         var end = image.Description.Data.End;
@@ -445,7 +456,7 @@ public sealed partial class GuestImageCache
         image.WatchEnd = address;
         if (image.WatchBegin == image.WatchEnd)
         {
-            MarkMaybeCpuDirty(imageIdentifier, image);
+            MarkMaybeCpuDirty(imageIdentifier, image, reason);
         }
 
         if (size != 0)
@@ -511,8 +522,12 @@ public sealed partial class GuestImageCache
         return result;
     }
 
-    // A CPU write on the faulting thread: true when an image page covers the range.
-    bool IGuestImageStore.MarkCpuWrite(ulong address, ulong size)
+    bool IGuestImageStore.MarkCpuWrite(ulong address, ulong size) => MarkCpuWrite(address, size, "emulator-write");
+
+    bool IGuestImageStore.MarkCpuWriteFault(ulong address, ulong size) => MarkCpuWrite(address, size, "cpu-write-fault");
+
+    // True when an image page covers the write notification or protection fault.
+    private bool MarkCpuWrite(ulong address, ulong size, string reason)
     {
         GpuMemoryAccessProfile.CountImageCpuWrite();
         if (!IsValidRange(address, size))
@@ -538,7 +553,7 @@ public sealed partial class GuestImageCache
             return false;
         }
 
-        return InvalidateAliases(address, size);
+        return InvalidateAliases(address, size, reason);
     }
 
     private const ulong MaxLockFreeOwnerPages = 64;
@@ -572,12 +587,12 @@ public sealed partial class GuestImageCache
 
         _readbackLandings.NoteGuestStore(address, size);
         using var held = _lock.Hold();
-        InvalidateAliases(address, size);
+        InvalidateAliases(address, size, "emulator-write");
     }
 
     // A byte overlap makes an image definitely dirty; a page-only overlap unwatches an edge page
     // or makes the image maybe dirty. Returns whether any image shares a page with the range.
-    private bool InvalidateAliases(ulong address, ulong size)
+    private bool InvalidateAliases(ulong address, ulong size, string reason)
     {
         RecordResourceHistory("cpu-write-notification", address, size);
         if (ImageClearTrace.Enabled)
@@ -597,7 +612,7 @@ public sealed partial class GuestImageCache
             covered = true;
             if (owner.Overlaps(address, size))
             {
-                owner.InvalidateCpuWrite(address, size);
+                owner.InvalidateCpuWrite(address, size, reason);
                 UnwatchImage(imageIdentifier);
                 continue;
             }
@@ -606,15 +621,15 @@ public sealed partial class GuestImageCache
             var imageEnd = owner.Description.Data.End;
             if (pageEnd < imageEnd)
             {
-                UnwatchImageHead(imageIdentifier);
+                UnwatchImageHead(imageIdentifier, reason);
             }
             else if (imageBegin < pageBegin)
             {
-                UnwatchImageTail(imageIdentifier);
+                UnwatchImageTail(imageIdentifier, reason);
             }
             else
             {
-                MarkMaybeCpuDirty(imageIdentifier, owner);
+                MarkMaybeCpuDirty(imageIdentifier, owner, reason);
             }
         }
 

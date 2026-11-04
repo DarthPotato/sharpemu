@@ -28,6 +28,9 @@ public interface IGpuQueueRelay
 
 public sealed class GuestGpuMemory : IDisposable
 {
+    private static readonly bool TraceImageLifecycle =
+        !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_IMAGE_LIFECYCLE"));
+
     [ThreadStatic]
     private static ulong _lastWriteRetryPage;
     [ThreadStatic]
@@ -119,7 +122,8 @@ public sealed class GuestGpuMemory : IDisposable
             var (markAddress, markSize) = CoversWrites(groupAddress, GuestWriteGranule) && GuestPermits(kind, groupAddress) && GuestPermits(kind, groupAddress + GuestWriteGranule - 1)
                 ? (groupAddress, GuestWriteGranule)
                 : (address, faultSize);
-            handled = (buffers?.MarkCpuWrite(markAddress, markSize) ?? false) | (images?.MarkCpuWrite(address, faultSize) ?? false);
+            handled = (buffers?.MarkCpuWrite(markAddress, markSize) ?? false) |
+                (TraceImageLifecycle ? images?.MarkCpuWriteFault(address, faultSize) ?? false : images?.MarkCpuWrite(address, faultSize) ?? false);
         }
         else
         {
