@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Generic;
+using System.Linq;
 
 namespace SharpEmu.ShaderCompiler.Resources;
 
@@ -660,7 +661,7 @@ internal sealed class MaterializationProgram
         }
     }
 
-    private static void ReadLevel(ReadStep[] reads, ResourceRuntimeInputs inputs, Scratch scratch)
+    private void ReadLevel(ReadStep[] reads, ResourceRuntimeInputs inputs, Scratch scratch)
     {
         var values = scratch.Values;
         var valid = scratch.Valid;
@@ -781,12 +782,120 @@ internal sealed class MaterializationProgram
         return true;
     }
 
-    private static void ReadWord(ResourceRuntimeInputs inputs, ulong address, ulong baseAddress, bool absolute, int target, ulong[] values, bool[] valid)
+    private string?[]? _uses;
+
+    // What a read register feeds, for SHARPEMU_TRACE_GPU_READS: descriptor words (src<index>/<dwords>w<word>),
+    // flattened table words (table@<offset>), device-address ranges, and, after "ptr:", what the
+    // reads it addresses feed.
+    private string DescribeUse(int register)
+    {
+        var uses = _uses ??= new string?[_registerCount];
+        if (uses[register] is { } known)
+        {
+            return known;
+        }
+
+        var consumers = new List<(int Target, bool Pointer)>[_registerCount];
+        void Link(int from, int to, bool pointer)
+        {
+            if (from >= 0)
+            {
+                (consumers[from] ??= []).Add((to, pointer));
+            }
+        }
+
+        foreach (var level in _levels)
+        {
+            foreach (var read in level.Reads)
+            {
+                Link(read.Low, read.Target, true);
+                Link(read.High, read.Target, true);
+                Link(read.Records, read.Target, true);
+                Link(read.Word3, read.Target, true);
+                Link(read.Offset, read.Target, true);
+            }
+
+            foreach (var step in level.Steps)
+            {
+                if (step.Kind == StepKind.Select)
+                {
+                    Link(step.First, step.Target, false);
+                    Link(step.Second, step.Target, false);
+                    Link(step.Third, step.Target, false);
+                }
+                else if (step.Operands is { } operands)
+                {
+                    foreach (var operand in operands)
+                    {
+                        Link(operand, step.Target, false);
+                    }
+                }
+            }
+        }
+
+        var outputs = new Dictionary<int, List<string>>();
+        void Output(int at, string name) => (outputs.TryGetValue(at, out var list) ? list : outputs[at] = []).Add(name);
+        for (var source = 0; source < _sourceWords.Length; source++)
+        {
+            for (var word = 0; word < _sourceWords[source].Length; word++)
+            {
+                Output(_sourceWords[source][word], $"src{source}/{_sourceWords[source].Length}w{word}");
+            }
+        }
+
+        for (var index = 0; index < _tableWords.Length; index++)
+        {
+            Output(_tableWords[index], $"table@{_tableOffsets[index]}");
+        }
+
+        for (var index = 0; index < _rangeLow.Length; index++)
+        {
+            Output(_rangeLow[index], $"range{index}");
+            Output(_rangeHigh[index], $"range{index}");
+        }
+
+        var direct = new SortedSet<string>(StringComparer.Ordinal);
+        var indirect = new SortedSet<string>(StringComparer.Ordinal);
+        var seen = new HashSet<(int, bool)>();
+        var pending = new Stack<(int Register, bool Pointer)>();
+        pending.Push((register, false));
+        while (pending.Count != 0)
+        {
+            var (at, pointer) = pending.Pop();
+            if (!seen.Add((at, pointer)))
+            {
+                continue;
+            }
+
+            if (outputs.TryGetValue(at, out var names))
+            {
+                (pointer ? indirect : direct).UnionWith(names);
+            }
+
+            if (consumers[at] is { } next)
+            {
+                foreach (var (target, viaRead) in next)
+                {
+                    pending.Push((target, pointer || viaRead));
+                }
+            }
+        }
+
+        static string Join(SortedSet<string> names) =>
+            names.Count <= 6 ? string.Join(',', names) : string.Join(',', names.Take(6)) + $",+{names.Count - 6}";
+        var text = (direct.Count != 0 ? Join(direct) : "none") + (indirect.Count != 0 ? " ptr:" + Join(indirect) : "");
+        uses[register] = text;
+        return text;
+    }
+
+    private void ReadWord(ResourceRuntimeInputs inputs, ulong address, ulong baseAddress, bool absolute, int target, ulong[] values, bool[] valid)
     {
         MaterializationReadTrace.Base = baseAddress;
+        MaterializationReadTrace.Use = MaterializationReadTrace.Enabled ? DescribeUse(target) : null;
         uint word = 0;
         var read = inputs.ReadMemory is not null && inputs.ReadMemory(address, out word);
         MaterializationReadTrace.Base = 0;
+        MaterializationReadTrace.Use = null;
         if (read)
         {
             values[target] = word;
@@ -803,4 +912,9 @@ internal sealed class MaterializationProgram
 public static class MaterializationReadTrace
 {
     [ThreadStatic] public static ulong Base;
+
+    // What the word feeds (MaterializationProgram.DescribeUse), set only while tracing.
+    [ThreadStatic] public static string? Use;
+
+    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_READS") == "1";
 }

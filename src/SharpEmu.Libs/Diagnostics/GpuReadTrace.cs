@@ -148,6 +148,35 @@ internal static class GpuReadTrace
 
     private static readonly Dictionary<ulong, ulong> _bases = new();
 
+    // Materialization reads of GPU-written words, per consumer shader and what the word feeds.
+    private static readonly Dictionary<(ulong Shader, string Use), (long Reads, long Changes, long Ticks, uint Last)> _uses = new();
+    private static readonly Dictionary<(ulong Shader, string Use, ulong Address), uint> _useLast = new();
+    private static long _nextUseReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    public static void RecordUse(ulong address, uint word, string use, long ticks)
+    {
+        lock (_uses)
+        {
+            var shader = CurrentShader;
+            var changed = _useLast.TryGetValue((shader, use, address), out var last) && last != word;
+            if (_useLast.Count < 1 << 16) _useLast[(shader, use, address)] = word;
+            var entry = _uses.GetValueOrDefault((shader, use));
+            _uses[(shader, use)] = (entry.Reads + 1, entry.Changes + (changed ? 1 : 0), entry.Ticks + ticks, word);
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now < _nextUseReport)
+            {
+                return;
+            }
+
+            _nextUseReport = now + System.Diagnostics.Stopwatch.Frequency * 5;
+            foreach (var (key, value) in _uses.OrderByDescending(pair => pair.Value.Ticks).Take(24))
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][SYNC_READ_USE] shader=0x{key.Shader:X16} reads={value.Reads} changes={value.Changes} ms={value.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} last=0x{value.Last:X8} use={key.Use}");
+            }
+        }
+    }
+
     public static void RecordValue(ulong address, uint word, ulong tableBase = 0)
     {
         lock (_values)
