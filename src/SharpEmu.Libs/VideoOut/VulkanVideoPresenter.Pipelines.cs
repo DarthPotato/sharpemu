@@ -463,7 +463,10 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             NoteUncleanRead(address, sizeof(uint));
-            var traced = Diagnostics.GpuReadTrace.Enabled && HasGpuWrittenCommandData(address, sizeof(uint));
+            var gpuWritten = (Diagnostics.GpuReadTrace.Enabled || SharpEmu.ShaderCompiler.Resources.GpuWrittenDataReads.Enabled) &&
+                HasGpuWrittenCommandData(address, sizeof(uint));
+            SharpEmu.ShaderCompiler.Resources.GpuWrittenDataReads.LastReadGpuWritten = gpuWritten;
+            var traced = Diagnostics.GpuReadTrace.Enabled && gpuWritten;
             var started = traced ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             if (!ReadOnCommandThread(address, bytes, RenderReadSource.Word))
             {

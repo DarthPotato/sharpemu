@@ -55,6 +55,11 @@ public sealed class ShaderResourcePlan
 
     // How this plan treats an image access with no plan-time descriptor source.
     public RuntimeDescriptorMode RuntimeDescriptors { get; private set; }
+
+    // Pcs of scalar data loads the shader performs on the device instead of reading them into the
+    // flattened table on the host (ResourceTableReadPlanner): loads of memory the GPU writes, which
+    // the host could only read after waiting for that GPU work.
+    public IReadOnlySet<uint> DeviceDataReads { get; private set; } = new HashSet<uint>();
     public ShaderResourceInfo Info { get; private set; } = new();
 
     internal RawReadPrefetchPlan? RawReadPrefetch { get; set; }
@@ -170,7 +175,8 @@ public sealed class ShaderResourcePlan
         IReadOnlySet<uint>? fixedFunctionVertexLoads = null, Action<ShaderResourcePlan>? beforeResourceTracking = null, uint waveSize = 64,
         bool callRecords = false, bool callMarks = false, int dynamicUserData = -1,
         BufferDescriptorNormalizer? normalizeBufferDescriptor = null,
-        ImageDescriptorNormalizer? normalizeImageDescriptor = null, Func<long>? imageNormalizationVersion = null, RuntimeDescriptorMode runtimeDescriptors = RuntimeDescriptorMode.Disabled)
+        ImageDescriptorNormalizer? normalizeImageDescriptor = null, Func<long>? imageNormalizationVersion = null, RuntimeDescriptorMode runtimeDescriptors = RuntimeDescriptorMode.Disabled,
+        IReadOnlySet<uint>? deviceDataReads = null)
     {
         // Mesh system inputs are not uniform user data, even when a GS pointer occupies s0:s1.
         var graph = ScalarGraphDiskCache.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize,
@@ -181,7 +187,12 @@ public sealed class ShaderResourcePlan
             NormalizeImageDescriptor = normalizeImageDescriptor,
             ImageNormalizationVersion = imageNormalizationVersion,
         };
-        var reads = ResourceTableReadPlanner.Plan(graph, stage, hash);
+        if (deviceDataReads is { Count: > 0 })
+        {
+            plan.DeviceDataReads = deviceDataReads;
+        }
+
+        var reads = ResourceTableReadPlanner.Plan(graph, stage, hash, plan.DeviceDataReads);
         var memo = new Dictionary<ScalarValue, ScalarValue>();
         ScalarValue Rewrite(ScalarValue value) => graph.Substitute(value, reads.Replacements, memo);
         ScalarValue RewriteRead(ScalarValue read)

@@ -23,11 +23,14 @@ public sealed class ResourceTableReadPlanner
     private readonly HashSet<ScalarValue> _visited = [];
     private readonly Dictionary<ScalarValue, ScalarValue> _replacements = [];
 
-    private ResourceTableReadPlanner(ScalarValueGraph graph, ShaderStage stage, ulong hash)
+    private readonly IReadOnlySet<uint>? _deviceDataReads;
+
+    private ResourceTableReadPlanner(ScalarValueGraph graph, ShaderStage stage, ulong hash, IReadOnlySet<uint>? deviceDataReads)
     {
         _graph = graph;
         _stage = stage;
         _hash = hash;
+        _deviceDataReads = deviceDataReads;
     }
 
     public sealed record Result(
@@ -36,8 +39,9 @@ public sealed class ResourceTableReadPlanner
         IReadOnlyDictionary<ScalarValue, ScalarValue> Replacements,
         IReadOnlyDictionary<int, uint> FlattenedSlotByMemoryIndex);
 
-    public static Result Plan(ScalarValueGraph graph, ShaderStage stage, ulong hash) =>
-        new ResourceTableReadPlanner(graph, stage, hash).Run();
+    // deviceDataReads: pcs of data loads (not reachable from a descriptor) left to the device.
+    public static Result Plan(ScalarValueGraph graph, ShaderStage stage, ulong hash, IReadOnlySet<uint>? deviceDataReads = null) =>
+        new ResourceTableReadPlanner(graph, stage, hash, deviceDataReads).Run();
 
     private Result Run()
     {
@@ -75,11 +79,29 @@ public sealed class ResourceTableReadPlanner
             }
         }
 
+        // Data loads left to the device, and every load equivalent to one: equivalent loads share one
+        // table slot, whose host read names only the first of them.
+        var deviceReads = new List<ScalarValue>();
+        if (_deviceDataReads is { Count: > 0 })
+        {
+            foreach (var access in _graph.Accesses)
+            {
+                if (access?.Read is { Kind: ScalarValueKind.ScalarAddressWord } read && read.MemoryIndex < _graph.Memory.Count &&
+                    _deviceDataReads.Contains(_graph.Memory[read.MemoryIndex].Pc))
+                {
+                    deviceReads.Add(read);
+                }
+            }
+        }
+
+        bool OnDevice(ScalarValue read) =>
+            deviceReads.Count != 0 && deviceReads.Exists(device => ReferenceEquals(device, read) || _graph.Equivalent(device, read));
+
         var validatorReadCount = _reads.Count;
         foreach (var access in _graph.Accesses)
         {
             if (access?.Read is { Kind: ScalarValueKind.ScalarAddressWord } read &&
-                IsRawRead(read) && read.Operands[1].IsConstant &&
+                IsRawRead(read) && read.Operands[1].IsConstant && !OnDevice(read) &&
                 new RuntimeValueValidator(_graph, _graph.UserDataBase, _graph.UserDataCount, validatorReadCount).Validate(read))
             {
                 Collect(read, _graph.Memory[read.MemoryIndex].Pc);

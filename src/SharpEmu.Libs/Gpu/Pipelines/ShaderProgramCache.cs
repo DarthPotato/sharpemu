@@ -606,6 +606,11 @@ internal sealed class ShaderProgramCache
             Diagnostics.GpuReadTrace.CurrentStage = source.Label;
         }
 
+        if (GpuWrittenDataReads.Enabled)
+        {
+            GpuWrittenDataReads.Clear();
+        }
+
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
@@ -651,6 +656,12 @@ internal sealed class ShaderProgramCache
                     throw new ShaderProgramRejectedException(message);
                 throw SubmissionScheduler.Fatal(message);
             }
+        }
+
+        if (GpuWrittenDataReads.Enabled && GpuWrittenDataReads.Noted is { } gpuWrittenDataReads)
+        {
+            LearnDeviceDataReads(source, options, entry, gpuWrittenDataReads);
+            GpuWrittenDataReads.Clear();
         }
 
         ulong[] callArguments = [];
@@ -1284,12 +1295,19 @@ internal sealed class ShaderProgramCache
                 normalizeBufferDescriptor: source.Registered.Frontend?.NormalizeBufferDescriptor,
                 normalizeImageDescriptor: ImageNormalizer(source.Registered.Frontend),
                 imageNormalizationVersion: source.Registered.Frontend?.ImageNormalizationVersion,
-                runtimeDescriptors: _host.RuntimeImageDescriptorsSupported ? RuntimeDescriptorMode.OnDemand : RuntimeDescriptorMode.Disabled);
+                runtimeDescriptors: _host.RuntimeImageDescriptorsSupported ? RuntimeDescriptorMode.OnDemand : RuntimeDescriptorMode.Disabled,
+                deviceDataReads: LearnedDeviceDataReads(source));
         }
         catch (ResourcePlanException exception)
         {
             if (dumpPlanning) ShaderPlanningDump.WriteFailure(source, exception.Message);
             throw new ShaderProgramRejectedException($"The shader resource plan is invalid: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={exception.Message}.");
+        }
+
+        if (plan.DeviceDataReads.Count != 0)
+        {
+            Console.Error.WriteLine($"[GPU][DEVICE_DATA_READS] kept stage={source.Label} hash=0x{source.Hash:X16} " +
+                $"pcs={plan.DeviceDataReads.Count} table_words={plan.TableReads.Count} ranges={DescribeRanges(plan)}");
         }
 
         var exclusiveOr = false;
@@ -1313,21 +1331,153 @@ internal sealed class ShaderProgramCache
         };
     }
 
+    // The plan of an existing entry again, with another runtime-descriptor mode or set of device data reads.
+    private ShaderResourcePlan ReextractPlan(ShaderSource source, StageCompileOptions options, ProgramSourceEntry entry,
+        RuntimeDescriptorMode runtimeDescriptors, IReadOnlySet<uint> deviceDataReads) =>
+        ShaderResourcePlan.Extract(entry.Program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
+            entry.EmbeddedFetch?.Loads.Select(load => load.Pc).ToHashSet(),
+            waveSize: source.Stage switch { ShaderStage.Mesh => options.MeshInfo!.Geometry.WaveSize,
+                ShaderStage.Compute => options.ComputeInfo?.WaveSize ?? 64u, _ => 32u },
+            dynamicUserData: options.VertexInfo?.StartInstanceUserData ?? -1,
+            normalizeBufferDescriptor: source.Registered.Frontend?.NormalizeBufferDescriptor,
+            normalizeImageDescriptor: ImageNormalizer(source.Registered.Frontend),
+            imageNormalizationVersion: source.Registered.Frontend?.ImageNormalizationVersion,
+            runtimeDescriptors: runtimeDescriptors,
+            deviceDataReads: deviceDataReads);
+
+    // Data loads whose word the host read after GPU work wrote it (GpuWrittenDataReads), per program. A load seen
+    // DeviceDataReadHits times moves to the device: the program is planned again without flattening it, so later
+    // draws and dispatches no longer wait for the GPU to read it on the host (opt-in: SHARPEMU_DEVICE_DATA_READS=1).
+    // A load only shows while its page is GPU-written when the host reads it, so a program's loads arrive over
+    // several uses: it is planned again once no new load arrived for DeviceDataReadSettle, one compile instead of
+    // one per load. The loads are kept on disk (DeviceDataReadStore) and planned from the first use next session.
+    private const int DeviceDataReadHits = 4;
+    private static readonly long DeviceDataReadSettle = System.Diagnostics.Stopwatch.Frequency * 4;
+
+    private sealed class DeviceDataLearning
+    {
+        public readonly Dictionary<uint, int> Hits = new();
+        public readonly HashSet<uint> Learned = new();
+        public long LastLearned;
+        public bool Refused;
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(ShaderStage Stage, ulong Hash), DeviceDataLearning> _deviceDataReads = new();
+    private DeviceDataReadStore? _deviceDataReadStore;
+
+    private DeviceDataLearning DeviceDataLearningFor(ShaderSource source) =>
+        _deviceDataReads.GetOrAdd((source.Stage, source.Hash), key =>
+        {
+            var learning = new DeviceDataLearning();
+            if (LazyInitializer.EnsureInitialized(ref _deviceDataReadStore, DeviceDataReadStore.Open).Load(key.Stage, key.Hash) is { } kept)
+            {
+                learning.Learned.UnionWith(kept);
+            }
+
+            return learning;
+        });
+
+    // Diagnostic: SHARPEMU_DEVICE_DATA_READS_ONLY=<hex hash,...> applies learned loads to these programs only.
+    private static readonly HashSet<ulong>? DeviceDataReadsOnly =
+        Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS_ONLY") is { Length: > 0 } only
+            ? only.Split(',').Select(hash => Convert.ToUInt64(hash.Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), 16)).ToHashSet()
+            : null;
+
+    private IReadOnlySet<uint>? LearnedDeviceDataReads(ShaderSource source)
+    {
+        if (!GpuWrittenDataReads.Enabled || DeviceDataReadsOnly?.Contains(source.Hash) == false)
+        {
+            return null;
+        }
+
+        var learning = DeviceDataLearningFor(source);
+        lock (learning)
+        {
+            return learning.Refused || learning.Learned.Count == 0 ? null : new HashSet<uint>(learning.Learned);
+        }
+    }
+
+    private void LearnDeviceDataReads(ShaderSource source, StageCompileOptions options, ProgramSourceEntry entry, List<uint> pcs)
+    {
+        if (DeviceDataReadsOnly is not null)
+        {
+            return;
+        }
+
+        var learning = DeviceDataLearningFor(source);
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        HashSet<uint> wanted;
+        lock (learning)
+        {
+            if (learning.Refused)
+            {
+                return;
+            }
+
+            foreach (var pc in pcs)
+            {
+                if (!learning.Learned.Contains(pc) && (learning.Hits[pc] = learning.Hits.GetValueOrDefault(pc) + 1) >= DeviceDataReadHits)
+                {
+                    learning.Learned.Add(pc);
+                    learning.LastLearned = now;
+                }
+            }
+
+            if (learning.Learned.IsSubsetOf(entry.Plan.DeviceDataReads) || now - learning.LastLearned < DeviceDataReadSettle)
+            {
+                return;
+            }
+
+            wanted = new HashSet<uint>(learning.Learned);
+        }
+
+        // A plan change is published only from the stream thread; a resolve worker leaves it to the next serial use.
+        if (entry.HasShaderCalls || _host.RuntimeDescriptorResolutionRequiresSerial)
+        {
+            return;
+        }
+
+        ShaderResourcePlan plan;
+        try
+        {
+            plan = ReextractPlan(source, options, entry, entry.Plan.RuntimeDescriptors, wanted);
+        }
+        catch (ResourcePlanException exception)
+        {
+            lock (learning) learning.Refused = true;
+            Console.Error.WriteLine($"[GPU][WARN][DEVICE_DATA_READS] stage={source.Label} hash=0x{source.Hash:X16} keeps host reads: {exception.Message}");
+            return;
+        }
+
+        var key = KeyFor(source, options);
+        lock (_gate)
+        {
+            if (!_programs.TryGetValue(key, out var current) || !ReferenceEquals(current, entry))
+            {
+                return;
+            }
+
+            _programs[key] = entry.WithPlan(plan);
+        }
+
+        _deviceDataReadStore?.Save(source.Stage, source.Hash, wanted);
+        Console.Error.WriteLine($"[GPU][DEVICE_DATA_READS] stage={source.Label} hash=0x{source.Hash:X16} pcs={string.Join(',', wanted.Order().Select(pc => $"0x{pc:X}"))} " +
+            $"table_words={entry.Plan.TableReads.Count}->{plan.TableReads.Count} ranges={DescribeRanges(entry.Plan)}->{DescribeRanges(plan)}");
+    }
+
+    // Count of device-address ranges, the unbounded ones and the bounded bytes, for the DEVICE_DATA_READS log.
+    private static string DescribeRanges(ShaderResourcePlan plan) =>
+        $"{plan.DeviceAddressRanges.Count}/unbounded:{plan.DeviceAddressRanges.Count(range => !range.Bounded)}" +
+        $"[{string.Join(',', plan.DeviceAddressRanges.Where(range => !range.Bounded).Select(range => range.UnboundedReason).Distinct())}]" +
+        $"/bytes:{plan.DeviceAddressRanges.Sum(range => (long)range.Extent)}";
+
     private bool PreferRuntimeDescriptors(ShaderSource source, StageCompileOptions options, ref ProgramSourceEntry entry)
     {
         if (!_host.RuntimeImageDescriptorsSupported || entry.Plan.RuntimeDescriptors == RuntimeDescriptorMode.Preferred) return false;
         ShaderResourcePlan plan;
         try
         {
-            plan = ShaderResourcePlan.Extract(entry.Program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
-                entry.EmbeddedFetch?.Loads.Select(load => load.Pc).ToHashSet(),
-                waveSize: source.Stage switch { ShaderStage.Mesh => options.MeshInfo!.Geometry.WaveSize,
-                    ShaderStage.Compute => options.ComputeInfo?.WaveSize ?? 64u, _ => 32u },
-                dynamicUserData: options.VertexInfo?.StartInstanceUserData ?? -1,
-                normalizeBufferDescriptor: source.Registered.Frontend?.NormalizeBufferDescriptor,
-                normalizeImageDescriptor: ImageNormalizer(source.Registered.Frontend),
-                imageNormalizationVersion: source.Registered.Frontend?.ImageNormalizationVersion,
-                runtimeDescriptors: RuntimeDescriptorMode.Preferred);
+            plan = ReextractPlan(source, options, entry, RuntimeDescriptorMode.Preferred, entry.Plan.DeviceDataReads);
         }
         catch (ResourcePlanException) { return false; }
         if (!plan.Info.UsesRuntimeDescriptors) return false;

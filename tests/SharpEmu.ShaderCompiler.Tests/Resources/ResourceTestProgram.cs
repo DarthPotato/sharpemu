@@ -174,10 +174,11 @@ internal static class ResourceTestProgram
     // The plan, its default specialization applied, and the layout of one program.
     public static (ShaderResourcePlan Plan, SpecializedResourceInfo Resources, BindingLayout Layout) Prepare(
         Gen5ShaderProgram program, ShaderStage stage = ShaderStage.Compute, uint userDataBase = 0, uint userDataCount = 64, uint pushDataStartDword = 0,
-        bool usesDispatchThreadLimits = false, bool callRecords = false, bool callMarks = false, bool tableBlock = false)
+        bool usesDispatchThreadLimits = false, bool callRecords = false, bool callMarks = false, bool tableBlock = false,
+        IReadOnlySet<uint>? deviceDataReads = null)
     {
         var plan = ShaderResourcePlan.Extract(program, stage, Hash, userDataBase, userDataCount,
-            callRecords: callRecords, callMarks: callMarks);
+            callRecords: callRecords, callMarks: callMarks, deviceDataReads: deviceDataReads);
         var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
         var layout = BindingLayout.Allocate(
             resources.Info,
@@ -195,10 +196,10 @@ internal static class ResourceTestProgram
     }
 
     public static ShaderCompileRequest Request(Gen5ShaderProgram program, ShaderStage stage = ShaderStage.Compute, uint userDataBase = 0, uint userDataCount = 64, uint pushDataStartDword = 0,
-        bool callRecords = false, bool callMarks = false, bool tableBlock = false)
+        bool callRecords = false, bool callMarks = false, bool tableBlock = false, IReadOnlySet<uint>? deviceDataReads = null)
     {
         var (plan, resources, layout) = Prepare(program, stage, userDataBase, userDataCount, pushDataStartDword,
-            callRecords: callRecords, callMarks: callMarks, tableBlock: tableBlock);
+            callRecords: callRecords, callMarks: callMarks, tableBlock: tableBlock, deviceDataReads: deviceDataReads);
         return new ShaderCompileRequest(plan, resources, layout)
         {
             PixelOutputs = stage == ShaderStage.Pixel ? [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)] : [],

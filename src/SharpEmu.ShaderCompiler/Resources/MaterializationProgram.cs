@@ -23,7 +23,7 @@ internal sealed class MaterializationProgram
     private readonly record struct Step(StepKind Kind, int Target, int First, int Second, int Third, ScalarOperation Operation, int[]? Operands);
 
     private readonly record struct ReadStep(int Target, ScalarValueKind Kind, int Low, int High, int Records, int Word3, int Offset, uint ConstantOffset,
-        long Immediate, bool Absolute);
+        long Immediate, bool Absolute, uint Pc);
 
     private sealed class Level
     {
@@ -94,6 +94,138 @@ internal sealed class MaterializationProgram
         _tableOffsets = tableOffsets;
         _rangeLow = rangeLow;
         _rangeHigh = rangeHigh;
+        _dataReadPcs = GpuWrittenDataReads.Enabled ? FindDataReads() : null;
+    }
+
+    // Per register: the pc of the scalar-address load it holds when that value only reaches flattened
+    // table words (shader data, no descriptor, range or further read), else NoDataRead.
+    private const uint NoDataRead = uint.MaxValue;
+    private readonly uint[]? _dataReadPcs;
+
+    // For each register, the registers computed from it; Pointer marks a read that uses it as an address.
+    private List<(int Target, bool Pointer)>?[] BuildConsumers()
+    {
+        var consumers = new List<(int Target, bool Pointer)>?[_registerCount];
+        void Link(int from, int to, bool pointer)
+        {
+            if (from >= 0)
+            {
+                (consumers[from] ??= []).Add((to, pointer));
+            }
+        }
+
+        foreach (var level in _levels)
+        {
+            foreach (var read in level.Reads)
+            {
+                Link(read.Low, read.Target, true);
+                Link(read.High, read.Target, true);
+                Link(read.Records, read.Target, true);
+                Link(read.Word3, read.Target, true);
+                Link(read.Offset, read.Target, true);
+            }
+
+            foreach (var step in level.Steps)
+            {
+                if (step.Kind == StepKind.Select)
+                {
+                    Link(step.First, step.Target, false);
+                    Link(step.Second, step.Target, false);
+                    Link(step.Third, step.Target, false);
+                }
+                else if (step.Operands is { } operands)
+                {
+                    foreach (var operand in operands)
+                    {
+                        Link(operand, step.Target, false);
+                    }
+                }
+            }
+        }
+
+        return consumers;
+    }
+
+    private uint[]? FindDataReads()
+    {
+        var consumers = BuildConsumers();
+
+        // 1: a table word, 2: anything the host itself needs (a descriptor word or a range base).
+        var outputs = new byte[_registerCount];
+        foreach (var registers in _sourceWords)
+        {
+            foreach (var register in registers)
+            {
+                outputs[register] = 2;
+            }
+        }
+
+        foreach (var register in _rangeLow)
+        {
+            if (register >= 0) outputs[register] = 2;
+        }
+
+        foreach (var register in _rangeHigh)
+        {
+            if (register >= 0) outputs[register] = 2;
+        }
+
+        foreach (var register in _tableWords)
+        {
+            outputs[register] = Math.Max(outputs[register], (byte)1);
+        }
+
+        uint[]? pcs = null;
+        var seen = new HashSet<int>();
+        var pending = new Stack<int>();
+        foreach (var level in _levels)
+        {
+            foreach (var read in level.Reads)
+            {
+                if (read.Kind != ScalarValueKind.ScalarAddressWord)
+                {
+                    continue;
+                }
+
+                seen.Clear();
+                pending.Clear();
+                pending.Push(read.Target);
+                var table = false;
+                var other = false;
+                while (pending.Count != 0 && !other)
+                {
+                    var at = pending.Pop();
+                    if (!seen.Add(at))
+                    {
+                        continue;
+                    }
+
+                    table |= outputs[at] == 1;
+                    other |= outputs[at] == 2;
+                    if (consumers[at] is { } next)
+                    {
+                        foreach (var (target, pointer) in next)
+                        {
+                            other |= pointer;
+                            pending.Push(target);
+                        }
+                    }
+                }
+
+                if (table && !other)
+                {
+                    if (pcs is null)
+                    {
+                        pcs = new uint[_registerCount];
+                        Array.Fill(pcs, NoDataRead);
+                    }
+
+                    pcs[read.Target] = read.Pc;
+                }
+            }
+        }
+
+        return pcs;
     }
 
     internal static MaterializationProgram? Build(ShaderResourcePlan plan, out string reason)
@@ -348,7 +480,8 @@ internal sealed class MaterializationProgram
                     level++;
                     register = NewRegister(level);
                     _reads.Add((level, new ReadStep(register, value.Kind, low, high, records, word3, offset, offsetValue.IsConstant ? (uint)offsetValue.Payload : 0,
-                        (int)plan.Memory[value.MemoryIndex].Offset, RuntimeValueEvaluator.IsAbsoluteAddress(value.Kind, handle))));
+                        (int)plan.Memory[value.MemoryIndex].Offset, RuntimeValueEvaluator.IsAbsoluteAddress(value.Kind, handle),
+                        plan.Memory[value.MemoryIndex].Pc)));
                     return true;
                 }
                 default:
@@ -795,44 +928,7 @@ internal sealed class MaterializationProgram
             return known;
         }
 
-        var consumers = new List<(int Target, bool Pointer)>[_registerCount];
-        void Link(int from, int to, bool pointer)
-        {
-            if (from >= 0)
-            {
-                (consumers[from] ??= []).Add((to, pointer));
-            }
-        }
-
-        foreach (var level in _levels)
-        {
-            foreach (var read in level.Reads)
-            {
-                Link(read.Low, read.Target, true);
-                Link(read.High, read.Target, true);
-                Link(read.Records, read.Target, true);
-                Link(read.Word3, read.Target, true);
-                Link(read.Offset, read.Target, true);
-            }
-
-            foreach (var step in level.Steps)
-            {
-                if (step.Kind == StepKind.Select)
-                {
-                    Link(step.First, step.Target, false);
-                    Link(step.Second, step.Target, false);
-                    Link(step.Third, step.Target, false);
-                }
-                else if (step.Operands is { } operands)
-                {
-                    foreach (var operand in operands)
-                    {
-                        Link(operand, step.Target, false);
-                    }
-                }
-            }
-        }
-
+        var consumers = BuildConsumers();
         var outputs = new Dictionary<int, List<string>>();
         void Output(int at, string name) => (outputs.TryGetValue(at, out var list) ? list : outputs[at] = []).Add(name);
         for (var source = 0; source < _sourceWords.Length; source++)
@@ -893,9 +989,14 @@ internal sealed class MaterializationProgram
         MaterializationReadTrace.Base = baseAddress;
         MaterializationReadTrace.Use = MaterializationReadTrace.Enabled ? DescribeUse(target) : null;
         uint word = 0;
+        GpuWrittenDataReads.LastReadGpuWritten = false;
         var read = inputs.ReadMemory is not null && inputs.ReadMemory(address, out word);
         MaterializationReadTrace.Base = 0;
         MaterializationReadTrace.Use = null;
+        if (GpuWrittenDataReads.LastReadGpuWritten && _dataReadPcs is { } dataReads && dataReads[target] != NoDataRead)
+        {
+            GpuWrittenDataReads.Note(dataReads[target]);
+        }
         if (read)
         {
             values[target] = word;
@@ -906,6 +1007,26 @@ internal sealed class MaterializationProgram
         values[target] = 0;
         valid[target] = (baseAddress & ~3ul) == 0 || (absolute && inputs.ReadMemory is not null && !inputs.ReadsClean);
     }
+}
+
+// Data loads (ShaderResourcePlan.DeviceDataReads candidates) whose word the host had to read after
+// GPU work wrote it. The host's guest reader sets LastReadGpuWritten; a materialization notes the
+// pc of each such data load on its thread, and the program cache takes them afterwards.
+public static class GpuWrittenDataReads
+{
+    // Opt-in (SHARPEMU_DEVICE_DATA_READS=1): in Ghost of Yotei some sessions then re-stream large textures every
+    // frame (CPU-written 2048x2048 images re-uploaded), as if a moved load read a different value on the device.
+    public static bool Enabled { get; internal set; } = Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS") == "1";
+
+    [ThreadStatic] public static bool LastReadGpuWritten;
+    [ThreadStatic] private static List<uint>? _pcs;
+
+    internal static void Note(uint pc) => (_pcs ??= []).Add(pc);
+
+    public static void Clear() => _pcs?.Clear();
+
+    // The pcs noted since the last Clear, or null.
+    public static List<uint>? Noted => _pcs is { Count: > 0 } pcs ? pcs : null;
 }
 
 // The table base of the word a materialization is reading, for SHARPEMU_TRACE_GPU_READS.

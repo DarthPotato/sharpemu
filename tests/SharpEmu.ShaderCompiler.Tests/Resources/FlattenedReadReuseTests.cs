@@ -75,6 +75,63 @@ public sealed class FlattenedReadReuseTests
         Assert.DoesNotContain(request.Bindings.Descriptors, descriptor => descriptor.Kind == DescriptorBindingKind.DeviceAddressPageTable);
     }
 
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(4u)]
+    public void DeviceDataReads_MoveTheLoadAndItsEquivalentsToTheDevice(uint components)
+    {
+        var program = RepeatedReadProgram(components);
+        var deviceDataReads = new HashSet<uint> { 0 };
+        var (plan, _, _) = Prepare(program, userDataCount: 9, deviceDataReads: deviceDataReads);
+        Assert.Empty(plan.TableReads);
+        Assert.Equal(deviceDataReads, plan.DeviceDataReads);
+        Assert.True(plan.Info.UsesDeviceAddresses);
+        Assert.NotEmpty(plan.DeviceAddressRanges);
+        for (var index = 0; index < plan.Memory.Count; index++)
+        {
+            Assert.False(plan.Memory[index].Kind == MemoryResourceKind.ScalarAddress && plan.Memory[index].PlanningOnly);
+        }
+
+        var request = Request(program, userDataCount: 9, deviceDataReads: deviceDataReads);
+        Assert.Empty(request.FlattenedSlotByMemoryIndex);
+        Assert.Contains(request.Bindings.Descriptors, descriptor => descriptor.Kind == DescriptorBindingKind.DeviceAddressPageTable);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var spirvError), spirvError);
+
+        // A pc the program does not load from changes nothing.
+        var (unchanged, _, _) = Prepare(program, userDataCount: 9, deviceDataReads: new HashSet<uint> { 4 });
+        Assert.Equal((int)components, unchanged.TableReads.Count);
+        Assert.False(unchanged.Info.UsesDeviceAddresses);
+    }
+
+    [Fact]
+    public void GpuWrittenDataReads_NameTheDataLoad()
+    {
+        var enabled = GpuWrittenDataReads.Enabled;
+        GpuWrittenDataReads.Enabled = true;
+        var plan = Extract(RepeatedReadProgram(4), userDataCount: 9);
+        var program = plan.MaterializationProgram;
+        GpuWrittenDataReads.Enabled = enabled;
+        Assert.NotNull(program);
+        var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
+        var inputs = Inputs([0x1000, 0], (ulong address, out uint value) =>
+        {
+            var read = memory.Read(address, out value);
+            GpuWrittenDataReads.LastReadGpuWritten = address == 0x1004;
+            return read;
+        });
+        GpuWrittenDataReads.Clear();
+        try
+        {
+            program.TryRunInto(plan, inputs, 0, new MaterializationProgram.Output());
+            Assert.Equal(4u, memory.Reads);
+            Assert.Equal(new uint[] { 0 }, GpuWrittenDataReads.Noted);
+        }
+        finally
+        {
+            GpuWrittenDataReads.Clear();
+        }
+    }
+
     [Fact]
     public void DynamicReads_KeepDeviceAddressBindings()
     {
