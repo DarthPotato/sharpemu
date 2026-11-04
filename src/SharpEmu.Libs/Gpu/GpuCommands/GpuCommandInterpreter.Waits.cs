@@ -228,13 +228,16 @@ public sealed partial class GpuCommandInterpreter
 
     // A COND_EXEC predicate that earlier GPU work may still write costs the command thread a GPU round
     // trip. One that read 0 ConditionPredictAfter times in a row is predicted 0 (block skipped) without
-    // waiting; every ConditionVerifyEvery-th use is read for real, and a mismatch stops prediction for
-    // that address. Only "skip" is predicted: a wrongly executed block could wait forever.
+    // waiting; every ConditionVerifyEvery-th use is read for real. A mismatch restarts the streak and
+    // doubles the zeros needed before predicting again (Yotei sets its flag once while loading, then
+    // never); after ConditionMaxMismatches prediction stops for that address. Only "skip" is
+    // predicted: a wrongly executed block could wait forever.
     private static readonly bool PredictConditions =
         Environment.GetEnvironmentVariable("SHARPEMU_PREDICT_COND_EXEC") != "0";
     internal const int ConditionPredictAfter = 8;
     internal const int ConditionVerifyEvery = 16;
-    private sealed class ConditionPredictor { public int ZeroStreak; public int SinceVerified; public bool Disabled; }
+    internal const int ConditionMaxMismatches = 8;
+    private sealed class ConditionPredictor { public int ZeroStreak; public int SinceVerified; public int Mismatches; }
     private Dictionary<ulong, ConditionPredictor>? _conditionPredictors;
 
     private uint ReadCondition(ulong address)
@@ -250,7 +253,8 @@ public sealed partial class GpuCommandInterpreter
             predictors[address] = predictor = new ConditionPredictor();
         }
 
-        var predicting = !predictor.Disabled && predictor.ZeroStreak >= ConditionPredictAfter;
+        var predicting = predictor.Mismatches < ConditionMaxMismatches &&
+            predictor.ZeroStreak >= ConditionPredictAfter << predictor.Mismatches;
         if (predicting && ++predictor.SinceVerified < ConditionVerifyEvery)
         {
             SharpEmu.Libs.Diagnostics.ProducerWaitProfile.Path("cond_exec.predicted");
@@ -263,8 +267,10 @@ public sealed partial class GpuCommandInterpreter
             predictor.SinceVerified = 0;
             if (value != 0)
             {
-                predictor.Disabled = true;
-                Console.Error.WriteLine($"[GPU][WARN][COND_EXEC_PREDICT] predicate 0x{address:X16} read 0x{value:X8} after a predicted 0; prediction stops for it.");
+                predictor.Mismatches++;
+                Console.Error.WriteLine(predictor.Mismatches < ConditionMaxMismatches
+                    ? $"[GPU][WARN][COND_EXEC_PREDICT] predicate 0x{address:X16} read 0x{value:X8} after a predicted 0; predicting again after {ConditionPredictAfter << predictor.Mismatches} zeros."
+                    : $"[GPU][WARN][COND_EXEC_PREDICT] predicate 0x{address:X16} read 0x{value:X8} after a predicted 0; prediction stops for it.");
             }
         }
 

@@ -168,7 +168,7 @@ public sealed class GpuCommandInterpreterWaitTests
     }
 
     [Fact]
-    public void ConditionalExecute_PredictsAGpuWrittenZeroAndStopsOnMismatch()
+    public void ConditionalExecute_PredictsAGpuWrittenZeroAndBacksOffOnMismatch()
     {
         var runner = new StreamRunner();
         runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
@@ -199,6 +199,57 @@ public sealed class GpuCommandInterpreterWaitTests
         runner.Host.WriteDword(Label, 1);
         runner.Run(execute, CreateInstanceCountPacket(10), nop);
         Assert.Equal(10u, runner.Interpreter.InstanceCount);
+
+        // After one mismatch it predicts again only after twice as many zeros in a row.
+        runner.Host.WriteDword(Label, 0);
+        for (var index = 0; index < GpuCommandInterpreter.ConditionPredictAfter * 2; index++)
+        {
+            runner.Run(execute, CreateInstanceCountPacket(11), nop);
+            Assert.Equal(10u, runner.Interpreter.InstanceCount);
+        }
+
+        runner.Host.WriteDword(Label, 1);
+        runner.Run(execute, CreateInstanceCountPacket(12), nop);
+        Assert.Equal(10u, runner.Interpreter.InstanceCount);
+    }
+
+    [Fact]
+    public void ConditionalExecute_StopsPredictingAfterRepeatedMismatches()
+    {
+        var runner = new StreamRunner();
+        runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
+        var execute = StreamRunner.Packet(PacketOpcode.ConditionalExecute, StreamRunner.Low(Label), StreamRunner.High(Label), 0, 2);
+        var nop = StreamRunner.Packet(PacketOpcode.Nop, 0);
+        runner.Run(CreateInstanceCountPacket(3));
+        for (var mismatch = 0; mismatch < GpuCommandInterpreter.ConditionMaxMismatches; mismatch++)
+        {
+            runner.Host.WriteDword(Label, 0);
+            for (var index = 0; index < GpuCommandInterpreter.ConditionPredictAfter << mismatch; index++)
+            {
+                runner.Run(execute, CreateInstanceCountPacket(3), nop);
+            }
+
+            // Predicted uses, then the verifying read that sees the 1.
+            runner.Host.WriteDword(Label, 1);
+            for (var index = 1; index < GpuCommandInterpreter.ConditionVerifyEvery; index++)
+            {
+                runner.Run(execute, CreateInstanceCountPacket(4), nop);
+                Assert.Equal(3u, runner.Interpreter.InstanceCount);
+            }
+
+            runner.Run(execute, CreateInstanceCountPacket(3), nop);
+        }
+
+        // Disabled: any number of zeros later the predicate is still read.
+        runner.Host.WriteDword(Label, 0);
+        for (var index = 0; index < GpuCommandInterpreter.ConditionPredictAfter << GpuCommandInterpreter.ConditionMaxMismatches; index++)
+        {
+            runner.Run(execute, CreateInstanceCountPacket(3), nop);
+        }
+
+        runner.Host.WriteDword(Label, 1);
+        runner.Run(execute, CreateInstanceCountPacket(6), nop);
+        Assert.Equal(6u, runner.Interpreter.InstanceCount);
     }
 
     [Fact]
