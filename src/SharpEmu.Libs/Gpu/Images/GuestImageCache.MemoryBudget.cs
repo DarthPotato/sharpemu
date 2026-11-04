@@ -9,6 +9,8 @@ public sealed partial class GuestImageCache
 {
     private long _nextMemoryBudgetSample;
 
+    private static readonly bool BudgetCountsPool = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BUDGET_COUNT_POOL") != "0";
+
     // Smaller heaps cannot afford hundreds of MiB stranded in every partially used block.
     internal static ulong ComputeImagePoolBlockSize(ulong heapBytes)
     {
@@ -27,12 +29,14 @@ public sealed partial class GuestImageCache
         var memory = _device.ReadDeviceLocalMemory();
         if (_device.HasMemoryBudget && GpuMemoryPolicyOptions.DynamicImageBudget)
         {
-            var availableForImages = memory.Available + _totalUsedMemory;
+            // Free space in the image pool's blocks and pooled backings are device memory only images reuse: the
+            // driver counts them as used, and leaving them out cost Ghost of Yotei ~1.1 GB of image budget, so its
+            // working set fell back past the critical threshold as other usage grew (SHARPEMU_IMAGE_BUDGET_COUNT_POOL=0
+            // leaves them out).
+            var reusable = BudgetCountsPool ? _imageMemoryPool.UnusedBytes + (_backingPool?.PooledBytes ?? 0) : 0;
+            var availableForImages = memory.Available + _totalUsedMemory + reusable;
             var budget = Math.Min(_initialImageBudget, ComputeImageCacheBudget(availableForImages, true));
-            _collectionStartBytes = Math.Max(budget / 2, MiB);
-            _memoryPressureBytes = Math.Max(budget * 3 / 5, MiB);
-            _criticalMemoryBytes = Math.Max(budget * 7 / 10, MiB);
-            _hardLimitBytes = Math.Max(budget, _criticalMemoryBytes);
+            SetCollectionThresholds(budget);
         }
         if (SharpEmu.Libs.Gpu.Buffers.GpuDeviceInfo.VramTrace)
             Console.Error.WriteLine($"[PERF][VRAM_SITES] {_device.DescribeTracedMemory()}");

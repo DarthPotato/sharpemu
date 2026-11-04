@@ -96,10 +96,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         _initialImageBudget = imageBudget;
-        _collectionStartBytes = Math.Max(imageBudget / 2, MiB);
-        _memoryPressureBytes = Math.Max(imageBudget * 3 / 5, MiB);
-        _criticalMemoryBytes = Math.Max(imageBudget * 7 / 10, MiB);
-        _hardLimitBytes = Math.Max(imageBudget, _criticalMemoryBytes);
+        SetCollectionThresholds(imageBudget);
         if (Interlocked.Exchange(ref _budgetLogged, 1) == 0)
         {
             Console.Error.WriteLine(
@@ -118,14 +115,47 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             ? megabytes * MiB
             : null;
 
-    // The image cache may use what is free minus a margin (a quarter, at least 512 MiB) for
+    // The image cache may use what is free minus a margin (an eighth, at least 512 MiB) for
     // everything else the process allocates. Without VK_EXT_memory_budget the heap size says
     // nothing about memory the driver or other processes already hold, so the budget stays at
     // the conservative fixed cap.
+    // SHARPEMU_IMAGE_BUDGET_MARGIN_DIVISOR: the margin is available / divisor (default 8; 4 before).
+    // SHARPEMU_IMAGE_THRESHOLDS=<start>,<pressure>,<critical>: collection thresholds in percent of the
+    // budget (default 60,85,92; 50,60,70 before). Past the critical threshold the cache evicts every image
+    // the current and previous frame did not use, so a working set larger than it is created and uploaded
+    // again each time a frame skips one of its images. Ghost of Yotei's ~3 GB texture working set sat above
+    // the old critical threshold on a 10 GB card with ~1.2 GB still free: its textures cycled through
+    // collection and upload every few frames (+7% fps with the new defaults).
+    private static readonly ulong BudgetMarginDivisor =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BUDGET_MARGIN_DIVISOR"), out var divisor) && divisor is >= 2 and <= 64
+            ? divisor
+            : 8;
+
+    private static readonly (ulong Start, ulong Pressure, ulong Critical) ThresholdPercents = ParseThresholds(
+        Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_THRESHOLDS"));
+
+    internal static (ulong Start, ulong Pressure, ulong Critical) ParseThresholds(string? value)
+    {
+        var parts = value?.Split(',');
+        return parts is { Length: 3 } &&
+            ulong.TryParse(parts[0], out var start) && ulong.TryParse(parts[1], out var pressure) && ulong.TryParse(parts[2], out var critical) &&
+            start > 0 && start <= pressure && pressure <= critical && critical <= 100
+            ? (start, pressure, critical)
+            : (60, 85, 92);
+    }
+
+    private void SetCollectionThresholds(ulong budget)
+    {
+        _collectionStartBytes = Math.Max(budget / 100 * ThresholdPercents.Start, MiB);
+        _memoryPressureBytes = Math.Max(budget / 100 * ThresholdPercents.Pressure, MiB);
+        _criticalMemoryBytes = Math.Max(budget / 100 * ThresholdPercents.Critical, MiB);
+        _hardLimitBytes = Math.Max(budget, _criticalMemoryBytes);
+    }
+
     internal static ulong ComputeImageCacheBudget(ulong available, bool hasMemoryBudget)
     {
         available = Math.Max(available, 1UL);
-        var safetyMargin = Math.Max(available / 4, MinimumMemorySafetyMargin);
+        var safetyMargin = Math.Max(available / BudgetMarginDivisor, MinimumMemorySafetyMargin);
         var imageBudget = available > safetyMargin
             ? available - safetyMargin
             : Math.Max(available / 2, MiB);

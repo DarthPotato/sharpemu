@@ -21,16 +21,26 @@ public sealed class MemoryBudgetTests
     }
 
     [Fact]
-    public void ImageCacheLeavesAQuarterOfWhatIsFree()
+    public void ImageCacheLeavesAnEighthOfWhatIsFree()
     {
-        Assert.Equal(6 * GiB, GuestImageCache.ComputeImageCacheBudget(8 * GiB, hasMemoryBudget: true));
-        Assert.Equal(9 * GiB, GuestImageCache.ComputeImageCacheBudget(12 * GiB, hasMemoryBudget: true));
+        Assert.Equal(7 * GiB, GuestImageCache.ComputeImageCacheBudget(8 * GiB, hasMemoryBudget: true));
+        Assert.Equal(21 * GiB / 2, GuestImageCache.ComputeImageCacheBudget(12 * GiB, hasMemoryBudget: true));
+    }
+
+    [Fact]
+    public void CollectionThresholdsParseOrFallBack()
+    {
+        Assert.Equal((60UL, 85UL, 92UL), GuestImageCache.ParseThresholds(null));
+        Assert.Equal((50UL, 60UL, 70UL), GuestImageCache.ParseThresholds("50,60,70"));
+        Assert.Equal((60UL, 85UL, 92UL), GuestImageCache.ParseThresholds("70,60,80"));
+        Assert.Equal((60UL, 85UL, 92UL), GuestImageCache.ParseThresholds("50,60,101"));
+        Assert.Equal((60UL, 85UL, 92UL), GuestImageCache.ParseThresholds("50,60"));
     }
 
     [Fact]
     public void ImageCacheMarginHasAFloor()
     {
-        // A quarter of 1 GiB is below the 512 MiB floor.
+        // An eighth of 1 GiB is below the 512 MiB floor.
         Assert.Equal(512 * MiB, GuestImageCache.ComputeImageCacheBudget(GiB, hasMemoryBudget: true));
         // Less free memory than the floor keeps half of it, never less than 1 MiB.
         Assert.Equal(200 * MiB, GuestImageCache.ComputeImageCacheBudget(400 * MiB, hasMemoryBudget: true));
@@ -41,6 +51,6 @@ public sealed class MemoryBudgetTests
     public void WithoutAMemoryBudgetTheHeapSizeIsCappedConservatively()
     {
         Assert.Equal(4 * GiB, GuestImageCache.ComputeImageCacheBudget(12 * GiB, hasMemoryBudget: false));
-        Assert.Equal(3 * GiB, GuestImageCache.ComputeImageCacheBudget(4 * GiB, hasMemoryBudget: false));
+        Assert.Equal(7 * GiB / 2, GuestImageCache.ComputeImageCacheBudget(4 * GiB, hasMemoryBudget: false));
     }
 }
