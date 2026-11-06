@@ -10,9 +10,13 @@ namespace SharpEmu.Libs.VideoOut;
 
 // Diagnostic only: never authorizes reuse. All callers guard the static switch so the
 // disabled path neither allocates TLS/collections nor reads image state or takes locks.
+// It costs fps on the acquisition path it measures, so it needs its own switch on top of
+// SHARPEMU_PROFILE_RENDER=1 (which reports it): SHARPEMU_PROFILE_SAMPLED_REUSE=1.
 internal static class ImageAcquisitionProfile
 {
-    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_RENDER") == "1";
+    internal static readonly bool Enabled =
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_RENDER") == "1" &&
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_SAMPLED_REUSE") == "1";
     internal enum Caller { Stage, Worker, Prologue, Memo, Other }
     private static class Storage { internal static readonly Tracker Instance = new(); }
     [ThreadStatic] private static Dictionary<Pair, Observation>? _preparation;
