@@ -204,9 +204,12 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // A CPU write fault: true when the range is tracked and any GPU data reached guest memory.
     bool IGuestBufferStore.MarkCpuWrite(ulong address, ulong size)
     {
+        _sharedPages.NoteCpuWrite(address, size);
         var tracked = _tracker.InvalidateRegion(address, size, out var needsGpuFlush);
         var completed = !needsGpuFlush || ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
             GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation);
+        // Recovery can adopt a previously unshadowed shader-written page.
+        _sharedPages.NoteCpuWrite(address, size);
         if (GuestGpuMemoryHook.Traces(address, size))
             GuestGpuMemoryHook.Trace(address, size, $"buffer-write tracked={tracked} completed={completed}");
         return tracked && completed;
@@ -216,15 +219,20 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // CPU-dirty again. GPU-dirty pages stay as they are, since a download now would replace the new bytes.
     void IGuestBufferStore.MarkCpuWriteLanded(ulong address, ulong size)
     {
+        _sharedPages.NoteCpuWrite(address, size);
         var tracked = _tracker.MarkLandedCpuWrite(address, size);
         if (GuestGpuMemoryHook.Traces(address, size))
             GuestGpuMemoryHook.Trace(address, size, $"buffer-write-landed tracked={tracked}");
     }
 
-    bool IGuestBufferStore.MayHoldGpuData(ulong address, ulong size) => _tracker.MayHaveGpuDirtyPages(address, size);
+    // Emulator stores must notify before writing a shared page too: a merge can run between
+    // the actual store and its landed notification, even though the tracker calls it CPU-owned.
+    bool IGuestBufferStore.MayHoldGpuData(ulong address, ulong size) =>
+        _tracker.MayHaveGpuDirtyPages(address, size) || _sharedPages.Overlaps(address, size);
 
     bool IGuestBufferStore.NoteEmulatorWrite(ulong address, ulong size)
     {
+        _sharedPages.NoteCpuWrite(address, size);
         var tracked = _tracker.MarkCpuWriteKeepingProtection(address, size, out var needsGpuFlush);
         return needsGpuFlush ? _tracker.MarkLandedCpuWrite(address, size) : tracked;
     }
@@ -277,7 +285,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             throw SubmissionScheduler.Fatal("The memory invalidation range is invalid.");
         }
 
+        _sharedPages.NoteCpuWrite(guestAddress, size);
         _tracker.InvalidateRegion(guestAddress, size, () => ReadMemory(guestAddress, size, isWrite: true));
+        _sharedPages.NoteCpuWrite(guestAddress, size);
     }
 
     public void ReadMemory(ulong guestAddress, ulong size, bool isWrite = false)
@@ -3318,8 +3328,10 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         if (source != null && _sharedPages.Count != 0)
         {
             using var filterScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferSharedPageFilter);
-            // Shared pages copy only the bytes the CPU changed, so shader bytes in the buffer stay.
-            _sharedPages.FilterUpload(copies, buffer, buffer.CpuAddress, source.Mapped, _scheduler.CurrentTick, merges);
+            // Untouched shared pages preserve shader bytes; a notified CPU write uploads the
+            // whole page because equal byte values do not establish write ordering.
+            var hotPages = FindCpuWriteHotSharedPages(copies, buffer.CpuAddress);
+            _sharedPages.FilterUpload(copies, buffer, buffer.CpuAddress, source.Mapped, _scheduler.CurrentTick, merges, hotPages);
             if (copies.Count == 0)
             {
                 source = null;

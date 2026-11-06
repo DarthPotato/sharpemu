@@ -16,6 +16,9 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // changed since (the shader's bytes in the GPU copy stay), and the bytes the GPU
 // changed since are merged into guest memory where the CPU left them alone. A byte both changed
 // keeps the CPU's value in guest memory, and the next upload carries it to the GPU copy.
+// A notified CPU write supersedes this byte comparison for the entire page until a full upload:
+// same-value stores and further stores on a released watch are otherwise indistinguishable from
+// untouched bytes. Hot CPU pages retain that ownership even across uploads.
 // The changed shared-page segments of one upload, each with its new and previous shadow bytes,
 // for the GPU merge that writes only the bytes that differ. Reused from upload to upload.
 internal sealed class SharedPageMergePlan
@@ -103,6 +106,9 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
         // The submission tick of the last upload staged for the page; the GPU copy lacks
         // its bytes until that tick completes.
         public ulong StagedTick;
+        // A write watch releases the whole page, so later native stores may not notify us.
+        // Equality with Bytes cannot prove that any byte is still the CPU's old value.
+        public bool CpuWritten;
     }
 
     // The owner of a page whose baseline is unproven: no buffer is it, so the next upload into the
@@ -135,6 +141,33 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
         lock (_gate)
         {
             return _pages.ContainsKey(page);
+        }
+    }
+
+    public bool Overlaps(ulong address, ulong size)
+    {
+        if (Count == 0 || size == 0) return false;
+        lock (_gate)
+        {
+            for (var page = address & ~(pageBytes - 1); page < address + size; page += pageBytes)
+            {
+                if (_pages.ContainsKey(page)) return true;
+            }
+            return false;
+        }
+    }
+
+    // CPU ownership lasts until a full upload establishes a new baseline. In particular a
+    // same-value store (or reuse of the mapping) must not admit an older GPU byte on a pull.
+    public void NoteCpuWrite(ulong address, ulong size)
+    {
+        if (Count == 0 || size == 0) return;
+        lock (_gate)
+        {
+            for (var page = address & ~(pageBytes - 1); page < address + size; page += pageBytes)
+            {
+                if (_pages.TryGetValue(page, out var shadow)) shadow.CpuWritten = true;
+            }
         }
     }
 
@@ -257,7 +290,9 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
     // change them, and returns the number of merged bytes (writeGuest receives each merged run as
     // an offset and length). Only once every upload staged for the page has executed: before that
     // the GPU copy still lacks staged CPU bytes, which would read as GPU changes. A page whose
-    // owner changed is shadowed again from the new copy. gpuPage must not change during the call.
+    // owner changed is shadowed again from the new copy. A CPU-written page waits for its full
+    // upload instead: equal byte values cannot establish write ordering. gpuPage must not change
+    // during the call.
     public int PullGpuWrites(ulong page, object owner, ReadOnlySpan<byte> gpuPage, Span<byte> guestPage, ulong completedTick,
         Action<int, int> writeGuest)
     {
@@ -266,6 +301,11 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
         lock (_gate)
         {
             if (!_pages.TryGetValue(page, out var shadow))
+            {
+                return 0;
+            }
+
+            if (shadow.CpuWritten)
             {
                 return 0;
             }
@@ -323,7 +363,7 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
     // Narrows an upload to the bytes the CPU changed on shadowed pages. copies stage from
     // staged (indexed by SrcOffset) into a buffer at targetAddress (indexed by DstOffset); copies
     // over shadowed pages are split into the runs that differ from the shadow, which takes them.
-    // An upload into a new owner copies everything and shadows the page from it.
+    // An upload into a new owner or a CPU-written page copies everything and shadows the page from it.
     //
     // With merges, a changed segment of a shadowed page whose destination offset and size are
     // multiples of four leaves the copies whole instead, with its new and previous shadow bytes, for
@@ -331,7 +371,7 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
     // same, but CPU-rewritten data splits into many runs wherever a byte happens to keep its value,
     // and thousands of copy regions per upload cost far more to record than one merge.
     public void FilterUpload(List<BufferCopy> copies, object target, ulong targetAddress, ReadOnlySpan<byte> staged, ulong tick,
-        SharedPageMergePlan? merges = null)
+        SharedPageMergePlan? merges = null, IReadOnlySet<ulong>? cpuWriteHot = null)
     {
         if (Count == 0)
         {
@@ -378,12 +418,17 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
                     var source = pageScratch[..stagedSlice.Length];
                     stagedSlice.CopyTo(source);
                     var shadowBytes = shadow.Bytes.AsSpan(checked((int)(from - page)), source.Length);
-                    if (!ReferenceEquals(shadow.Owner, target))
+                    var hot = cpuWriteHot?.Contains(page) ?? false;
+                    shadow.CpuWritten |= hot;
+                    if (shadow.CpuWritten || !ReferenceEquals(shadow.Owner, target))
                     {
                         shadow.Owner = target;
                         filtered.Add(Slice(copy, begin, from, to - from));
                         shadow.StagedTick = Math.Max(shadow.StagedTick, tick);
                         source.CopyTo(shadowBytes);
+                        // A partial upload cannot establish the rest of a reused page. Hot pages
+                        // remain writable after staging, so even a full upload cannot release them.
+                        if (from == page && to == page + pageBytes) shadow.CpuWritten = hot;
                         continue;
                     }
 

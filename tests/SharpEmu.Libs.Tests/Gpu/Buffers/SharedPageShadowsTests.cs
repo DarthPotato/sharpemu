@@ -279,6 +279,83 @@ public sealed class SharedPageShadowsTests
         Assert.Equal(9UL, tick);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CpuReuseOfAShaderPagePreservesSameValueStoresAndUploadsThemWhole(bool mergeUpload)
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        var baseline = Fill(0);
+        Assert.True(shadows.Adopt(Page, owner, baseline));
+        var gpu = baseline.ToArray();
+        BitConverter.TryWriteBytes(gpu.AsSpan(0x14), 0x0085D900u);
+
+        // Reuse as a command buffer: the CPU writes zeros too, including the dword at 0x14.
+        // Comparing bytes alone cannot tell those stores from an untouched shader target.
+        shadows.NoteCpuWrite(Page, PageBytes);
+        var commands = Fill(0);
+        BitConverter.TryWriteBytes(commands.AsSpan(0x10), 0xC0001000u);
+        var expected = commands.ToArray();
+        Assert.Equal(0, shadows.PullGpuWrites(Page, owner, gpu, commands, 1,
+            (_, _) => Assert.Fail("An older shader write must not reach the reused page.")));
+        Assert.Equal(expected, commands);
+
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        var plan = mergeUpload ? new SharedPageMergePlan() : null;
+        shadows.FilterUpload(copies, owner, Page, commands, 2, plan);
+        Assert.Equal([new BufferCopy(0, 0, PageBytes)], copies);
+        if (plan is not null) Assert.Empty(plan.Segments);
+        commands.CopyTo(gpu, 0);
+
+        // A snapshot from before the full upload still cannot restore the stale packet bytes.
+        var stale = baseline.ToArray();
+        stale[0x14] = 0xAA;
+        Assert.Equal(0, shadows.PullGpuWrites(Page, owner, stale, commands, 1, (_, _) => Assert.Fail()));
+        Assert.Equal(expected, commands);
+
+        // Once synchronized, a genuinely later shader write is still merged normally.
+        gpu[0x30] = 0x55;
+        Assert.Equal(1, shadows.PullGpuWrites(Page, owner, gpu, commands, 2, (_, _) => { }));
+        Assert.Equal(0x55, commands[0x30]);
+    }
+
+    [Fact]
+    public void APartialUploadAndAnOwnerCopyDoNotReleaseCpuOwnershipOfAReusedPage()
+    {
+        var owner = new object();
+        var replacement = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.Adopt(Page, owner, Fill(0)));
+        // Even a small native write releases the page watch; further writes may go unreported.
+        shadows.NoteCpuWrite(Page + 8, 4);
+        shadows.NoteOwnerCopy(owner, replacement, 2);
+        var commands = Fill(0);
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes / 2) };
+        shadows.FilterUpload(copies, replacement, Page, commands, 3);
+        Assert.Equal([new BufferCopy(0, 0, PageBytes / 2)], copies);
+        var gpu = Fill(0);
+        gpu[PageBytes - 1] = 0xAA;
+        Assert.Equal(0, shadows.PullGpuWrites(Page, replacement, gpu, commands, 3, (_, _) => Assert.Fail()));
+        Assert.Equal(Fill(0), commands);
+    }
+
+    [Fact]
+    public void AHotCpuPageStaysProtectedFromMergesAfterAFullUpload()
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.Adopt(Page, owner, Fill(0)));
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        shadows.FilterUpload(copies, owner, Page, Fill(0), 2, cpuWriteHot: new HashSet<ulong> { Page });
+        Assert.Equal([new BufferCopy(0, 0, PageBytes)], copies);
+        var gpu = Fill(0);
+        gpu[20] = 0xAA;
+        var guest = Fill(0);
+        Assert.Equal(0, shadows.PullGpuWrites(Page, owner, gpu, guest, 2, (_, _) => Assert.Fail()));
+        Assert.Equal(Fill(0), guest);
+    }
+
     private static byte[] Fill(byte value)
     {
         var bytes = new byte[PageBytes];

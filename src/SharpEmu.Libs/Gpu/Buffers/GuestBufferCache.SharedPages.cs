@@ -152,6 +152,7 @@ public sealed unsafe partial class GuestBufferCache
         var adopted = owner.MappedPointer != null && owner.IsCoherent &&
             _sharedPages.Adopt(page, owner, new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), (int)TrackerLayout.PageBytes),
                 _scheduler.CurrentTick);
+        if (adopted) _sharedPages.NoteCpuWrite(page, TrackerLayout.PageBytes);
         if (!adopted && _sharedPages.Count >= SharedPageCapacity && Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
         {
             Console.Error.WriteLine("[GPU][WARN] The shared page shadows are full; CPU writes to further shader-written pages may lose shader bytes.");
@@ -250,10 +251,30 @@ public sealed unsafe partial class GuestBufferCache
             return false;
         }
 
+        // Read the completed tick first: a tick completed after the snapshot cannot prove
+        // that the snapshot includes its uploads.
+        var completedTick = _scheduler.Timeline.CompletedTick;
         // The GPU may still write the page: merge one snapshot of it.
         Span<byte> gpu = stackalloc byte[(int)TrackerLayout.PageBytes];
         new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), gpu.Length).CopyTo(gpu);
-        return MergeSharedPage(page, owner, gpu, _scheduler.Timeline.CompletedTick);
+        return MergeSharedPage(page, owner, gpu, completedTick);
+    }
+
+    private bool IsCpuWriteHotPage(ulong page) => _tracker.IsCpuWriteHotRange(page, TrackerLayout.PageBytes);
+
+    // Query tracker locks before entering the shadow lock: downloads can take them in that order.
+    private HashSet<ulong>? FindCpuWriteHotSharedPages(List<BufferCopy> copies, ulong address)
+    {
+        HashSet<ulong>? hot = null;
+        foreach (var copy in copies)
+        {
+            var begin = address + copy.DstOffset;
+            for (var page = begin & ~(TrackerLayout.PageBytes - 1); page < begin + copy.Size; page += TrackerLayout.PageBytes)
+            {
+                if (_sharedPages.Contains(page) && IsCpuWriteHotPage(page)) (hot ??= new()).Add(page);
+            }
+        }
+        return hot;
     }
 
     // Merges a snapshot of the owner's copy of a shadowed page into guest memory and the shadow: the
@@ -262,6 +283,7 @@ public sealed unsafe partial class GuestBufferCache
     // tick whose effects the snapshot is known to include. True when bytes were merged.
     private bool MergeSharedPage(ulong page, GpuBuffer owner, ReadOnlySpan<byte> gpu, ulong completedTick)
     {
+        if (IsCpuWriteHotPage(page)) _sharedPages.NoteCpuWrite(page, TrackerLayout.PageBytes);
         var guest = new byte[TrackerLayout.PageBytes];
         if (!_backing.TryReadBacking(page, guest))
         {
@@ -306,9 +328,8 @@ public sealed unsafe partial class GuestBufferCache
     // opportunistically after each batch submission and fault scan. Only a caller that needs a page
     // whose copy is still in flight waits, for that copy alone. The owner is looked up again at the
     // merge: a replaced owner holds the same bytes, and a retired one needs no merge.
-    // A CPU write that repeats the shadow's value between the report and the merge cannot be told
-    // from no write: the shader's byte wins there, as it would on a coherent owner for a write that
-    // came before the report.
+    // A notified CPU write supersedes the pending snapshot for the entire page, even if it repeats
+    // the shadow's value. The next full upload carries the CPU's page and reestablishes the baseline.
     private readonly Dictionary<ulong, ulong> _pendingSharedMerges = new();
     private readonly Dictionary<ulong, SharedMergeFlight> _inflightSharedMerges = new();
     private readonly List<SharedMergeBatch> _sharedMergeBatches = new();

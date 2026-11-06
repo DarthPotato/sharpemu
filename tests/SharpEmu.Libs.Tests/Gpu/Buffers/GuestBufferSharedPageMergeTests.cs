@@ -103,6 +103,129 @@ public sealed unsafe class GuestBufferSharedPageMergeTests(HeadlessVulkanFixture
     }
 
     [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 1)]
+    [InlineData(true, 1)]
+    [InlineData(false, 2)]
+    [InlineData(true, 2)]
+    [InlineData(false, 3)]
+    [InlineData(true, 3)]
+    [InlineData(false, 4)]
+    [InlineData(true, 4)]
+    public void CpuCommandBufferReuseDoesNotTakeStaleShaderBytes(bool asyncReadback, int notification)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan!);
+        using var fatal = new FatalScope();
+        if (asyncReadback) Attach(harness, _vulkan!);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var (buffer, offset) = EstablishShadow(harness, address);
+        harness.Worker.Run(() =>
+        {
+            buffer.Fill(offset + 0x74, 4, 0x0085D900);
+            harness.Scheduler.Finish();
+        });
+
+        // The shader store predates reuse, but its write report arrives afterwards. The CPU
+        // explicitly writes zeros at 0x74: equal to the old shadow, yet newer than the shader.
+        if (notification == 0) Assert.True(harness.Store.MarkCpuWrite(address, Tracker));
+        if (notification == 4)
+        {
+            Assert.False(harness.Cache.Tracker.MayHaveGpuDirtyPages(address, Tracker));
+            Assert.True(harness.Store.MayHoldGpuData(address, Tracker));
+            harness.Gpu.PrepareEmulatorWrite(address, Tracker);
+        }
+        var commands = new byte[Tracker];
+        BitConverter.TryWriteBytes(commands.AsSpan(0x70), 0xC0001000u);
+        harness.Write(address, commands);
+        switch (notification)
+        {
+            case 1: harness.Store.MarkCpuWriteLanded(address, Tracker); break;
+            case 2: Assert.True(harness.Store.NoteEmulatorWrite(address, Tracker)); break;
+            case 3: harness.Cache.InvalidateMemory(address, Tracker); break;
+        }
+        harness.Worker.Run(() =>
+        {
+            harness.Cache.NoteDeviceAddressWrites(address, Tracker);
+            harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: true);
+        });
+
+        Assert.Equal(commands, harness.Read(address, (int)Tracker));
+        harness.Worker.Run(() => _ = harness.Cache.ObtainBufferForImage(address, 256));
+        Assert.Equal(commands, harness.ReadBack(buffer, offset, Tracker));
+        if (asyncReadback) Detach(harness);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void ARemappedPageDoesNotTakeShaderBytesFromItsSurvivingBufferOwner()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan!);
+        using var fatal = new FatalScope();
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var (buffer, offset) = EstablishShadow(harness, address);
+        harness.Worker.Run(() =>
+        {
+            buffer.Fill(offset + 0x74, 4, 0x0085D900);
+            harness.Scheduler.Finish();
+        });
+        harness.Gpu.RunMappingChange(() =>
+        {
+            harness.Gpu.Unregister(address, 0x10000);
+            Assert.True(harness.Memory.TryUnmapBacked(address, 0x10000));
+            Assert.True(harness.Memory.TryMapBacked(address, 0x10000, 0x10000, ReadWrite, out _));
+            harness.Gpu.Register(address, 0x10000, ReadWrite);
+        });
+        var commands = new byte[Tracker];
+        BitConverter.TryWriteBytes(commands.AsSpan(0x70), 0xC0001000u);
+        harness.Write(address, commands);
+        harness.Worker.Run(() =>
+        {
+            harness.Cache.NoteDeviceAddressWrites(address, Tracker);
+            harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: true);
+        });
+        Assert.Equal(commands, harness.Read(address, (int)Tracker));
+        harness.Worker.Run(() => _ = harness.Cache.ObtainBufferForImage(address, 256));
+        Assert.Equal(commands, harness.ReadBack(buffer, offset, Tracker));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void CpuReuseWhileAReadbackIsInFlightDoesNotTakeItsOlderShaderBytes()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan!);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan!);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var (buffer, offset) = EstablishShadow(harness, address);
+        CpuWritesThenShadersWrite(harness, address, buffer, offset);
+        if (!Deferred(buffer))
+        {
+            Detach(harness);
+            harness.Shutdown();
+            return;
+        }
+
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: false));
+        Assert.Equal(1, harness.Cache.SharedMergesIssued);
+        var commands = new byte[Tracker];
+        BitConverter.TryWriteBytes(commands.AsSpan(0x70), 0xC0001000u);
+        harness.Write(address, commands);
+        harness.Store.MarkCpuWriteLanded(address, Tracker);
+        WaitUntilReadsComplete(harness);
+        harness.Worker.Run(() => harness.Cache.ResolvePendingSharedMerges(address, Tracker, wait: true));
+
+        Assert.Equal(commands, harness.Read(address, (int)Tracker));
+        harness.Worker.Run(() => _ = harness.Cache.ObtainBufferForImage(address, 256));
+        Assert.Equal(commands, harness.ReadBack(buffer, offset, Tracker));
+        Detach(harness);
+        harness.Shutdown();
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public void AShaderByteTheCpuLaterRewritesToTheShadowValueIsOverwrittenOnTheGpu(bool asyncReadback)
