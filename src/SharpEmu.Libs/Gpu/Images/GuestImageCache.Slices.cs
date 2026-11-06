@@ -455,11 +455,18 @@ public sealed partial class GuestImageCache
         return image is null || (!image.Registered && !ImageDescription.IsEmptyRange(image.Description.Data)) || image.Binding.NeedsRebind;
     }
 
-    public bool CanReuseAcquiredForSlice(ResourceSlotIdentifier imageIdentifier, ulong backing)
+    public bool CanReuseAcquiredForSlice(ResourceSlotIdentifier imageIdentifier, ulong backing, ImageViewDescription? profileView = null)
     {
         using var held = _lock.Read();
-        return _slots.TryGet(imageIdentifier) is { Registered: true, Parked: false } image && !image.DepthOwner.IsValid &&
-               !image.Binding.NeedsRebind && !image.IsCpuDirty && !image.IsBufferModified && image.Backing.Handle.Handle == backing;
+        if (_slots.TryGet(imageIdentifier) is not { Registered: true, Parked: false } image || image.DepthOwner.IsValid ||
+            image.Binding.NeedsRebind || image.IsCpuDirty || image.IsBufferModified || image.Backing.Handle.Handle != backing) return false;
+        if (ImageAcquisitionProfile.Enabled && profileView.HasValue)
+        {
+            var reuse = ImageAcquisitionProfile.Begin(this, _scheduler, imageIdentifier, image,
+                new ImageRequest(image.Description, profileView.Value, ImageRole.Texture), ImageAcquisitionProfile.Caller.Memo);
+            reuse.Complete();
+        }
+        return true;
     }
 
     public bool TryRememberedForSlice(ResourceSlotIdentifier imageIdentifier, ref ulong generation, ulong begin, ulong end)
@@ -543,7 +550,9 @@ public sealed partial class GuestImageCache
         }
 
         if (HasTransferAliasForSlice(imageIdentifier, image)) return false;
+        var reuse = ImageAcquisitionProfile.Enabled ? ImageAcquisitionProfile.Begin(this, _scheduler, imageIdentifier, image, request, ImageAcquisitionProfile.Caller.Worker) : default;
         view = image.GetOrCreateView(request.View);
+        if (ImageAcquisitionProfile.Enabled) reuse.Complete();
         return true;
     }
 
@@ -790,6 +799,7 @@ public sealed partial class GuestImageCache
             throw SubmissionScheduler.Fatal($"A slice used an image that no longer exists: image={imageIdentifier.Index}.");
         }
 
+        var reuse = ImageAcquisitionProfile.Enabled ? ImageAcquisitionProfile.Begin(this, _scheduler, imageIdentifier, image, request, ImageAcquisitionProfile.Caller.Prologue) : default;
         image.LastAccessTick = _scheduler.CurrentTick;
         TouchImage(image);
         switch (request.Role)
@@ -807,5 +817,6 @@ public sealed partial class GuestImageCache
             default:
                 throw SubmissionScheduler.Fatal($"The slice image role is invalid: role={request.Role}.");
         }
+        if (ImageAcquisitionProfile.Enabled) reuse.Complete();
     }
 }

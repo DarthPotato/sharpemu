@@ -176,6 +176,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
     public void Record(ResolvedDraw record)
     {
+        using var reusePreparation = ImageAcquisitionProfile.Enabled ? ImageAcquisitionProfile.BeginPreparation() : default;
         try
         {
             RecordDraw(record);

@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using SharpEmu.HLE.Diagnostics;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Buffers;
+using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Libs.Gpu.Images;
 
@@ -58,6 +59,7 @@ public sealed partial class GuestImageCache
 
     private void InvalidateLookups(ulong begin, ulong end)
     {
+        if (ImageAcquisitionProfile.Enabled && end > begin) ImageAcquisitionProfile.Invalidate(begin, end - begin);
         _lookupGeneration++;
         _lookupEvents[_lookupEventCursor++ & (LookupEventSlots - 1)] = new LookupEvent(_lookupGeneration, begin, end);
         _totalGenerationBumps.Increment();
@@ -69,7 +71,7 @@ public sealed partial class GuestImageCache
 
     // What a remembered lookup still does on reuse: the image counts as used now. False when the
     // image is gone.
-    public bool TryReuseAcquired(ResourceSlotIdentifier imageIdentifier, ulong backing)
+    public bool TryReuseAcquired(ResourceSlotIdentifier imageIdentifier, ulong backing, ImageViewDescription? profileView = null)
     {
         using var held = _lock.Hold();
         if (_slots.TryGet(imageIdentifier) is not { Registered: true, Parked: false } image || image.DepthOwner.IsValid ||
@@ -78,6 +80,8 @@ public sealed partial class GuestImageCache
             return false;
         }
 
+        var reuse = ImageAcquisitionProfile.Enabled && profileView.HasValue ? ImageAcquisitionProfile.Begin(this, _scheduler, imageIdentifier, image,
+            new ImageRequest(image.Description, profileView.Value, ImageRole.Texture), ImageAcquisitionProfile.Caller.Memo) : default;
         image.LastAccessTick = _scheduler.CurrentTick;
         TouchImage(image);
         if (!ImageDescription.IsEmptyRange(image.Description.Data))
@@ -85,6 +89,7 @@ public sealed partial class GuestImageCache
             MergeMipTailBlock(image);
         }
 
+        if (ImageAcquisitionProfile.Enabled) reuse.Complete();
         return true;
     }
 

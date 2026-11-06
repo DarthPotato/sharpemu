@@ -683,8 +683,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             throw SubmissionScheduler.Fatal($"A texture must be found again before its view is acquired: address=0x{image.Description.Data.Address:X16} registered={image.Registered} proxy={image.DepthOwner.IsValid} rebind={image.Binding.NeedsRebind}.");
         }
 
+        var reuse = ImageAcquisitionProfile.Enabled ? ImageAcquisitionProfile.Begin(this, _scheduler, imageIdentifier, image, request,
+            ImageAcquisitionProfile.InPreparation ? ImageAcquisitionProfile.Caller.Stage : ImageAcquisitionProfile.Caller.Other) : default;
         AcquireTextureCore(imageIdentifier, image, in request);
-        return image.GetOrCreateView(request.View);
+        var view = image.GetOrCreateView(request.View);
+        if (ImageAcquisitionProfile.Enabled) reuse.Complete();
+        return view;
     }
 
     private void AcquireTextureCore(ResourceSlotIdentifier imageIdentifier, CachedImage image, in ImageRequest request)

@@ -208,6 +208,7 @@ public static partial class VideoOutExports
             request.State = FlipRequestState.Completed;
             if (FrameTimeline.Enabled) FrameTimeline.Flip(requestId);
             if (ReuseProbe.Enabled) ReuseProbe.Flip();
+            if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.RecordFrame();
             if (_ports.TryGetValue(request.Handle, out var port))
             {
                 port.FlipCount++;

@@ -629,6 +629,7 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(VulkanVideoPresenter.TakeSliceReport());
         Console.Error.WriteLine(VulkanVideoPresenter.TakeStagePreparationReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.ContentUploadArena.TakeReport());
+        if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.WriteReport(seconds);
         ReportResolveWorker(seconds, frames);
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeLookupReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccReport());

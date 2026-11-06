@@ -417,6 +417,7 @@ public sealed unsafe partial class GuestImageCache
             TracePublishing ? $"{depth.Backing.Format}/{depth.Backing.Extent.Width}x{depth.Backing.Extent.Height}<-" +
                 string.Join("<-", new System.Diagnostics.StackTrace(1, false).GetFrames().Take(4).Select(f => f.GetMethod()?.Name)) : null);
         lock (_publishingDownloads) _publishingDownloads.Add(publishing);
+        if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.BeginPublication();
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             try
@@ -431,6 +432,7 @@ public sealed unsafe partial class GuestImageCache
             {
                 if (DccNonclearMemo) _bufferCache.NoteExternalWriteForInspection(plane.Address, plane.Size);
                 lock (_publishingDownloads) _publishingDownloads.Remove(publishing);
+                if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.EndPublication();
             }
         });
     }
@@ -1229,6 +1231,7 @@ public sealed unsafe partial class GuestImageCache
         }
 
         var landing = _readbackLandings.Queue(range.Address, download.Mapped.Slice((int)offset, (int)range.Size));
+        if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.Invalidate(range.Address, range.Size);
         download.Flush(offset, range.Size);
         DownloadToBuffer(image, download, offset, range.Size, plan);
         var barrier = new BufferMemoryBarrier2
@@ -1246,18 +1249,27 @@ public sealed unsafe partial class GuestImageCache
         VulkanSynchronization.PipelineBarrier(_device.Vk,new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null, BarrierSource.Download);
         var backing = _backing;
         var landingDecided = LandingDecidedForTest;
+        if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.BeginPublication();
         _scheduler.QueuePriorityCompletionAction(() =>
         {
-            download.Invalidate(offset, range.Size);
-            var published = download.Mapped.Slice((int)offset, (int)range.Size);
-            // A range that lost resident pages since it was queued cannot be compared page by page; its resident pages
-            // take the readback whole, as before the landing.
-            if (!landing.TryLand(backing, published, landingDecided) &&
-                !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
+            try
             {
-                throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
+                download.Invalidate(offset, range.Size);
+                if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.Invalidate(range.Address, range.Size);
+                var published = download.Mapped.Slice((int)offset, (int)range.Size);
+                // A range that lost resident pages since it was queued cannot be compared page by page; its resident pages
+                // take the readback whole, as before the landing.
+                if (!landing.TryLand(backing, published, landingDecided) &&
+                    !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
+                {
+                    throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
+                }
+                if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-published", range.Address, range.Size, "completion-callback=true");
             }
-            if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-published", range.Address, range.Size, "completion-callback=true");
+            finally
+            {
+                if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.EndPublication();
+            }
         });
         // Completion actions wait for the priority readback before freeing spill buffers.
         if (download != ring) _scheduler.QueueCompletionAction(download.Dispose);

@@ -425,6 +425,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void AssociateDepth(ResourceSlotIdentifier depthImage)
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         var changed = DepthOwner != depthImage;
         DepthOwner = depthImage;
         if (ImageLifecycleTrace.Enabled && LifecycleCache != null && changed && ImageLifecycleTrace.HasCapacity)
@@ -437,6 +438,7 @@ public sealed unsafe partial class CachedImage : IDisposable
     // A byte overlap makes the image definitely dirty; a page-only overlap makes it maybe dirty.
     public void InvalidateCpuWrite(ulong address, ulong size, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         var wasDirty = ImageLifecycleTrace.Enabled && _cpuDirty;
         var wasMaybeDirty = ImageLifecycleTrace.Enabled && _maybeCpuDirty;
         if (GuestRangeOverlap.Bytes(Description.Data.Address, Description.Data.Size, address, size))
@@ -473,6 +475,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void MarkMaybeCpuDirty([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         if (!_cpuDirty)
         {
             var changed = !_maybeCpuDirty;
@@ -487,6 +490,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void SetMaybeCpuHash(ulong hash)
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         if (!NeedsMaybeCpuHash)
         {
             throw SubmissionScheduler.Fatal("The image cannot initialize a maybe-dirty hash in its current state.");
@@ -499,6 +503,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public bool ResolveMaybeCpuHash(ulong hash)
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         if (!_maybeCpuDirty || !_maybeHashValid || _cpuDirty)
         {
             throw SubmissionScheduler.Fatal("The image cannot resolve a maybe-dirty hash in its current state.");
@@ -513,6 +518,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void RefreshComplete()
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         if (!IsCpuDirty)
         {
             throw SubmissionScheduler.Fatal("A clean image cannot complete a refresh.");
@@ -555,6 +561,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void MarkRawWriteAfterGpuWrite([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         var changed = !RawWriteAfterGpuWrite;
         RawWriteAfterGpuWrite = true;
         if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("raw-buffer-write", reason);
@@ -562,6 +569,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void MarkGpuModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         InspectionWrite?.Invoke(Description.Data.Address, Description.Data.Size);
         RawWriteAfterGpuWrite = false;
         var ownershipChanged = !_gpuModified || _bufferHoldsGpuContents;
@@ -582,6 +590,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void ClearGpuModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         var changed = _gpuModified;
         _gpuModified = false;
         if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("gpu-owner-release", reason);
@@ -594,6 +603,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void MarkBufferHoldsGpuContents([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         var changed = !_bufferHoldsGpuContents;
         _bufferHoldsGpuContents = true;
         if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("buffer-holds-gpu", reason);
@@ -601,6 +611,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void MarkBufferModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         var changed = !_bufferModified;
         _bufferModified = true;
         if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("buffer-dirty", reason);
@@ -608,6 +619,7 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void ClearBufferModified([System.Runtime.CompilerServices.CallerMemberName] string reason = "")
     {
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Invalidate(this);
         var changed = _bufferModified;
         _bufferModified = false;
         if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("buffer-clean", reason);

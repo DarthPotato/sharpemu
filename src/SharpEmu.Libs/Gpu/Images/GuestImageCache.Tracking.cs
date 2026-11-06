@@ -75,6 +75,7 @@ public sealed partial class GuestImageCache
         }
 
         _totalUsedMemory -= accounted;
+        if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.Invalidate(image);
         image.Registered = false;
         image.HeapChanged?.Invoke(image);
     }

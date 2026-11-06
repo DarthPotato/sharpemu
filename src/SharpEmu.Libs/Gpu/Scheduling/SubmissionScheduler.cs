@@ -709,6 +709,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 throw Fatal("Cannot queue a memory publication after shutdown starts.");
             if (dependencyTick > CurrentTick)
                 throw Fatal("Cannot publish memory for an unknown submission tick.");
+            if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled)
+                operation = SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Publication(operation);
             // Keep ready results behind earlier work without attaching them to an unused future tick.
             var tick = _pending.Count == 0 && _parked.Count == 0 ? dependencyTick : Math.Max(dependencyTick, _pendingTailTick);
             if (_parked.Count != 0)
@@ -815,6 +817,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     public RecordingBuffer BeginCommand()
     {
         _command.Acquire();
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.BeginSegment(this);
         return _command;
     }
 
@@ -824,6 +827,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     {
         buffer.Bind(_context ?? throw Fatal("The scheduler requires a submission context."));
         buffer.Acquire();
+        if (SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.Enabled) SharpEmu.Libs.VideoOut.ImageAcquisitionProfile.BeginSegment(this);
     }
 
     public void EndRecording(RecordingBuffer buffer) => buffer.End();

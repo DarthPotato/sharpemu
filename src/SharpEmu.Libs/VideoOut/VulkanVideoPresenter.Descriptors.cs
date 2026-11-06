@@ -1702,7 +1702,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var resource = info.Images[index];
                 var view = binding.Request.View;
                 if (prepared.Memoized && !binding.IsStorage && binding.View.Handle != 0 && binding.CachedImage is not null &&
-                    (_worker ? _imageCache.CanReuseAcquiredForSlice(binding.ImageIdentifier, binding.Image.Handle) : _imageCache.TryReuseAcquired(binding.ImageIdentifier, binding.Image.Handle)))
+                    (_worker ? _imageCache.CanReuseAcquiredForSlice(binding.ImageIdentifier, binding.Image.Handle, ImageAcquisitionProfile.Enabled ? binding.Request.View : null) : _imageCache.TryReuseAcquired(binding.ImageIdentifier, binding.Image.Handle, ImageAcquisitionProfile.Enabled ? binding.Request.View : null)))
                 {
                     if (_worker)
                     {
