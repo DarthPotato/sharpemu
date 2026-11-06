@@ -62,7 +62,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private const long PipelineCacheRetryMs = 1_000;
         private long _pipelineCacheRetryTick;
         private const ulong MaxPipelineCacheBytes = 1024UL * 1024 * 1024;
-        private HashSet<string>? _resetPipelineCachePaths;
+        private System.Collections.Concurrent.ConcurrentDictionary<string, byte>? _resetPipelineCachePaths;
         private nuint _pipelineCacheSavedBytes;
         private Queue _queue;
         private uint _queueFamilyIndex;
@@ -1720,11 +1720,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _pipelineCacheDirty = true;
-            // Exporting MoltenVK's cache can itself serialize the compiler.
-            // Gameplay may discover dozens of expensive pipelines in one
-            // frame, so saving after every slow creation compounds a warm-up
-            // hitch into a multi-minute stall. Coalesce all creations into one
-            // periodic snapshot; shutdown still forces a final save.
+            // Expensive compiles also request a debounced background snapshot.
+            // Keep the periodic checkpoint for all other cache changes.
             CheckpointPipelineCache();
         }
 
@@ -1747,6 +1744,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void SavePipelineCache(bool force)
         {
+            FinishExpensiveCompileSave(wait: force);
+            if (_expensiveCompileSaveTask is not null) return;
             // Cache export must not race asynchronous pipeline creation.
             if (_pendingComputePipelines.Values.Any(pending => !pending.Compile.IsCompleted)) return;
             _lastPipelineCacheSaveTick = Environment.TickCount64;
@@ -1805,7 +1804,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (size > byteLimit)
                 {
-                    if ((_resetPipelineCachePaths ??= new HashSet<string>(StringComparer.Ordinal)).Add(path))
+                    if (LazyInitializer.EnsureInitialized(ref _resetPipelineCachePaths,
+                            () => new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal))
+                        .TryAdd(path, 0))
                     {
                         WritePipelineCacheFile(path, []);
                         Console.Error.WriteLine(

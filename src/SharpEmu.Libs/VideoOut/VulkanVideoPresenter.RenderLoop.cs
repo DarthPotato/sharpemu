@@ -126,6 +126,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void RenderCore()
         {
+            if (_vulkanReady) PollExpensiveCompileSave();
             using var timeline = FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Render);
             using var timelineThread = FrameTimeline.OnRenderThread();
             using var profileScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Unattributed);

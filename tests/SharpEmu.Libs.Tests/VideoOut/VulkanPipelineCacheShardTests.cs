@@ -4,6 +4,7 @@
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Tests.Gpu.Images;
 using SharpEmu.Libs.Tests.Gpu.Vulkan;
+using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 using Xunit;
 
@@ -11,6 +12,82 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 
 public sealed class VulkanPipelineCacheShardTests(HeadlessVulkanFixture fixture) : IClassFixture<HeadlessVulkanFixture>
 {
+    [Fact]
+    public void ExpensiveSaveRunsWithoutAnotherCompileAndPreservesNewDirtyShards()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan)) return;
+        var directory = Path.Combine(Path.GetTempPath(), "SharpEmuTests", Guid.NewGuid().ToString("N"));
+        using var presenter = new PresenterUnderTest(vulkan);
+        presenter.SetField("_pipelineCacheShardDirectory", directory);
+        presenter.SetField("_pipelineCachePath", Path.Combine(directory, "present.bin"));
+        var schedule = new PipelineCacheSaveSchedule(2000);
+        presenter.SetField("_expensiveCompileSave", schedule);
+        try
+        {
+            _ = ((Lazy<PipelineCache>)presenter.InvokeMethod("GetGuestPipelineCacheSource", "first")!).Value;
+            var now = Environment.TickCount64;
+            schedule.RecordCompile(79_000, now - PipelineCacheSaveSchedule.DebounceMilliseconds);
+            presenter.SetField("_lastPipelineCacheSaveTick", now - 60_000);
+            presenter.InvokeMethod("PollExpensiveCompileSave");
+
+            // These mutations happen after the snapshot, before its result is applied.
+            presenter.InvokeMethod("GetGuestPipelineCacheSource", "first");
+            _ = ((Lazy<PipelineCache>)presenter.InvokeMethod("GetGuestPipelineCacheSource", "second")!).Value;
+            presenter.SetField("_pipelineCacheDirty", true);
+            presenter.InvokeMethod("FinishExpensiveCompileSave", true);
+            Assert.True(File.Exists(Path.Combine(directory, "first.bin")));
+            Assert.False(File.Exists(Path.Combine(directory, "second.bin")));
+            Assert.True(presenter.GetField<bool>("_pipelineCacheDirty"));
+
+            presenter.InvokeMethod("SaveGuestPipelineCaches");
+            Assert.True(File.Exists(Path.Combine(directory, "second.bin")));
+        }
+        finally
+        {
+            presenter.InvokeMethod("FinishExpensiveCompileSave", true);
+            presenter.InvokeMethod("DestroyGuestPipelineCaches");
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FailedExpensiveSaveRestoresDirtyStateAndRetries()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan)) return;
+        var directory = Path.Combine(Path.GetTempPath(), "SharpEmuTests", Guid.NewGuid().ToString("N"));
+        using var presenter = new PresenterUnderTest(vulkan);
+        presenter.SetField("_pipelineCacheShardDirectory", directory);
+        presenter.SetField("_pipelineCachePath", Path.Combine(directory, "present.bin"));
+        var schedule = new PipelineCacheSaveSchedule(2000);
+        presenter.SetField("_expensiveCompileSave", schedule);
+        try
+        {
+            var path = Path.Combine(directory, "first.bin");
+            Directory.CreateDirectory(path); // Block the atomic rename without requiring filesystem permissions.
+            _ = ((Lazy<PipelineCache>)presenter.InvokeMethod("GetGuestPipelineCacheSource", "first")!).Value;
+            var now = Environment.TickCount64;
+            schedule.RecordCompile(3000, now - PipelineCacheSaveSchedule.DebounceMilliseconds);
+            presenter.SetField("_lastPipelineCacheSaveTick", now - 60_000);
+            presenter.InvokeMethod("PollExpensiveCompileSave");
+            presenter.InvokeMethod("FinishExpensiveCompileSave", true);
+            Assert.False(schedule.IsDue(now, now));
+
+            Directory.Delete(path);
+            // A regular save must still see the failed shard as dirty.
+            presenter.InvokeMethod("SaveGuestPipelineCaches");
+            Assert.True(File.Exists(path));
+            Assert.True(schedule.IsDue(Environment.TickCount64 + 60_000, now));
+        }
+        finally
+        {
+            presenter.InvokeMethod("FinishExpensiveCompileSave", true);
+            presenter.InvokeMethod("DestroyGuestPipelineCaches");
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
     [Fact]
     public void ShardsLoadLazilyShareInitializationAndRecoverFromInvalidData()
     {
