@@ -10,7 +10,7 @@ namespace SharpEmu.Libs.VideoOut;
 internal static partial class RenderPhaseProfile
 {
     internal enum DescriptorMemoKind { None, Reference, Content, Count }
-    internal enum DescriptorStep { Rest, MemoValidation, ImageResolution, BufferDiscovery, PublicationMetadata, ShaderData, Samplers, Count }
+    internal enum DescriptorStep { Rest, MemoValidation, ImageResolution, BufferDiscovery, PublicationMetadata, ShaderData, Samplers, RuntimeDescriptors, Count }
     internal enum DescriptorMissReason
     {
         Unclassified, FirstProgramUse, NoContentEntry, CapacityEviction,

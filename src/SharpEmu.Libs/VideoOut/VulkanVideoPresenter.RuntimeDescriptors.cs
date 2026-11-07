@@ -103,6 +103,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // shader's registered images into the draw.
         private void PrepareRuntimeDescriptors(PreparedStageBindings prepared)
         {
+            using var detail = RenderPhaseProfile.MeasureDescriptorStep(RenderPhaseProfile.DescriptorStep.RuntimeDescriptors);
             if (_worker) { PrepareRuntimeWorker(prepared); return; }
             var descriptors = RuntimeDescriptorsFor(prepared.Program);
             var heap = _runtimeDescriptorHeap ?? throw SubmissionScheduler.Fatal(
@@ -195,6 +196,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Called with the stage's other images, once their views are acquired: acquires each registered view.
         private void BindRuntimeDescriptors(PreparedStageBindings prepared)
         {
+            using var detail = RenderPhaseProfile.MeasureDescriptorStep(RenderPhaseProfile.DescriptorStep.RuntimeDescriptors);
             if (_worker) { BindRuntimeWorker(prepared); return; }
             for (var index = 0; index < prepared.RuntimeImages.Count; index++)
             {

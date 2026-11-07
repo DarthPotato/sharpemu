@@ -484,7 +484,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool KeepsTextureSet(PreparedStageBindings stage)
         {
             var slot = TextureSetSlot(stage.Program);
-            return slot >= 0 && stage.Memoized && stage.Memo is { Valid: true } memo && ReferenceEquals(_keptTextureSets[slot], memo) &&
+            // A runtime stage memo covers only its ordinary images. Its runtime image set
+            // can change independently, so it cannot stand for the whole transitioned set.
+            return !stage.Resources.Info.UsesRuntimeDescriptors && slot >= 0 && stage.Memoized && stage.Memo is { Valid: true } memo && ReferenceEquals(_keptTextureSets[slot], memo) &&
                 _keptTextureScope.IsActive && DrawScope == _keptTextureScope && _presenter._hostMovieFramePixels is null;
         }
 

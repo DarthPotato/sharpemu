@@ -509,6 +509,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 descriptors.GlobalDataShare = new BufferView(_bufferCache.GdsBuffer.Handle, 0, Vk.WholeSize);
             }
 
+            // The memo owns only ordinary bindings. Runtime feedback, registry membership,
+            // worker epoch pins and per-draw runtime bindings must be refreshed even on a hit,
+            // before buffer discovery just as on the full preparation path.
+            if (prepared.Resources.Info.UsesRuntimeDescriptors) PrepareRuntimeDescriptors(prepared);
             FindDeviceAddressBuffers(prepared);
             using var bufferDetail = RenderPhaseProfile.MeasureDescriptorStep(RenderPhaseProfile.DescriptorStep.BufferDiscovery);
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
@@ -547,6 +551,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 memo.Sources.CopyTo(prepared.BufferSources, 0);
             }
 
+            if (prepared.Resources.Info.UsesRuntimeDescriptors) ValidateDrawImageTypes(prepared);
             return prepared;
         }
 
@@ -1001,14 +1006,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             if (RenderPhaseProfile.MovableEnabled)
-                RenderPhaseProfile.DescriptorMiss(info.UsesRuntimeDescriptors ? MissReason.RuntimeDescriptors :
+                RenderPhaseProfile.DescriptorMiss(info.UsesRuntimeDescriptors && !DescriptorPreparationOptions.Fast ? MissReason.RuntimeDescriptors :
                     !frontendReady ? MissReason.FrontendNotReady : movieActive ? MissReason.HostMovie :
                     Gpu.Images.ImageClearTrace.Enabled ? MissReason.ImageTrace : MeshDrawTrace.Active ? MissReason.MeshTrace :
                     layout.UsesBindlessHeap ? MissReason.BindlessHeap :
                     program.CallRecordCallees.Count != 0 || (plan?.CallRecords ?? (layout.Find(DescriptorBindingKind.CallRecords) is not null)) ? MissReason.CallRecords :
                     !DescriptorPreparationOptions.Fast && layout.CallTargetCount != 0 ? MissReason.CallTargets :
                     !DescriptorPreparationOptions.Fast && layout.CallArgumentCount != 0 ? MissReason.CallArguments : MissReason.Unclassified);
-            if (!info.UsesRuntimeDescriptors && frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active &&
+            if ((!info.UsesRuntimeDescriptors || DescriptorPreparationOptions.Fast) && frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active &&
                 TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out var memo, out var kind))
             {
                 RenderPhaseProfile.DescriptorMemo(kind);
@@ -1060,7 +1065,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 FindBuffers(prepared);
             using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ValidateImages, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                 ValidateDrawImageTypes(prepared);
-            if (!info.UsesRuntimeDescriptors && !movieActive && !layout.UsesBindlessHeap &&
+            if ((!info.UsesRuntimeDescriptors || DescriptorPreparationOptions.Fast) && !movieActive && !layout.UsesBindlessHeap &&
                 (DescriptorPreparationOptions.Fast
                     ? program.CallRecordCallees.Count == 0 && !(plan?.CallRecords ?? false)
                     : layout.CallTargetCount == 0 && layout.CallArgumentCount == 0))
