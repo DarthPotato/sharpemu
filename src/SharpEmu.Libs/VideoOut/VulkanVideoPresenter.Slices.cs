@@ -1344,6 +1344,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void CompleteOverlappingPublications(ulong address, ulong size, bool includeLabels = true)
         {
+            using var detail = RenderPhaseProfile.MeasureDescriptorStep(RenderPhaseProfile.DescriptorStep.PublicationMetadata);
             if (!_worker)
             {
                 _presenter.CompleteOverlappingPublications(address, size, includeLabels);
@@ -1356,6 +1357,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void SynchronizeColorMetadata(in ImageRequest request)
         {
+            using var detail = RenderPhaseProfile.MeasureDescriptorStep(RenderPhaseProfile.DescriptorStep.PublicationMetadata);
             if (!_worker)
             {
                 _imageCache.SynchronizeColorMetadata(request);
@@ -1370,6 +1372,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void ApplyNativeColorClear(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
         {
+            using var detail = RenderPhaseProfile.MeasureDescriptorStep(RenderPhaseProfile.DescriptorStep.PublicationMetadata);
             if (!_worker)
             {
                 _imageCache.ApplyNativeColorClear(imageIdentifier, request);

@@ -760,7 +760,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var storage = AcquireStencilStorage(binding, image, writeBack: false);
-                binding.Preparation?.Invalidate();
+                binding.Preparation?.Invalidate(RenderPhaseProfile.DescriptorMissReason.StencilStorage);
                 binding.CachedImage = storage;
                 binding.Image = storage.Backing.Handle;
                 binding.View = storage.GetOrCreateView(binding.Request.View with { Aspect = ImageAspectFlags.ColorBit });

@@ -518,7 +518,11 @@ internal static partial class RenderPhaseProfile
             else
             {
                 _ticks[(int)previous] += now - _lastTimestamp;
-                if (MovableEnabled) ChargeMovable(previous, now - _lastTimestamp);
+                if (MovableEnabled)
+                {
+                    ChargeMovable(previous, now - _lastTimestamp);
+                    ChargeDescriptor(previous, now - _lastTimestamp);
+                }
             }
 
             if (FrameTraceEnabled && _threadTicks is null)
@@ -569,6 +573,9 @@ internal static partial class RenderPhaseProfile
 
         var parts = new List<(Phase Phase, double Percent, long Entries, double Milliseconds)>((int)Phase.Count);
         var accounted = 0L;
+        var descriptorTicks = _ticks[(int)Phase.DescriptorPreparation];
+        var materializationTicks = _ticks[(int)Phase.ResourceMaterialization];
+        var materializationCalls = _entries[(int)Phase.ResourceMaterialization];
         for (var index = 0; index < (int)Phase.Count; index++)
         {
             var phaseTicks = _ticks[index];
@@ -600,6 +607,7 @@ internal static partial class RenderPhaseProfile
             string.Join(" ", parts.Select(part => $"{part.Phase}={part.Milliseconds:F2}ms/n{part.Entries}")));
 
         if (MovableEnabled) ReportMovable(seconds, frames, accounted);
+        if (MovableEnabled) Console.Error.WriteLine(DescriptorStorage.Counters.TakeReport(seconds, frames, descriptorTicks, materializationTicks, materializationCalls));
 
         SharpEmu.Libs.Gpu.Scheduling.SubmitReasonProfile.Report();
         GpuWaitSiteProfile.Report();

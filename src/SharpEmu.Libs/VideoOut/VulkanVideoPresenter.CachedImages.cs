@@ -986,7 +986,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var snapshot = CreateDepthFeedbackSnapshot(image, sampledAspect);
-                binding.Preparation?.Invalidate();
+                binding.Preparation?.Invalidate(RenderPhaseProfile.DescriptorMissReason.DepthFeedback);
                 binding.CachedImage = snapshot;
                 binding.Image = snapshot.Backing.Handle;
                 binding.View = snapshot.GetOrCreateView(binding.Request.View);

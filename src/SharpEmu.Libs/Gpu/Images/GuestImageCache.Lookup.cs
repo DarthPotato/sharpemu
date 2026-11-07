@@ -28,7 +28,19 @@ public sealed partial class GuestImageCache
         public bool ExactFormat;
     }
 
-    private const int LookupEventSlots = 64;
+    // A memo older than this many lookup events cannot be revalidated and misses. With 64,
+    // Yotei overflowed on ~270 stage preparations per frame (~11 us each vs ~2.4 us for a hit);
+    // a revalidation stops at the memo's own generation, so a longer history only costs memory.
+    // SHARPEMU_IMAGE_LOOKUP_HISTORY=<power of two, 16..65536> overrides (64 = old behaviour).
+    private static readonly int LookupEventSlots =
+        ParseLookupHistory(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_LOOKUP_HISTORY"));
+
+    internal static int LookupHistorySlots => LookupEventSlots;
+
+    internal static int ParseLookupHistory(string? value) =>
+        int.TryParse(value, out var slots) && slots is >= 16 and <= 65536 && (slots & (slots - 1)) == 0
+            ? slots
+            : 1024;
 
     private readonly record struct LookupEvent(ulong Generation, ulong Begin, ulong End);
 
@@ -120,6 +132,97 @@ public sealed partial class GuestImageCache
         return true;
     }
 
+    internal readonly record struct RememberedStageImage(ResourceSlotIdentifier Image, GuestSpan Range, bool Touch);
+
+    internal enum StagePreparationFailure { None, SlotGeneration, Unregistered, Parked, DepthOwner, Rebind, RangeInvalidated, HistoryOverflow }
+
+    // Profiled legacy validation keeps its separate state and remembered-range locks.
+    // Returning the predicate at the point of failure avoids a second, racy diagnosis.
+    internal StagePreparationFailure StageImageStateForProfile(ResourceSlotIdentifier identifier)
+    {
+        using var held = _lock.Read();
+        return CheckStageImage(_slots.TryGet(identifier), false, 0, default);
+    }
+
+    internal StagePreparationFailure TouchRememberedForProfile(ResourceSlotIdentifier identifier, ref ulong generation,
+        GuestSpan range, bool worker)
+    {
+        if (worker)
+        {
+            using var read = _lock.Read();
+            return TouchRememberedForProfileLocked(identifier, ref generation, range, true);
+        }
+        using var held = _lock.Hold();
+        return TouchRememberedForProfileLocked(identifier, ref generation, range, false);
+    }
+
+    private StagePreparationFailure TouchRememberedForProfileLocked(ResourceSlotIdentifier identifier, ref ulong generation,
+        GuestSpan range, bool worker)
+    {
+        // Same order as TryTouchRemembered / TryRememberedForSlice, including history
+        // taking precedence if the registration also changed between the two locks.
+        if (!LookupUnchangedSince(generation, range.Address, range.End))
+            return _lookupGeneration - generation > (ulong)LookupEventSlots ? StagePreparationFailure.HistoryOverflow : StagePreparationFailure.RangeInvalidated;
+        var image = _slots.TryGet(identifier);
+        if (image is null) return StagePreparationFailure.SlotGeneration;
+        if (!image.Registered) return StagePreparationFailure.Unregistered;
+        if (image.Parked) return StagePreparationFailure.Parked;
+        generation = _lookupGeneration;
+        if (!worker)
+        {
+            image.LastAccessTick = _scheduler.CurrentTick;
+            TouchImage(image);
+        }
+        return StagePreparationFailure.None;
+    }
+
+    private StagePreparationFailure CheckStageImage(CachedImage? image, bool touch, ulong generation, GuestSpan range)
+    {
+        if (image is null) return StagePreparationFailure.SlotGeneration;
+        if (!ImageDescription.IsEmptyRange(image.Description.Data))
+        {
+            if (!image.Registered) return StagePreparationFailure.Unregistered;
+            if (image.DepthOwner.IsValid) return StagePreparationFailure.DepthOwner;
+        }
+        if (image.Binding.NeedsRebind) return StagePreparationFailure.Rebind;
+        if (!touch) return StagePreparationFailure.None;
+        if (!LookupUnchangedSince(generation, range.Address, range.End))
+            return _lookupGeneration - generation > (ulong)LookupEventSlots ? StagePreparationFailure.HistoryOverflow : StagePreparationFailure.RangeInvalidated;
+        if (!image.Registered) return StagePreparationFailure.Unregistered;
+        if (image.Parked) return StagePreparationFailure.Parked;
+        return StagePreparationFailure.None;
+    }
+
+    // Same staleness, range-generation and recency checks as IsStaleImage followed by
+    // TryTouchRemembered, with one slot lookup per image and one lock for the stage.
+    // Workers retain their original snapshot/read-only path in RecordingHost.
+    internal bool TryTouchStagePreparation(ReadOnlySpan<RememberedStageImage> bindings, ref ulong generation) =>
+        TouchStagePreparation(bindings, ref generation) == StagePreparationFailure.None;
+
+    // Return the failing predicate directly; the success path does no diagnostic bookkeeping.
+    internal StagePreparationFailure TouchStagePreparation(ReadOnlySpan<RememberedStageImage> bindings, ref ulong generation)
+    {
+        if (bindings.IsEmpty) return StagePreparationFailure.None;
+        using var held = _lock.Hold();
+        var checkedGeneration = generation;
+        foreach (var binding in bindings)
+        {
+            var image = _slots.TryGet(binding.Image);
+            var failure = CheckStageImage(image, binding.Touch, generation, binding.Range);
+            if (failure != StagePreparationFailure.None) return failure;
+            if (binding.Touch)
+            {
+                // All ranges must be checked against the original generation, even when an
+                // earlier range has advanced successfully past unrelated lookup events.
+                image!.LastAccessTick = _scheduler.CurrentTick;
+                TouchImage(image);
+            }
+            checkedGeneration = binding.Touch ? _lookupGeneration : generation;
+        }
+        generation = checkedGeneration;
+        return StagePreparationFailure.None;
+    }
+
     public GuestSpan RememberedRange(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
         using var held = _lock.Read();
@@ -140,7 +243,7 @@ public sealed partial class GuestImageCache
             return true;
         }
 
-        if (_lookupGeneration - generation > LookupEventSlots)
+        if (_lookupGeneration - generation > (ulong)LookupEventSlots)
         {
             return false;
         }
