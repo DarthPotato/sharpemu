@@ -16,7 +16,7 @@ public sealed partial class SpirvModuleBuilder
     private readonly Dictionary<uint, ulong> _wideConstantValues = [];
     private readonly Dictionary<uint, uint> _floatConstantBits = [];
     private readonly Dictionary<uint, Definition> _definitions = [];
-    private readonly Dictionary<InstructionKey, uint> _blockValues = [];
+    private readonly SharedExpressions _blockValues = new();
     private readonly HashSet<uint> _localVariables = [];
     private readonly HashSet<uint> _escapedVariables = [];
     private readonly Dictionary<uint, uint> _elementBases = [];
@@ -41,7 +41,7 @@ public sealed partial class SpirvModuleBuilder
     private readonly Dictionary<int, List<uint>> _entryPrologues = [];
     private bool _entryLabelPending;
     private int _entryLabelOffset = -1;
-    private readonly Dictionary<uint, uint> _variableValues = [];
+    private Dictionary<uint, uint> _variableValues = [];
     private readonly Dictionary<uint, int> _pendingStores = [];
     private readonly HashSet<int> _removedInstructions = [];
     private readonly HashSet<(uint Target, SpirvDecoration Decoration)> _plainDecorations = [];
@@ -49,7 +49,7 @@ public sealed partial class SpirvModuleBuilder
 
     private readonly record struct Definition(SpirvOp Opcode, uint Type, uint[] Operands);
 
-    private sealed record BlockState(Dictionary<uint, uint> Values, Dictionary<InstructionKey, uint> Expressions);
+    private sealed record BlockState(Dictionary<uint, uint> Values, ExpressionSnapshot Expressions);
 
     private readonly struct InstructionKey : IEquatable<InstructionKey>
     {
@@ -235,13 +235,13 @@ public sealed partial class SpirvModuleBuilder
 
         var result = EmitResult(_functions, SpirvOp.Load, resultType, operands);
         _inheritedPointers.Remove(pointer);
-        _pendingStores.Remove(pointer);
+        RemovePendingStore(pointer);
         if (_localVariables.Contains(pointer))
         {
             ForgetElements(pointer, keepValues: true);
         }
 
-        _variableValues[pointer] = result;
+        SetVariableValue(pointer, result);
         return result;
     }
 
@@ -252,8 +252,8 @@ public sealed partial class SpirvModuleBuilder
         {
             if (_localVariables.Contains(pointer))
             {
-                _variableValues.Remove(pointer);
-                _pendingStores.Remove(pointer);
+                RemoveVariableValue(pointer);
+                RemovePendingStore(pointer);
                 ForgetElements(pointer, keepValues: false);
             }
 
@@ -263,8 +263,8 @@ public sealed partial class SpirvModuleBuilder
 
         if (_elementBases.TryGetValue(pointer, out var elementBase))
         {
-            _variableValues.Remove(elementBase);
-            _pendingStores.Remove(elementBase);
+            RemoveVariableValue(elementBase);
+            RemovePendingStore(elementBase);
         }
         else
         {
@@ -282,9 +282,9 @@ public sealed partial class SpirvModuleBuilder
             _removedInstructions.Add(previous);
         }
 
-        _pendingStores[pointer] = _functions.Count;
+        SetPendingStore(pointer, _functions.Count);
         Emit(_functions, SpirvOp.Store, operands);
-        _variableValues[pointer] = value;
+        SetVariableValue(pointer, value);
         _inheritedPointers.Remove(pointer);
     }
 
@@ -391,34 +391,15 @@ public sealed partial class SpirvModuleBuilder
     {
         if (_escapedVariables.Add(variable))
         {
-            _variableValues.Remove(variable);
-            _pendingStores.Remove(variable);
+            RemoveVariableValue(variable);
+            RemovePendingStore(variable);
             ForgetElements(variable, keepValues: false);
         }
     }
 
     private void ForgetElements(uint variable, bool keepValues)
     {
-        foreach (var (element, _) in _pendingStores)
-        {
-            if (_elementBases.TryGetValue(element, out var owner) && owner == variable)
-            {
-                _pendingStores.Remove(element);
-            }
-        }
-
-        if (keepValues)
-        {
-            return;
-        }
-
-        foreach (var (element, _) in _variableValues)
-        {
-            if (_elementBases.TryGetValue(element, out var owner) && owner == variable)
-            {
-                _variableValues.Remove(element);
-            }
-        }
+        ForgetOwnedElements(variable, keepValues);
     }
 
     private void NoteBranchTargets(SpirvOp opcode, uint[] operands)
@@ -452,7 +433,9 @@ public sealed partial class SpirvModuleBuilder
                 continue;
             }
 
-            state ??= new BlockState(new Dictionary<uint, uint>(_variableValues), new Dictionary<InstructionKey, uint>(_blockValues));
+            // A branch immediately resets the current state. The dictionary is never
+            // mutated after publication; successors construct their own value map.
+            state ??= new BlockState(_variableValues, _blockValues.Snapshot());
             if (!_incomingStates.TryGetValue(target, out var incoming))
             {
                 incoming = [];
@@ -474,13 +457,7 @@ public sealed partial class SpirvModuleBuilder
         }
 
         var first = incoming[0].State;
-        foreach (var (expression, value) in first.Expressions)
-        {
-            if (incoming.All(entry => entry.State.Expressions.TryGetValue(expression, out var other) && other == value))
-            {
-                _blockValues[expression] = value;
-            }
-        }
+        _blockValues.Intersect(incoming);
 
         if (!_loopHeaders.Contains(label))
         {
@@ -489,7 +466,7 @@ public sealed partial class SpirvModuleBuilder
                 var merged = MergeIncomingValue(pointer, value, incoming);
                 if (merged != 0)
                 {
-                    _variableValues[pointer] = merged;
+                    SetVariableValue(pointer, merged);
                     _inheritedPointers.Add(pointer);
                 }
             }
@@ -547,7 +524,7 @@ public sealed partial class SpirvModuleBuilder
 
         foreach (var pointer in _inheritedPointers)
         {
-            _variableValues.Remove(pointer);
+            RemoveVariableValue(pointer);
         }
 
         _inheritedPointers.Clear();
@@ -555,7 +532,8 @@ public sealed partial class SpirvModuleBuilder
 
     private void ResetMemoryState()
     {
-        _variableValues.Clear();
+        _variableValues = [];
+        ResetOwnership();
         _pendingStores.Clear();
         _inheritedPointers.Clear();
         _inheritedValueUsed = false;
