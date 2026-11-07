@@ -94,6 +94,8 @@ public sealed partial class SpirvModuleBuilder
 
     public uint CurrentFunction { get; private set; }
 
+    public bool Optimize { get; init; } = SpirvOptimizationPolicy.Enabled;
+
     public bool InheritBlockState { get; init; } = true;
 
     public bool InheritedBlocksHeld => !_loopHeaderReadStaleValue &&
@@ -104,6 +106,8 @@ public sealed partial class SpirvModuleBuilder
 
     public uint AddInstruction(SpirvOp opcode, uint resultType, params uint[] operands)
     {
+        if (!Optimize) return EmitResult(_functions, opcode, resultType, operands);
+
         if (opcode == SpirvOp.Load)
         {
             return AddLoad(resultType, operands);
@@ -152,6 +156,12 @@ public sealed partial class SpirvModuleBuilder
 
     public void AddStatement(SpirvOp opcode, params uint[] operands)
     {
+        if (!Optimize)
+        {
+            Emit(_functions, opcode, operands);
+            return;
+        }
+
         if (opcode == SpirvOp.Store)
         {
             AddStore(operands);
@@ -188,14 +198,28 @@ public sealed partial class SpirvModuleBuilder
             return false;
         }
 
+        uint[]? canonical = null;
         for (var index = 1; index < operands.Length; index++)
         {
-            if (!IsIntegerConstant(operands[index], out _))
+            if (!IsIntegerConstant(operands[index], out var value) || value > int.MaxValue)
             {
+                // Leave unusual/negative indices untracked: their base escapes
+                // through the ordinary AccessChain path below.
                 return false;
+            }
+
+            // Signed and unsigned constants can name the same element. Use one
+            // key (and pointer) for that address, or forwarding through the other
+            // spelling could keep a value from before an aliased element store.
+            var constant = Constant(TypeInt(32, false), (uint)value);
+            if (constant != operands[index])
+            {
+                canonical ??= operands.ToArray();
+                canonical[index] = constant;
             }
         }
 
+        operands = canonical ?? operands;
         var lookup = new InstructionKey(SpirvOp.AccessChain, resultType, operands);
         if (!ReusesValues || !_blockValues.TryGetValue(lookup, out element))
         {
@@ -220,8 +244,14 @@ public sealed partial class SpirvModuleBuilder
 
         if (operands.Length != 1 || !IsTrackedPointer(pointer))
         {
+            // A memory-operand load must observe the store in memory, even when
+            // a later ordinary store overwrites the same tracked location.
+            if (IsTrackedPointer(pointer)) ResetMemoryState();
             return EmitResult(_functions, SpirvOp.Load, resultType, operands);
         }
+
+        // An element read observes a pending whole-variable store as well.
+        if (_elementBases.TryGetValue(pointer, out var owner)) RemovePendingStore(owner);
 
         if (_variableValues.TryGetValue(pointer, out var known) && TypeOf(known) == resultType)
         {
@@ -250,6 +280,7 @@ public sealed partial class SpirvModuleBuilder
         var pointer = operands[0];
         if (operands.Length != 2 || !IsTrackedPointer(pointer))
         {
+            if (IsTrackedPointer(pointer)) ResetMemoryState();
             if (_localVariables.Contains(pointer))
             {
                 RemoveVariableValue(pointer);
@@ -606,12 +637,10 @@ public sealed partial class SpirvModuleBuilder
         _ => IsSubgroupOperation(opcode),
     };
 
-    private static bool IsSubgroupOperation(SpirvOp opcode) => opcode is
-        SpirvOp.GroupNonUniformElect or SpirvOp.GroupNonUniformAll or SpirvOp.GroupNonUniformAny or
-        SpirvOp.GroupNonUniformAllEqual or SpirvOp.GroupNonUniformBroadcast or SpirvOp.GroupNonUniformBroadcastFirst or
-        SpirvOp.GroupNonUniformBallot or SpirvOp.GroupNonUniformBallotBitCount or SpirvOp.GroupNonUniformShuffle or
-        SpirvOp.GroupNonUniformShuffleXor or SpirvOp.GroupNonUniformShuffleUp or SpirvOp.GroupNonUniformShuffleDown or
-        SpirvOp.GroupNonUniformUMin;
+    // The complete core GroupNonUniform range, including vote, ballot, shuffle,
+    // arithmetic scans/reductions and quad operations. Participation is an implicit
+    // operand, so these cannot be hoisted or inherited across control flow.
+    private static bool IsSubgroupOperation(SpirvOp opcode) => (ushort)opcode is >= 333 and <= 366;
 
     private bool TrySimplify(SpirvOp opcode, uint resultType, uint[] operands, out uint result)
     {

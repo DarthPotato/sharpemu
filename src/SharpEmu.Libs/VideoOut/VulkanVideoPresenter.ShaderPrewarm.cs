@@ -241,6 +241,7 @@ internal static unsafe partial class VulkanVideoPresenter
             string.Join(
                 '|',
                 "success-only-v2",
+                SpirvOptimizationPolicy.CacheIdentity,
                 ShaderPrewarmHost.CapabilityStamp(this),
                 ShaderPrewarmStampPart(typeof(ShaderProgramCache)),
                 ShaderPrewarmStampPart(typeof(Gen5ShaderTranslator)),

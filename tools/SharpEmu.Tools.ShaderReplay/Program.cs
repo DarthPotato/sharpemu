@@ -72,6 +72,9 @@ void Measure(string id, uint codeBytes, Action capture)
 }
 
 var computes = list.LoadedComputes((kind, key) => failures.Add($"Missing {kind}: {key}"));
+var graphics = list.LoadedGraphics((kind, key) => failures.Add($"Missing {kind}: {key}"));
+if (computes.Count == 0 && graphics.Count == 0)
+    throw new InvalidDataException("No compatible recordings. Prewarm fingerprints include assembly versions; build replay with the recording's Version property.");
 for (var i = 0; i < computes.Count; i++)
 {
     var (record, code) = computes[i];
@@ -81,7 +84,6 @@ for (var i = 0; i < computes.Count; i++)
             throw new InvalidOperationException(error);
     });
 }
-var graphics = list.LoadedGraphics((kind, key) => failures.Add($"Missing {kind}: {key}"));
 foreach (var stage in graphics.SelectMany(item => item.Pixel is { } pixel
              ? new[] { item.Vertex, pixel } : new[] { item.Vertex }).DistinctBy(stage => stage.Identity))
 {

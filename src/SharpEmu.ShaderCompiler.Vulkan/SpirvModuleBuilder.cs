@@ -1122,9 +1122,10 @@ public sealed partial class SpirvModuleBuilder
             SetLogicalGlsl450MemoryModel();
         }
 
-        var unreadVariables = FindUnreadVariables(out var unreadPointers);
+        var unreadPointers = new HashSet<uint>();
+        var unreadVariables = Optimize ? FindUnreadVariables(out unreadPointers) : new HashSet<uint>();
         var removedIds = new HashSet<uint>(unreadVariables);
-        var functions = CompactFunctions(removedIds, unreadPointers);
+        var functions = Optimize ? CompactFunctions(removedIds, unreadPointers) : _functions;
         var debug = WithoutTargets(_debug, removedIds);
         var annotations = WithoutTargets(_annotations, removedIds);
         var entryPoints = WithoutInterfaces(_entryPoints, unreadVariables);

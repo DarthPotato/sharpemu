@@ -22,6 +22,13 @@ Request planning, CFG counting and SHA-256 hashing are outside that interval.
 Use the same .NET environment, input files and machine for comparisons. Allocation
 counts include allocations performed by that translator call.
 
+Prewarm schema fingerprints include assembly versions in generic property type
+names. When replaying recordings from before a version bump, build this tool and
+its dependencies with the recording's version, for example
+`-p:Version=0.0.6-mono` for the November 7 pre-merge corpus. This changes assembly
+metadata, not translator source or emitted SPIR-V. Use a separate `BaseOutputPath`
+when keeping several compiler revisions for comparison.
+
 CSV rows identify compute records by recording order and graphics stages by their
 recorded identity; hashes alone do not identify specialized variants. Graphics
 stages shared by several pipelines are compiled once. Failures are reported and

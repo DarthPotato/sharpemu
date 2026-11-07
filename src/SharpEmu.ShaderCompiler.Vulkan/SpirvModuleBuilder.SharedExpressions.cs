@@ -33,11 +33,17 @@ public sealed partial class SpirvModuleBuilder
         private ImmutableList<InstructionKey>.Builder _order = ImmutableList.CreateBuilder<InstructionKey>();
         private ExpressionSnapshot _parent = ExpressionSnapshot.Empty;
         private readonly HashSet<InstructionKey> _changes = [];
+        private readonly Dictionary<InstructionKey, uint> _laneDependent = [];
 
         public uint this[InstructionKey key]
         {
             set
             {
+                if (IsSubgroupOperation(key.Opcode))
+                {
+                    _laneDependent[key] = value;
+                    return;
+                }
                 var found = _values.TryGetValue(key, out var previous);
                 if (found && previous.Value == value) return;
                 var position = found ? previous.Position : _order.Count;
@@ -49,6 +55,7 @@ public sealed partial class SpirvModuleBuilder
 
         public bool TryGetValue(InstructionKey key, out uint value)
         {
+            if (IsSubgroupOperation(key.Opcode)) return _laneDependent.TryGetValue(key, out value);
             var found = _values.TryGetValue(key, out var entry);
             value = entry.Value;
             return found;
@@ -65,6 +72,7 @@ public sealed partial class SpirvModuleBuilder
         }
         public void Restore(ExpressionSnapshot snapshot)
         {
+            _laneDependent.Clear();
             _values = snapshot.Values.ToBuilder();
             _order = snapshot.Order.ToBuilder();
             _parent = snapshot;
@@ -113,6 +121,7 @@ public sealed partial class SpirvModuleBuilder
         }
         public void Clear()
         {
+            _laneDependent.Clear();
             _values = ImmutableDictionary.CreateBuilder<InstructionKey, ExpressionValue>();
             _order = ImmutableList.CreateBuilder<InstructionKey>();
             _parent = ExpressionSnapshot.Empty;
