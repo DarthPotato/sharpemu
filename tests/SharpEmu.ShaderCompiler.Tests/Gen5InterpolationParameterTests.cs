@@ -9,6 +9,7 @@ using Xunit;
 
 namespace SharpEmu.ShaderCompiler.Tests;
 
+[Collection("SpirvValueReuse")]
 public sealed class Gen5InterpolationParameterTests
 {
     [Theory]
@@ -197,7 +198,7 @@ public sealed class Gen5InterpolationParameterTests
             instruction.Operands[0] == input && instruction.Operands[1] == (uint)SpirvDecoration.Location);
         Assert.Equal(1u, location.Operands[2]);
         Assert.Equal(2u, shader.InputLocationMask);
-        Assert.Equal(2, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
+        Assert.Equal(1, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
             instruction.Operands[2] == input));
         ValidateWhenAvailable(shader.Spirv);
     }
@@ -208,6 +209,7 @@ public sealed class Gen5InterpolationParameterTests
         // Slot 1 is flat, slot 2 is smooth, both map to VS parameter 1 and neither is a
         // V_INTERP_MOV. Two host inputs would put the second on a location the vertex program
         // never writes (it reads zero); one per-vertex input serves both.
+        using var reuseOff = new SpirvValueReuseOff();
         Gen5ShaderInstruction Interpolate(uint pc, uint attribute, uint destination) =>
             new(pc, Gen5ShaderEncoding.Vintrp, "VInterpP2F32",
                 [0], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(destination)], new Gen5InterpolationControl(attribute, 0));
@@ -266,7 +268,7 @@ public sealed class Gen5InterpolationParameterTests
         Assert.Equal(2u, shader.InputLocationMask);
         Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
             instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn && instruction.Operands[2] == (uint)SpirvBuiltIn.BaryCoordKhr);
-        Assert.Equal(4, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
+        Assert.Equal(3, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
             instruction.Operands[2] == input));
         ValidateWhenAvailable(shader.Spirv);
     }

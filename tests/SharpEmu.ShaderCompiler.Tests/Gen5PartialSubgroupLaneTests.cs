@@ -13,6 +13,7 @@ namespace SharpEmu.ShaderCompiler.Tests;
 // may be absent from the host. The fetch-inactive-off forms judge the partner with a
 // subgroup ballot of EXEC (absent invocations have no bit) instead of shuffling an
 // activity word out of a lane that may not exist.
+[Collection("SpirvValueReuse")]
 public sealed class Gen5PartialSubgroupLaneTests
 {
     private const uint GroupNonUniformBallot = 339;
@@ -73,6 +74,7 @@ public sealed class Gen5PartialSubgroupLaneTests
     {
         // Bound control clear: a lane whose partner is inactive or absent keeps its old
         // destination, which needs the partner test for the write mask as well.
+        using var reuseOff = new SpirvValueReuseOff();
         var keep = CompilePixel(new Gen5DppControl(0x104, false, false, 0, 0, 15, 15));
         var zero = CompilePixel(new Gen5DppControl(0x104, false, true, 0, 0, 15, 15));
         Assert.True(Count(keep, GroupNonUniformBallot) > Count(zero, GroupNonUniformBallot));
@@ -104,6 +106,7 @@ public sealed class Gen5PartialSubgroupLaneTests
     {
         // Before a min, an absent partner (one more ballot, of every present invocation) gives the
         // lane's own value, the identity of the reduction. Before an add it stays zero.
+        using var reuseOff = new SpirvValueReuseOff();
         var permute = ResourceTestProgram.Vop3(0, "VPermlanex16B32", 4,
             Gen5Operand.Vector(3), ResourceTestProgram.Operand(uint.MaxValue), ResourceTestProgram.Operand(uint.MaxValue));
         var reduce = CompilePixel([permute, ResourceTestProgram.Vop3(0, "VMinU32", 3, Gen5Operand.Vector(3), Gen5Operand.Vector(4))]);

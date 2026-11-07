@@ -151,6 +151,9 @@ public static partial class VideoOutExports
 
         requestId = request.RequestId;
         if (FrameTimeline.Enabled) FrameTimeline.Note(FrameTimelineAccumulator.Event.FlipRequest);
+        // The CPU export and GPU capture can process the same request; count its acceptance once.
+        PerfOverlay.RecordSubmit();
+        ReportFrameRate(presented: false);
         return 0;
     }
 
@@ -406,13 +409,11 @@ public static partial class VideoOutExports
             _ = TryDumpFrame(memory, port, bufferIndex, flipMode, flipArg);
         }
 
-        PerfOverlay.RecordSubmit();
         TraceVideoOut(
             $"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} " +
             $"arg={flipArg} addr=0x{address:X16} submitted=True events={flipEventCount} ordered_completion=True");
         LoadProgressDiagnostics.TraceFlipSubmit(handle, bufferIndex, flipMode, false, true, address, flipEventCount);
         LoadProgressDiagnostics.TraceGpuWaitSnapshot(memory);
-        ReportFrameRate(presented: false);
     }
 
     internal static int GetFlipEventCount(ulong requestId)

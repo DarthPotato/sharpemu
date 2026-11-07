@@ -36,6 +36,13 @@ internal static unsafe partial class VulkanVideoPresenter
             ref _shaderPrewarmStatistics, static () => new ShaderPrewarmStatistics());
         private int _shaderPrewarmFailed;
         private int _shaderPrewarmRuntimeHits;
+        private int _shaderPrewarmComputeDone;
+        private int _shaderPrewarmComputeTotal;
+        private int _shaderPrewarmGraphicsDone;
+        private int _shaderPrewarmGraphicsTotal;
+        private int _shaderPrewarmWorkers;
+        private long _shaderPrewarmStarted;
+        private Func<ShaderCacheProgressView>? _shaderPrewarmProgressView;
         private readonly ConcurrentQueue<ulong> _shaderPrewarmCompleted = new();
         private readonly ConcurrentDictionary<ulong, Lazy<PrewarmedStage?>> _prewarmStages = new();
         private readonly ConcurrentBag<ShaderModule> _prewarmStageModules = [];
@@ -121,6 +128,12 @@ internal static unsafe partial class VulkanVideoPresenter
             var remaining = workerCount;
             Volatile.Write(ref _shaderPrewarmTotal, pendingCount);
             Volatile.Write(ref _shaderPrewarmProgress, 0);
+            Volatile.Write(ref _shaderPrewarmComputeTotal, computes.Count);
+            Volatile.Write(ref _shaderPrewarmGraphicsTotal, graphics.Count);
+            Volatile.Write(ref _shaderPrewarmWorkers, workerCount);
+            _shaderPrewarmStarted = started;
+            _shaderPrewarmProgressView = ShaderPrewarmProgressView;
+            ShowShaderCacheProgress(_shaderPrewarmProgressView);
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Shader prewarm started: compute={computes.Count} graphics={graphics.Count} resumed=0 workers={workerCount}");
             SetShaderPrewarmState(true);
@@ -139,10 +152,17 @@ internal static unsafe partial class VulkanVideoPresenter
                             {
                                 _shaderPrewarmCompleted.Enqueue(pipeline.Identity);
                             }
+
+                            Interlocked.Increment(ref _shaderPrewarmGraphicsDone);
                         }
-                        else if (PrewarmComputePipeline(item.Compute!, item.Code!, compiler))
+                        else
                         {
-                            _shaderPrewarmCompleted.Enqueue(ShaderPrewarmList.Identity(item.Compute!));
+                            if (PrewarmComputePipeline(item.Compute!, item.Code!, compiler))
+                            {
+                                _shaderPrewarmCompleted.Enqueue(ShaderPrewarmList.Identity(item.Compute!));
+                            }
+
+                            Interlocked.Increment(ref _shaderPrewarmComputeDone);
                         }
 
                         if (Interlocked.Increment(ref _shaderPrewarmProgress) % PrewarmProgressBatch == 0)
@@ -167,6 +187,30 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             return true;
+        }
+
+        private ShaderCacheProgressView ShaderPrewarmProgressView() => new(
+            "Warming up shaders",
+            "Rebuilding pipelines recorded in earlier sessions",
+            [
+                new ShaderCacheProgressRow("Compute pipelines",
+                    Volatile.Read(ref _shaderPrewarmComputeDone), Volatile.Read(ref _shaderPrewarmComputeTotal)),
+                new ShaderCacheProgressRow("Graphics pipelines",
+                    Volatile.Read(ref _shaderPrewarmGraphicsDone), Volatile.Read(ref _shaderPrewarmGraphicsTotal)),
+            ],
+            [
+                $"Warmed {Volatile.Read(ref _shaderPrewarmCompiled)} / Failed {Volatile.Read(ref _shaderPrewarmFailed)}",
+                string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"{Volatile.Read(ref _shaderPrewarmWorkers)} workers / {Stopwatch.GetElapsedTime(_shaderPrewarmStarted).TotalSeconds:F0} seconds"),
+            ],
+            Stopwatch.GetElapsedTime(_shaderPrewarmStarted).TotalSeconds);
+
+        private void EndShaderPrewarmProgress()
+        {
+            if (Interlocked.Exchange(ref _shaderPrewarmProgressView, null) is { } view)
+            {
+                HideShaderCacheProgress(view);
+            }
         }
 
         private void FlushShaderPrewarmProgress(ShaderPrewarmList list, string stamp)
@@ -421,6 +465,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var runtime = _runtimeComputeIdentities!;
             var prewarmed = _prewarmedShaderIdentities!;
             var matched = runtime.Keys.Count(prewarmed.ContainsKey);
+            EndShaderPrewarmProgress();
             if (_shaderPrewarmStopping)
             {
                 SetShaderPrewarmState(false);
@@ -468,6 +513,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void StopShaderPrewarm()
         {
             _shaderPrewarmStopping = true;
+            EndShaderPrewarmProgress();
             SetShaderPrewarmState(false);
             foreach (var thread in _shaderPrewarmThreads)
             {

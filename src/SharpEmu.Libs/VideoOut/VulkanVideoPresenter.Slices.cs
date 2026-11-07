@@ -311,6 +311,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public readonly List<ImageSliceUse> Images = new();
         private HashSet<BufferSliceUse>? _bufferSet;
         private Dictionary<(ResourceSlotIdentifier Image, ImageRole Role, ImageViewDescription View), int>? _imageIndex;
+        private readonly List<int> _previousImageUses = new();
 
         public void AddBuffer(in BufferSliceUse use)
         {
@@ -335,20 +336,26 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var key = (use.Image, use.Request.Role, use.Request.View);
             _imageIndex ??= new();
+            var previous = -1;
             if (_imageIndex.TryGetValue(key, out var index))
             {
-                var known = Images[index];
-                if (ReferenceEquals(known.Expected, use.Expected) && SameRequest(known.Request, use.Request))
+                previous = index;
+                do
                 {
-                    _usesShared.Increment();
-                    return;
+                    var known = Images[index];
+                    if (ReferenceEquals(known.Expected, use.Expected) && SameRequest(known.Request, use.Request))
+                    {
+                        _usesShared.Increment();
+                        return;
+                    }
+                    index = _previousImageUses[index];
                 }
-            }
-            else
-            {
-                _imageIndex.Add(key, Images.Count);
+                while (index >= 0);
             }
 
+            // Keep distinct metadata requests, but retain each repeated variant only once.
+            _imageIndex[key] = Images.Count;
+            _previousImageUses.Add(previous);
             Images.Add(use);
         }
 
@@ -726,7 +733,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (segment.Count == 0)
                 {
                     _segmentsEmpty.Increment();
-                    _scheduler.DiscardRecording(segment.Buffer!);
+                    if (segment.Buffer is { } emptyBuffer)
+                    {
+                        _scheduler.DiscardRecording(emptyBuffer);
+                    }
                     return false;
                 }
 
@@ -1046,16 +1056,37 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             slice.Host = this;
             _buffers = _bufferCache.Snapshot;
-            var segment = BeginSegment(0);
+            SliceSegment? segment = null;
             slice.Resume = slice.Items.Count;
             try
             {
                 for (var index = 0; index < slice.Items.Count; index++)
                 {
                     var started = System.Diagnostics.Stopwatch.GetTimestamp();
-                    var marksBefore = segment!.Requests.GpuWritten.Count;
+                    var marksBefore = 0;
                     try
                     {
+                        if (!_presenter._translation.CanRecordDeferred(slice.Items[index].Work!))
+                        {
+                            const string reason = "unresolved draw";
+                            Interlocked.Increment(ref _serialReasons.GetOrAdd(reason, static _ => new StrongBox<long>()).Value);
+                            if (segment is null)
+                            {
+                                slice.Segments.Enqueue(new SliceSegment { First = index, SerialReason = reason });
+                                slice.Progress.Set();
+                            }
+                            else
+                            {
+                                segment.SerialReason = reason;
+                                EndSegment(slice, segment);
+                                segment = null;
+                            }
+
+                            continue;
+                        }
+
+                        segment ??= BeginSegment(index);
+                        marksBefore = segment.Requests.GpuWritten.Count;
                         if (RuntimeRecordWorkers) _runtimeItemRecorded = false;
                         _itemSequence = slice.Items[index].Sequence;
                         if (slice.Items[index].Work is SharpEmu.Libs.Agc.AgcExports.GlobalBarrierWork)
@@ -1089,8 +1120,6 @@ internal static unsafe partial class VulkanVideoPresenter
                             slice.Resume = index + 1;
                             break;
                         }
-
-                        segment = BeginSegment(index + 1);
                     }
                     finally
                     {
