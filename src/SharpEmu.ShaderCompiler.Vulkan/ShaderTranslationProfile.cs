@@ -7,13 +7,32 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 
 public static class ShaderTranslationProfile
 {
-    internal enum Part { Validation, ContextSetup, Blocks, FlowAnalysis, Declarations, InitialState, Emission, Finalization, Serialization, Count }
+    internal enum Part { Validation, ContextSetup, Blocks, FlowAnalysis, Declarations, InitialState, Emission, Finalization, Serialization, Simplification, Count }
     private static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_RENDER") == "1" ||
         Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_PERFORMANCE") == "1";
     private static readonly long[] Ticks = new long[(int)Part.Count];
     private static readonly long[] Calls = new long[(int)Part.Count];
     private static long _instructions;
     private static long _blocks;
+    [ThreadStatic] private static int _simplificationDepth;
+
+    // A subset of Emission, counted only at the outermost recursive simplifier.
+    internal struct SimplificationScope : IDisposable
+    {
+        private long _start;
+        public SimplificationScope()
+        {
+            _start = Enabled && _simplificationDepth++ == 0 ? Stopwatch.GetTimestamp() : 0;
+        }
+        public void Dispose()
+        {
+            if (!Enabled) return;
+            _simplificationDepth--;
+            if (_start == 0) return;
+            Interlocked.Add(ref Ticks[(int)Part.Simplification], Stopwatch.GetTimestamp() - _start);
+            Interlocked.Increment(ref Calls[(int)Part.Simplification]);
+        }
+    }
 
     internal static void RecordBlocks(int instructions, int blocks)
     {

@@ -46,6 +46,8 @@ against `vulkaninfo` on 2026-11-07 and the current presenter policies:
   runtime call records, call marks and fragment subgroup reduction.
 
 The device has subgroup size 32, RTE/denormal-preserving float16 and full float
-control independence with `shaderFloat16`, so the **current** presenter enables
-exact float16 conversion. Older run logs that reported it disabled predate this
-profile. Update the profile when comparing another device or presenter policy.
+control independence with `shaderFloat16`, so the presenter enables exact float16
+conversion. `LoadComputeDeviceLimits` prints its startup diagnostic before
+`CreateDevice` assigns that flag; the early `enabled=False` line does not report
+the final host capability. Update the profile when comparing another device or
+presenter policy.

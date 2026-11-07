@@ -58,11 +58,13 @@ public sealed class SpirvOptimizerCorrectnessTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void VolatileLoadObservesThePreviousStore(bool indexed)
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void VolatileLoadObservesThePreviousStore(bool indexed, bool inherit)
     {
-        var (module, integer, register, pointer, output) = MemoryModule(indexed);
+        var (module, integer, register, pointer, output) = MemoryModule(indexed, inherit);
         var first = module.Constant(integer, 7);
         module.AddStatement(SpirvOp.Store, pointer, first);
         var read = module.AddInstruction(SpirvOp.Load, integer, pointer, 1); // Volatile memory operand
@@ -75,11 +77,13 @@ public sealed class SpirvOptimizerCorrectnessTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void VolatileStoreInvalidatesForwardedValues(bool indexed)
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void VolatileStoreInvalidatesForwardedValues(bool indexed, bool inherit)
     {
-        var (module, integer, _, pointer, output) = MemoryModule(indexed);
+        var (module, integer, _, pointer, output) = MemoryModule(indexed, inherit);
         var first = module.Constant(integer, 7);
         module.AddStatement(SpirvOp.Store, pointer, first);
         module.AddStatement(SpirvOp.Store, pointer, module.Constant(integer, 8), 1);
@@ -91,10 +95,12 @@ public sealed class SpirvOptimizerCorrectnessTests
         Assert.Contains(Instructions(module.Build()), instruction => instruction.Op == SpirvOp.Load && instruction.Operands[2] == pointer);
     }
 
-    [Fact]
-    public void ElementLoadObservesThePreviousWholeArrayStore()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ElementLoadObservesThePreviousWholeArrayStore(bool inherit)
     {
-        var (module, integer, register, pointer, output) = MemoryModule(true);
+        var (module, integer, register, pointer, output) = MemoryModule(true, inherit);
         var array = module.TypeArray(integer, 2);
         var first = module.ConstantComposite(array, module.Constant(integer, 7), module.Constant(integer, 9));
         var second = module.ConstantComposite(array, module.Constant(integer, 8), module.Constant(integer, 10));
@@ -108,10 +114,12 @@ public sealed class SpirvOptimizerCorrectnessTests
             instruction.Operands.SequenceEqual(new[] { register, first }));
     }
 
-    [Fact]
-    public void SignedAndUnsignedConstantIndicesNameTheSameTrackedElement()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SignedAndUnsignedConstantIndicesNameTheSameTrackedElement(bool inherit)
     {
-        var (module, integer, register, pointer, _) = MemoryModule(true);
+        var (module, integer, register, pointer, _) = MemoryModule(true, inherit);
         var alias = module.AddInstruction(SpirvOp.AccessChain, module.TypePointer(SpirvStorageClass.Private, integer),
             register, module.Constant(module.TypeInt(32, true), 0));
         Assert.Equal(pointer, alias);
@@ -119,6 +127,50 @@ public sealed class SpirvOptimizerCorrectnessTests
         var next = module.Constant(integer, 8);
         module.AddStatement(SpirvOp.Store, alias, next);
         Assert.Equal(next, module.AddInstruction(SpirvOp.Load, integer, pointer));
+    }
+
+    [Fact]
+    public void LocalOptimizationRemainsEnabledWithoutInheritance()
+    {
+        var module = new SpirvModuleBuilder { InheritBlockState = false };
+        var integer = module.TypeInt(32, false);
+        var input = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Input, integer), SpirvStorageClass.Input);
+        var register = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, integer), SpirvStorageClass.Private);
+        module.BeginFunction(module.TypeVoid(), module.TypeFunction(module.TypeVoid()));
+        module.AddLabel();
+        var read = module.AddInstruction(SpirvOp.Load, integer, input);
+        var divisor = module.Constant(integer, 3);
+        var first = module.AddInstruction(SpirvOp.UDiv, integer, read, divisor);
+        Assert.Equal(first, module.AddInstruction(SpirvOp.UDiv, integer, read, divisor));
+        var stored = module.Constant(integer, 7);
+        module.AddStatement(SpirvOp.Store, register, stored);
+        Assert.Equal(stored, module.AddInstruction(SpirvOp.Load, integer, register));
+        var successor = module.AllocateId();
+        module.AddStatement(SpirvOp.Branch, successor);
+        module.AddLabel(successor);
+        Assert.NotEqual(first, module.AddInstruction(SpirvOp.UDiv, integer, read, divisor));
+        Assert.NotEqual(stored, module.AddInstruction(SpirvOp.Load, integer, register));
+    }
+
+    [Fact]
+    public void LargeShaderModeKeepsStoreForwardingAndBasicFolding()
+    {
+        var (module, integer, _, pointer, output) = MemoryModule(false, false, false);
+        var first = module.Constant(integer, 7);
+        var second = module.Constant(integer, 8);
+        module.AddStatement(SpirvOp.Store, pointer, first);
+        Assert.Equal(first, module.AddInstruction(SpirvOp.Load, integer, pointer));
+        module.AddStatement(SpirvOp.Store, output, first);
+        module.AddStatement(SpirvOp.Store, pointer, second);
+        Assert.Equal(second, module.AddInstruction(SpirvOp.Load, integer, pointer));
+        module.AddStatement(SpirvOp.Store, output, second);
+        Assert.Equal(module.Constant(integer, 5), module.AddInstruction(SpirvOp.IAdd, integer,
+            module.Constant(integer, 2), module.Constant(integer, 3)));
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+        Assert.Equal(new[] { first, second }, Instructions(module.Build())
+            .Where(instruction => instruction.Op == SpirvOp.Store && instruction.Operands[0] == output)
+            .Select(instruction => instruction.Operands[1]));
     }
 
     [Fact]
@@ -140,9 +192,9 @@ public sealed class SpirvOptimizerCorrectnessTests
         Assert.Equal(2, Instructions(module.Build()).Count(instruction => instruction.Op == SpirvOp.IAdd));
     }
 
-    private static (SpirvModuleBuilder Module, uint Integer, uint Register, uint Pointer, uint Output) MemoryModule(bool indexed)
+    private static (SpirvModuleBuilder Module, uint Integer, uint Register, uint Pointer, uint Output) MemoryModule(bool indexed, bool inherit = true, bool expressions = true)
     {
-        var module = new SpirvModuleBuilder();
+        var module = new SpirvModuleBuilder { InheritBlockState = inherit, OptimizeExpressions = expressions };
         var integer = module.TypeInt(32, false);
         var storage = indexed ? module.TypeArray(integer, 2) : integer;
         var register = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, storage), SpirvStorageClass.Private);

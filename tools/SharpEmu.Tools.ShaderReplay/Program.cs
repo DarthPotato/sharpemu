@@ -62,7 +62,11 @@ void Measure(string id, uint codeBytes, Action capture)
         rows.Add(row);
         csv.WriteLine(row.Csv());
         csv.Flush();
-        if (rows.Count % 100 == 0) Console.WriteLine($"Translated {rows.Count}, total {rows.Sum(r => r.Ms):F1} ms");
+        if (rows.Count % 100 == 0)
+        {
+            Console.WriteLine($"Translated {rows.Count}, total {rows.Sum(r => r.Ms):F1} ms");
+            ShaderTranslationProfile.Report();
+        }
     }
     catch (Exception exception)
     {
@@ -98,6 +102,7 @@ foreach (var stage in graphics.SelectMany(item => item.Pixel is { } pixel
 }
 
 var ordered = rows.OrderBy(row => row.Ms).ToArray();
+ShaderTranslationProfile.Report();
 using var summary = new StreamWriter(prefix + ".md");
 void Write(string value) { summary.WriteLine(value); Console.WriteLine(value); }
 Write($"Recorded computes: {computes.Count}; graphics pipelines: {graphics.Count}; translated stages: {rows.Count}; failures: {failures.Count}.");

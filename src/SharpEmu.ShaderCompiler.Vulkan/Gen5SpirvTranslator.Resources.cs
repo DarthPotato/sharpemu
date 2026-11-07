@@ -136,10 +136,13 @@ public static partial class Gen5SpirvTranslator
             return false;
         }
 
+        var inheritBlockState = SpirvOptimizationPolicy.AllowsInheritance(request.Program.Instructions.Count);
+        var optimizeExpressions = SpirvOptimizationPolicy.AllowsExpressions(request.Program.Instructions.Count);
         request = ShareLinkedCallBodies(request, out var sharedCalls);
         var arguments = request.Bindings.CallArgumentCount != 0 ? callArguments : null;
         var targetSlots = request.Bindings.CallTargetCount != 0 ? callTargets : null;
-        var context = new CompilationContext(request, sharedCalls, arguments, targetSlots);
+        var context = new CompilationContext(request, sharedCalls, arguments, targetSlots,
+            inheritBlockState: inheritBlockState, optimizeExpressions: optimizeExpressions);
         var compiled = context.TryCompile(out shader, out error, ref profile);
         if (!compiled || context.InheritedBlocksHeld)
         {
@@ -152,7 +155,8 @@ public static partial class Gen5SpirvTranslator
                 $"[GPU][INFO] SPIR-V block inheritance did not hold: shader=0x{request.Hash:X16} retrying without it");
         }
 
-        return new CompilationContext(request, sharedCalls, arguments, targetSlots, inheritBlockState: false)
+        return new CompilationContext(request, sharedCalls, arguments, targetSlots,
+                inheritBlockState: false, optimizeExpressions: optimizeExpressions)
             .TryCompile(out shader, out error, ref profile);
     }
 
@@ -222,9 +226,9 @@ public static partial class Gen5SpirvTranslator
         public bool InheritedBlocksHeld => _module.InheritedBlocksHeld;
 
         public CompilationContext(ShaderCompileRequest request, SharedCallBodies? sharedCalls = null,
-            ulong[]? callArguments = null, ulong[]? callTargets = null, bool inheritBlockState = true)
+            ulong[]? callArguments = null, ulong[]? callTargets = null, bool inheritBlockState = true, bool optimizeExpressions = true)
         {
-            _module = new SpirvModuleBuilder { InheritBlockState = inheritBlockState };
+            _module = new SpirvModuleBuilder { InheritBlockState = inheritBlockState, OptimizeExpressions = optimizeExpressions };
             _request = request;
             _compactMemoryAccess = Gen5ShaderCallLinker.IsLinked(request.Program);
             _sharedCalls = sharedCalls;

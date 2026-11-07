@@ -11,11 +11,16 @@ public sealed partial class SpirvModuleBuilder
     private const uint SubgroupScope = 3;
     private static readonly uint[] GlslMinMax = [37, 38, 39, 40, 41, 42, 79, 80];
 
-    private readonly Dictionary<uint, uint> _resultTypes = [];
+    private uint[] _resultTypes = new uint[256];
     private readonly Dictionary<uint, (uint Width, bool Signed)> _integerTypeInfo = [];
-    private readonly Dictionary<uint, ulong> _wideConstantValues = [];
-    private readonly Dictionary<uint, uint> _floatConstantBits = [];
-    private readonly Dictionary<uint, Definition> _definitions = [];
+    private const byte ScalarConstant = 1;
+    private const byte WideConstant = 2;
+    private const byte FloatConstant = 3;
+    private byte[] _constantKinds = new byte[256];
+    private ulong[] _constantValues = new ulong[256];
+    private uint[] _entryFunctions = new uint[256];
+    private Definition[] _definitions = new Definition[256];
+    private uint[] _variableOwners = new uint[256];
     private readonly SharedExpressions _blockValues = new();
     private readonly HashSet<uint> _localVariables = [];
     private readonly HashSet<uint> _escapedVariables = [];
@@ -25,7 +30,6 @@ public sealed partial class SpirvModuleBuilder
     private readonly HashSet<uint> _changingInputs = [];
     private readonly Dictionary<uint, uint> _entryValues = [];
     private readonly Dictionary<InstructionKey, uint> _entryOperations = [];
-    private readonly HashSet<uint> _entryIds = [];
     private readonly HashSet<uint> _laneIdInputs = [];
     private readonly HashSet<uint> _laneIdValues = [];
     private readonly Dictionary<uint, int> _predecessorCounts = [];
@@ -84,6 +88,16 @@ public sealed partial class SpirvModuleBuilder
         public override bool Equals(object? obj) => obj is InstructionKey other && Equals(other);
 
         public override int GetHashCode() => _hash;
+
+        private InstructionKey(InstructionKey source)
+        {
+            _hash = source._hash;
+            Opcode = source.Opcode;
+            Type = source.Type;
+            Operands = source.Operands.ToArray();
+        }
+
+        public InstructionKey Stored() => new(this);
     }
 
     public static bool KeepsUnreadVariables { get; set; }
@@ -95,8 +109,18 @@ public sealed partial class SpirvModuleBuilder
     public uint CurrentFunction { get; private set; }
 
     public bool Optimize { get; init; } = SpirvOptimizationPolicy.Enabled;
+    public bool OptimizeExpressions { get; init; } = true;
 
-    public bool InheritBlockState { get; init; } = true;
+    private bool _inheritBlockState = true;
+    public bool InheritBlockState
+    {
+        get => _inheritBlockState;
+        init
+        {
+            _inheritBlockState = value;
+            _blockValues.SharingEnabled = value;
+        }
+    }
 
     public bool InheritedBlocksHeld => !_loopHeaderReadStaleValue &&
         _inheritedLabels.All(entry => _loopHeaderBlocks.Contains(entry.Key) ||
@@ -120,7 +144,7 @@ public sealed partial class SpirvModuleBuilder
 
         NoteVariableUses(operands);
         if (TryFold(opcode, resultType, operands, out var folded) ||
-            TrySimplify(opcode, resultType, operands, out folded))
+            (OptimizeExpressions && TrySimplify(opcode, resultType, operands, out folded)))
         {
             return folded;
         }
@@ -141,6 +165,8 @@ public sealed partial class SpirvModuleBuilder
             return EntryOperation(opcode, resultType, operands);
         }
 
+        if (!OptimizeExpressions) return EmitResult(_functions, opcode, resultType, operands);
+
         var lookup = new InstructionKey(opcode, resultType, operands);
         if (ReusesValues && _blockValues.TryGetValue(lookup, out var existing))
         {
@@ -148,7 +174,7 @@ public sealed partial class SpirvModuleBuilder
         }
 
         var result = EmitResult(_functions, opcode, resultType, operands);
-        var key = new InstructionKey(opcode, resultType, operands.ToArray());
+        var key = lookup.Stored();
         _blockValues[key] = result;
         _definitions[result] = new Definition(opcode, resultType, key.Operands);
         return result;
@@ -224,12 +250,13 @@ public sealed partial class SpirvModuleBuilder
         if (!ReusesValues || !_blockValues.TryGetValue(lookup, out element))
         {
             element = EmitResult(_functions, SpirvOp.AccessChain, resultType, operands);
-            var key = new InstructionKey(SpirvOp.AccessChain, resultType, operands.ToArray());
+            var key = lookup.Stored();
             _blockValues[key] = element;
-            _definitions[element] = new Definition(SpirvOp.AccessChain, resultType, key.Operands);
+            if (OptimizeExpressions) _definitions[element] = new Definition(SpirvOp.AccessChain, resultType, key.Operands);
         }
 
         _elementBases[element] = operands[0];
+        NoteVariableOwner(element, operands[0]);
         return true;
     }
 
@@ -266,7 +293,7 @@ public sealed partial class SpirvModuleBuilder
         var result = EmitResult(_functions, SpirvOp.Load, resultType, operands);
         _inheritedPointers.Remove(pointer);
         RemovePendingStore(pointer);
-        if (_localVariables.Contains(pointer))
+        if (IsLocalVariable(pointer))
         {
             ForgetElements(pointer, keepValues: true);
         }
@@ -281,7 +308,7 @@ public sealed partial class SpirvModuleBuilder
         if (operands.Length != 2 || !IsTrackedPointer(pointer))
         {
             if (IsTrackedPointer(pointer)) ResetMemoryState();
-            if (_localVariables.Contains(pointer))
+            if (IsLocalVariable(pointer))
             {
                 RemoveVariableValue(pointer);
                 RemovePendingStore(pointer);
@@ -351,12 +378,11 @@ public sealed partial class SpirvModuleBuilder
         var usesEntryValue = false;
         foreach (var operand in operands)
         {
-            if (_entryIds.Contains(operand))
+            if (operand < (uint)_entryFunctions.Length && _entryFunctions[operand] == CurrentFunction)
             {
                 usesEntryValue = true;
             }
-            else if (!_scalarConstantValues.ContainsKey(operand) && !_wideConstantValues.ContainsKey(operand) &&
-                !_floatConstantBits.ContainsKey(operand))
+            else if (operand >= (uint)_constantKinds.Length || _constantKinds[operand] == 0)
             {
                 return false;
             }
@@ -367,15 +393,17 @@ public sealed partial class SpirvModuleBuilder
 
     private uint EntryOperation(SpirvOp opcode, uint resultType, uint[] operands)
     {
-        if (_entryOperations.TryGetValue(new InstructionKey(opcode, resultType, operands), out var known))
+        var lookup = new InstructionKey(opcode, resultType, operands);
+        if (_entryOperations.TryGetValue(lookup, out var known))
         {
             return known;
         }
 
-        var stored = operands.ToArray();
+        var key = lookup.Stored();
+        var stored = key.Operands;
         var result = AppendToEntry(opcode, resultType, stored);
-        _entryOperations[new InstructionKey(opcode, resultType, stored)] = result;
-        _definitions[result] = new Definition(opcode, resultType, stored);
+        _entryOperations[key] = result;
+        if (OptimizeExpressions) _definitions[result] = new Definition(opcode, resultType, stored);
         return result;
     }
 
@@ -393,28 +421,32 @@ public sealed partial class SpirvModuleBuilder
         prologue.Add(result);
         prologue.AddRange(operands);
         NoteResultType(result, resultType);
-        _entryIds.Add(result);
+        _entryFunctions[result] = CurrentFunction;
         return result;
     }
 
-    private bool IsTrackedVariable(uint pointer) =>
-        _localVariables.Contains(pointer) && !_escapedVariables.Contains(pointer);
+    private uint VariableOwner(uint pointer) => pointer < (uint)_variableOwners.Length ? _variableOwners[pointer] : 0;
+
+    private bool IsLocalVariable(uint pointer) => pointer != 0 && VariableOwner(pointer) == pointer;
+
+    private bool IsTrackedVariable(uint pointer) => IsLocalVariable(pointer) && !_escapedVariables.Contains(pointer);
 
     private bool IsTrackedPointer(uint pointer) =>
-        IsTrackedVariable(pointer) || (_elementBases.TryGetValue(pointer, out var variable) && IsTrackedVariable(variable));
+        VariableOwner(pointer) is var owner && owner != 0 && !_escapedVariables.Contains(owner);
+
+    private void NoteVariableOwner(uint pointer, uint owner)
+    {
+        if (pointer >= (uint)_variableOwners.Length)
+            Array.Resize(ref _variableOwners, checked(Math.Max((int)pointer + 1, _variableOwners.Length * 2)));
+        _variableOwners[pointer] = owner;
+    }
 
     private void NoteVariableUses(uint[] operands)
     {
         foreach (var operand in operands)
         {
-            if (_localVariables.Contains(operand))
-            {
-                EscapeVariable(operand);
-            }
-            else if (_elementBases.TryGetValue(operand, out var variable))
-            {
-                EscapeVariable(variable);
-            }
+            var owner = VariableOwner(operand);
+            if (owner != 0) EscapeVariable(owner);
         }
     }
 
@@ -563,7 +595,8 @@ public sealed partial class SpirvModuleBuilder
 
     private void ResetMemoryState()
     {
-        _variableValues = [];
+        if (InheritBlockState) _variableValues = [];
+        else _variableValues.Clear();
         ResetOwnership();
         _pendingStores.Clear();
         _inheritedPointers.Clear();
@@ -576,11 +609,23 @@ public sealed partial class SpirvModuleBuilder
         _blockValues.Clear();
     }
 
-    private void NoteResultType(uint id, uint type) => _resultTypes[id] = type;
+    private void NoteResultType(uint id, uint type)
+    {
+        if (id >= (uint)_resultTypes.Length)
+        {
+            var length = checked(Math.Max((int)id + 1, _resultTypes.Length * 2));
+            Array.Resize(ref _resultTypes, length);
+            if (OptimizeExpressions) Array.Resize(ref _definitions, length);
+            Array.Resize(ref _constantKinds, length);
+            Array.Resize(ref _constantValues, length);
+            Array.Resize(ref _entryFunctions, length);
+        }
+        _resultTypes[id] = type;
+    }
 
-    private uint TypeOf(uint id) => _resultTypes.GetValueOrDefault(id);
+    private uint TypeOf(uint id) => id < (uint)_resultTypes.Length ? _resultTypes[id] : 0;
 
-    private bool HasType(uint id, uint type) => _resultTypes.TryGetValue(id, out var actual) && actual == type;
+    private bool HasType(uint id, uint type) => id < (uint)_resultTypes.Length && _resultTypes[id] != 0 && _resultTypes[id] == type;
 
     private uint IntegerWidth(uint type) => _integerTypeInfo.TryGetValue(type, out var info) ? info.Width : 0;
 
@@ -590,18 +635,25 @@ public sealed partial class SpirvModuleBuilder
     private bool IsFloat32Type(uint type) => _floatTypes.TryGetValue(32, out var floatType) && floatType == type;
 
     private bool Defines(uint id, SpirvOp opcode, out Definition definition) =>
-        _definitions.TryGetValue(id, out definition) && definition.Opcode == opcode;
+        TryDefinition(id, out definition) && definition.Opcode == opcode;
+
+    private bool TryDefinition(uint id, out Definition definition)
+    {
+        definition = id < (uint)_definitions.Length ? _definitions[id] : default;
+        return definition.Operands is not null;
+    }
 
     private bool IsIntegerConstant(uint id, out ulong value)
     {
-        if (_wideConstantValues.TryGetValue(id, out value))
+        if (id < (uint)_constantKinds.Length && _constantKinds[id] == WideConstant)
         {
+            value = _constantValues[id];
             return true;
         }
 
-        if (_scalarConstantValues.TryGetValue(id, out var narrow) && IntegerWidth(TypeOf(id)) == 32)
+        if (id < (uint)_constantKinds.Length && _constantKinds[id] == ScalarConstant && IntegerWidth(TypeOf(id)) == 32)
         {
-            value = narrow;
+            value = _constantValues[id];
             return true;
         }
 
@@ -644,6 +696,7 @@ public sealed partial class SpirvModuleBuilder
 
     private bool TrySimplify(SpirvOp opcode, uint resultType, uint[] operands, out uint result)
     {
+        using var profile = new ShaderTranslationProfile.SimplificationScope();
         result = 0;
         switch (opcode)
         {
@@ -935,7 +988,7 @@ public sealed partial class SpirvModuleBuilder
             return constant;
         }
 
-        if (depth > MaxWordSplitDepth || !_definitions.TryGetValue(value, out var definition))
+        if (depth > MaxWordSplitDepth || !TryDefinition(value, out var definition))
         {
             return unbounded;
         }
@@ -967,9 +1020,9 @@ public sealed partial class SpirvModuleBuilder
                 return true;
             }
 
-            if (_floatConstantBits.TryGetValue(value, out var floatBits))
+            if (value < (uint)_constantKinds.Length && _constantKinds[value] == FloatConstant)
             {
-                result = Constant(resultType, floatBits);
+                result = Constant(resultType, (uint)_constantValues[value]);
                 return true;
             }
         }
@@ -1041,7 +1094,7 @@ public sealed partial class SpirvModuleBuilder
             return true;
         }
 
-        if (!_definitions.TryGetValue(value, out var definition))
+        if (!TryDefinition(value, out var definition))
         {
             return false;
         }
@@ -1091,7 +1144,7 @@ public sealed partial class SpirvModuleBuilder
             return true;
         }
 
-        if (!_definitions.TryGetValue(value, out var definition))
+        if (!TryDefinition(value, out var definition))
         {
             return false;
         }
@@ -1170,9 +1223,19 @@ public sealed partial class SpirvModuleBuilder
 
     private HashSet<uint> FindUnreadVariables(out HashSet<uint> unreadPointers)
     {
+        if (KeepsUnreadVariables)
+        {
+            unreadPointers = [];
+            return [];
+        }
         var words = _functions;
-        var chainBases = new Dictionary<uint, uint>();
-        var read = new HashSet<uint>();
+        // IDs are dense and bounded by _nextId. Literal words outside that range
+        // cannot name a local or an access chain; keep the original literal/ID
+        // treatment inside the range, including its conservative false uses.
+        var chainBases = new uint[_nextId];
+        var local = new bool[_nextId];
+        var read = new bool[_nextId];
+        foreach (var variable in _localVariables) local[variable] = true;
         for (var offset = 0; offset < words.Count; offset += (int)(words[offset] >> 16))
         {
             var wordCount = (int)(words[offset] >> 16);
@@ -1185,7 +1248,7 @@ public sealed partial class SpirvModuleBuilder
                 case SpirvOp.Store when wordCount == 3:
                     first = 2;
                     break;
-                case SpirvOp.AccessChain when wordCount >= 4 && _localVariables.Contains(words[offset + 3]):
+                case SpirvOp.AccessChain when wordCount >= 4 && words[offset + 3] < _nextId && local[words[offset + 3]]:
                     chainBases[words[offset + 2]] = words[offset + 3];
                     first = 4;
                     break;
@@ -1194,22 +1257,23 @@ public sealed partial class SpirvModuleBuilder
             for (var word = first; word < wordCount; word++)
             {
                 var id = words[offset + word];
-                if (_localVariables.Contains(id))
+                if (id >= _nextId) continue;
+                if (local[id])
                 {
-                    read.Add(id);
+                    read[id] = true;
                 }
-                else if (chainBases.TryGetValue(id, out var variable))
+                else if (chainBases[id] is var variable && variable != 0)
                 {
-                    read.Add(variable);
+                    read[variable] = true;
                 }
             }
         }
 
-        var unread = KeepsUnreadVariables ? [] : new HashSet<uint>(_localVariables.Where(variable => !read.Contains(variable)));
+        var unread = new HashSet<uint>(_localVariables.Where(variable => !read[variable]));
         unreadPointers = new HashSet<uint>(unread);
-        foreach (var (chain, variable) in chainBases)
+        for (uint chain = 1; chain < _nextId; chain++)
         {
-            if (unread.Contains(variable))
+            if (chainBases[chain] != 0 && unread.Contains(chainBases[chain]))
             {
                 unreadPointers.Add(chain);
             }
@@ -1290,8 +1354,9 @@ public sealed partial class SpirvModuleBuilder
         }
 
         var removed = new bool[starts.Count];
-        var uses = new Dictionary<uint, int>();
-        var definers = new Dictionary<uint, int>();
+        var uses = new int[_nextId];
+        var definers = new int[_nextId]; // Instruction index + 1; zero means no definer.
+        var definedIds = new List<uint>();
         for (var index = 0; index < starts.Count; index++)
         {
             var offset = starts[index];
@@ -1308,23 +1373,25 @@ public sealed partial class SpirvModuleBuilder
             var first = 1;
             if (IsRemovableDefinition(words, offset, wordCount))
             {
-                definers[words[offset + 2]] = index;
+                definers[words[offset + 2]] = index + 1;
+                definedIds.Add(words[offset + 2]);
                 first = 3;
             }
 
             for (var word = first; word < wordCount; word++)
             {
                 var id = words[offset + word];
-                uses[id] = uses.GetValueOrDefault(id) + 1;
+                if (id < _nextId) uses[id]++;
             }
         }
 
         var pending = new Stack<int>();
-        foreach (var (id, index) in definers)
+        // Preserve the original instruction/definer order when seeding the stack.
+        foreach (var id in definedIds)
         {
-            if (uses.GetValueOrDefault(id) == 0)
+            if (uses[id] == 0)
             {
-                pending.Push(index);
+                pending.Push(definers[id] - 1);
             }
         }
 
@@ -1342,13 +1409,14 @@ public sealed partial class SpirvModuleBuilder
             for (var word = 3; word < wordCount; word++)
             {
                 var id = words[offset + word];
-                if (!uses.TryGetValue(id, out var count))
+                if (id >= _nextId)
                 {
                     continue;
                 }
 
-                uses[id] = --count;
-                if (count == 0 && definers.TryGetValue(id, out var definer) && !removed[definer])
+                var count = --uses[id];
+                var definer = definers[id] - 1;
+                if (count == 0 && definer >= 0 && !removed[definer])
                 {
                     pending.Push(definer);
                 }

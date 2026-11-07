@@ -34,11 +34,18 @@ public sealed partial class SpirvModuleBuilder
         private ExpressionSnapshot _parent = ExpressionSnapshot.Empty;
         private readonly HashSet<InstructionKey> _changes = [];
         private readonly Dictionary<InstructionKey, uint> _laneDependent = [];
+        private readonly Dictionary<InstructionKey, uint> _local = [];
+        public bool SharingEnabled { get; set; } = true;
 
         public uint this[InstructionKey key]
         {
             set
             {
+                if (!SharingEnabled)
+                {
+                    _local[key] = value;
+                    return;
+                }
                 if (IsSubgroupOperation(key.Opcode))
                 {
                     _laneDependent[key] = value;
@@ -55,6 +62,7 @@ public sealed partial class SpirvModuleBuilder
 
         public bool TryGetValue(InstructionKey key, out uint value)
         {
+            if (!SharingEnabled) return _local.TryGetValue(key, out value);
             if (IsSubgroupOperation(key.Opcode)) return _laneDependent.TryGetValue(key, out value);
             var found = _values.TryGetValue(key, out var entry);
             value = entry.Value;
@@ -121,6 +129,11 @@ public sealed partial class SpirvModuleBuilder
         }
         public void Clear()
         {
+            if (!SharingEnabled)
+            {
+                _local.Clear();
+                return;
+            }
             _laneDependent.Clear();
             _values = ImmutableDictionary.CreateBuilder<InstructionKey, ExpressionValue>();
             _order = ImmutableList.CreateBuilder<InstructionKey>();

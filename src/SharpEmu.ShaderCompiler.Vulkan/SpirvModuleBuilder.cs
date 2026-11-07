@@ -437,7 +437,6 @@ public sealed partial class SpirvModuleBuilder
     private readonly Dictionary<string, uint> _functionTypes = [];
     private readonly Dictionary<(uint Type, ulong Value), uint> _constants = [];
     // The value of every 32-bit integer and boolean constant, for folding instructions over them.
-    private readonly Dictionary<uint, uint> _scalarConstantValues = [];
     private readonly HashSet<SpirvCapability> _declaredCapabilities = [];
     private readonly HashSet<string> _declaredExtensions = [];
     private readonly Dictionary<string, uint> _extInstImports = [];
@@ -786,8 +785,9 @@ public sealed partial class SpirvModuleBuilder
             type,
             id);
         _constants.Add(key, id);
-        _scalarConstantValues[id] = value ? 1u : 0u;
         NoteResultType(id, type);
+        _constantKinds[id] = ScalarConstant;
+        _constantValues[id] = value ? 1u : 0u;
         return id;
     }
 
@@ -805,11 +805,13 @@ public sealed partial class SpirvModuleBuilder
         NoteResultType(id, type);
         if (IsInt32Type(type))
         {
-            _scalarConstantValues[id] = value;
+            _constantKinds[id] = ScalarConstant;
+            _constantValues[id] = value;
         }
         else if (IsFloat32Type(type))
         {
-            _floatConstantBits[id] = value;
+            _constantKinds[id] = FloatConstant;
+            _constantValues[id] = value;
         }
 
         return id;
@@ -835,7 +837,8 @@ public sealed partial class SpirvModuleBuilder
         NoteResultType(id, type);
         if (IntegerWidth(type) == 64)
         {
-            _wideConstantValues[id] = value;
+            _constantKinds[id] = WideConstant;
+            _constantValues[id] = value;
         }
 
         return id;
@@ -895,6 +898,7 @@ public sealed partial class SpirvModuleBuilder
         if (storageClass == SpirvStorageClass.Private)
         {
             _localVariables.Add(id);
+            NoteVariableOwner(id, id);
         }
         else if (storageClass == SpirvStorageClass.Input)
         {
@@ -936,7 +940,6 @@ public sealed partial class SpirvModuleBuilder
             _entryLabelOffset = _functions.Count;
             _entryValues.Clear();
             _entryOperations.Clear();
-            _entryIds.Clear();
         }
 
         Emit(_functions, SpirvOp.Label, result);
@@ -968,6 +971,7 @@ public sealed partial class SpirvModuleBuilder
         }
 
         _localVariables.Add(id);
+        NoteVariableOwner(id, id);
         return id;
     }
 
@@ -977,7 +981,16 @@ public sealed partial class SpirvModuleBuilder
 
     private bool IsBoolType(uint type) => _boolType == type;
 
-    private bool TryConstant(uint id, out uint value) => _scalarConstantValues.TryGetValue(id, out value);
+    private bool TryConstant(uint id, out uint value)
+    {
+        if (id < (uint)_constantKinds.Length && _constantKinds[id] == ScalarConstant)
+        {
+            value = (uint)_constantValues[id];
+            return true;
+        }
+        value = 0;
+        return false;
+    }
 
     // The value of a 32-bit integer or boolean constant id.
     public bool TryGetConstantValue(uint id, out uint value) => TryConstant(id, out value);
