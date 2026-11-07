@@ -112,6 +112,7 @@ internal static class FrameTimeline
 {
     [ThreadStatic] private static bool _renderThread;
     [ThreadStatic] private static FrameTimelineAccumulator.Metric? _wait;
+    internal static FrameTimelineAccumulator.Metric? CurrentWait => _wait;
     internal readonly struct ThreadScope : IDisposable
     {
         private readonly bool _active, _previous;

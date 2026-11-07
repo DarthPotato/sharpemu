@@ -610,9 +610,11 @@ public sealed unsafe class GpuTiler : IDisposable
         {
             infos[2] = new DescriptorBufferInfo(dispatch.ArgumentsBuffer, dispatch.ArgumentsOffset, TileTransferArguments.Size);
             BindDescriptorSet(command, WriteDescriptorSet(infos, 2));
+            // Lazy pipeline creation must not be charged as immutable native emission.
+            var pipeline = GetPipeline(dispatch.PipelineSlot);
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
             {
-                vk.CmdBindPipeline(command, PipelineBindPoint.Compute, GetPipeline(dispatch.PipelineSlot));
+                vk.CmdBindPipeline(command, PipelineBindPoint.Compute, pipeline);
             }
             Vulkan.NativeBindingEpoch.Advance();
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))

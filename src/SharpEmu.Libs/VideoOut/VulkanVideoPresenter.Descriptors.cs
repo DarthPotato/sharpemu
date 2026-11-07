@@ -374,6 +374,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private uint[] AssembleShaderData(ShaderStageResources stage, ShaderProgramInfo program, BindingLayout layout)
         {
+            using var movable = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.ImmutablePacking);
             var snapshot = stage.Resources;
             var shaderData = Scratch.ShaderData.Rent(checked((int)layout.ShaderDataDwordCount));
             for (var index = 0; index < layout.UserDataRegisters.Count; index++)
@@ -794,6 +795,8 @@ internal static unsafe partial class VulkanVideoPresenter
             if (MeshDrawTrace.Active) MeshDrawTrace.Write("stage-binding", $"stage={stage.Program?.Stage} hash=0x{stage.Program?.Hash:X16} shaderBase=0x{stage.ShaderBase:X16} userData={string.Join(",", stage.Resources.UserData.Select(value => value.ToString("X8")))}");
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var program = RequireProgram(stage);
+            if (RenderPhaseProfile.MovableEnabled && program.Resources!.Info.UsesRuntimeDescriptors)
+                RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.RuntimeDescriptors, blocksRecording: !RuntimeRecordWorkers);
             if (_worker && program.Resources!.Info.UsesRuntimeDescriptors && !RuntimeRecordWorkers) throw Serial("runtime image descriptors", resumable: true);
             if (_worker && program.Frontend is { RequiresOrderedImagePreparation: true } orderedFrontend)
             {
@@ -825,6 +828,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var info = resources.Info;
             if (layout.UsesBindlessHeap)
             {
+                RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.BindlessHeap);
                 if (_worker)
                 {
                     throw Serial("bindless heap", resumable: true);
@@ -835,6 +839,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (layout.Find(DescriptorBindingKind.CallMarks) is not null)
             {
+                RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.CallRecords);
                 if (_worker)
                 {
                     throw Serial("call marks", resumable: true);
@@ -860,6 +865,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var preparations = StagePreparationsOf(program);
             var movieActive = _presenter._hostMovieFramePixels is not null;
+            if (RenderPhaseProfile.MovableEnabled && movieActive) RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.HostMovie);
             if (movieActive && _worker)
             {
                 throw Serial("host movie");
@@ -915,6 +921,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (program.CallRecordCallees.Count != 0)
             {
+                RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.CallRecords);
                 if (_worker)
                 {
                     throw Serial("call records", resumable: true);
@@ -1183,6 +1190,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // Uploads every mapped range into the cache before a device-address draw; the fault pass follows.
         public void PrepareDeviceAddresses()
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DeviceAddressResidency, blocksRecording: false);
             var preparation = RequirePreparation();
             ulong vertexProgramHash = 0, pixelProgramHash = 0, computeProgramHash = 0;
             if (BufferUploadProfile.Enabled)
@@ -1266,6 +1275,8 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var stage = (PreparedStageBindings)prepared;
             var info = stage.Resources.Info;
+            if (RenderPhaseProfile.MovableEnabled && info.Buffers.Count != 0)
+                RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.BufferOwnership, blocksRecording: false);
             using var stallProfile = DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.Bind, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count);
             if (!_worker)
             {
@@ -1352,6 +1363,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private (GpuBuffer Buffer, ulong Offset, ulong Available) ObtainStorageBuffer(ulong address, ulong size, BufferResource resource,
             ResourceSlotIdentifier bufferIdentifier, ulong programHash)
         {
+            using var ownership = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.BufferOwnership, blocksRecording: false);
             var obtained = _worker
                 ? ObtainBufferRangeForSlice(address, size, resource.Written, resource.Formatted, invalidateImages: resource.Formatted && resource.Written)
                 : (_bufferCache.ObtainBuffer(address, size, resource.Written, isTexelBuffer: resource.Formatted, bufferIdentifier, programHash) is var found
@@ -1823,6 +1836,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var entry = RequirePipelineEntry(in pipeline);
             var command = BeginBatchedGuestStateCommands();
             _commandBuffer = command;
+            using var counting = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.ImmutablePacking);
             var writeCount = 0;
             var bufferCount = 0;
             var imageCount = 0;
@@ -1859,9 +1873,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 maxStageImages = Math.Max(maxStageImages, stage.Textures.Length);
             }
 
+            counting.SwitchPhase(RenderPhaseProfile.Phase.DescriptorCommit);
             // All stages that read the same stencil bytes share the shader's working image.
             if (preparation.StencilStorageImages is { } stencilImages)
             {
+                using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
                 foreach (var prepared in stages)
                 {
                     foreach (var texture in ((PreparedStageBindings)prepared).Textures)
@@ -1949,6 +1965,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
 
                     var occurrences = occurrenceScratch[..descriptors.Images.Length];
+                    using var packing = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.ImmutablePacking);
                     occurrences.Clear();
                     var bindings = stage.Layout.Descriptors;
                     for (var bindingIndex = 0; bindingIndex < bindings.Count; bindingIndex++)
@@ -1991,13 +2008,17 @@ internal static unsafe partial class VulkanVideoPresenter
 
                                     break;
                                 case DescriptorBindingKind.MipStatistics:
+                                    using (RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership))
                                     bufferInfos[bufferIndex++] = _presenter.MipStatisticsDescriptor();
                                     break;
                                 case DescriptorBindingKind.CallMarks:
+                                    RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.CallRecords);
+                                    using (RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership))
                                     bufferInfos[bufferIndex++] = _worker ? throw Serial("call marks", resumable: true) : _presenter.CallMarksDescriptor();
                                     break;
                                 case DescriptorBindingKind.DeviceAddressFallback:
                                 {
+                                    using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
                                     var fallback = _bufferCache.DeviceAddressFallbackBuffer;
                                     bufferInfos[bufferIndex++] = new DescriptorBufferInfo { Buffer = fallback.Handle, Offset = 0, Range = fallback.Size };
                                     break;
@@ -2103,6 +2124,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (hasPushData)
                 {
+                    using var emission = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.DescriptorEmission);
                     var pushStages = bindPoint == PipelineBindPoint.Graphics
                         ? ((entry.Description?.VertexStage.Stage == ShaderStageKind.Mesh
                             ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
@@ -2121,6 +2143,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     fixed (WriteDescriptorSet* writePointer = writes)
                     {
+                        using var emission = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.DescriptorEmission);
                         if (entry.UsesPushDescriptors)
                         {
                             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
@@ -2131,12 +2154,15 @@ internal static unsafe partial class VulkanVideoPresenter
                         }
                         else
                         {
+                            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DescriptorHeap);
                             if (_worker)
                             {
                                 throw Serial("descriptor heap", resumable: true);
                             }
 
-                            var set = _descriptorHeap.Commit(entry.SetLayout, in entry.Demand);
+                            DescriptorSet set;
+                            using (RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership))
+                                set = _descriptorHeap.Commit(entry.SetLayout, in entry.Demand);
                             for (var index = 0; index < writeIndex; index++)
                             {
                                 writes[index].DstSet = set;

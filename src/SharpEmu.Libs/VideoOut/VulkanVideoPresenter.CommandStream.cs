@@ -420,6 +420,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            using var movable = RenderPhaseProfile.MeasureOperation(work.IsDispatch
+                ? RenderPhaseProfile.WorkKind.Dispatch : RenderPhaseProfile.WorkKind.Draw);
             using var translationScope = RenderPhaseProfile.MeasureDetail(work.IsDispatch
                 ? RenderPhaseProfile.Phase.CommandDispatchTranslation
                 : RenderPhaseProfile.Phase.CommandDrawTranslation);
@@ -688,6 +690,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedGuestRead);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.GuestRead, blocksRecording: false);
             if (!IsTrackedGuestRange(address, destination))
             {
                 return false;
@@ -1085,6 +1089,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            using var movable = RenderPhaseProfile.MeasureOperation(RenderPhaseProfile.WorkKind.Draw);
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
@@ -1105,6 +1110,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            using var movable = RenderPhaseProfile.MeasureOperation(RenderPhaseProfile.WorkKind.Draw);
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
@@ -1138,6 +1144,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _translation.Dispatch(submitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
                 return;
             }
+            using var movable = RenderPhaseProfile.MeasureOperation(RenderPhaseProfile.WorkKind.Dispatch);
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try

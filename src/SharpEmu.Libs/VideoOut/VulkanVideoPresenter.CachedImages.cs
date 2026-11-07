@@ -307,6 +307,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // Final acquisition: the view, the attachment layout and a pending DCC clear.
         internal void AcquireColorAttachment(ColorAttachment target)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedMetadata);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DccDepthPreparation, blocksRecording: false);
             if (_worker)
             {
                 AcquireColorAttachmentForSlice(target);
@@ -581,6 +583,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // Final acquisition of the depth target: HTile clear state, the view and the layout.
         private void AcquireDepthAttachment(DepthAttachment depth, in GuestDepthState state)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedMetadata);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DccDepthPreparation, blocksRecording: false);
             if (IsStaleImage(depth.ImageIdentifier, out _))
             {
                 throw SubmissionScheduler.Fatal($"The depth target changed after render-state discovery: address=0x{depth.Resolution.DepthAddress:X16}.");
@@ -722,6 +726,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private CachedImage AcquireStencilStorage(TextureResource binding, CachedImage attachment, bool writeBack = true)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.StencilOwnership);
             // The view can be smaller than the attachment (a dynamic-resolution pass writes only
             // the region it renders); the storage image then has the view's size.
             if (_worker)

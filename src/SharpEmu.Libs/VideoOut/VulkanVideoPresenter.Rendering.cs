@@ -363,6 +363,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.ImageLookup, blocksRecording: false);
             _imageCache.TraceNativeColorMetadata(request);
             _imageCache.TraceTextureMetadata(request);
             SynchronizeColorMetadata(request);
@@ -403,6 +405,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         ColorAttachmentAcquisition IRenderHost.AcquireColorAttachment(in ColorTargetState target)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedMetadata);
             var attachment = _colorAttachmentScratch ??= new ColorAttachment();
             attachment.ImageIdentifier = target.Image;
             attachment.Request = target.Resolution.Request;
@@ -422,6 +425,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         DepthAttachmentAcquisition IRenderHost.AcquireDepthAttachment(in DepthAttachmentState depth)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedMetadata);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DccDepthPreparation, blocksRecording: false);
             if (_worker)
             {
                 return AcquireDepthAttachmentForSlice(in depth);
@@ -522,6 +527,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public ulong ObtainBufferDeviceAddress(ulong address, ulong size, bool isWritten)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.TessellationDeviceAddresses, blocksRecording: !TessBdaWorkers);
             if (_worker)
             {
                 if (!TessBdaWorkers) throw Serial("tessellation device addresses");
@@ -545,6 +552,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.BufferOwnership, blocksRecording: false);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.TessellationDeviceAddresses, blocksRecording: !TessBdaWorkers);
             if (_worker)
             {
                 if (!TessBdaWorkers) throw Serial("tessellation device addresses");
@@ -580,6 +590,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.BufferOwnership, blocksRecording: false);
             if (_worker)
             {
                 var (sliceBuffer, sliceOffset) = ObtainBufferForSlice(address, size, isWritten, isTexelBuffer: false);
@@ -872,6 +884,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // known only when the surface is a target.
         private void RecordSampledColorMetadataClears(TextureResource[] bindings)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedMetadata);
             const byte DccClearToZero = 0x00;
             foreach (var binding in bindings)
             {
@@ -882,6 +895,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var metadataAddress = image.Description.Metadata.Range.Address;
+                RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DccDepthPreparation, blocksRecording: false);
                 var sliceSize = image.Description.DccSliceSize;
                 var fixedClearSupported = ImageRequestBuilders.SupportsDccFixedClear(image.Description.PixelFormat);
                 var view = binding.Request.View;
@@ -908,6 +922,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         throw Serial("sampled dcc clear");
                     }
 
+                    RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DccDepthPreparation);
                     EndRendering();
                     var command = BeginBatchedGuestCommands();
                     var range = new SubresourceRange(0, 1, layer, 1);
@@ -947,6 +962,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void RecordSampledDepthClear(CachedImage image, in ImageViewDescription view, Format format)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedMetadata);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.DccDepthPreparation);
             var aspects = (_boundDepthLoadState.DepthClearEnabled ? ImageAspectFlags.DepthBit : 0) |
                 (_boundDepthLoadState.StencilClearEnabled ? ImageAspectFlags.StencilBit : 0);
             aspects &= ViewFormatRules.DepthAspects(format);
@@ -1413,6 +1430,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var entry = RequirePipelineEntry(in pipeline);
             var command = BeginBatchedGuestStateCommands();
+            using var movable = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.ExistingPipeline);
             if (bindPoint == PipelineBindPoint.Graphics)
             {
                 _boundGraphicsPipeline = entry;
@@ -1774,6 +1792,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void ShaderWriteBarrier(PipelineStageFlags sourceStages)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedBarrierDecision);
             NoteShaderMayWriteMappedMemory();
             RecordMemoryBarrier(
                 sourceStages,
@@ -1794,6 +1813,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void ShaderWriteHazardBarrier()
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedBarrierDecision);
             if (!BatchBarriers)
             {
                 RecordMemoryBarrier(
@@ -1823,6 +1843,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryDeferShaderAccessBarrier()
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedBarrierDecision);
             EndRendering();
             if (!BatchBarriers)
             {
@@ -1850,6 +1871,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Clears the bound targets on the GPU in place of the draw; the store owns the result.
         public void ClearColorTargets(ReadOnlySpan<ColorTargetState> targets, SolidColorClear clear)
         {
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.SpecialDraw);
             if (_worker)
             {
                 throw Serial("clear color targets");
@@ -1895,6 +1917,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void MarkGpuWritten(ResourceSlotIdentifier image)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.MarkGpuWritten, blocksRecording: !DeferredGpuWritten);
             if (_worker)
             {
                 if (!DeferredGpuWritten || !_imageCache.TryCaptureGpuWrittenMark(image, out var mark))
@@ -1912,6 +1936,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void NoteKnownGpuContents(ulong address, ReadOnlySpan<uint> words)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
             if (_worker)
             {
                 Requests.KnownWrites.Add((address, words.ToArray()));
@@ -1923,6 +1948,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer)
         {
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.SpecialDraw);
             if (_worker)
             {
                 throw Serial("resolve image");
@@ -1940,6 +1966,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void CopyDepthStencilImage(ResourceSlotIdentifier source, ResourceSlotIdentifier destination, in SubresourceRange range, in Extent3D extent, ImageAspectFlags aspects)
         {
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.SpecialDraw);
             if (_worker)
             {
                 throw Serial("depth copy");

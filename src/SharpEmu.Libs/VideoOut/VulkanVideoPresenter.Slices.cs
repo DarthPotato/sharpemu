@@ -1400,6 +1400,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void TransitionImage(CachedImage image, AccessFlags access, SubresourceRange? range, CommandBuffer command, bool guest = false)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedBarrierDecision);
             if (!_worker)
             {
                 image.Transition(access, range, command, guest);

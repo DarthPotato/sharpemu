@@ -156,6 +156,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public uint ReadInheritedInstances(GpuInstanceState state)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedGuestRead);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.GuestRead);
             // The current tessellation bridge sizes CPU batches from the instance count.
             // Its exceptional fallback reads the captured register, never a reused guest record.
             if (_worker) throw Serial("tessellation GPU instances", resumable: true);

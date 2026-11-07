@@ -176,6 +176,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
     public void Record(ResolvedDraw record)
     {
+        using var movable = RenderPhaseProfile.MeasureOperation(RenderPhaseProfile.WorkKind.Draw);
         using var reusePreparation = ImageAcquisitionProfile.Enabled ? ImageAcquisitionProfile.BeginPreparation() : default;
         try
         {
@@ -985,6 +986,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
     private PipelineHandle ResolvePipeline(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput, PixelInputInfo? pixelInput)
     {
+        using var movable = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.ExistingPipeline);
         var boundSlots = 0u;
         for (var index = 0; index < state.ColorCount; index++)
         {
@@ -1012,6 +1014,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             return kept.Handle;
         }
 
+        movable.SwitchPhase(RenderPhaseProfile.Phase.PipelineCreation);
         var pipeline = _pipelines.CreateGraphicsPipeline(
             DrawState.BoundColors(ref state),
             in state.Depth,

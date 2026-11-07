@@ -73,6 +73,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedGuestRead);
+            RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.GuestRead, blocksRecording: false);
             if (_worker && DeferredGpuWritten)
                 Requests.OwnershipReads.Add(new(address, (ulong)destination.Length));
             return ((ICommandStreamHost)_presenter).TryReadGuest(address, destination);
@@ -142,6 +144,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void RequestGuestMemoryBarrier(in MemoryBarrierRequest request)
         {
+            using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedBarrierDecision);
             if (_worker)
             {
                 _workerBuffer!.RequestMemoryBarrier(in request);

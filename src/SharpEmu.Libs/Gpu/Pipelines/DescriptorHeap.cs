@@ -3,6 +3,7 @@
 
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Pipelines;
@@ -163,6 +164,7 @@ public sealed unsafe class DescriptorHeap : IDisposable
             Result result;
             fixed (DescriptorSet* sets = batch.Sets)
             {
+                using var movable = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.DescriptorEmission);
                 result = _device.Vk.AllocateDescriptorSets(_device.Device, &allocate, sets);
             }
 

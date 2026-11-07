@@ -18,7 +18,7 @@ namespace SharpEmu.Libs.VideoOut;
 /// dispose, so a <see cref="Phase.QueueSubmit"/> inside
 /// <see cref="Phase.Flush"/> is never counted twice.
 /// </summary>
-internal static class RenderPhaseProfile
+internal static partial class RenderPhaseProfile
 {
     internal enum Phase
     {
@@ -167,6 +167,13 @@ internal static class RenderPhaseProfile
         CommandPacketRead,
         CommandPacketHandler,
         CommandSpaceWait,
+        ImmutablePacking,
+        DescriptorEmission,
+        ExistingPipeline,
+        OrderedOwnership,
+        OrderedGuestRead,
+        OrderedBarrierDecision,
+        OrderedMetadata,
         Count,
     }
 
@@ -483,7 +490,7 @@ internal static class RenderPhaseProfile
             _entries[(int)phase]++;
         }
 
-        return new Scope(previous, relay: phase == Phase.QueueRelay);
+        return new Scope(previous, timeline, relay: phase == Phase.QueueRelay);
     }
 
     // Cache calls on other threads must not enter the render-thread counters.
@@ -511,6 +518,7 @@ internal static class RenderPhaseProfile
             else
             {
                 _ticks[(int)previous] += now - _lastTimestamp;
+                if (MovableEnabled) ChargeMovable(previous, now - _lastTimestamp);
             }
 
             if (FrameTraceEnabled && _threadTicks is null)
@@ -590,6 +598,8 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(
             $"[PERF][RENDER_MS] window_s={seconds:F1} frames={frames} " +
             string.Join(" ", parts.Select(part => $"{part.Phase}={part.Milliseconds:F2}ms/n{part.Entries}")));
+
+        if (MovableEnabled) ReportMovable(seconds, frames, accounted);
 
         SharpEmu.Libs.Gpu.Scheduling.SubmitReasonProfile.Report();
         GpuWaitSiteProfile.Report();

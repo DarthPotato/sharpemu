@@ -15,6 +15,7 @@ internal sealed partial class RenderRecorder
 
     public void Record(ResolvedDispatch record)
     {
+        using var movable = RenderPhaseProfile.MeasureOperation(RenderPhaseProfile.WorkKind.Dispatch);
         using var reusePreparation = ImageAcquisitionProfile.Enabled ? ImageAcquisitionProfile.BeginPreparation() : default;
         try
         {

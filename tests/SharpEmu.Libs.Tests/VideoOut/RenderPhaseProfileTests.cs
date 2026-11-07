@@ -9,6 +9,27 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class RenderPhaseProfileTests
 {
     [Fact]
+    public void RenderProfile_DisposesTimelineWaitAndRestoresNestedWaitAfterException()
+    {
+        if (!RenderPhaseProfile.Enabled || !FrameTimeline.Enabled) return;
+        using var thread = FrameTimeline.OnRenderThread();
+        Assert.Null(FrameTimeline.CurrentWait);
+        using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.GpuCompletionWait))
+        {
+            Assert.Equal(FrameTimelineAccumulator.Metric.GpuWait, FrameTimeline.CurrentWait);
+            Assert.Throws<InvalidOperationException>((Action)(() =>
+            {
+                using var nested = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.FrameSlotWait);
+                throw new InvalidOperationException();
+            }));
+            Assert.Equal(FrameTimelineAccumulator.Metric.GpuWait, FrameTimeline.CurrentWait);
+        }
+        Assert.Null(FrameTimeline.CurrentWait);
+        using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.CommandStream))
+            Assert.Null(FrameTimeline.CurrentWait);
+    }
+
+    [Fact]
     public void RelayElapsedCountsNestedWorkOnceAndDoesNotCountOtherScopes()
     {
         if (!RenderPhaseProfile.Enabled) return;
