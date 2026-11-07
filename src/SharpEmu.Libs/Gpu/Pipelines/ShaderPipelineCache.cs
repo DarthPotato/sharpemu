@@ -33,6 +33,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ComputePipelineKey, PipelineHandle> _computePipelines = new();
     private readonly Dictionary<Gen5ShaderProgram, bool> _rayTracingComputePrograms = new();
     private readonly object _pipelineGate = new();
+    private readonly object _tessellationGate = new();
+    private readonly PipelineCompileScheduler? _compiles;
+    private readonly Dictionary<ComputePipelineKey, TaskCompletionSource> _computeClaims = new();
     private readonly bool _strictShaders = Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0";
     private readonly bool _skipRayTracing = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_RT") == "1";
     private readonly HashSet<(ShaderStage Stage, ulong Hash, uint CodeSize)> _reportedShaderSkips = [];
@@ -45,7 +48,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         _context = context;
         _host = host;
         _registry = registry;
+        _compiles = host.PipelineCompiles;
         _programs = new ShaderProgramCache(context, compiler, host) { DeferLinking = true };
+        host.RegisterPipelineProducer(_programs.StopBackgroundWork);
         _programs.TryComputePipeline = (program, stage, input) =>
         {
             input.Stage = stage;
@@ -476,7 +481,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         TessellationDrawPrograms? tessellationPrograms = null;
         if (tessellated)
         {
-            lock (_pipelineGate)
+            lock (_tessellationGate)
             {
                 tessellationPrograms = PrepareTessellationHull(vertex, shaderInterface, tessellation!.Value);
                 var bridge = _programs.GetTessellationBridge(vertexStage.Program!.Bindings!, tessellation.Value.Domain);
@@ -1326,13 +1331,18 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         lookup.Tessellation = vertexInput.Tessellation;
         if (_graphicsPipelines.TryGetValue(lookup, out var known))
         {
+            if (RenderPhaseProfile.Enabled) { AsyncPipelineProfile.Ready(); _compiles?.ConsumeKey(lookup); }
             return known;
         }
 
         var description = BuildGraphicsDescription(
             colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
-            vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts);
+            vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts, freeze: _compiles is not null);
         var key = KeyOf(description);
+        if (_compiles is not null)
+        {
+            return RequestGraphics(description, key, speculative: false)!.Use();
+        }
         profileScope.SwitchPhase(RenderPhaseProfile.Phase.PipelineSharedGateWait);
         lock (_pipelineGate)
         {
@@ -1383,22 +1393,24 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         bool disableBlending,
         ShaderProgram vertexProgram,
         ShaderProgram pixelProgram,
-        SampleCountFlags noAttachmentSampleCounts)
+        SampleCountFlags noAttachmentSampleCounts,
+        bool metadataOnly = false,
+        bool freeze = false)
     {
         var renderingState = new PipelineRenderingState();
         var parameters = new PipelineStaticParameters();
         var vertexState = new PipelineVertexInputState();
         var (vertexStage, pixelStage) = FillGraphicsState(colors, in depth, vertexInput, pixelInput, context, in rendering, topology,
-            primitiveRestartEnabled, disableBlending, vertexProgram, pixelProgram, noAttachmentSampleCounts, renderingState, parameters, vertexState);
+            primitiveRestartEnabled, disableBlending, vertexProgram, pixelProgram, noAttachmentSampleCounts, renderingState, parameters, vertexState, metadataOnly);
         return new GraphicsPipelineDescription
         {
             Tessellation = vertexInput.Tessellation,
             Rendering = renderingState,
             VertexInput = vertexState,
-            VertexInfo = vertexInput,
+            VertexInfo = metadataOnly || freeze ? vertexInput.Snapshot() : vertexInput,
             VertexProgram = vertexProgram,
             VertexStage = vertexStage,
-            PixelInfo = pixelInput,
+            PixelInfo = metadataOnly || freeze ? pixelInput?.Snapshot() : pixelInput,
             PixelProgram = pixelProgram,
             PixelStage = pixelStage,
             StaticParameters = parameters,
@@ -1421,7 +1433,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         SampleCountFlags noAttachmentSampleCounts,
         PipelineRenderingState renderingState,
         PipelineStaticParameters parameters,
-        PipelineVertexInputState vertexState)
+        PipelineVertexInputState vertexState,
+        bool metadataOnly = false)
     {
         if (colors.Length > PipelineStaticParameters.ColorAttachmentCount)
         {
@@ -1448,7 +1461,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         {
             ref readonly var color = ref colors[index];
             var format = rendering.ColorAttachments[index].Format;
-            if (!color.Image.IsValid || format == Format.Undefined)
+            if ((!metadataOnly && !color.Image.IsValid) || format == Format.Undefined)
             {
                 throw SubmissionScheduler.Fatal($"A color attachment has no image or format: slot={color.Slot} format={format}.");
             }
@@ -1588,9 +1601,14 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var key = new ComputePipelineKey(program.Id);
         if (_computePipelines.TryGetValue(key, out var known))
         {
+            if (RenderPhaseProfile.Enabled) { AsyncPipelineProfile.Ready(); _compiles?.ConsumeKey(key); }
             return known;
         }
 
+        if (_compiles is not null && stage.Bindings is not { CallTargetCount: not 0 })
+        {
+            return RequestCompute(input, program, stage, speculative: false)!.Use();
+        }
         profileScope.SwitchPhase(RenderPhaseProfile.Phase.PipelineSharedGateWait);
         lock (_pipelineGate)
         {
@@ -1629,9 +1647,17 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var key = new ComputePipelineKey(program.Id);
         if (_computePipelines.TryGetValue(key, out var known))
         {
+            if (RenderPhaseProfile.Enabled) { AsyncPipelineProfile.Ready(); _compiles?.ConsumeKey(key); }
             handle = known;
             return true;
         }
+
+        if (_compiles is not null && stage.Bindings is not { CallTargetCount: not 0 })
+        {
+            handle = RequestCompute(input, program, stage, speculative: false)!.Use();
+            return true;
+        }
+        if (_compiles is not null) return TryCreateComputeOutsideGate(input, program, out handle);
 
         profileScope.SwitchPhase(RenderPhaseProfile.Phase.PipelineSharedGateWait);
         lock (_pipelineGate)
@@ -1665,8 +1691,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     {
         lock (_pipelineGate)
         {
-            return _host.GetComputePipelineCompletion(program);
+            if (_computeClaims.TryGetValue(new ComputePipelineKey(program.Id), out var claim)) return claim.Task;
         }
+        return _host.GetComputePipelineCompletion(program);
     }
 }
 

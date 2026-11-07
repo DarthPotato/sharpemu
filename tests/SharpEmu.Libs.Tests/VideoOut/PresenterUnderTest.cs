@@ -87,6 +87,7 @@ internal sealed class PresenterUnderTest : IDisposable
         foreach (var name in new[]
         {
             "_instanceRegisters", "_instanceRegisterGate",
+            "_pipelineCompileInitGate", "_pipelineProducers", "_linkedComputeCompiles",
             "_batchResources", "_batchRetireBuffers", "_pendingGuestSubmissions",
             "_deferredGuestImageVersionDestroys",
             "_pendingComputePipelines", "_pipelineEntries", "_shaderModules", "_shaderModuleSpirvBytes", "_rectangleStageCode",
@@ -97,6 +98,7 @@ internal sealed class PresenterUnderTest : IDisposable
         }
 
         SetField("_shaderModuleCacheIdentities", new Dictionary<ulong, string>());
+        SetField("_pipelineCompileBudget", new SharpEmu.Libs.Gpu.Pipelines.PipelineCompileBudget(4));
         var cacheShards = PresenterType.GetField("_pipelineCacheShards", InstanceMembers)!;
         cacheShards.SetValue(Instance, Activator.CreateInstance(cacheShards.FieldType, nonPublic: true));
         forwarder.Target = this;
@@ -185,6 +187,12 @@ internal sealed class PresenterUnderTest : IDisposable
 
     private void DestroyPipelineResources()
     {
+        var compiles = GetField<PipelineCompileScheduler?>("_pipelineCompiles");
+        compiles?.StopAdmission();
+        foreach (var stop in GetField<System.Collections.Concurrent.ConcurrentBag<Action>>("_pipelineProducers")) stop();
+        compiles?.Dispose();
+        InvokeMethod("DrainPendingComputePipelines");
+        InvokeMethod("FinishExpensiveCompileSave", true);
         InvokeMethod("DestroyRenderPipelines");
         GetField<DescriptorHeap>("_descriptorHeap").Dispose();
     }

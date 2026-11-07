@@ -642,6 +642,7 @@ internal static partial class RenderPhaseProfile
         Console.Error.WriteLine(SharpEmu.Libs.Diagnostics.PacketHandlerTally.TakeReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Pipelines.ShaderPipelineCache.TakeKeptProgramsReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Pipelines.ShaderPipelineCache.TakeFastPathReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Pipelines.AsyncPipelineProfile.TakeReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Pipelines.ShaderPipelineCache.TakeCpuKernelReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.GpuCommands.GpuCommandInterpreter.TakePredicationReport());
         Console.Error.WriteLine(VulkanVideoPresenter.TakeSliceReport());

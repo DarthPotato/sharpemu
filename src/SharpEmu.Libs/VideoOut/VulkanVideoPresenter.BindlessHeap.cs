@@ -41,15 +41,24 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _bindlessHeapSupported;
         private DescriptorSetLayout _heapSetLayout;
         private DescriptorSetLayout _emptyHeapSetLayout;
+        private Lazy<DescriptorSetLayout>? _emptyHeapSetLayoutCreation;
 
         private DescriptorSetLayout RequireEmptyHeapSetLayout()
         {
-            if (_emptyHeapSetLayout.Handle == 0)
+            Lazy<DescriptorSetLayout> creation;
+            lock (_shaderModules)
             {
-                var create = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo };
-                Check(_vk.CreateDescriptorSetLayout(_device, &create, null, out _emptyHeapSetLayout), "vkCreateDescriptorSetLayout(empty heap placeholder)");
+                if (_emptyHeapSetLayout.Handle != 0) return _emptyHeapSetLayout;
+                creation = _emptyHeapSetLayoutCreation ??= new Lazy<DescriptorSetLayout>(() =>
+                {
+                    var create = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo };
+                    Check(_vk.CreateDescriptorSetLayout(_device, &create, null, out var layout), "vkCreateDescriptorSetLayout(empty heap placeholder)");
+                    return layout;
+                });
             }
-            return _emptyHeapSetLayout;
+            var ready = creation.Value;
+            lock (_shaderModules) _emptyHeapSetLayout = ready;
+            return ready;
         }
         private DescriptorPool _heapPool;
         private DescriptorSet _heapSet;
@@ -224,6 +233,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _vk.DestroyDescriptorSetLayout(_device, _emptyHeapSetLayout, null);
                 _emptyHeapSetLayout = default;
+                _emptyHeapSetLayoutCreation = null;
             }
             if (_heapSetLayout.Handle != 0)
             {

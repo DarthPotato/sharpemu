@@ -100,6 +100,8 @@ public sealed partial class RenderExecutor
 
         var input = computeProgram.Input;
         var program = input.Stage.Program ?? throw _host.Fatal($"The compute program is missing: shader=0x{compute.Address:X16}.");
+        if (_pipelines is Pipelines.ShaderPipelineCache cache)
+            cache.RequestComputeAhead(input, computeProgram.Program);
         if (Diagnostics.DccWriterTrace.Enabled)
         {
             Diagnostics.DccWriterTrace.CurrentProgram = program.Hash;

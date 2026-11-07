@@ -669,6 +669,8 @@ public sealed partial class RenderExecutor
         record.SetBindDebug = setBindDebug;
         record.SetAutoDebug = setAutoDebug;
         record.ResetBindings = true;
+        if (_pipelines is Pipelines.ShaderPipelineCache cache)
+            record.PredictedPipeline = cache.RequestGraphicsAhead(in state, context, topology, primitiveRestart);
     }
 
     private byte[] ConvertRestartIndices(ulong indexAddress, uint indexCount, IndexType indexType, uint restartIndex)

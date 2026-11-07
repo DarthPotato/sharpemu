@@ -246,6 +246,17 @@ public sealed class VertexInputInfo
         copy.Stage = default;
         return copy;
     }
+
+    internal VertexInputInfo Snapshot() => new()
+    {
+        Tessellation = Tessellation, Buffers = (VertexInputBuffer[])Buffers.Clone(),
+        Attributes = (VertexAttributeResource[])Attributes.Clone(), FetchEmbedded = FetchEmbedded,
+        FetchAttributeRegister = FetchAttributeRegister, FetchBufferRegister = FetchBufferRegister,
+        IeeeMode = IeeeMode, ScratchDwords = ScratchDwords, PositionExportControl = PositionExportControl,
+        // Native descriptions carry program metadata separately. Do not retain a
+        // draw's resource snapshots in the compile queue or pipeline registry.
+        ClipSpace = ClipSpace, StartInstanceUserData = StartInstanceUserData,
+    };
 }
 
 public sealed record MeshDrawConfiguration
@@ -321,10 +332,28 @@ public sealed class PixelInputInfo
         copy.Stage = default;
         return copy;
     }
+
+    internal PixelInputInfo Snapshot() => new()
+    {
+        InputCount = InputCount, SystemInputBase = SystemInputBase, CustomInterpolationMask = CustomInterpolationMask,
+        PerspectiveCenterRegister = PerspectiveCenterRegister, InterpolatorSettings = (uint[])InterpolatorSettings.Clone(),
+        TargetOutputModes = (byte[])TargetOutputModes.Clone(), TargetExportFormats = (byte[])TargetExportFormats.Clone(),
+        TargetExportMappings = (ColorComponentMap[])TargetExportMappings.Clone(), IeeeMode = IeeeMode, ScratchDwords = ScratchDwords,
+        PositionX = PositionX, PositionY = PositionY, PositionZ = PositionZ, PositionW = PositionW, FrontFace = FrontFace,
+        FrontFaceAllBits = FrontFaceAllBits, NoPerspective = NoPerspective, KillEnable = KillEnable,
+        DepthExportEnable = DepthExportEnable, SampleMaskExportEnable = SampleMaskExportEnable,
+        SampleShading = SampleShading, EarlyDepth = EarlyDepth, ExecuteOnNoop = ExecuteOnNoop,
+    };
 }
 
 public sealed class ComputeInputInfo
 {
+    internal ComputeInputInfo Snapshot()
+    {
+        var copy = (ComputeInputInfo)MemberwiseClone();
+        copy.Stage = default;
+        return copy;
+    }
     public uint ThreadsX { get; init; }
     public uint ThreadsY { get; init; }
     public uint ThreadsZ { get; init; }

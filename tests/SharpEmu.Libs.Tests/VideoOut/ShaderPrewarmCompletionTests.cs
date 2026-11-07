@@ -19,6 +19,8 @@ public sealed class ShaderPrewarmCompletionTests
     private static object CreateHost()
     {
         var host = RuntimeHelpers.GetUninitializedObject(Presenter);
+        var shards = Presenter.GetField("_pipelineCacheShards", Members)!;
+        shards.SetValue(host, Activator.CreateInstance(shards.FieldType));
         foreach (var name in new[] { "_runtimeComputeIdentities", "_prewarmedShaderIdentities" })
             Presenter.GetField(name, Members)!.SetValue(host, new ConcurrentDictionary<string, byte>());
         return host;

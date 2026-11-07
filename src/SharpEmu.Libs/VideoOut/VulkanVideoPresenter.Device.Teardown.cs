@@ -16,6 +16,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             ShutdownScheduler();
+            _pipelineCompiles?.StopAdmission();
+            foreach (var stop in _pipelineProducers) stop();
+            StopShaderPrewarm();
+            _pipelineCompiles?.Dispose();
+            DrainPendingComputePipelines();
+            FinishExpensiveCompileSave(wait: true);
             _occlusionQueries?.Dispose();
             _occlusionQueries = null;
             if (_debugUtils is not null && _debugMessenger.Handle != 0)
@@ -28,8 +34,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 _vk.DeviceWaitIdle(_device);
             }
 
-            StopShaderPrewarm();
-            DrainPendingComputePipelines();
             SavePipelineCache(force: true);
             DrainFrameSlots();
             CollectCompletedGuestSubmissions(waitForOldest: false);

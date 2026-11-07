@@ -1477,6 +1477,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 ref var slot = ref strip ? ref entry.StripVariant : ref entry.ListVariant;
                 if (slot.Handle == 0)
                 {
+                    Gpu.Pipelines.AsyncPipelineProfile.Rectangle();
                     slot = _presenter.CreateRenderPipeline(entry.Description!, strip ? PrimitiveTopology.TriangleStrip : PrimitiveTopology.TriangleList, entry.Layout);
                 }
 
@@ -1493,6 +1494,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (entry.RectangleVariant.Handle == 0)
                 {
+                    Gpu.Pipelines.AsyncPipelineProfile.Rectangle();
                     entry.RectangleVariant = _presenter.CreateRenderPipeline(entry.Description!, PrimitiveTopology.TriangleList,
                         entry.Layout, _presenter._supportsFillRectangle ? PolygonMode.FillRectangleNV : PolygonMode.Fill,
                         expandRectangles: !_presenter._supportsFillRectangle);

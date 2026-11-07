@@ -13,6 +13,58 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class VulkanPipelineCacheShardTests(HeadlessVulkanFixture fixture) : IClassFixture<HeadlessVulkanFixture>
 {
     [Fact]
+    public async Task SaveAdmissionDrainsGraphicsJobsBeforeTakingSnapshot()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan)) return;
+        var directory = Path.Combine(Path.GetTempPath(), "SharpEmuTests", Guid.NewGuid().ToString("N"));
+        using var presenter = new PresenterUnderTest(vulkan);
+        using var scheduler = new PipelineCompileScheduler(1);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        presenter.SetField("_pipelineCacheShardDirectory", directory);
+        presenter.SetField("_pipelineCachePath", Path.Combine(directory, "present.bin"));
+        var budget = presenter.GetField<PipelineCompileBudget>("_pipelineCompileBudget");
+        var schedule = new PipelineCacheSaveSchedule(2000);
+        presenter.SetField("_expensiveCompileSave", schedule);
+        Task? poll = null;
+        try
+        {
+            _ = ((Lazy<PipelineCache>)presenter.InvokeMethod("GetGuestPipelineCacheSource", "graphics")!).Value;
+            var graphics = scheduler.Enqueue("graphics", () =>
+            {
+                using var permit = budget.Enter();
+                entered.Set();
+                Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+                return default;
+            }, true, 1)!;
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            var now = Environment.TickCount64;
+            schedule.RecordCompile(3000, now - PipelineCacheSaveSchedule.DebounceMilliseconds);
+            presenter.SetField("_lastPipelineCacheSaveTick", now - 60_000);
+            poll = Task.Run(() => presenter.InvokeMethod("PollExpensiveCompileSave"));
+            var saving = typeof(PipelineCompileBudget).GetField("_saving", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+            Assert.True(SpinWait.SpinUntil(() => (bool)saving.GetValue(budget)!, TimeSpan.FromSeconds(5)));
+            Assert.False(poll.IsCompleted);
+            Assert.False(File.Exists(Path.Combine(directory, "graphics.bin")));
+            release.Set();
+            await graphics.Completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await poll.WaitAsync(TimeSpan.FromSeconds(10));
+            presenter.InvokeMethod("FinishExpensiveCompileSave", true);
+            Assert.True(File.Exists(Path.Combine(directory, "graphics.bin")));
+        }
+        finally
+        {
+            release.Set();
+            scheduler.Dispose();
+            if (poll is not null) await poll.WaitAsync(TimeSpan.FromSeconds(10));
+            presenter.InvokeMethod("FinishExpensiveCompileSave", true);
+            presenter.InvokeMethod("DestroyGuestPipelineCaches");
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void ExpensiveSaveRunsWithoutAnotherCompileAndPreservesNewDirtyShards()
     {
         var vulkan = fixture.Vulkan;
@@ -151,6 +203,15 @@ public sealed class VulkanPipelineCacheShardTests(HeadlessVulkanFixture fixture)
             File.Delete(path);
             presenter.InvokeMethod("SaveGuestPipelineCaches");
             Assert.False(File.Exists(path));
+            if (PipelineCompileScheduler.Enabled)
+            {
+                // Native use changes the compile generation even when the blob
+                // stays the same size; that generation must be exported.
+                var source = (Lazy<PipelineCache>)presenter.InvokeMethod("GetGuestPipelineCacheSource", "test")!;
+                presenter.InvokeMethod("ResolveGuestPipelineCache", source);
+                presenter.InvokeMethod("SaveGuestPipelineCaches");
+                Assert.True(File.Exists(path));
+            }
         }
         finally
         {

@@ -1168,9 +1168,15 @@ internal static partial class VulkanVideoPresenter
             _stopping = true;
             _queue.Wake();
             var deadline = Stopwatch.GetTimestamp() + 5 * Stopwatch.Frequency;
-            while (_thread.IsAlive && Stopwatch.GetTimestamp() < deadline)
+            var warned = false;
+            while (_thread.IsAlive)
             {
                 runItems();
+                if (!warned && Stopwatch.GetTimestamp() >= deadline)
+                {
+                    Console.Error.WriteLine("[GPU][WARN] Command producer still running; continuing to service it before destruction.");
+                    warned = true;
+                }
                 _thread.Join(1);
             }
 

@@ -4,6 +4,7 @@
 namespace SharpEmu.Libs.VideoOut;
 
 using System.Diagnostics;
+using SharpEmu.Libs.Gpu.Pipelines;
 using Silk.NET.Vulkan;
 
 internal static unsafe partial class VulkanVideoPresenter
@@ -17,7 +18,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private long _expensiveCompileSaveTrigger;
 
         private sealed record PipelineCacheSaveRequest(PipelineCache Cache, string Path,
-            nuint SavedBytes, DriverCacheShard? Shard);
+            nuint SavedBytes, DriverCacheShard? Shard, long Generation, long CompileGeneration, bool CanSkipUnchanged);
         private sealed record PipelineCacheSaveResult(PipelineCacheSaveRequest Request, bool Success, nuint Bytes);
 
         private void NotePipelineCompile(long milliseconds)
@@ -26,34 +27,51 @@ internal static unsafe partial class VulkanVideoPresenter
                 _expensiveCompileSave?.RecordCompile(milliseconds, Environment.TickCount64);
         }
 
-        // Called by the window loop even when no more pipelines are requested. Mutable dictionaries and
-        // dirty flags stay on their owning thread; the worker receives only stable native handles/paths.
+        // Called on the window loop. Close native admission and drain outside all
+        // metadata locks before capturing handles; the save worker owns the pause.
         private void PollExpensiveCompileSave()
         {
             FinishExpensiveCompileSave(wait: false);
             if (_expensiveCompileSaveTask is not null || _pipelineCachePath is null || _deviceLost ||
                 _shaderPrewarmRunning || _expensiveCompileSave is null) return;
-            if (!_expensiveCompileSave.IsDue(Environment.TickCount64, _lastPipelineCacheSaveTick)) return;
-
-            lock (_pendingComputePipelines)
+            if (!_expensiveCompileSave.IsDue(Environment.TickCount64, _lastPipelineCacheSaveTick))
             {
-                if (_pendingComputePipelines.Values.Any(pending => !pending.Compile.IsCompleted)) return;
-                if (!_expensiveCompileSave.TryTakeSave(Environment.TickCount64, _lastPipelineCacheSaveTick,
-                        out var trigger)) return;
-
-                var requests = new List<PipelineCacheSaveRequest>();
-                foreach (var shard in _pipelineCacheShards.Values)
-                {
-                    if (!shard.Dirty || !shard.Cache.IsValueCreated || shard.Cache.Value.Handle == 0) continue;
-                    requests.Add(new(shard.Cache.Value, shard.Path, shard.SavedBytes, shard));
-                    shard.Dirty = false;
-                }
-                if (_pipelineCache.Handle != 0)
-                    requests.Add(new(_pipelineCache, _pipelineCachePath, _pipelineCacheSavedBytes, null));
-                _pipelineCacheDirty = false;
-                _expensiveCompileSaveTrigger = trigger;
-                _expensiveCompileSaveTask = Task.Run(() => SaveAfterExpensiveCompile(requests, trigger));
+                CheckpointPipelineCache();
+                return;
             }
+            if (!PipelineCompileScheduler.Enabled)
+                lock (_pendingComputePipelines)
+                    if (_pendingComputePipelines.Values.Any(pending => !pending.Compile.IsCompleted)) return;
+            if (!_expensiveCompileSave.TryTakeSave(Environment.TickCount64, _lastPipelineCacheSaveTick, out var trigger)) return;
+            var pause = PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Pause() : null;
+            try
+            {
+                var requests = new List<PipelineCacheSaveRequest>();
+                foreach (var shard in GuestCacheShards())
+                {
+                    lock (shard)
+                    {
+                        if (!shard.Dirty || !shard.Cache.IsValueCreated || shard.Cache.Value.Handle == 0) continue;
+                        requests.Add(new(shard.Cache.Value, shard.Path, shard.SavedBytes, shard, shard.Generation, shard.CompileGeneration,
+                            !PipelineCompileScheduler.Enabled || shard.CompileGeneration == shard.SavedCompileGeneration));
+                        shard.Dirty = false;
+                    }
+                }
+                lock (_pipelineCacheShards)
+                {
+                    if (_pipelineCache.Handle != 0)
+                        requests.Add(new(_pipelineCache, _pipelineCachePath, _pipelineCacheSavedBytes, null, _pipelineCacheGeneration, 0,
+                            !PipelineCompileScheduler.Enabled && Volatile.Read(ref _shaderPrewarmCompletion) is null));
+                    _pipelineCacheDirty = false;
+                }
+                _expensiveCompileSaveTrigger = trigger;
+                _expensiveCompileSaveTask = Task.Run(() =>
+                {
+                    try { return SaveAfterExpensiveCompile(requests, trigger); }
+                    finally { pause?.Dispose(); }
+                });
+            }
+            catch { pause?.Dispose(); throw; }
         }
 
         private PipelineCacheSaveResult[] SaveAfterExpensiveCompile(List<PipelineCacheSaveRequest> requests, long trigger)
@@ -68,8 +86,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     // Vulkan caches are internally synchronized (no externally-synchronized flag is used).
                     // A new compile may grow the cache between size and data queries: the existing writer
                     // treats VK_INCOMPLETE as a failed snapshot, leaving the previous atomic file intact.
-                    if ((request.Shard is not null || Volatile.Read(ref _shaderPrewarmCompletion) is null) &&
-                        QueryPipelineCacheSize(request.Cache) is { } size && size == request.SavedBytes)
+                    if (request.CanSkipUnchanged && QueryPipelineCacheSize(request.Cache) is { } size && size == request.SavedBytes)
                     {
                         results.Add(new(request, true, size));
                         continue;
@@ -103,13 +120,25 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (result.Request.Shard is { } shard)
                 {
-                    if (result.Success) shard.SavedBytes = result.Bytes;
-                    else shard.Dirty = true;
+                    lock (shard)
+                    {
+                        if (result.Success)
+                        {
+                            shard.SavedBytes = result.Bytes;
+                            shard.SavedCompileGeneration = result.Request.CompileGeneration;
+                        }
+                        else shard.Dirty = true;
+                        if (shard.Generation != result.Request.Generation) shard.Dirty = true;
+                    }
                 }
                 else
                 {
-                    if (result.Success) _pipelineCacheSavedBytes = result.Bytes;
-                    else _pipelineCacheDirty = true;
+                    lock (_pipelineCacheShards)
+                    {
+                        if (result.Success) _pipelineCacheSavedBytes = result.Bytes;
+                        else _pipelineCacheDirty = true;
+                        if (_pipelineCacheGeneration != result.Request.Generation) _pipelineCacheDirty = true;
+                    }
                 }
             }
             if (results.Any(result => !result.Success))

@@ -54,7 +54,8 @@ internal static unsafe partial class VulkanVideoPresenter
         internal Device _device;
         private PipelineCache _pipelineCache;
         private string? _pipelineCachePath;
-        private bool _pipelineCacheDirty;
+        private volatile bool _pipelineCacheDirty;
+        private long _pipelineCacheGeneration;
         private long _lastPipelineCacheSaveTick;
         // Reading a mature driver cache can itself take several seconds. Keep the
         // render thread focused on pipeline warm-up; teardown still saves eagerly.
@@ -1719,10 +1720,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            _pipelineCacheDirty = true;
+            lock (_pipelineCacheShards)
+            {
+                _pipelineCacheDirty = true;
+                _pipelineCacheGeneration++;
+            }
             // Expensive compiles also request a debounced background snapshot.
             // Keep the periodic checkpoint for all other cache changes.
-            CheckpointPipelineCache();
+            if (!Gpu.Pipelines.PipelineCompileScheduler.Enabled && !Gpu.Pipelines.PipelineCompileScheduler.IsWorker)
+                CheckpointPipelineCache();
         }
 
         private void CheckpointPipelineCache()
@@ -1747,7 +1753,12 @@ internal static unsafe partial class VulkanVideoPresenter
             FinishExpensiveCompileSave(wait: force);
             if (_expensiveCompileSaveTask is not null) return;
             // Cache export must not race asynchronous pipeline creation.
-            if (_pendingComputePipelines.Values.Any(pending => !pending.Compile.IsCompleted)) return;
+            if (!Gpu.Pipelines.PipelineCompileScheduler.Enabled)
+                lock (_pendingComputePipelines)
+                    if (_pendingComputePipelines.Values.Any(pending => !pending.Compile.IsCompleted)) return;
+            using var pause = Gpu.Pipelines.PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Pause() : null;
+            long generation;
+            lock (_pipelineCacheShards) generation = _pipelineCacheGeneration;
             _lastPipelineCacheSaveTick = Environment.TickCount64;
             SaveGuestPipelineCaches();
             if (_pipelineCache.Handle == 0 || string.IsNullOrWhiteSpace(_pipelineCachePath))
@@ -1760,17 +1771,20 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            if (Volatile.Read(ref _shaderPrewarmCompletion) is null &&
+            if (!Gpu.Pipelines.PipelineCompileScheduler.Enabled && Volatile.Read(ref _shaderPrewarmCompletion) is null &&
                 QueryPipelineCacheSize(_pipelineCache) is { } size && size == _pipelineCacheSavedBytes)
             {
-                _pipelineCacheDirty = false;
+                lock (_pipelineCacheShards) if (_pipelineCacheGeneration == generation) _pipelineCacheDirty = false;
                 return;
             }
 
             if (SaveDriverPipelineCache(_pipelineCache, _pipelineCachePath, MaxPipelineCacheBytes, out var savedBytes))
             {
-                _pipelineCacheDirty = false;
-                _pipelineCacheSavedBytes = savedBytes;
+                lock (_pipelineCacheShards)
+                {
+                    if (_pipelineCacheGeneration == generation) _pipelineCacheDirty = false;
+                    _pipelineCacheSavedBytes = savedBytes;
+                }
                 Console.Error.WriteLine(
                     $"[LOADER][INFO] Vulkan pipeline cache saved: path={_pipelineCachePath} bytes={savedBytes}");
             }

@@ -19,6 +19,29 @@ public sealed class ComputePipelineOwnershipTests
     private static readonly Type Presenter = typeof(VulkanVideoPresenter).GetNestedType("Presenter", BindingFlags.NonPublic)!;
 
     [Fact]
+    public async Task OrdinaryPendingCompilePollingDoesNotWaitUnderPendingMapLock()
+    {
+        var host = RuntimeHelpers.GetUninitializedObject(Presenter);
+        var field = Presenter.GetField("_pendingComputePipelines", Members)!;
+        var pending = RuntimeHelpers.GetUninitializedObject(field.FieldType.GenericTypeArguments[1]);
+        var completion = new TaskCompletionSource<Pipeline>();
+        pending.GetType().GetField("Compile", Members)!.SetValue(pending, completion.Task);
+        var entries = (IDictionary)Activator.CreateInstance(field.FieldType)!;
+        entries.Add(55UL, pending);
+        field.SetValue(host, entries);
+        var description = new ComputePipelineDescription
+        {
+            Input = new ComputeInputInfo(), Program = new ShaderProgram(55), Stage = new ShaderProgramInfo(),
+        };
+        var poll = Task.Run(() => (bool)Presenter.GetMethod("TryCreateComputePipeline", Members)!
+            .Invoke(host, [description, default(PipelineHandle)])!);
+        Assert.False(await poll.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Same(completion.Task, Presenter.GetMethod("GetComputePipelineCompletion", Members)!.Invoke(host, [description.Program]));
+        Assert.Single(entries);
+        completion.SetResult(default);
+    }
+
+    [Fact]
     public void FailedCompile_RemainsOwnedByPendingCleanup()
     {
         var host = RuntimeHelpers.GetUninitializedObject(Presenter);

@@ -17,12 +17,16 @@ internal static unsafe partial class VulkanVideoPresenter
             public required string Path;
             public bool Dirty;
             public nuint SavedBytes;
+            public long Generation;
+            public long CompileGeneration;
+            public long SavedCompileGeneration;
         }
 
         private const double SlowShardLoadMilliseconds = 50;
 
         private string? _pipelineCacheShardDirectory;
         private readonly Dictionary<string, DriverCacheShard> _pipelineCacheShards = new();
+        private Dictionary<Lazy<PipelineCache>, DriverCacheShard>? _pipelineCacheShardSources;
 
         // Linked programs' pipelines (Bindings.CallTargetCount != 0) keep a cache file of their own, one per caller, when the
         // other pipelines keep none: the driver can spend minutes on one, and its own shader cache does not keep pipelines
@@ -54,21 +58,39 @@ internal static unsafe partial class VulkanVideoPresenter
         private PipelineCache GetGuestPipelineCache(string key)
             => ResolveGuestPipelineCache(GetGuestPipelineCacheSource(key));
 
-        // The dictionary belongs to the render thread. Only the lazy native
-        // creation runs on compiler workers; variants share one initialization.
+        // Registry and shard metadata locks are short leaf locks. Lazy creation,
+        // driver calls and disk writes happen after releasing them.
         private Lazy<PipelineCache>? GetGuestPipelineCacheSource(string key)
         {
             if (_pipelineCacheShardDirectory is null) return null;
-            if (_pipelineCacheShards.TryGetValue(key, out var existing))
+            DriverCacheShard shard;
+            lock (_pipelineCacheShards)
             {
-                existing.Dirty = true;
-                return existing.Cache;
+                if (!_pipelineCacheShards.TryGetValue(key, out shard!))
+                {
+                    shard = new DriverCacheShard { Path = Path.Combine(_pipelineCacheShardDirectory, key + ".bin") };
+                    shard.Cache = new Lazy<PipelineCache>(() => LoadGuestPipelineCache(key, shard));
+                    _pipelineCacheShards.Add(key, shard);
+                    (_pipelineCacheShardSources ??= new()).Add(shard.Cache, shard);
+                }
             }
-
-            var shard = new DriverCacheShard { Path = Path.Combine(_pipelineCacheShardDirectory, key + ".bin"), Dirty = true };
-            shard.Cache = new Lazy<PipelineCache>(() => LoadGuestPipelineCache(key, shard));
-            _pipelineCacheShards.Add(key, shard);
+            MarkShardDirty(shard);
             return shard.Cache;
+        }
+
+        private static void MarkShardDirty(DriverCacheShard shard, bool compile = false)
+        {
+            lock (shard)
+            {
+                shard.Generation++;
+                if (compile) shard.CompileGeneration++;
+                shard.Dirty = true;
+            }
+        }
+
+        private DriverCacheShard[] GuestCacheShards()
+        {
+            lock (_pipelineCacheShards) return _pipelineCacheShards.Values.ToArray();
         }
 
         // A linked compile's own pipeline cache, created from its caller's cache file; null when shards keep every pipeline or
@@ -98,7 +120,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var cache = shard.Cache.Value;
             if (save)
             {
-                SaveDriverPipelineCache(cache, shard.Path, MaxPipelineCacheBytes, out _);
+                // Variants have independent native caches but share the caller's filename.
+                lock (LinkedCacheFileGates.GetOrAdd(shard.Path, static _ => new object()))
+                    SaveDriverPipelineCache(cache, shard.Path, MaxPipelineCacheBytes, out _);
             }
 
             _vk.DestroyPipelineCache(_device, cache, null);
@@ -106,6 +130,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private PipelineCache ResolveGuestPipelineCache(Lazy<PipelineCache>? source)
         {
+            DriverCacheShard? shard = null;
+            if (source is not null)
+            {
+                lock (_pipelineCacheShards) _pipelineCacheShardSources?.TryGetValue(source, out shard);
+            }
+            if (shard is not null) MarkShardDirty(shard, compile: true);
             var cache = source?.Value ?? default;
             return cache.Handle != 0 ? cache : _pipelineCache;
         }
@@ -140,7 +170,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var milliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             if (QueryPipelineCacheSize(cache) is { } size)
-                shard.SavedBytes = size;
+                lock (shard) shard.SavedBytes = size;
             if (milliseconds >= SlowShardLoadMilliseconds)
                 Console.Error.WriteLine($"[LOADER][INFO] Vulkan cache shard loaded: key={key} bytes={data.Length} ms={milliseconds:F1}");
             return cache;
@@ -150,22 +180,37 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var savedShards = 0;
             nuint savedBytes = 0;
-            foreach (var shard in _pipelineCacheShards.Values)
+            foreach (var shard in GuestCacheShards())
             {
-                if (!shard.Dirty || !shard.Cache.IsValueCreated || shard.Cache.Value.Handle == 0)
-                    continue;
+                long generation;
+                long compileGeneration;
+                bool canSkipUnchanged;
+                nuint previousBytes;
+                lock (shard)
+                {
+                    if (!shard.Dirty || !shard.Cache.IsValueCreated || shard.Cache.Value.Handle == 0) continue;
+                    generation = shard.Generation;
+                    compileGeneration = shard.CompileGeneration;
+                    canSkipUnchanged = !PipelineCompileScheduler.Enabled || compileGeneration == shard.SavedCompileGeneration;
+                    previousBytes = shard.SavedBytes;
+                }
 
                 var cache = shard.Cache.Value;
-                if (QueryPipelineCacheSize(cache) is { } size && size == shard.SavedBytes)
+                // A new generation can change contents without changing blob size.
+                if (canSkipUnchanged && QueryPipelineCacheSize(cache) is { } size && size == previousBytes)
                 {
-                    shard.Dirty = false;
+                    lock (shard) if (shard.Generation == generation) shard.Dirty = false;
                     continue;
                 }
 
                 if (SaveDriverPipelineCache(cache, shard.Path, MaxPipelineCacheBytes, out var bytes))
                 {
-                    shard.Dirty = false;
-                    shard.SavedBytes = bytes;
+                    lock (shard)
+                    {
+                        if (shard.Generation == generation) shard.Dirty = false;
+                        shard.SavedBytes = bytes;
+                        shard.SavedCompileGeneration = compileGeneration;
+                    }
                     savedShards++;
                     savedBytes += bytes;
                 }
@@ -178,12 +223,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DestroyGuestPipelineCaches()
         {
-            foreach (var shard in _pipelineCacheShards.Values)
+            foreach (var shard in GuestCacheShards())
             {
                 if (shard.Cache.IsValueCreated && shard.Cache.Value.Handle != 0)
                     _vk.DestroyPipelineCache(_device, shard.Cache.Value, null);
             }
-            _pipelineCacheShards.Clear();
+            lock (_pipelineCacheShards)
+            {
+                _pipelineCacheShards.Clear();
+                _pipelineCacheShardSources?.Clear();
+            }
         }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, object> LinkedCacheFileGates = new(StringComparer.OrdinalIgnoreCase);
     }
 }

@@ -30,7 +30,10 @@ internal sealed class FakeCompiledShader(ShaderCompileRequest request, byte[]? s
 // Counts modules and pipelines; every guest read comes straight from the fake memory.
 internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
 {
-    private ulong _nextHandle = 1;
+    public PipelineCompileScheduler? PipelineCompiles { get; set; }
+    private long _nextHandle;
+    public Action<GraphicsPipelineDescription>? BeforeGraphicsCompile { get; set; }
+    public Action<ComputePipelineDescription>? BeforeComputeCompile { get; set; }
 
     public int ImageNormalizations { get; private set; }
 
@@ -157,20 +160,22 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
     {
         Modules.Add((stage, hash, programId));
         CompiledShaders.Add(shader);
-        return _nextHandle++;
+        return (ulong)Interlocked.Increment(ref _nextHandle);
     }
 
     public PipelineHandle CreateGraphicsPipeline(GraphicsPipelineDescription description)
     {
-        GraphicsPipelines.Add(description);
-        var handle = _nextHandle++;
+        BeforeGraphicsCompile?.Invoke(description);
+        lock (GraphicsPipelines) GraphicsPipelines.Add(description);
+        var handle = (ulong)Interlocked.Increment(ref _nextHandle);
         return new PipelineHandle(handle, handle, UsesPushDescriptors: true);
     }
 
     public PipelineHandle CreateComputePipeline(ComputePipelineDescription description)
     {
-        ComputePipelines.Add(description);
-        var handle = _nextHandle++;
+        BeforeComputeCompile?.Invoke(description);
+        lock (ComputePipelines) ComputePipelines.Add(description);
+        var handle = (ulong)Interlocked.Increment(ref _nextHandle);
         return new PipelineHandle(handle, handle, UsesPushDescriptors: true);
     }
 

@@ -1055,29 +1055,44 @@ internal static unsafe partial class VulkanVideoPresenter
             var heaps = PipelineLayoutHeaps.For(description.VertexStage.Bindings, description.PixelStage?.Bindings);
             var runtimeHeap = heaps.Runtime;
             var bindlessHeap = heaps.Bindless;
-            var entry = new RenderPipelineEntry
+            RenderPipelineEntry? entry = null;
+            try
             {
-                SetLayout = setLayout,
-                Demand = demand,
-                Layout = CreatePipelineLayout(setLayout,
-                    (description.VertexStage.Stage == ShaderStageKind.Mesh
-                        ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
-                    ShaderStageFlags.FragmentBit |
-                    (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit), bindlessHeap, runtimeHeap),
-                UsesPushDescriptors = usesPushDescriptors,
-                UsesBindlessHeap = bindlessHeap,
-                UsesRuntimeHeap = runtimeHeap,
-                Description = description,
-                ProfileVertexHash = description.VertexStage.Hash,
-                ProfilePixelHash = description.PixelStage?.Hash ?? 0,
-            };
-            // Rectangle draws bind a native fill or compatibility variant at draw time.
-            if (!entry.RectangleList)
-            {
-                entry.Pipeline = CreateRenderPipeline(description, description.StaticParameters.Topology, entry.Layout);
-            }
+                entry = new RenderPipelineEntry
+                {
+                    SetLayout = setLayout,
+                    Demand = demand,
+                    Layout = CreatePipelineLayout(setLayout,
+                        (description.VertexStage.Stage == ShaderStageKind.Mesh
+                            ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
+                        ShaderStageFlags.FragmentBit |
+                        (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit), bindlessHeap, runtimeHeap),
+                    UsesPushDescriptors = usesPushDescriptors,
+                    UsesBindlessHeap = bindlessHeap,
+                    UsesRuntimeHeap = runtimeHeap,
+                    Description = description,
+                    ProfileVertexHash = description.VertexStage.Hash,
+                    ProfilePixelHash = description.PixelStage?.Hash ?? 0,
+                };
+                // Rectangle draws bind a native fill or compatibility variant at draw time.
+                if (!entry.RectangleList)
+                {
+                    entry.Pipeline = CreateRenderPipeline(description, description.StaticParameters.Topology, entry.Layout);
+                }
 
-            return RegisterPipeline(entry);
+                return RegisterPipeline(entry);
+            }
+            catch
+            {
+                // RegisterPipeline transfers ownership at insertion, before diagnostics.
+                if (entry is null || entry.Id == 0 || !_pipelineEntries.ContainsKey(entry.Id))
+                {
+                    if (entry is { Pipeline.Handle: not 0 }) _vk.DestroyPipeline(_device, entry.Pipeline, null);
+                    if (entry is { Layout.Handle: not 0 }) _vk.DestroyPipelineLayout(_device, entry.Layout, null);
+                    _vk.DestroyDescriptorSetLayout(_device, setLayout, null);
+                }
+                throw;
+            }
         }
 
         private static StencilOpState ToVkStencilOpState(in StencilOperations operations) => new()
@@ -1209,6 +1224,7 @@ internal static unsafe partial class VulkanVideoPresenter
             PolygonMode polygonMode = PolygonMode.Fill, bool expandRectangles = false, bool prewarm = false,
             Action<Result>? creationResultObserver = null)
         {
+            using var compilePermit = PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Enter() : null;
             var parameters = description.StaticParameters;
             var rendering = description.Rendering;
             var vertexModule = new ShaderModule(description.VertexProgram.Module);
@@ -1221,6 +1237,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ShaderModule rectangleModule = default;
             ShaderModule rectangleVertexModule = default;
             ShaderModule rectanglePixelModule = default;
+            Pipeline unownedPipeline = default;
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
             try
             {
@@ -1477,8 +1494,15 @@ internal static unsafe partial class VulkanVideoPresenter
                     Pipeline pipeline;
                     using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GraphicsPipelineDriver))
                     {
-                        creationResult = _vk.CreateGraphicsPipelines(_device, cache, 1, &pipelineInfo, null, out pipeline);
+                        AsyncPipelineProfile.Start();
+                        try
+                        {
+                            creationResult = _vk.CreateGraphicsPipelines(_device, cache, 1, &pipelineInfo, null, out pipeline);
+                            unownedPipeline = pipeline;
+                        }
+                        finally { AsyncPipelineProfile.Finish(); }
                     }
+                    AsyncPipelineProfile.Driver(RenderPhaseProfile.Enabled ? creationStart : 0, Thread.CurrentThread == _thread, OnCommandThread);
                     var creationMilliseconds = Stopwatch.GetElapsedTime(creationStart).TotalMilliseconds;
                     if (RenderPhaseProfile.Enabled && !prewarm)
                     {
@@ -1490,6 +1514,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     NotePipelineCompile((long)creationMilliseconds);
                     if (prewarm)
                     {
+                        unownedPipeline = default;
                         return pipeline;
                     }
 
@@ -1508,11 +1533,13 @@ internal static unsafe partial class VulkanVideoPresenter
                         ObjectType.Pipeline,
                         pipeline.Handle,
                         $"SharpEmu graphics vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16} colors={colorCount}");
+                    unownedPipeline = default;
                     return pipeline;
                 }
             }
             finally
             {
+                if (unownedPipeline.Handle != 0) _vk.DestroyPipeline(_device, unownedPipeline, null);
                 if (rectangleModule.Handle != 0) _vk.DestroyShaderModule(_device, rectangleModule, null);
                 if (rectangleVertexModule.Handle != 0) _vk.DestroyShaderModule(_device, rectangleVertexModule, null);
                 if (rectanglePixelModule.Handle != 0) _vk.DestroyShaderModule(_device, rectanglePixelModule, null);
@@ -1522,85 +1549,104 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public PipelineHandle CreateComputePipeline(ComputePipelineDescription description)
         {
+            using var compilePermit = PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Enter() : null;
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var heaps = PipelineLayoutHeaps.For(description.Stage.Bindings);
-            var runtimeHeap = heaps.Runtime;
-            var bindlessHeap = heaps.Bindless;
-            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, bindlessHeap, runtimeHeap);
-            var computeModule = new ShaderModule(description.Program.Module);
-            if (computeModule.Handle == 0)
-            {
-                throw SubmissionScheduler.Fatal($"The compute pipeline has no module: hash=0x{description.Stage.Hash:X16}.");
-            }
-
-            var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
-            Pipeline pipeline;
+            PipelineLayout layout = default;
+            Pipeline pipeline = default;
+            RenderPipelineEntry? entry = null;
             try
             {
-                var pin = ComputeRequiredSubgroupSize(description.Input);
-                var requiredSubgroupSize = new PipelineShaderStageRequiredSubgroupSizeCreateInfo
+                var heaps = PipelineLayoutHeaps.For(description.Stage.Bindings);
+                var runtimeHeap = heaps.Runtime;
+                var bindlessHeap = heaps.Bindless;
+                layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, bindlessHeap, runtimeHeap);
+                var computeModule = new ShaderModule(description.Program.Module);
+                if (computeModule.Handle == 0)
                 {
-                    SType = StructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
-                    RequiredSubgroupSize = pin,
-                };
-                var stageInfo = new PipelineShaderStageCreateInfo
-                {
-                    SType = StructureType.PipelineShaderStageCreateInfo,
-                    PNext = pin != 0 ? &requiredSubgroupSize : null,
-                    Stage = ShaderStageFlags.ComputeBit,
-                    Module = computeModule,
-                    PName = entryPoint,
-                };
-                var pipelineInfo = new ComputePipelineCreateInfo
-                {
-                    SType = StructureType.ComputePipelineCreateInfo,
-                    Stage = stageInfo,
-                    Layout = layout,
-                };
-                var reportStart = Stopwatch.GetTimestamp();
-                var cache = GetGuestPipelineCache(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
-                var creationStart = Stopwatch.GetTimestamp();
-                Result creationResult;
-                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ComputePipelineDriver))
-                {
-                    creationResult = _vk.CreateComputePipelines(_device, cache, 1, &pipelineInfo, null, out pipeline);
+                    throw SubmissionScheduler.Fatal($"The compute pipeline has no module: hash=0x{description.Stage.Hash:X16}.");
                 }
-                var creationMilliseconds = Stopwatch.GetElapsedTime(creationStart).TotalMilliseconds;
-                if (RenderPhaseProfile.Enabled)
-                {
-                    Console.Error.WriteLine($"[PERF][PIPELINE_DRIVER] kind=compute compute=0x{description.Stage.Hash:X16} driver_ms={creationMilliseconds:F3} result={creationResult}");
-                }
-                Check(creationResult, $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
-                NotePipelineCompile((long)creationMilliseconds);
-                ReportPipelineCreation(
-                    (long)Stopwatch.GetElapsedTime(reportStart).TotalMilliseconds,
-                    "compute",
-                    $"cs=0x{description.Stage.Hash:X16}",
-                    SpirvBytesOf(computeModule.Handle).ToString());
-                MarkPipelineCacheDirty();
-                Interlocked.Increment(ref _perfPipelineCreations);
-                SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");
-            }
-            finally
-            {
-                SilkMarshal.Free((nint)entryPoint);
-            }
 
-            var entry = new RenderPipelineEntry
+                var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+                try
+                {
+                    var pin = ComputeRequiredSubgroupSize(description.Input);
+                    var requiredSubgroupSize = new PipelineShaderStageRequiredSubgroupSizeCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
+                        RequiredSubgroupSize = pin,
+                    };
+                    var stageInfo = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        PNext = pin != 0 ? &requiredSubgroupSize : null,
+                        Stage = ShaderStageFlags.ComputeBit,
+                        Module = computeModule,
+                        PName = entryPoint,
+                    };
+                    var pipelineInfo = new ComputePipelineCreateInfo
+                    {
+                        SType = StructureType.ComputePipelineCreateInfo,
+                        Stage = stageInfo,
+                        Layout = layout,
+                    };
+                    var reportStart = Stopwatch.GetTimestamp();
+                    var cache = GetGuestPipelineCache(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
+                    var creationStart = Stopwatch.GetTimestamp();
+                    Result creationResult;
+                    using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ComputePipelineDriver))
+                    {
+                        AsyncPipelineProfile.Start();
+                        try { creationResult = _vk.CreateComputePipelines(_device, cache, 1, &pipelineInfo, null, out pipeline); }
+                        finally { AsyncPipelineProfile.Finish(); }
+                    }
+                    AsyncPipelineProfile.Driver(RenderPhaseProfile.Enabled ? creationStart : 0, Thread.CurrentThread == _thread, OnCommandThread);
+                    var creationMilliseconds = Stopwatch.GetElapsedTime(creationStart).TotalMilliseconds;
+                    if (RenderPhaseProfile.Enabled)
+                    {
+                        Console.Error.WriteLine($"[PERF][PIPELINE_DRIVER] kind=compute compute=0x{description.Stage.Hash:X16} driver_ms={creationMilliseconds:F3} result={creationResult}");
+                    }
+                    Check(creationResult, $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
+                    NotePipelineCompile((long)creationMilliseconds);
+                    ReportPipelineCreation(
+                        (long)Stopwatch.GetElapsedTime(reportStart).TotalMilliseconds,
+                        "compute",
+                        $"cs=0x{description.Stage.Hash:X16}",
+                        SpirvBytesOf(computeModule.Handle).ToString());
+                    MarkPipelineCacheDirty();
+                    Interlocked.Increment(ref _perfPipelineCreations);
+                    SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");
+                }
+                finally
+                {
+                    SilkMarshal.Free((nint)entryPoint);
+                }
+
+                entry = new RenderPipelineEntry
+                {
+                    Pipeline = pipeline,
+                    Layout = layout,
+                    SetLayout = setLayout,
+                    Demand = demand,
+                    UsesPushDescriptors = usesPushDescriptors,
+                    UsesBindlessHeap = bindlessHeap,
+                    UsesRuntimeHeap = runtimeHeap,
+                    ProfileComputeHash = description.Stage.Hash,
+                };
+                return RegisterPipeline(entry);
+            }
+            catch
             {
-                Pipeline = pipeline,
-                Layout = layout,
-                SetLayout = setLayout,
-                Demand = demand,
-                UsesPushDescriptors = usesPushDescriptors,
-                UsesBindlessHeap = bindlessHeap,
-                UsesRuntimeHeap = runtimeHeap,
-                ProfileComputeHash = description.Stage.Hash,
-            };
-            return RegisterPipeline(entry);
+                if (entry is null || entry.Id == 0 || !_pipelineEntries.ContainsKey(entry.Id))
+                {
+                    if (pipeline.Handle != 0) _vk.DestroyPipeline(_device, pipeline, null);
+                    if (layout.Handle != 0) _vk.DestroyPipelineLayout(_device, layout, null);
+                    _vk.DestroyDescriptorSetLayout(_device, setLayout, null);
+                }
+                throw;
+            }
         }
 
         // One compute pipeline whose vkCreateComputePipelines call runs on a worker
@@ -1631,8 +1677,11 @@ internal static unsafe partial class VulkanVideoPresenter
         // The compile in flight for each linked guest program (Bindings.CallTargetCount != 0), by program hash.
         private readonly Dictionary<ulong, Task> _linkedComputeCompiles = new();
 
-        public Task? GetComputePipelineCompletion(ShaderProgram program) =>
-            _pendingComputePipelines.TryGetValue(program.Id, out var pending) ? pending.Compile : null;
+        public Task? GetComputePipelineCompletion(ShaderProgram program)
+        {
+            lock (_pendingComputePipelines)
+                return _pendingComputePipelines.TryGetValue(program.Id, out var pending) ? pending.Compile : null;
+        }
         private static readonly SemaphoreSlim _computeCompileSlots =
             new(Math.Max(2, Environment.ProcessorCount / 2));
 
@@ -1648,6 +1697,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryCreateComputePipeline(ComputePipelineDescription description, out PipelineHandle handle)
         {
+            if (!_asyncComputePipelines)
+            {
+                handle = CreateComputePipeline(description);
+                return true;
+            }
             lock (_pendingComputePipelines)
             {
                 return TryCreateComputePipelineCore(description, out handle);
@@ -1656,17 +1710,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool TryCreateComputePipelineCore(ComputePipelineDescription description, out PipelineHandle handle)
         {
-            if (!_asyncComputePipelines)
-            {
-                handle = CreateComputePipeline(description);
-                return true;
-            }
-
             handle = default;
             var key = description.Program.Id;
             if (_pendingComputePipelines.TryGetValue(key, out var pending))
             {
-                if (!pending.Compile.IsCompleted && description.Stage.Bindings is { CallTargetCount: not 0 })
+                if (!pending.Compile.IsCompleted)
                 {
                     return false;
                 }
@@ -1747,7 +1795,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     // so the number in flight is bounded instead of one thread per
                     // program the frame happens to touch.
                     var slotStart = ComputeCompileProfile.Start();
-                    _computeCompileSlots.Wait();
+                    PipelineCompileScheduler.IsWorker = true;
+                    using var sharedPermit = PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Enter() : null;
+                    if (!PipelineCompileScheduler.Enabled) _computeCompileSlots.Wait();
                     ComputeCompileProfile.Record(ComputeCompileProfile.Part.SlotWait, slotStart);
                     var compileStart = Stopwatch.GetTimestamp();
                     try
@@ -1767,7 +1817,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Interlocked.Exchange(
                             ref started.CompileMilliseconds,
                             (long)Stopwatch.GetElapsedTime(compileStart).TotalMilliseconds);
-                        _computeCompileSlots.Release();
+                        if (!PipelineCompileScheduler.Enabled) _computeCompileSlots.Release();
+                        MarkPipelineCacheDirty();
                         started.CompletedTimestamp = ComputeCompileProfile.Start();
                     }
                 },
@@ -1817,10 +1868,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     Layout = layout,
                 };
                 var compileStart = Stopwatch.GetTimestamp();
-                var result = vk.CreateComputePipelines(device, cache, 1, &pipelineInfo, null, out var pipeline);
+                Result result;
+                Pipeline pipeline;
+                AsyncPipelineProfile.Start();
+                try { result = vk.CreateComputePipelines(device, cache, 1, &pipelineInfo, null, out pipeline); }
+                finally { AsyncPipelineProfile.Finish(); }
+                AsyncPipelineProfile.Driver(RenderPhaseProfile.Enabled ? compileStart : 0, false);
                 creationResultObserver?.Invoke(result);
                 if (result != Result.Success)
                 {
+                    if (pipeline.Handle != 0) vk.DestroyPipeline(device, pipeline, null);
                     throw SubmissionScheduler.Fatal($"vkCreateComputePipelines(async) failed: {result}.");
                 }
 

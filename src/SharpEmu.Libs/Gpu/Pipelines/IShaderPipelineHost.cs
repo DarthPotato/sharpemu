@@ -66,6 +66,9 @@ public readonly record struct MeshShaderLimits(
 // The host objects the shader and pipeline caches need: modules, pipelines, limits and guest readers.
 internal interface IShaderPipelineHost
 {
+    PipelineCompileScheduler? PipelineCompiles => null;
+    void RegisterPipelineProducer(Action stop) { }
+
     uint MaxPushDescriptors { get; }
 
     // The host serves shaders that read their image and sampler descriptors at run time

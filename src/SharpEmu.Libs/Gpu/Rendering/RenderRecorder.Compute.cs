@@ -101,6 +101,7 @@ internal sealed partial class RenderRecorder
             PipelineHandle pipeline;
             if (ReferenceEquals(computeProgram, _keptComputeProgram))
             {
+                Pipelines.AsyncPipelineProfile.Ready();
                 pipeline = _keptComputePipeline;
             }
             else

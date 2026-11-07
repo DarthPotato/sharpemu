@@ -986,6 +986,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
     private PipelineHandle ResolvePipeline(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput, PixelInputInfo? pixelInput)
     {
+        if (record.PredictedPipeline is not null && _pipelines is Pipelines.ShaderPipelineCache cache)
+            cache.ValidatePrediction(record, ref state, vertexInput, pixelInput);
         using var movable = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.ExistingPipeline);
         var boundSlots = 0u;
         for (var index = 0; index < state.ColorCount; index++)
@@ -1011,6 +1013,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         var kept = _pipeline;
         if (kept.Valid && kept.Key == key && kept.Rendering.Equals(state.Rendering))
         {
+            Pipelines.AsyncPipelineProfile.Ready();
             return kept.Handle;
         }
 

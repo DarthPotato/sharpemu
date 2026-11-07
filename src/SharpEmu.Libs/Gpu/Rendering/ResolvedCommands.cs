@@ -84,6 +84,7 @@ internal sealed class ResolvedDraw
     public DrawCall Draw;
     public DrawState State = DrawState.Create();
     public PrimitiveTopology Topology;
+    public Pipelines.PipelineCompileScheduler.Request? PredictedPipeline;
     public bool PrimitiveRestart;
     public GuestPrimitiveType PrimitiveType;
     public uint ObjectId;
@@ -127,6 +128,7 @@ internal sealed class ResolvedDraw
         Draw = default;
         State.Begin(-1);
         Topology = default;
+        PredictedPipeline = null;
         PrimitiveRestart = false;
         PrimitiveType = default;
         Emission = default;

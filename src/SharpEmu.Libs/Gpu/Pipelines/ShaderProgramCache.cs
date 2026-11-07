@@ -268,7 +268,25 @@ internal sealed class ShaderProgramCache
 
     private sealed record PendingTranslation(ProgramSourceEntry Entry, ResourceSpecialization Specialization, uint PushDataCursor,
         Task<DeferredTranslation> Translation);
-    private ulong _nextProgramId;
+    private long _nextProgramId;
+    private bool _stoppingBackgroundWork;
+
+    internal void StopBackgroundWork()
+    {
+        Task[] tasks;
+        lock (_callGate)
+        lock (_gate)
+        {
+            _stoppingBackgroundWork = true;
+            tasks = _pendingLinks.Values.Select(p => (Task)p.Link)
+                .Concat(_pendingTranslations.Values.Select(p => (Task)p.Translation)).ToArray();
+        }
+        foreach (var task in tasks)
+        {
+            try { task.GetAwaiter().GetResult(); }
+            catch (Exception exception) { Console.Error.WriteLine($"[GPU][WARN] Shader producer failed during shutdown: {exception.Message}"); }
+        }
+    }
 
     private static List<uint> StaticState => _threadStaticState ??= new List<uint>(StageStaticKey.MaxWords);
 
@@ -351,22 +369,30 @@ internal sealed class ShaderProgramCache
         }
     }
 
-    private readonly Dictionary<(BindingLayout Layout, Gen5TessellationDomain Domain), (ShaderProgram Vertex, ShaderProgram Control)> _tessellationBridges = [];
+    private readonly Dictionary<(BindingLayout Layout, Gen5TessellationDomain Domain), Lazy<(ShaderProgram Vertex, ShaderProgram Control)>> _tessellationBridges = [];
 
     // The fixed-function control stage beside a domain stage, and the vertex stage a tessellated pipeline requires.
     public (ShaderProgram Vertex, ShaderProgram Control) GetTessellationBridge(BindingLayout layout, Gen5TessellationDomain domain)
     {
-        if (_tessellationBridges.TryGetValue((layout, domain), out var bridge)) return bridge;
-        var shaders = _compiler.CompileTessellationBridge(layout, domain);
-        ShaderProgram Create(IGuestCompiledShader shader, ShaderStage stage)
+        Lazy<(ShaderProgram Vertex, ShaderProgram Control)> bridge;
+        lock (_tessellationBridges)
         {
-            var id = ++_nextProgramId;
-            return new(id, _host.CreateShaderModule(shader, stage, 0, id));
+            if (!_tessellationBridges.TryGetValue((layout, domain), out bridge!))
+            {
+                bridge = new Lazy<(ShaderProgram, ShaderProgram)>(() =>
+                {
+                    var shaders = _compiler.CompileTessellationBridge(layout, domain);
+                    ShaderProgram Create(IGuestCompiledShader shader, ShaderStage stage)
+                    {
+                        var id = (ulong)Interlocked.Increment(ref _nextProgramId);
+                        return new(id, _host.CreateShaderModule(shader, stage, 0, id));
+                    }
+                    return (Create(shaders.Vertex, ShaderStage.Vertex), Create(shaders.Control, ShaderStage.TessellationEvaluation));
+                });
+                _tessellationBridges.Add((layout, domain), bridge);
+            }
         }
-
-        bridge = (Create(shaders.Vertex, ShaderStage.Vertex), Create(shaders.Control, ShaderStage.TessellationEvaluation));
-        _tessellationBridges.Add((layout, domain), bridge);
-        return bridge;
+        return bridge.Value;
     }
 
     // The decoded instructions of a program, shared by every static variant of the same code.
@@ -1189,6 +1215,7 @@ internal sealed class ShaderProgramCache
         var (stage, hash, userDataBase, userDataCount) = (source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length);
         var callMarks = runtimeRecords && CalleeTiering;
         var frontend = source.Registered.Frontend;
+        ObjectDisposedException.ThrowIf(_stoppingBackgroundWork, this);
         _pendingLinks.Add(source.Hash, (linkedKey, Task.Run(() =>
             LinkProgram(caller, library, stage, hash, userDataBase, userDataCount, waveSize, null, runtimeRecords, callMarks, frontend))));
         throw new ShaderProgramPendingException();
@@ -1681,6 +1708,7 @@ internal sealed class ShaderProgramCache
         var usesBufferLengths = source.Registered.Frontend?.RequiresExplicitBufferLengths ?? false;
         var tessellationHull = options.TessellationHull;
         var usesTessellationData = options.Tessellation is not null || tessellationHull is not null;
+        ObjectDisposedException.ThrowIf(_stoppingBackgroundWork, this);
         _pendingTranslations[source.Hash] = new(entry, specialization, pushDataCursor, Task.Run(() =>
         {
             var resources = ResourceMaterializer.ApplyTo(plan, specialization);
@@ -1754,7 +1782,7 @@ internal sealed class ShaderProgramCache
         }
         var permutationDump = ShaderPermutationDump.WriteInputs(
             source, key, sourceWasCached, _programs.Keys, entry.Permutations,
-            specialization, request, pushDataCursor, _nextProgramId + 1);
+            specialization, request, pushDataCursor, (ulong)(Volatile.Read(ref _nextProgramId) + 1));
         IGuestCompiledShader? compiled;
         string error;
         bool translated;
@@ -1843,7 +1871,7 @@ internal sealed class ShaderProgramCache
         _compiler.CountShaderCompilation();
         ShaderPermutationDump.WriteModule(permutationDump, compiled.Payload, compiled.PayloadFileExtension);
         CompiledShaderDump.Write(source.Label, source.Address, source.Hash, compiled, program);
-        var id = ++_nextProgramId;
+        var id = (ulong)Interlocked.Increment(ref _nextProgramId);
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
         var info = CreateProgramInfo(source, entry, resources, layout, request, compiled.InputLocationMask);
         if (source.Stage == ShaderStage.Compute && options.TessellationHull is null &&

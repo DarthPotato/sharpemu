@@ -130,6 +130,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _shaderPrewarmThreads[index] = new Thread(() =>
                 {
                     SubmissionScheduler.ThrowOnFatal = true;
+                    Gpu.Pipelines.PipelineCompileScheduler.IsWorker = true;
                     while (!_shaderPrewarmStopping && work.TryDequeue(out var item))
                     {
                         if (item.Graphics is { } pipeline)
@@ -252,6 +253,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var heaps = PipelineLayoutHeaps.For(layout);
                 pipelineLayout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, heaps.Bindless, heaps.Runtime);
                 module = CreateShaderModule(payload);
+                using var compilePermit = Gpu.Pipelines.PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Enter() : null;
                 var pipeline = CompileComputePipeline(_vk, _device, _pipelineCache, module, pipelineLayout,
                     ComputeRequiredSubgroupSize(record.Info), result => nativeResult = result);
                 _vk.DestroyPipeline(_device, pipeline, null);
@@ -431,7 +433,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             _shaderPrewarmFinished = true;
             SetShaderPrewarmState(false);
-            _pipelineCacheDirty = true;
+            lock (_pipelineCacheShards)
+            {
+                _pipelineCacheDirty = true;
+                _pipelineCacheGeneration++;
+            }
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Shader prewarm done: compiled={Volatile.Read(ref _shaderPrewarmCompiled)} " +
                 $"failed={Volatile.Read(ref _shaderPrewarmFailed)} ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} " +
@@ -465,7 +471,7 @@ internal static unsafe partial class VulkanVideoPresenter
             SetShaderPrewarmState(false);
             foreach (var thread in _shaderPrewarmThreads)
             {
-                thread.Join(TimeSpan.FromSeconds(10));
+                Gpu.Pipelines.PipelineCompileScheduler.JoinCompiler(thread, "Prewarm");
             }
 
             _shaderPrewarmThreads = [];
