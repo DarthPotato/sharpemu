@@ -2054,57 +2054,40 @@ internal sealed class ShaderProgramCache
             LocalSizeZ = Math.Max(info.ThreadsZ, 1),
         };
 
+    // Replay uses the runtime planner and request builder, including frontend normalization,
+    // learned device data reads, descriptor mode, and all device compile capabilities.
     internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
-        bool sharedInt64Atomics, bool execGuardElision, bool signedZeroInfNanPreserve, out IGuestCompiledShader? compiled,
-        out BindingLayout? layout, out string error, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
-        bool imageInt64Atomics = false, bool tableBlocks = false, Func<ulong, IShaderFrontend?>? frontendOf = null, bool runtimeImageDescriptorsSupported = false, bool exactFloat16Conversion = false)
+        IShaderPipelineHost runtimeHost, out IGuestCompiledShader? compiled, out BindingLayout? layout, out string error,
+        Func<ulong, IShaderFrontend?>? frontendOf = null)
     {
         compiled = null;
         layout = null;
         try
         {
             IShaderFrontend? frontend = null;
-            Gen5ShaderProgram program;
-            if (code.FrontendDomain != 0)
+            if (code.FrontendDomain != 0 && (frontend = frontendOf?.Invoke(code.FrontendDomain)) is null)
             {
-                frontend = frontendOf?.Invoke(code.FrontendDomain);
-                if (frontend is null)
-                {
-                    error = $"The shader frontend 0x{code.FrontendDomain:X16} is not registered.";
-                    return false;
-                }
-
-                var shader = new RegisteredShader(code.Address, 0, code.CodeSize, 0, 0, 0, 0, 0, 0)
-                {
-                    Frontend = frontend,
-                    FrontendUserData = code.FrontendUserData,
-                };
-                if (!frontend.TryDecode(code.CreateContext(), shader, ShaderStage.Compute, out program, out error))
-                {
-                    return false;
-                }
-            }
-            else if (!Gen5ShaderTranslator.TryDecodeProgram(code.CreateContext(), code.Address, out program, out error))
-            {
+                error = $"The shader frontend 0x{code.FrontendDomain:X16} is not registered.";
                 return false;
             }
 
-            var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, record.Hash, record.UserDataBase, record.UserDataCount,
-                waveSize: record.Info.WaveSize,
-                normalizeBufferDescriptor: frontend?.NormalizeBufferDescriptor,
-                normalizeImageDescriptor: frontend?.NormalizeImageDescriptor,
-                imageNormalizationVersion: frontend?.ImageNormalizationVersion,
-                runtimeDescriptors: runtimeImageDescriptorsSupported
-                    ? (record.RuntimeDescriptors == RuntimeDescriptorMode.Preferred ? RuntimeDescriptorMode.Preferred : RuntimeDescriptorMode.OnDemand)
-                    : RuntimeDescriptorMode.Disabled);
-            var resources = ResourceMaterializer.ApplyTo(plan, record.Specialization);
-            layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
-                record.Info.DispatchThreadDimensions, usesBufferLengths: frontend?.RequiresExplicitBufferLengths ?? false,
-                tableBlocks: tableBlocks);
-            var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
-                sharedInt64Atomics, execGuardElision, signedZeroInfNanPreserve, hostWave64Supported, hostComputeSubgroup32,
-                imageInt64Atomics, exactFloat16: exactFloat16Conversion);
-            return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
+            var registered = new RegisteredShader(code.Address, 0, code.CodeSize, record.Info.ScratchDwords, 0, 0, 0,
+                code.FrontendContinuationOffset == 0 ? 0 : code.Address + code.FrontendContinuationOffset, 0)
+            {
+                Frontend = frontend,
+                FrontendUserData = code.FrontendUserData,
+            };
+            var source = new ShaderSource(registered, record.Hash, new uint[record.UserDataCount], record.UserDataBase, ShaderStage.Compute);
+            IGuestCompiledShader? replayed = null;
+            var host = new ShaderPrewarmHost(runtimeHost, shader => { replayed = shader; return 1; });
+            var programs = new ShaderProgramCache(code.CreateContext(), compiler, host);
+            var (_, program) = programs.CompilePrewarmStage(source,
+                new StageCompileOptions { ComputeInfo = record.Info, ComputeSystemRegisters = record.SystemRegisters },
+                record.Specialization, record.PushDataCursor, record.RuntimeDescriptors);
+            compiled = replayed;
+            layout = program.Bindings;
+            error = "";
+            return compiled is not null && layout is not null;
         }
         catch (Exception exception)
         {

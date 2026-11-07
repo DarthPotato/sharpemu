@@ -377,7 +377,7 @@ internal sealed class ShaderPrewarmList : IDisposable
         }
     }
 
-    public IReadOnlyList<(ComputePrewarmRecord Record, ShaderCodeCapture Code)> LoadedComputes()
+    public IReadOnlyList<(ComputePrewarmRecord Record, ShaderCodeCapture Code)> LoadedComputes(Action<string, string>? missing = null)
     {
         var result = new List<(ComputePrewarmRecord, ShaderCodeCapture)>(_loadedComputes.Count);
         foreach (var record in _loadedComputes)
@@ -386,22 +386,36 @@ internal sealed class ShaderPrewarmList : IDisposable
             {
                 result.Add((record, code));
             }
+            else
+            {
+                missing?.Invoke("code", record.CodeKey.ToString());
+            }
         }
 
         return result;
     }
 
-    public IReadOnlyList<GraphicsPrewarmItem> LoadedGraphics()
+    public IReadOnlyList<GraphicsPrewarmItem> LoadedGraphics(Action<string, string>? missing = null)
     {
         var stages = new Dictionary<ulong, PrewarmStage?>();
         PrewarmStage? Stage(ulong identity)
         {
             if (!stages.TryGetValue(identity, out var stage))
             {
-                stage = _loadedStages.TryGetValue(identity, out var record) &&
-                    _loadedGraphicsCodes.TryGetValue(record.CodeKey, out var code)
-                    ? new PrewarmStage(identity, record, code)
-                    : null;
+                if (!_loadedStages.TryGetValue(identity, out var record))
+                {
+                    missing?.Invoke("stage", $"0x{identity:X16}");
+                    stage = null;
+                }
+                else if (!_loadedGraphicsCodes.TryGetValue(record.CodeKey, out var code))
+                {
+                    missing?.Invoke("code", record.CodeKey.ToString());
+                    stage = null;
+                }
+                else
+                {
+                    stage = new PrewarmStage(identity, record, code);
+                }
                 stages.Add(identity, stage);
             }
 

@@ -33,16 +33,18 @@ public sealed class ShaderPrewarmListTests : IDisposable
     }
 
     private static (IShaderPipelineHost Host, byte[] Spirv) CompileAtRuntime(ShaderPrewarmList list, uint format, bool ieeeMode = false,
-        bool imageInt64Atomics = false)
+        bool imageInt64Atomics = false, bool exactFloat16 = false)
     {
         var guest = new PipelineTestGuest(request =>
         {
             Assert.Equal(ieeeMode, request.IeeeMode);
             Assert.Equal(imageInt64Atomics, request.SupportsImageInt64Atomics);
+            Assert.Equal(exactFloat16, request.ExactFloat16ConversionSupported);
             return Compile(request);
         });
         guest.Host.ShaderPrewarm = list;
         guest.Host.ImageInt64AtomicsEnabled = imageInt64Atomics;
+        guest.Host.ExactFloat16ConversionSupported = exactFloat16;
         guest.RegisterProgram(CodeAddress, HeaderAddress, PipelineTestGuest.FormatLoadProgram);
         var userData = PipelineTestGuest.BufferDescriptor(BufferAddress, 4, 64, format);
         var cursor = 0u;
@@ -55,17 +57,32 @@ public sealed class ShaderPrewarmListTests : IDisposable
 
     private ShaderPrewarmList Open() => ShaderPrewarmList.Open(_directory) ?? throw new InvalidOperationException("The list did not open.");
 
+    [Fact]
+    public void MissingComputeCodeIsReportedInsteadOfSilentlyDiscarded()
+    {
+        using (var list = Open()) CompileAtRuntime(list, BufferDescriptorWords.Format32UInt);
+        using var reloaded = Open();
+        var codes = (System.Collections.IDictionary)typeof(ShaderPrewarmList)
+            .GetField("_loadedCodes", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(reloaded)!;
+        codes.Clear();
+        var missing = new List<string>();
+        Assert.Empty(reloaded.LoadedComputes((kind, key) => missing.Add(kind)));
+        Assert.Equal(1, reloaded.LoadedComputeCount);
+        Assert.Equal("code", Assert.Single(missing));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
     [InlineData(false, true)]
-    public void ARecordedComputeProgramCompilesToTheSameSpirvAfterReload(bool ieeeMode, bool imageInt64Atomics = false)
+    [InlineData(false, false, true)]
+    public void ARecordedComputeProgramCompilesToTheSameSpirvAfterReload(bool ieeeMode, bool imageInt64Atomics = false, bool exactFloat16 = false)
     {
         byte[] runtime;
         IShaderPipelineHost host;
         using (var list = Open())
         {
-            (host, runtime) = CompileAtRuntime(list, BufferDescriptorWords.Format32UInt, ieeeMode, imageInt64Atomics);
+            (host, runtime) = CompileAtRuntime(list, BufferDescriptorWords.Format32UInt, ieeeMode, imageInt64Atomics, exactFloat16);
         }
 
         using var reloaded = Open();
@@ -75,13 +92,12 @@ public sealed class ShaderPrewarmListTests : IDisposable
         {
             Assert.Equal(ieeeMode, request.IeeeMode);
             Assert.Equal(imageInt64Atomics, request.SupportsImageInt64Atomics);
+            Assert.Equal(exactFloat16, request.ExactFloat16ConversionSupported);
             return Compile(request);
         });
         Assert.True(
             ShaderProgramCache.TryCompilePrewarm(
-                record, code, compiler, host.SharedInt64AtomicsEnabled, host.ExecGuardElisionEnabled,
-                host.ShaderSignedZeroInfNanPreserveFloat32Supported, out var compiled, out var layout, out var error,
-                imageInt64Atomics: host.ImageInt64AtomicsEnabled),
+                record, code, compiler, host, out var compiled, out var layout, out var error),
             error);
         Assert.NotNull(layout);
         Assert.False(layout.UsesMeshDrawParameters);

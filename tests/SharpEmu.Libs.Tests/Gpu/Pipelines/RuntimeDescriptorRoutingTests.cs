@@ -3,9 +3,11 @@
 
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.Libs.VideoOut;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
+using SharpEmu.ShaderCompiler.Vulkan;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.Gpu.Pipelines;
@@ -74,6 +76,84 @@ public sealed class RuntimeDescriptorRoutingTests : IDisposable
         var source = _guest.Source(Code, ShaderStage.Pixel, UserData());
         var cursor = 0u;
         return _guest.Programs.TryGetProgram(source, PixelOptions(), strictShaders: false, ref cursor, out _, out stage, out rejection);
+    }
+
+    [Theory]
+    [InlineData(8, false)]
+    [InlineData(8, true)]
+    [InlineData(200, false)]
+    [InlineData(200, true)]
+    public void RecordedPixelStageReplaysWithRuntimeCapabilitiesPlanLayoutAndSpirv(uint materials, bool exactFloat16)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "SharpEmuTests", Guid.NewGuid().ToString("N"));
+        try
+        {
+            _guest.Host.RuntimeImageDescriptorsSupported = true;
+            _guest.Host.ExactFloat16ConversionSupported = exactFloat16;
+            _guest.Host.TableBlocks = true;
+            WriteScene(materials);
+            ShaderCompileRequest runtime;
+            using (var list = ShaderPrewarmList.Open(directory)!)
+            {
+                _guest.Host.ShaderPrewarm = list;
+                _guest.RegisterProgram(Code, Header, CapturedShaders.MaterialTablePixelShader);
+                var cursor = 0u;
+                var pixel = _guest.Programs.GetOrCompile(_guest.Source(Code, ShaderStage.Pixel, UserData()),
+                    PixelOptions(), ref cursor, out var pixelStage);
+                runtime = Assert.Single(_guest.Compiler.Requests);
+                var vertexCode = Code + 0x2000;
+                _guest.RegisterProgram(vertexCode, Header + 0x100, PipelineTestGuest.EndProgram);
+                var vertexInfo = new VertexInputInfo();
+                cursor = 0;
+                var vertex = _guest.Programs.GetOrCompile(_guest.Source(vertexCode, ShaderStage.Vertex, []),
+                    new StageCompileOptions { VertexInfo = vertexInfo }, ref cursor, out var vertexStage);
+                list.RecordGraphics(new GraphicsPipelineDescription
+                {
+                    Rendering = new(), VertexInput = new(), VertexInfo = vertexInfo,
+                    VertexProgram = vertex, VertexStage = vertexStage.Program!,
+                    PixelProgram = pixel, PixelStage = pixelStage.Program!, PixelInfo = PixelOptions().PixelInfo,
+                    StaticParameters = new(),
+                });
+            }
+            using var reloaded = ShaderPrewarmList.Open(directory)!;
+            var recorded = Assert.Single(reloaded.LoadedGraphics()).Pixel!;
+            var record = recorded.Record;
+            var compiler = new FakeShaderCompiler();
+            IShaderPipelineHost host = new ShaderPrewarmHost(_guest.Host, _ => 99);
+            foreach (var property in typeof(IShaderPipelineHost).GetProperties().Where(property => property.Name != nameof(IShaderPipelineHost.ShaderPrewarm)))
+                Assert.Equal(property.GetValue(_guest.Host), property.GetValue(host));
+            Assert.Equal(exactFloat16, host.ExactFloat16ConversionSupported);
+            Assert.True(host.RuntimeImageDescriptorsSupported);
+            var replay = new ShaderProgramCache(recorded.Code.CreateContext(), compiler, host);
+            replay.CompilePrewarmStage(new ShaderSource(record.Registered, record.Hash,
+                new uint[record.UserDataCount], record.UserDataBase, record.Stage), record.Options,
+                record.Specialization, record.PushDataCursor, record.RuntimeDescriptors);
+            var request = Assert.Single(compiler.Requests);
+            Assert.Equal(runtime.Resources.Info.UsesRuntimeDescriptors, request.Resources.Info.UsesRuntimeDescriptors);
+            Assert.Equal(System.Text.Json.JsonSerializer.Serialize(runtime.Resources.Info),
+                System.Text.Json.JsonSerializer.Serialize(request.Resources.Info));
+            Assert.Equal(runtime.Bindings, request.Bindings);
+            var heaps = PipelineLayoutHeaps.For(request.Bindings);
+            Assert.Equal(PipelineLayoutHeaps.For(runtime.Bindings), heaps);
+            Assert.Equal(materials == 200, heaps.Runtime);
+            Assert.Equal(exactFloat16, request.ExactFloat16ConversionSupported);
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(runtime, out var runtimeShader, out var error), error);
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var replayShader, out error), error);
+            Assert.Equal(runtimeShader.Spirv, replayShader.Spirv);
+
+            var fields = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var missing = new List<string>();
+            ((System.Collections.IDictionary)typeof(ShaderPrewarmList).GetField("_loadedGraphicsCodes", fields)!.GetValue(reloaded)!).Clear();
+            Assert.Empty(reloaded.LoadedGraphics((kind, key) => missing.Add(kind)));
+            Assert.Equal(2, missing.Count);
+            Assert.All(missing, kind => Assert.Equal("code", kind));
+            missing.Clear();
+            ((System.Collections.IDictionary)typeof(ShaderPrewarmList).GetField("_loadedStages", fields)!.GetValue(reloaded)!).Clear();
+            Assert.Empty(reloaded.LoadedGraphics((kind, key) => missing.Add(kind)));
+            Assert.Equal(2, missing.Count);
+            Assert.All(missing, kind => Assert.Equal("stage", kind));
+        }
+        finally { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
     }
 
     [Fact]

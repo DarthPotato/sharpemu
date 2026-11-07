@@ -42,6 +42,7 @@ public static class PadExports
     private static readonly bool LogPadState =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PAD_STATE"), "1", StringComparison.Ordinal);
     private static long _loggedPadSignature = -1;
+    private static readonly PadInputScript? InputScript = PadInputScript.FromEnvironment();
 
     private static PadSessionRegistry GetSessions(CpuContext context)
     {
@@ -987,6 +988,7 @@ public static class PadExports
             KeyboardButtons = keyboardButtons,
             ControllerButtons = controllerButtons,
         };
+        if (InputScript is { } script) _cachedInputState = script.Merge(_cachedInputState);
         _lastInputSampleTicks = now;
         return _cachedInputState;
     }

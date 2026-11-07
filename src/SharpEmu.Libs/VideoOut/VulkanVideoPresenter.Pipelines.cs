@@ -89,9 +89,6 @@ internal static unsafe partial class VulkanVideoPresenter
         private RuntimeDescriptorHeap.Limits _runtimeDescriptorLimits;
         internal RuntimeDescriptorHeap? _runtimeDescriptorHeap;
 
-        private static bool UsesRuntimeHeap(ShaderProgramInfo program) =>
-            program.Bindings?.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null;
-
         private void CreateRuntimeDescriptorHeap()
         {
             var heap = new RuntimeDescriptorHeap(_deviceInfo, _scheduler, _runtimeDescriptorLimits);
@@ -939,8 +936,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 program.Bindings ?? throw SubmissionScheduler.Fatal($"The program has no binding layout: hash=0x{program.Hash:X16}."),
                 stage);
 
-        private static bool UsesBindlessHeap(ShaderProgramInfo program) => program.Bindings?.UsesBindlessHeap == true;
-
         private static void CollectLayoutBindings(List<DescriptorSetLayoutBinding> bindings, BindingLayout layout, ShaderStage stage)
         {
             foreach (var binding in layout.Descriptors)
@@ -1057,9 +1052,9 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var runtimeHeap = UsesRuntimeHeap(description.VertexStage) || (description.PixelStage is { } runtimePixel && UsesRuntimeHeap(runtimePixel));
-            var bindlessHeap = UsesBindlessHeap(description.VertexStage) ||
-                (description.PixelStage is { } heapPixelStage && UsesBindlessHeap(heapPixelStage));
+            var heaps = PipelineLayoutHeaps.For(description.VertexStage.Bindings, description.PixelStage?.Bindings);
+            var runtimeHeap = heaps.Runtime;
+            var bindlessHeap = heaps.Bindless;
             var entry = new RenderPipelineEntry
             {
                 SetLayout = setLayout,
@@ -1211,7 +1206,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // One graphics pipeline for dynamic rendering: the attachment formats travel in the create info.
         internal Pipeline CreateRenderPipeline(GraphicsPipelineDescription description, PrimitiveTopology topology, PipelineLayout layout,
-            PolygonMode polygonMode = PolygonMode.Fill, bool expandRectangles = false, bool prewarm = false)
+            PolygonMode polygonMode = PolygonMode.Fill, bool expandRectangles = false, bool prewarm = false,
+            Action<Result>? creationResultObserver = null)
         {
             var parameters = description.StaticParameters;
             var rendering = description.Rendering;
@@ -1488,6 +1484,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         Console.Error.WriteLine($"[PERF][PIPELINE_DRIVER] kind=graphics stage={description.VertexStage.Stage} vertex=0x{description.VertexStage.Hash:X16} pixel=0x{description.PixelStage?.Hash ?? 0:X16} topology={topology} driver_ms={creationMilliseconds:F3} result={creationResult}");
                     }
+                    creationResultObserver?.Invoke(creationResult);
                     Check(creationResult,
                         $"vkCreateGraphicsPipelines(rendering vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16})");
                     NotePipelineCompile((long)creationMilliseconds);
@@ -1529,8 +1526,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var runtimeHeap = UsesRuntimeHeap(description.Stage);
-            var bindlessHeap = UsesBindlessHeap(description.Stage);
+            var heaps = PipelineLayoutHeaps.For(description.Stage.Bindings);
+            var runtimeHeap = heaps.Runtime;
+            var bindlessHeap = heaps.Bindless;
             var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, bindlessHeap, runtimeHeap);
             var computeModule = new ShaderModule(description.Program.Module);
             if (computeModule.Handle == 0)
@@ -1713,8 +1711,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var bindings = new List<DescriptorSetLayoutBinding>();
             CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
-            var runtimeHeap = UsesRuntimeHeap(description.Stage);
-            var bindlessHeap = UsesBindlessHeap(description.Stage);
+            var heaps = PipelineLayoutHeaps.For(description.Stage.Bindings);
+            var runtimeHeap = heaps.Runtime;
+            var bindlessHeap = heaps.Bindless;
             var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, bindlessHeap, runtimeHeap);
             var computeModule = new ShaderModule(description.Program.Module);
             if (computeModule.Handle == 0)
@@ -1792,7 +1791,8 @@ internal static unsafe partial class VulkanVideoPresenter
             PipelineCache cache,
             ShaderModule module,
             PipelineLayout layout,
-            uint requiredSubgroupSize)
+            uint requiredSubgroupSize,
+            Action<Result>? creationResultObserver = null)
         {
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
             try
@@ -1818,6 +1818,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 };
                 var compileStart = Stopwatch.GetTimestamp();
                 var result = vk.CreateComputePipelines(device, cache, 1, &pipelineInfo, null, out var pipeline);
+                creationResultObserver?.Invoke(result);
                 if (result != Result.Success)
                 {
                     throw SubmissionScheduler.Fatal($"vkCreateComputePipelines(async) failed: {result}.");

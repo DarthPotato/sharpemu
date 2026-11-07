@@ -59,9 +59,11 @@ public sealed class PrewarmRuntimeDescriptorTests : IDisposable
     public void ARuntimePlannedProgramIsPrewarmedWithTheSamePlan()
     {
         ShaderCompileRequest runtime;
+        FakePipelineHost host;
         using (var list = ShaderPrewarmList.Open(_directory)!)
         {
             var guest = new PipelineTestGuest { };
+            host = guest.Host;
             guest.Host.RuntimeImageDescriptorsSupported = true;
             guest.Host.ShaderPrewarm = list;
             guest.RegisterProgram(Code, Header, CapturedShaders.MaterialTablePixelShader);
@@ -78,16 +80,19 @@ public sealed class PrewarmRuntimeDescriptorTests : IDisposable
         Assert.NotEqual(RuntimeDescriptorMode.Disabled, record.RuntimeDescriptors);
 
         var withoutHost = new FakeShaderCompiler();
+        host.RuntimeImageDescriptorsSupported = false;
         Assert.False(ShaderProgramCache.TryCompilePrewarm(
-            record, code, withoutHost, false, true, false, out _, out _, out var error));
+            record, code, withoutHost, host, out _, out _, out var error));
         Assert.NotEmpty(error);
 
         var compiler = new FakeShaderCompiler();
+        host.RuntimeImageDescriptorsSupported = true;
         Assert.True(ShaderProgramCache.TryCompilePrewarm(
-            record, code, compiler, false, true, false, out _, out var layout, out error,
-            runtimeImageDescriptorsSupported: true), error);
+            record, code, compiler, host, out _, out var layout, out error), error);
         var prewarm = Assert.Single(compiler.Requests);
         Assert.True(prewarm.Resources.Info.UsesRuntimeDescriptors);
+        Assert.Equal(runtime.Bindings, prewarm.Bindings);
+        Assert.Equal(runtime.Bindings, layout);
         Assert.Equal(runtime.Resources.Info.Images.Count, prewarm.Resources.Info.Images.Count);
         Assert.NotNull(layout!.Find(DescriptorBindingKind.RuntimeDescriptorTable));
     }
