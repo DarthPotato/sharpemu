@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../tools/SharpEmu.Tools.ShaderReplay/SpirvNonce.cs" Link="SpirvNonce.cs" />
+    <Compile Include="../../tools/SharpEmu.Tools.ShaderReplay/SpirvReflection.cs" Link="SpirvReflection.cs" />
+    <Compile Include="../../tools/SharpEmu.Tools.ShaderReplay/ReplayOptions.cs" Link="ReplayOptions.cs" />
+    <PackageReference Include="Silk.NET.Vulkan" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+</Project>

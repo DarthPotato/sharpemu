@@ -1,0 +1,8 @@
+<!-- Copyright (C) 2026 SharpEmu Emulator Project; SPDX-License-Identifier: GPL-2.0-or-later -->
+<Project>
+  <!-- The repository normally launches a task host. Use the same task in-process
+       for standalone builds in sandboxes that cannot launch that host. -->
+  <UsingTask TaskName="SharpEmu.SourceGenerators.GenerateAerolibBinaryTask"
+             AssemblyFile="$(SharpEmuAerolibTaskAssembly)"
+             Override="true" Condition="'$(MSBuildProjectName)' == 'SharpEmu.HLE'" />
+</Project>

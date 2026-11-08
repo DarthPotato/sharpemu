@@ -11,25 +11,46 @@ using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
-if (args.Length != 2)
-    throw new ArgumentException("Usage: ShaderReplay <recording-directory> <output-prefix>");
+if (args.Length > 0 && args[0] == "--semantic-check")
+{
+    SemanticCheck.Run(args);
+    return;
+}
+if (args.Length > 0 && args[0] == "--native-worker")
+{
+    NativeBench.Worker(args);
+    return;
+}
+var options = ReplayOptions.Parse(args);
+if (options.Native)
+{
+    NativeBench.Run(options);
+    return;
+}
+if (options.Positional.Count != 2)
+    throw new ArgumentException("Usage: ShaderReplay <recording-directory> <output-prefix> [--dump-spirv <dir>] [--hash <hex,...>] [--csv <replay.csv> --top N --rank spirv_bytes|translation_ms]\n" +
+        "       ShaderReplay --native-bench <output-prefix> --mode name=dir [--mode name=dir ...] [--hash <hex,...>] [--csv <replay.csv> --top N] [--repeat 2]");
+var manifest = new DumpManifest { Mode = SpirvOptimizationPolicy.CacheIdentity };
+var companions = new HashSet<string>();
 
 // Open is allowed to truncate corrupt tails. Always isolate it from the caller's recordings.
 var scratch = Path.Combine(Path.GetTempPath(), "SharpEmuShaderReplay", Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(scratch);
 foreach (var name in new[] { "shader-prewarm.bin", "shader-prewarm-graphics.bin" })
-    File.Copy(Path.Combine(args[0], name), Path.Combine(scratch, name));
-var linked = Path.Combine(args[0], "vulkan-pipeline-cache.bin.linked", "callees.bin");
+    File.Copy(Path.Combine(options.Positional[0], name), Path.Combine(scratch, name));
+var linked = Path.Combine(options.Positional[0], "vulkan-pipeline-cache.bin.linked", "callees.bin");
 if (File.Exists(linked))
 {
     Directory.CreateDirectory(Path.Combine(scratch, "vulkan-pipeline-cache.bin.linked"));
     File.Copy(linked, Path.Combine(scratch, "vulkan-pipeline-cache.bin.linked", "callees.bin"));
 }
 Environment.SetEnvironmentVariable("SHARPEMU_VK_PIPELINE_CACHE_PATH", Path.Combine(scratch, "vulkan-pipeline-cache.bin"));
-var prefix = Path.GetFullPath(args[1]);
+var prefix = Path.GetFullPath(options.Positional[1]);
 Directory.CreateDirectory(Path.GetDirectoryName(prefix)!);
 var compiler = new CaptureCompiler();
 var host = new Rtx3080Host();
+manifest.TranslatorAssemblySha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(typeof(Gen5SpirvTranslator).Assembly.Location)));
+manifest.HostCapabilities = ShaderPrewarmHost.CapabilityStamp(host);
 var rows = new List<Row>();
 var failures = new List<string>();
 var warmed = new HashSet<ShaderStage>();
@@ -45,6 +66,7 @@ void Measure(string id, uint codeBytes, Action capture)
     {
         capture();
         var request = compiler.Requests.Single();
+        if (!options.Selected(id, request.Hash) && !companions.Contains(id)) return;
         // Untimed stage-specific JIT warmup. Run with DOTNET_TieredCompilation=0 for comparisons.
         if (warmed.Add(request.Stage))
             for (var i = 0; i < 3; i++)
@@ -60,6 +82,7 @@ void Measure(string id, uint codeBytes, Action capture)
         var row = new Row(id, request.Hash, request.Stage, codeBytes, blocks, ms,
             shader.Spirv.Length, Convert.ToHexString(SHA256.HashData(shader.Spirv)), allocated);
         rows.Add(row);
+        if (options.Dump is { } dump) SpirvDump.Add(manifest, dump, id, request, shader.Spirv);
         csv.WriteLine(row.Csv());
         csv.Flush();
         if (rows.Count % 100 == 0)
@@ -79,9 +102,22 @@ var computes = list.LoadedComputes((kind, key) => failures.Add($"Missing {kind}:
 var graphics = list.LoadedGraphics((kind, key) => failures.Add($"Missing {kind}: {key}"));
 if (computes.Count == 0 && graphics.Count == 0)
     throw new InvalidDataException("No compatible recordings. Prewarm fingerprints include assembly versions; build replay with the recording's Version property.");
+// A graphics benchmark must retain both stages of the recorded pipeline, even
+// when selection names only one of them. Translation of companions stays offline.
+foreach (var item in graphics)
+{
+    var vertex = $"graphics-{item.Vertex.Identity:X16}";
+    var pixel = item.Pixel is { } ps ? $"graphics-{ps.Identity:X16}" : null;
+    if (!options.Selected(vertex, item.Vertex.Record.Hash) &&
+        !(item.Pixel is { } p && options.Selected(pixel!, p.Record.Hash))) continue;
+    companions.Add(vertex);
+    if (pixel is not null) companions.Add(pixel);
+    manifest.Graphics.Add(new($"pair-{item.Vertex.Identity:X16}-{item.Pixel?.Identity ?? 0:X16}", vertex, pixel));
+}
 for (var i = 0; i < computes.Count; i++)
 {
     var (record, code) = computes[i];
+    if (!options.Selected($"compute-{i:D5}", record.Hash)) continue;
     Measure($"compute-{i:D5}", code.CodeSize, () =>
     {
         if (!ShaderProgramCache.TryCompilePrewarm(record, code, compiler, host, out _, out _, out var error))
@@ -91,6 +127,8 @@ for (var i = 0; i < computes.Count; i++)
 foreach (var stage in graphics.SelectMany(item => item.Pixel is { } pixel
              ? new[] { item.Vertex, pixel } : new[] { item.Vertex }).DistinctBy(stage => stage.Identity))
 {
+    var stageId = $"graphics-{stage.Identity:X16}";
+    if (!options.Selected(stageId, stage.Record.Hash) && !companions.Contains(stageId)) continue;
     Measure($"graphics-{stage.Identity:X16}", stage.Code.CodeSize, () =>
     {
         var record = stage.Record;
@@ -102,6 +140,12 @@ foreach (var stage in graphics.SelectMany(item => item.Pixel is { } pixel
 }
 
 var ordered = rows.OrderBy(row => row.Ms).ToArray();
+if (options.Dump is { } dumpDirectory)
+{
+    Directory.CreateDirectory(dumpDirectory);
+    SpirvDump.Save(manifest, dumpDirectory);
+}
+if (rows.Count == 0) throw new InvalidDataException("No stages matched the selection");
 ShaderTranslationProfile.Report();
 using var summary = new StreamWriter(prefix + ".md");
 void Write(string value) { summary.WriteLine(value); Console.WriteLine(value); }
