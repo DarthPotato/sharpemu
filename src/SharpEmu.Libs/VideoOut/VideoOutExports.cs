@@ -1699,7 +1699,10 @@ public static partial class VideoOutExports
             $"[LOADER][PERF] videoout submitted_fps={submitted / elapsedSeconds:F1} " +
             $"presented_fps={presentedCount / elapsedSeconds:F1} " +
             $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles} " +
-            $"pool_leases={poolLeases} pool_cached_mb={poolCachedBytes / 1024.0 / 1024.0:F1} {TakeFrameTimes()}{TakeRelaxedWaits()}");
+            $"pool_leases={poolLeases} pool_cached_mb={poolCachedBytes / 1024.0 / 1024.0:F1} {TakeFrameTimes()}{TakeRelaxedWaits()}" +
+            (SharpEmu.HLE.Diagnostics.AbToggle.Enabled
+                ? FormattableString.Invariant($" ab={(SharpEmu.HLE.Diagnostics.AbToggle.On ? 1 : 0)} submitted={submitted} elapsed_ms={elapsedSeconds * 1000:F1}")
+                : ""));
     }
 
     private static readonly List<long> _presentIntervals = new();

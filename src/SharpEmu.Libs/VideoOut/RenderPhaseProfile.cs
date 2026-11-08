@@ -427,19 +427,26 @@ internal static partial class RenderPhaseProfile
         private readonly long _relayStarted;
         private readonly bool _active;
         private readonly FrameTimeline.PhaseScope _timeline;
+        private readonly SampleSlot? _sampled;
 
-        internal Scope(Phase previous, FrameTimeline.PhaseScope timeline = default, bool active = true, bool relay = false)
+        internal Scope(Phase previous, FrameTimeline.PhaseScope timeline = default, bool active = true, bool relay = false, SampleSlot? sampled = null)
         {
             _previous = previous;
             _relay = relay;
             _relayStarted = relay && _relayDepth++ == 0 ? Stopwatch.GetTimestamp() : 0;
             _active = active;
             _timeline = timeline;
+            _sampled = sampled;
         }
 
         public void Dispose()
         {
             _timeline.Dispose();
+            if (_sampled is not null)
+            {
+                _sampled.Phase = (int)_previous;
+            }
+
             if (_relay && --_relayDepth == 0)
                 _relayElapsedTicks += Stopwatch.GetTimestamp() - _relayStarted;
             if (!_active)
@@ -454,6 +461,11 @@ internal static partial class RenderPhaseProfile
         // Switch sequential work in this scope. Nested scopes must finish first.
         public void SwitchPhase(Phase phase)
         {
+            if (_sampled is not null)
+            {
+                _sampled.Phase = (int)phase;
+            }
+
             if (!_active)
             {
                 return;
@@ -476,7 +488,7 @@ internal static partial class RenderPhaseProfile
         var timeline = FrameTimeline.Enabled ? FrameTimeline.MeasurePhase(phase) : default;
         if (!Enabled)
         {
-            return new Scope(default, timeline, active: false);
+            return SampleEnabled && _sampleSlot is { } slot ? EnterSampled(slot, phase, timeline) : new Scope(default, timeline, active: false);
         }
 
         var previous = Charge(phase);
@@ -497,6 +509,7 @@ internal static partial class RenderPhaseProfile
     // Check the switch first to avoid thread-local storage allocation when profiling is disabled.
     internal static Scope MeasureDetail(Phase phase) =>
         Enabled && _scopeDepth > 0 ? Measure(phase) :
+        SampleEnabled && _sampleSlot is { } slot ? EnterSampled(slot, phase, FrameTimeline.Enabled ? FrameTimeline.MeasurePhase(phase) : default) :
         FrameTimeline.Enabled ? new Scope(default, FrameTimeline.MeasurePhase(phase), active: false) : default;
 
     internal static bool DetailMeasurementsEnabled => Enabled && _scopeDepth > 0;
@@ -539,6 +552,11 @@ internal static partial class RenderPhaseProfile
     /// <summary>Called once per presented frame; also drives the report.</summary>
     public static void RecordFrame()
     {
+        if (SampleEnabled)
+        {
+            RecordSampledFrame();
+        }
+
         if (!Enabled)
         {
             return;

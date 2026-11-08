@@ -413,6 +413,7 @@ internal static unsafe partial class VulkanVideoPresenter
     private static void Run()
     {
         SharpEmu.HLE.Host.HostLaneReservation.ApplyToRenderThread();
+        RenderPhaseProfile.AttachSampledThread(RenderPhaseProfile.SampledThread.Render);
         // The render thread executes stream items: its guest writes are stores for the prefetch.
         SharpEmu.HLE.GuestMemory.StreamStoreHook.MarkStreamThread();
         uint width;

@@ -1200,6 +1200,7 @@ internal static partial class VulkanVideoPresenter
         {
             SharpEmu.HLE.Host.HostLaneReservation.ApplyToFrontEndThread();
             RenderPhaseProfile.AttachResolveWorker();
+            RenderPhaseProfile.AttachSampledThread(RenderPhaseProfile.SampledThread.Command);
             try
             {
                 var lastProgress = Stopwatch.GetTimestamp();
