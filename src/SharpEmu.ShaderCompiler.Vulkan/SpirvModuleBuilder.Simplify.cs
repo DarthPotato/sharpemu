@@ -21,7 +21,7 @@ public sealed partial class SpirvModuleBuilder
     private uint[] _entryFunctions = new uint[256];
     private Definition[] _definitions = new Definition[256];
     private uint[] _variableOwners = new uint[256];
-    private readonly SharedExpressions _blockValues = new();
+    private readonly SharedExpressions _blockValues = new() { SharingEnabled = SpirvOptimizationPolicy.Inherit };
     private readonly HashSet<uint> _localVariables = [];
     private readonly HashSet<uint> _escapedVariables = [];
     private readonly Dictionary<uint, uint> _elementBases = [];
@@ -110,8 +110,15 @@ public sealed partial class SpirvModuleBuilder
 
     public bool Optimize { get; init; } = SpirvOptimizationPolicy.Enabled;
     public bool OptimizeExpressions { get; init; } = true;
+    public bool ForwardRegisters { get; init; } = SpirvOptimizationPolicy.Forward;
+    public bool ElideStores { get; init; } = SpirvOptimizationPolicy.StoreElision;
+    public bool RemoveUnread { get; init; } = SpirvOptimizationPolicy.Unread;
+    public bool RemoveDeadCode { get; init; } = SpirvOptimizationPolicy.Dce;
+    public bool FoldLaneMasks { get; init; } = SpirvOptimizationPolicy.LaneMask;
+    public bool HoistEntry { get; init; } = SpirvOptimizationPolicy.Hoist;
+    public bool FoldExpressions { get; init; } = SpirvOptimizationPolicy.Expressions;
 
-    private bool _inheritBlockState = true;
+    private bool _inheritBlockState = SpirvOptimizationPolicy.Inherit;
     public bool InheritBlockState
     {
         get => _inheritBlockState;
@@ -143,8 +150,8 @@ public sealed partial class SpirvModuleBuilder
         }
 
         NoteVariableUses(operands);
-        if (TryFold(opcode, resultType, operands, out var folded) ||
-            (OptimizeExpressions && TrySimplify(opcode, resultType, operands, out folded)))
+        if (FoldExpressions && (TryFold(opcode, resultType, operands, out var folded) ||
+            (OptimizeExpressions && TrySimplify(opcode, resultType, operands, out folded))))
         {
             return folded;
         }
@@ -160,7 +167,7 @@ public sealed partial class SpirvModuleBuilder
             return effect;
         }
 
-        if (ReusesValues && CanHoistToEntry(opcode, operands))
+        if (HoistEntry && FoldExpressions && ReusesValues && CanHoistToEntry(opcode, operands))
         {
             return EntryOperation(opcode, resultType, operands);
         }
@@ -168,7 +175,7 @@ public sealed partial class SpirvModuleBuilder
         if (!OptimizeExpressions) return EmitResult(_functions, opcode, resultType, operands);
 
         var lookup = new InstructionKey(opcode, resultType, operands);
-        if (ReusesValues && _blockValues.TryGetValue(lookup, out var existing))
+        if (FoldExpressions && ReusesValues && _blockValues.TryGetValue(lookup, out var existing))
         {
             return existing;
         }
@@ -263,7 +270,7 @@ public sealed partial class SpirvModuleBuilder
     private uint AddLoad(uint resultType, uint[] operands)
     {
         var pointer = operands[0];
-        if (operands.Length == 1 && _inputVariables.Contains(pointer) && !_changingInputs.Contains(pointer) &&
+        if (HoistEntry && operands.Length == 1 && _inputVariables.Contains(pointer) && !_changingInputs.Contains(pointer) &&
             IsEntryAvailable())
         {
             return EntryLoad(resultType, pointer);
@@ -280,7 +287,7 @@ public sealed partial class SpirvModuleBuilder
         // An element read observes a pending whole-variable store as well.
         if (_elementBases.TryGetValue(pointer, out var owner)) RemovePendingStore(owner);
 
-        if (_variableValues.TryGetValue(pointer, out var known) && TypeOf(known) == resultType)
+        if (ForwardRegisters && _variableValues.TryGetValue(pointer, out var known) && TypeOf(known) == resultType)
         {
             if (_inheritedPointers.Contains(pointer))
             {
@@ -330,12 +337,12 @@ public sealed partial class SpirvModuleBuilder
         }
 
         var value = operands[1];
-        if (_variableValues.TryGetValue(pointer, out var current) && current == value)
+        if (ElideStores && _variableValues.TryGetValue(pointer, out var current) && current == value)
         {
             return;
         }
 
-        if (_pendingStores.TryGetValue(pointer, out var previous))
+        if (ElideStores && _pendingStores.TryGetValue(pointer, out var previous))
         {
             _removedInstructions.Add(previous);
         }
@@ -749,7 +756,7 @@ public sealed partial class SpirvModuleBuilder
                 return TrySimplifyBitcast(resultType, operands[0], out result);
             case SpirvOp.UConvert when operands.Length == 1:
                 return TrySimplifyUConvert(resultType, operands[0], out result);
-            case SpirvOp.ShiftRightLogical when operands.Length == 2 && IsUnsignedInteger(resultType, 64) &&
+            case SpirvOp.ShiftRightLogical when FoldLaneMasks && operands.Length == 2 && IsUnsignedInteger(resultType, 64) &&
                 IsIntegerConstant(operands[1], out var amount) && amount == 32 &&
                 _integerTypes.TryGetValue((32, false), out var word) &&
                 TrySplitHighWord(operands[0], word, 0, out var high):
@@ -898,14 +905,14 @@ public sealed partial class SpirvModuleBuilder
             return true;
         }
 
-        if (Defines(tested, SpirvOp.BitwiseAnd, out var masked) &&
+        if (FoldLaneMasks && Defines(tested, SpirvOp.BitwiseAnd, out var masked) &&
             TryOwnLaneBallotTest(masked.Operands[0], masked.Operands[1], out var ownLane))
         {
             result = notEqual ? ownLane : AddInstruction(SpirvOp.LogicalNot, resultType, ownLane);
             return true;
         }
 
-        if (IntegerWidth(TypeOf(tested)) == 64 && _integerTypes.TryGetValue((32, false), out var word) &&
+        if (FoldLaneMasks && IntegerWidth(TypeOf(tested)) == 64 && _integerTypes.TryGetValue((32, false), out var word) &&
             TrySplitHighWord(tested, word, 0, out var high) && IsIntegerConstant(high, out var highValue) &&
             highValue == 0 && TrySplitLowWord(tested, word, 0, out var low))
         {
@@ -1071,7 +1078,7 @@ public sealed partial class SpirvModuleBuilder
             return true;
         }
 
-        if (width == 32 && sourceWidth == 64 && TrySplitLowWord(value, resultType, 0, out var low))
+        if (FoldLaneMasks && width == 32 && sourceWidth == 64 && TrySplitLowWord(value, resultType, 0, out var low))
         {
             result = low;
             return true;
@@ -1223,7 +1230,7 @@ public sealed partial class SpirvModuleBuilder
 
     private HashSet<uint> FindUnreadVariables(out HashSet<uint> unreadPointers)
     {
-        if (KeepsUnreadVariables)
+        if (KeepsUnreadVariables || !RemoveUnread)
         {
             unreadPointers = [];
             return [];
@@ -1389,7 +1396,7 @@ public sealed partial class SpirvModuleBuilder
         // Preserve the original instruction/definer order when seeding the stack.
         foreach (var id in definedIds)
         {
-            if (uses[id] == 0)
+            if (RemoveDeadCode && uses[id] == 0)
             {
                 pending.Push(definers[id] - 1);
             }

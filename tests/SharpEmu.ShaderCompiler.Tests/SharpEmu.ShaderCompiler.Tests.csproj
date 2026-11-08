@@ -10,6 +10,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="../../tools/SharpEmu.Tools.ShaderReplay/SpirvCpu.cs" Link="Replay/SpirvCpu.cs" />
+    <Compile Include="../../tools/SharpEmu.Tools.ShaderReplay/SpirvNonce.cs" Link="Replay/SpirvNonce.cs" />
     <ProjectReference Include="..\..\src\SharpEmu.ShaderCompiler\SharpEmu.ShaderCompiler.csproj" />
     <ProjectReference Include="..\..\src\SharpEmu.ShaderCompiler.Vulkan\SharpEmu.ShaderCompiler.Vulkan.csproj" />
   </ItemGroup>
