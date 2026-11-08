@@ -208,7 +208,8 @@ public sealed class CommandStreamQueue
         submission.AdmissionOrdinal = ++_admissionOrdinal;
         if (FrameTimeline.Enabled && submission.Kind is CommandSubmissionKind.Graphics or CommandSubmissionKind.Compute)
             FrameTimeline.Note(FrameTimelineAccumulator.Event.Admission);
-        submission.AcceptedAt = Diagnostics.LabelLatencyProfile.Start();
+        submission.AcceptedAt = Diagnostics.SyncChainTrace.Enabled
+            ? System.Diagnostics.Stopwatch.GetTimestamp() : Diagnostics.LabelLatencyProfile.Start();
         _queues[submission.QueueId].AddLast(submission);
         _submissionCount++;
         if (submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
@@ -579,6 +580,7 @@ public sealed class CommandStreamQueue
         if (firstSlice)
         {
             submission.Started = true;
+            Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.Admit, submission.AcceptedAt, null, submission.QueueId);
             Diagnostics.LabelLatencyProfile.Record(submission.QueueId == 0
                 ? Diagnostics.LabelLatencyProfile.Path.AdmitGraphics
                 : Diagnostics.LabelLatencyProfile.Path.AdmitCompute, submission.AcceptedAt);
@@ -591,8 +593,10 @@ public sealed class CommandStreamQueue
         SlicesRun++;
         _host.BeginSubmission(submission.QueueId, submission.SubmissionId, submission.GeometrySnapshots);
         processor.ConstantEngineComplete = true;
+        var sliceTrace = Diagnostics.SyncChainTrace.Begin();
         var complete = processor.Process(submission.Commands, submission.Address, submission.DwordCount,
             submission.CommandBytes, submission.RegisterTables) == SubmissionProgress.Complete;
+        Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.Slice, sliceTrace, complete ? "complete" : "suspended", submission.QueueId);
         submission.CommandsComplete = complete;
         if (submission.Commands.MadeProgress)
         {

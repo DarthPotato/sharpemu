@@ -195,10 +195,13 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
                 PValues = &signalValue,
             };
             var waitStart = VideoOut.GpuWaitSiteProfile.Begin();
+            var traceStart = Diagnostics.SyncChainTrace.Begin();
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.GpuCompletionWait))
             {
                 Require(vk.WaitSemaphores(_device.Device, &waitInfo, ulong.MaxValue), "vkWaitSemaphores(readback)");
             }
+
+            Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.GpuWait, traceStart, "readback");
 
             VideoOut.GpuWaitSiteProfile.End(waitStart);
         }

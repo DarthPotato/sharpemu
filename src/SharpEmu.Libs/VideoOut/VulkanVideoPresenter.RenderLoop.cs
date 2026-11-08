@@ -90,8 +90,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.WaitStarted,
                         detail: waitMilliseconds);
                     bool signaled;
+                    var idleTrace = Diagnostics.SyncChainTrace.Begin();
                     using (FrameTimeline.Measure(FrameTimelineAccumulator.Metric.Idle))
                         signaled = System.Threading.Monitor.Wait(_gate, waitMilliseconds);
+                    Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.RenderIdle, idleTrace, waitPhase.ToString());
                     // The result describes the monitor wait, not the arrival of runnable guest work.
                     SubmissionFlowProfile.Record(signaled ? SubmissionFlowProfile.EventKind.WaitSignaled
                         : SubmissionFlowProfile.EventKind.WaitTimedOut, detail: (int)waitPhase);
@@ -505,6 +507,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (FrameTimeline.Enabled) FrameTimeline.Note(FrameTimelineAccumulator.Event.HostPresent);
             PerfOverlay.RecordPresent();
             RenderPhaseProfile.RecordFrame();
+            Diagnostics.SyncChainTrace.NoteFlip();
             if (_swapchainReadbackPending)
             {
                 // Diagnostics read back GPU memory and need this frame done.

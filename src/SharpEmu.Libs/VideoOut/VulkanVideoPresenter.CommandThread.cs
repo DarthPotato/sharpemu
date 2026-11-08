@@ -148,6 +148,8 @@ internal static partial class VulkanVideoPresenter
 
         public bool IsProducerThread => Environment.CurrentManagedThreadId == _thread.ManagedThreadId;
 
+        public int ProcessingQueueIdForTrace => _queue.ProcessingQueueId;
+
         public bool HasWork => Volatile.Read(ref _outstanding) != 0 || _failure is not null;
 
         public long NextSequence => Volatile.Read(ref _enqueued) + 1;
@@ -219,6 +221,7 @@ internal static partial class VulkanVideoPresenter
         {
             var started = Stopwatch.GetTimestamp();
             var context = Diagnostics.CommandThreadTally.Enabled ? QueueContext() : null;
+            var traceStart = Diagnostics.SyncChainTrace.Begin();
             var item = new Item { Kind = Kind.Call, Action = action, Sync = true, DirectSubtype = 3 };
             Enqueue(item);
             var previous = _producerState;
@@ -229,6 +232,7 @@ internal static partial class VulkanVideoPresenter
             }
 
             _producerState = previous;
+            Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.RoundTrip, traceStart, caller, _queue.ProcessingQueueId);
             var elapsed = Stopwatch.GetTimestamp() - started;
             Diagnostics.PacketHandlerTally.WaitedTicks += elapsed;
             Presenter.NoteRoundTrip(caller, elapsed);
@@ -612,6 +616,8 @@ internal static partial class VulkanVideoPresenter
 
             var started = Diagnostics.CommandThreadTally.Enabled ? Stopwatch.GetTimestamp() : 0;
             var context = started != 0 ? QueueContext() : null;
+            var traceStart = Diagnostics.SyncChainTrace.Begin();
+            var traceGap = traceStart != 0 ? sequence - Volatile.Read(ref _executed) : 0;
             using var waitPhase = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProducerPendingWait);
             var spinner = new SpinWait();
             for (var spin = 0; spin < 100 && Volatile.Read(ref _executed) < sequence; spin++)
@@ -639,6 +645,7 @@ internal static partial class VulkanVideoPresenter
                 }
             }
 
+            Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.PendingWait, traceStart, null, _queue.ProcessingQueueId, traceGap);
             if (started != 0)
             {
                 var waited = Stopwatch.GetTimestamp() - started;
@@ -1229,10 +1236,13 @@ internal static partial class VulkanVideoPresenter
                     {
                         case SliceResult.NoWork:
                             _producerState = ProducerIdle;
+                            var idleTrace = Diagnostics.SyncChainTrace.Begin();
                             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProducerIdle))
                             {
                                 _ = _queue.WaitForWork(8);
                             }
+
+                            Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.ProducerIdle, idleTrace, "no_work");
 
                             if (tally)
                             {
@@ -1277,6 +1287,19 @@ internal static partial class VulkanVideoPresenter
         // Blocked heads retry when a GPU completion or a presentation unblocks them, or every
         // retry interval without progress.
         private void WaitBlocked(ref long lastProgress)
+        {
+            var traceStart = Diagnostics.SyncChainTrace.Begin();
+            try
+            {
+                WaitBlockedCore(ref lastProgress);
+            }
+            finally
+            {
+                Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.ProducerIdle, traceStart, "blocked");
+            }
+        }
+
+        private void WaitBlockedCore(ref long lastProgress)
         {
             using var idle = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProducerIdle);
             if (_queue.HasUnresolvedSpeculation)

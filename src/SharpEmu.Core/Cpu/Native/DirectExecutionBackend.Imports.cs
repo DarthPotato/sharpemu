@@ -56,6 +56,16 @@ public sealed partial class DirectExecutionBackend
 				return 18446744071562199042uL;
 			}
 
+			if (SharpEmu.Libs.Diagnostics.SyncChainTrace.Recording)
+			{
+				var traceStart = System.Diagnostics.Stopwatch.GetTimestamp();
+				var traced = directExecutionBackend.DispatchImport(importIndex, argPackPtr);
+				SharpEmu.Libs.Diagnostics.SyncChainTrace.NoteImport(traceStart, directExecutionBackend.ActiveImportName(importIndex));
+				directExecutionBackend.ClearActiveImportIndex();
+				CompleteImportContextTransfer(transferStubAddress);
+				return traced;
+			}
+
 			if (_perfHleHistogram)
 			{
 				var startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -864,6 +874,7 @@ public sealed partial class DirectExecutionBackend
 					out var blockDeadlineTimestamp) &&
 				TryYieldGuestThreadToHostStub(argPackPtr, num, num7, importStubEntry.Nid, blockReason))
 			{
+				SharpEmu.Libs.Diagnostics.SyncChainTrace.NotePark(cpuContext, importStubEntry.Export?.Name ?? blockReason, blockWakeKey);
 				if (hasBlockContinuation)
 				{
 					RegisterBlockedGuestThreadContinuation(
@@ -1500,6 +1511,11 @@ public sealed partial class DirectExecutionBackend
 	/// CpuContext register marshalling, import-call frames, and vector return
 	/// stores when guest memory can satisfy the copy directly.
 	/// </summary>
+	private string ActiveImportName(int importIndex) =>
+		(uint)importIndex < (uint)_importEntries.Length
+			? _importEntries[importIndex].Export?.Name ?? _importEntries[importIndex].Nid
+			: "unknown";
+
 	private unsafe bool TryDispatchHotMemoryLeaf(
 		CpuContext cpuContext,
 		ImportStubEntry importStubEntry,

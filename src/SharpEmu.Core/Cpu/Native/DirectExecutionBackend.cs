@@ -6548,6 +6548,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out string? reason)
 	{
 		reason = null;
+		SharpEmu.Libs.Diagnostics.SyncChainTrace.NoteResume(context);
 		if (context[CpuRegister.Rsp] == 0)
 		{
 			reason = "guest thread stack pointer is zero";

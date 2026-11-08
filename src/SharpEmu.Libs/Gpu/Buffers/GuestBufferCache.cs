@@ -204,6 +204,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // A CPU write fault: true when the range is tracked and any GPU data reached guest memory.
     bool IGuestBufferStore.MarkCpuWrite(ulong address, ulong size)
     {
+        if (Diagnostics.SyncChainTrace.Enabled) Diagnostics.SyncChainTrace.FaultAddress = address | 1;
         _sharedPages.NoteCpuWrite(address, size);
         var tracked = _tracker.InvalidateRegion(address, size, out var needsGpuFlush);
         var completed = !needsGpuFlush || ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
@@ -269,6 +270,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // A CPU read fault: GPU-dirty pages download through the worker first.
     public bool DownloadToCpu(ulong address, ulong size)
     {
+        if (Diagnostics.SyncChainTrace.Enabled) Diagnostics.SyncChainTrace.FaultAddress = address & ~1ul;
         var tracked = _tracker.HasRegion(address, size);
         var dirty = tracked && _tracker.HasGpuDirtyPages(address, size);
         var completed = tracked && (!dirty || ReadMemoryOrAwaitShutdown(address, size, isWrite: false,

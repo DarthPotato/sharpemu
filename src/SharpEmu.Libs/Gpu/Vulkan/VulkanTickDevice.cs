@@ -153,10 +153,13 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         };
         Result result;
         var waitStart = GpuWaitSiteProfile.Begin();
+        var traceStart = Diagnostics.SyncChainTrace.Begin();
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
             result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
         }
+
+        Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.GpuWait, traceStart, "tick");
 
         GpuWaitSiteProfile.End(waitStart);
         failure = result.ToString();

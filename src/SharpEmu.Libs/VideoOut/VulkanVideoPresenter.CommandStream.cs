@@ -549,6 +549,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             var buffer = new byte[destination.Length];
+            var traceStart = Diagnostics.SyncChainTrace.Begin();
             long lambdaStart = 0, lambdaEnd = 0;
             var read = _commandThread!.Run(() =>
             {
@@ -558,6 +559,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 return result;
             });
             buffer.CopyTo(destination);
+            if (traceStart != 0)
+                Diagnostics.SyncChainTrace.Note(Diagnostics.SyncChainTrace.Kind.Read, traceStart,
+                    FormattableString.Invariant($"{source}{(publication ? "/publication" : "")} addr=0x{address:X} size={destination.Length} queued_ms={(lambdaStart - started) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F2} site={ReadSite()}"),
+                    _commandThread.ProcessingQueueIdForTrace);
             var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - started;
             if (RenderPhaseProfile.Enabled && lambdaStart != 0)
                 RoundTripSplit.Note(lambdaStart - started, lambdaEnd - lambdaStart, System.Diagnostics.Stopwatch.GetTimestamp() - lambdaEnd);

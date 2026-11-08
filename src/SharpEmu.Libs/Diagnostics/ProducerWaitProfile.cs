@@ -36,8 +36,10 @@ internal static class ProducerWaitProfile
         public Scope(string purpose) { _previous = _purpose; _purpose = purpose; }
         public void Dispose() => _purpose = _previous;
     }
-    public static Scope Begin(string purpose) => new(CommandThreadTally.Enabled || TraceReads ? purpose : _purpose ?? "other");
-    public static Scope Packet(uint opcode, uint header) => Begin(CommandThreadTally.Enabled || TraceReads ? PacketHandlerTally.Purpose(opcode, header) : "other");
+    public static string? CurrentPurpose => _purpose;
+    private static readonly bool KeepPurpose = CommandThreadTally.Enabled || TraceReads || SyncChainTrace.Enabled;
+    public static Scope Begin(string purpose) => new(KeepPurpose ? purpose : _purpose ?? "other");
+    public static Scope Packet(uint opcode, uint header) => Begin(KeepPurpose ? PacketHandlerTally.Purpose(opcode, header) : "other");
     public static void Note(string kind, long ticks, string caller = "")
     {
         if (!CommandThreadTally.Enabled) return;
