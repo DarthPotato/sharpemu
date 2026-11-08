@@ -218,6 +218,7 @@ internal static partial class VulkanVideoPresenter
         public void Run(Action action, [CallerMemberName] string caller = "")
         {
             var started = Stopwatch.GetTimestamp();
+            var context = Diagnostics.CommandThreadTally.Enabled ? QueueContext() : null;
             var item = new Item { Kind = Kind.Call, Action = action, Sync = true, DirectSubtype = 3 };
             Enqueue(item);
             var previous = _producerState;
@@ -228,6 +229,15 @@ internal static partial class VulkanVideoPresenter
             Diagnostics.PacketHandlerTally.WaitedTicks += elapsed;
             Presenter.NoteRoundTrip(caller, elapsed);
             Diagnostics.ProducerWaitProfile.Note("run", elapsed, caller);
+            if (context is not null) Diagnostics.ProducerWaitProfile.Note("run_ctx", elapsed, context);
+        }
+
+        // Diagnostic: the queue the producer waits in, and whether another queue could have run meanwhile.
+        private string QueueContext()
+        {
+            var current = _queue.ProcessingQueueId;
+            var others = _queue.RunnableOtherQueueCount();
+            return (current == 0 ? "gfx" : current > 0 ? "acq" : "none") + (others > 0 ? "_others" : "_alone");
         }
 
         public T Run<T>(Func<T> function, [CallerMemberName] string caller = "")
@@ -597,6 +607,7 @@ internal static partial class VulkanVideoPresenter
             }
 
             var started = Diagnostics.CommandThreadTally.Enabled ? Stopwatch.GetTimestamp() : 0;
+            var context = started != 0 ? QueueContext() : null;
             var spinner = new SpinWait();
             for (var spin = 0; spin < 100 && Volatile.Read(ref _executed) < sequence; spin++)
             {
@@ -625,7 +636,9 @@ internal static partial class VulkanVideoPresenter
 
             if (started != 0)
             {
-                Diagnostics.CommandThreadTally.NotePendingWait(Stopwatch.GetTimestamp() - started);
+                var waited = Stopwatch.GetTimestamp() - started;
+                Diagnostics.CommandThreadTally.NotePendingWait(waited);
+                Diagnostics.ProducerWaitProfile.Note("pending_ctx", waited, context!);
             }
 
             ThrowIfFailed();
@@ -1255,6 +1268,14 @@ internal static partial class VulkanVideoPresenter
         // retry interval without progress.
         private void WaitBlocked(ref long lastProgress)
         {
+            if (_queue.HasUnresolvedSpeculation)
+            {
+                // Its escape read must not wait for the idle retry interval.
+                _ = _queue.WaitForRetryInterval(1);
+                _queue.RetryBlocked();
+                return;
+            }
+
             var remaining = RetryTicks - (Stopwatch.GetTimestamp() - lastProgress);
             if (remaining <= 0)
             {

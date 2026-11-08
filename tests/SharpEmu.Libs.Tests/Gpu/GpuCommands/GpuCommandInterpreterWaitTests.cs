@@ -213,6 +213,67 @@ public sealed class GpuCommandInterpreterWaitTests
         Assert.Equal(10u, runner.Interpreter.InstanceCount);
     }
 
+    // A wait-only block of a GPU-written predicate runs unread; an unmet wait in it reads the predicate after the
+    // escape interval (4 ms by default) and passes when the block should have been skipped.
+    [Fact]
+    public void ConditionalExecute_SpeculatesAWaitOnlyBlockAndEscapesWhenThePredicateIsZero()
+    {
+        var runner = new StreamRunner();
+        runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
+        runner.Host.WriteDword(Label, 0);
+        runner.Host.WriteDword(Data, 0);
+        var wait = Wait32(3, Data, 1, 1);
+        var execute = StreamRunner.Packet(PacketOpcode.ConditionalExecute, StreamRunner.Low(Label), StreamRunner.High(Label), 0, (uint)wait.Length);
+
+        Assert.Equal(SubmissionProgress.Blocked, runner.Run(execute, wait, CreateInstanceCountPacket(4)));
+        Assert.True(runner.Interpreter.HasUnresolvedSpeculation);
+        Thread.Sleep(20);
+        Assert.Equal(SubmissionProgress.Complete, runner.Run());
+        Assert.Equal(4u, runner.Interpreter.InstanceCount);
+        Assert.False(runner.Interpreter.HasUnresolvedSpeculation);
+    }
+
+    [Fact]
+    public void ConditionalExecute_SpeculatedBlockKeepsWaitingWhenThePredicateIsSet()
+    {
+        var runner = new StreamRunner();
+        runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
+        runner.Host.WriteDword(Label, 1);
+        runner.Host.WriteDword(Data, 0);
+        var wait = Wait32(3, Data, 1, 1);
+        var execute = StreamRunner.Packet(PacketOpcode.ConditionalExecute, StreamRunner.Low(Label), StreamRunner.High(Label), 0, (uint)wait.Length);
+
+        Assert.Equal(SubmissionProgress.Blocked, runner.Run(execute, wait, CreateInstanceCountPacket(5)));
+        Thread.Sleep(20);
+        Assert.Equal(SubmissionProgress.Blocked, runner.Run());
+        Assert.False(runner.Interpreter.HasUnresolvedSpeculation);
+        runner.Host.WriteDword(Data, 1);
+        Assert.Equal(SubmissionProgress.Complete, runner.Run());
+        Assert.Equal(5u, runner.Interpreter.InstanceCount);
+    }
+
+    [Fact]
+    public void ConditionalExecute_SpeculatesOnlyBlocksOfMarkersAndWaits()
+    {
+        var runner = new StreamRunner();
+        runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
+        runner.Host.WriteDword(Label, 0);
+        runner.Host.WriteDword(Data, 1);
+        var wait = Wait32(3, Data, 1, 1);
+        var execute = StreamRunner.Packet(PacketOpcode.ConditionalExecute, StreamRunner.Low(Label), StreamRunner.High(Label), 0, (uint)wait.Length);
+
+        // A met wait passes at once; the result equals the skipped block.
+        Assert.Equal(SubmissionProgress.Complete, runner.Run(execute, wait, CreateInstanceCountPacket(6)));
+        Assert.Equal(6u, runner.Interpreter.InstanceCount);
+
+        // A block with any other packet is decided by the predicate as before.
+        var block = CreateInstanceCountPacket(7);
+        var mixed = StreamRunner.Packet(PacketOpcode.ConditionalExecute, StreamRunner.Low(Label), StreamRunner.High(Label), 0, (uint)(wait.Length + block.Length));
+        runner.Host.WriteDword(Data, 0);
+        Assert.Equal(SubmissionProgress.Complete, runner.Run(mixed, wait, block, CreateInstanceCountPacket(8)));
+        Assert.Equal(8u, runner.Interpreter.InstanceCount);
+    }
+
     [Fact]
     public void ConditionalExecute_StopsPredictingAfterRepeatedMismatches()
     {

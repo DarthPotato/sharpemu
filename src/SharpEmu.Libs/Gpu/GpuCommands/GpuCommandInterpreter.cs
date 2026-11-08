@@ -147,6 +147,7 @@ public sealed partial class GpuCommandInterpreter
     {
         var before = TypedRegisters.Context;
         _lastWriteLength = 0;
+        _conditionSpeculation = null;
         Registers.Reset();
         TypedRegisters.Reset();
         IndexTypeAndSize = 0;

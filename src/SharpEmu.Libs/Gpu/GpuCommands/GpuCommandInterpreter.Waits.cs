@@ -33,7 +33,7 @@ public sealed partial class GpuCommandInterpreter
         // A deferred label is visible here at once; guest CPU threads see it after the dump before it.
         if (!_host.TryReadDeferredLabel(QueueId, address, is64Bit ? 8UL : 4UL, out var deferred, out var value))
         {
-            Suspend();
+            if (!SpeculativeWaitPasses()) Suspend();
             return;
         }
         var stale = false;
@@ -64,10 +64,11 @@ public sealed partial class GpuCommandInterpreter
 
         if (!satisfied)
         {
-            Suspend();
+            if (!SpeculativeWaitPasses()) Suspend();
         }
         else
         {
+            if (_conditionSpeculation is { } speculation) speculation.Suspended = false;
             _host.CpuGpuVisibilityBoundary();
         }
     }
@@ -278,6 +279,137 @@ public sealed partial class GpuCommandInterpreter
         return value;
     }
 
+    // SHARPEMU_SPECULATE_COND_EXEC (default on; 0 = off): a COND_EXEC whose predicate GPU work may still write, and
+    // whose block holds only markers and memory waits, runs the block without reading the predicate. Markers and
+    // waits change no state, so running a block the predicate would skip ends the same way, only later. What must
+    // not happen is a wait that never passes because its block should have been skipped: a wait of such a block
+    // that stays unmet for SHARPEMU_COND_EXEC_ESCAPE_MS (default 4) reads the predicate, and on 0 the block's
+    // remaining waits pass. Ghost of Yotei: one per frame on the graphics queue ("Wait for Async Dir Shadow
+    // Combine", "SSR wait for compute ring"), predicate 1 in play; reading it cost the command thread a pending
+    // wait plus a GPU round trip every frame while the compute queues had work ready.
+    private static readonly bool SpeculateConditions =
+        Environment.GetEnvironmentVariable("SHARPEMU_SPECULATE_COND_EXEC") != "0";
+    private static readonly long ConditionEscapeTicks =
+        (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_COND_EXEC_ESCAPE_MS"), out var escapeMilliseconds) &&
+         escapeMilliseconds >= 0 ? escapeMilliseconds : 4) * System.Diagnostics.Stopwatch.Frequency / 1000;
+    private const uint SpeculativeBlockMaxDwords = 256;
+
+    private sealed class ConditionSpeculation
+    {
+        public ulong SubmitId;
+        public int Depth;
+        public ulong Start;
+        public ulong End;
+        public ulong Predicate;
+        public long FirstUnmet;
+        public bool Suspended;
+        public bool Resolved;
+        public bool Skip;
+    }
+
+    private ConditionSpeculation? _conditionSpeculation;
+
+    // The queue waits in a speculated block whose predicate is unread: the command thread retries it soon rather
+    // than after the blocked-queue interval, so the escape read cannot be held back by an idle stream.
+    internal bool HasUnresolvedSpeculation => _conditionSpeculation is { Suspended: true, Resolved: false };
+
+    private bool PredictsConditionSkip(ulong address) =>
+        PredictConditions && _conditionPredictors is { } predictors && predictors.TryGetValue(address, out var predictor) &&
+        predictor.Mismatches < ConditionMaxMismatches && predictor.ZeroStreak >= ConditionPredictAfter << predictor.Mismatches;
+
+    // Whether every packet of the block is a marker, a plain NOP or a memory wait.
+    private bool IsWaitOnlyBlock(ulong address, uint dwords)
+    {
+        if (dwords == 0 || dwords > SpeculativeBlockMaxDwords)
+        {
+            return false;
+        }
+
+        Span<byte> bytes = stackalloc byte[(int)dwords * sizeof(uint)];
+        if (!TryReadCommand(address, bytes))
+        {
+            return false;
+        }
+
+        var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
+        for (var offset = 0; offset < words.Length;)
+        {
+            var header = words[offset];
+            if (header == PacketHeader.FillerHeader)
+            {
+                offset++;
+                continue;
+            }
+
+            if ((header >> 30) != 3 || PacketHeader.IsPredicated(header))
+            {
+                return false;
+            }
+
+            var length = (int)PacketHeader.Length(header);
+            if (length < 2 || length > words.Length - offset)
+            {
+                return false;
+            }
+
+            var opcode = PacketHeader.Opcode(header);
+            var waitOnly = opcode switch
+            {
+                // Memory-space waits only; a register-space wait stops the stream.
+                PacketOpcode.WaitRegisterMemory or PacketOpcode.WaitRegisterMemory64 => (words[offset + 1] & 0x10u) != 0,
+                PacketOpcode.Nop => PacketHeader.CustomCode(header) is 0 or PacketCustomCode.PushMarker or
+                    PacketCustomCode.PopMarker or PacketCustomCode.WaitMemory32 or PacketCustomCode.WaitMemory64,
+                _ => false,
+            };
+            if (!waitOnly)
+            {
+                return false;
+            }
+
+            offset += length;
+        }
+
+        return true;
+    }
+
+    // Whether an unmet wait passes because it lies in a speculated block whose predicate read 0. The first unmet
+    // wait starts the escape clock; one still unmet after it reads the predicate.
+    private bool SpeculativeWaitPasses()
+    {
+        if (_conditionSpeculation is not { } speculation)
+        {
+            return false;
+        }
+
+        var execution = RequireExecution();
+        var packetAddress = execution.CurrentPacketAddress;
+        if (speculation.SubmitId != SubmitId || speculation.Depth != execution.Depth ||
+            packetAddress < speculation.Start || packetAddress >= speculation.End)
+        {
+            _conditionSpeculation = null;
+            return false;
+        }
+
+        if (!speculation.Resolved)
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (speculation.FirstUnmet == 0)
+            {
+                speculation.FirstUnmet = now;
+            }
+
+            if (now - speculation.FirstUnmet >= ConditionEscapeTicks)
+            {
+                speculation.Resolved = true;
+                speculation.Skip = ReadCondition(speculation.Predicate) == 0;
+                SharpEmu.Libs.Diagnostics.ProducerWaitProfile.Path(speculation.Skip ? "cond_exec.escape_skip" : "cond_exec.escape_execute");
+            }
+        }
+
+        speculation.Suspended = !speculation.Skip;
+        return speculation.Skip;
+    }
+
     internal uint ConditionalExecutePacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {
         var payloadDwords = packet.Length - 1;
@@ -294,6 +426,23 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal(
                 $"The conditional-execute packet is not supported: control={control} reserved=0x{payload[2]:X8} " +
                 $"address=0x{address:X16} count={executeCount} remaining={packet.Remaining}.");
+        }
+
+        _conditionSpeculation = null;
+        var blockAddress = packet.PacketAddress + (payloadDwords + 1) * sizeof(uint);
+        if (SpeculateConditions && !PredictsConditionSkip(address) &&
+            _host.HasGpuWrittenCommandData(address, sizeof(uint)) && IsWaitOnlyBlock(blockAddress, executeCount))
+        {
+            _conditionSpeculation = new ConditionSpeculation
+            {
+                SubmitId = SubmitId,
+                Depth = RequireExecution().Depth,
+                Start = blockAddress,
+                End = blockAddress + executeCount * sizeof(uint),
+                Predicate = address,
+            };
+            SharpEmu.Libs.Diagnostics.ProducerWaitProfile.Path("cond_exec.speculated");
+            return payloadDwords;
         }
 
         var predicate = ReadCondition(address);

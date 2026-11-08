@@ -41,6 +41,7 @@ public sealed class CommandStreamQueue
     private readonly GpuCommandInterpreter?[] _interpreters = new GpuCommandInterpreter?[QueueCount];
     private readonly Queue<ControlBarrier> _controlBarriers = new();
     private int _nextQueue;
+    private int _processingQueueId = -1;
     private int _submissionCount;
     private ulong _admissionOrdinal;
     private bool _accepting = true;
@@ -445,6 +446,7 @@ public sealed class CommandStreamQueue
                 queue.RemoveFirst();
                 _submissionCount--;
                 _nextQueue = (selected + 1) % QueueCount;
+                Volatile.Write(ref _processingQueueId, selected);
             }
 
             _processing = true;
@@ -541,6 +543,7 @@ public sealed class CommandStreamQueue
             }
 
             _processing = false;
+            Volatile.Write(ref _processingQueueId, -1);
             Monitor.PulseAll(_gate);
             return result;
         }
@@ -794,6 +797,41 @@ public sealed class CommandStreamQueue
             {
                 return _outcome;
             }
+        }
+    }
+
+    // A queue waits inside a speculated COND_EXEC block whose predicate is unread (processing thread only).
+    public bool HasUnresolvedSpeculation
+    {
+        get
+        {
+            foreach (var interpreter in _interpreters)
+            {
+                if (interpreter is { HasUnresolvedSpeculation: true }) return true;
+            }
+
+            return false;
+        }
+    }
+
+    // The queue whose submission the processing thread runs now; -1 between slices and for control barriers.
+    public int ProcessingQueueId => Volatile.Read(ref _processingQueueId);
+
+    // Diagnostic: queues other than the processing one whose next submission could run now.
+    public int RunnableOtherQueueCount()
+    {
+        lock (_gate)
+        {
+            var count = 0;
+            for (var queueId = 0; queueId < QueueCount; queueId++)
+            {
+                if (queueId != _processingQueueId && _queues[queueId].First is { } head && !head.Value.Blocked)
+                {
+                    count++;
+                }
+            }
+
+            return count;
         }
     }
 
