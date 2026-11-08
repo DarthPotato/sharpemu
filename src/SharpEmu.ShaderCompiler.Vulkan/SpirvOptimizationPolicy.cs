@@ -6,7 +6,9 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 // Process-constant settings: in-memory programs never change policy beneath their cache.
 public static class SpirvOptimizationPolicy
 {
-    public static bool Enabled { get; } = Environment.GetEnvironmentVariable("SHARPEMU_SPIRV_OPTIMIZE") != "0";
+    // Off unless SHARPEMU_SPIRV_OPTIMIZE=1: with the builder optimizations on, Ghost of
+    // Yotei renders smeared characters and striped terrain (cause not found yet).
+    public static bool Enabled { get; } = Environment.GetEnvironmentVariable("SHARPEMU_SPIRV_OPTIMIZE") == "1";
     // A guest instruction can expand into many guarded SPIR-V blocks. The replay
     // corpus shows that even medium guest programs can grow huge inherited maps.
     // Keep the cheap local passes for those requests, without speculative inheritance.
