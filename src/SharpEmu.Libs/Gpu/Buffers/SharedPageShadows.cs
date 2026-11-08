@@ -117,6 +117,10 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
 
     private readonly Dictionary<ulong, Shadow> _pages = new();
     private readonly object _gate = new();
+    // One bit per hashed page, set before its shadow is added and never cleared (shadows are never removed):
+    // a range whose pages have no bit holds no shadow, and the checks every emulator store makes skip the gate.
+    private const int FilterBits = 1 << 18;
+    private readonly ulong[] _filter = new ulong[FilterBits / 64];
     // The narrowed copies of one upload, reused under the gate.
     private readonly List<BufferCopy> _filtered = new();
     private int _count;
@@ -131,9 +135,33 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
     // Bytes uploads left alone because the CPU had not changed them.
     public long SkippedUploadBytes => Interlocked.Read(ref _skippedUploadBytes);
 
+    // Lock-free: false only when no page of the range has a shadow.
+    private bool MayHold(ulong address, ulong size)
+    {
+        for (var page = address & ~(pageBytes - 1); page < address + size; page += pageBytes)
+        {
+            var bit = FilterBit(page);
+            if ((Volatile.Read(ref _filter[bit >> 6]) & (1UL << (bit & 63))) != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Under the gate, before the shadow is added.
+    private void NoteFilter(ulong page)
+    {
+        var bit = FilterBit(page);
+        Volatile.Write(ref _filter[bit >> 6], _filter[bit >> 6] | (1UL << (bit & 63)));
+    }
+
+    private int FilterBit(ulong page) => (int)((page / pageBytes) & (FilterBits - 1));
+
     public bool Contains(ulong page)
     {
-        if (Count == 0)
+        if (Count == 0 || !MayHold(page, 1))
         {
             return false;
         }
@@ -146,7 +174,7 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
 
     public bool Overlaps(ulong address, ulong size)
     {
-        if (Count == 0 || size == 0) return false;
+        if (Count == 0 || size == 0 || !MayHold(address, size)) return false;
         lock (_gate)
         {
             for (var page = address & ~(pageBytes - 1); page < address + size; page += pageBytes)
@@ -161,7 +189,7 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
     // same-value store (or reuse of the mapping) must not admit an older GPU byte on a pull.
     public void NoteCpuWrite(ulong address, ulong size)
     {
-        if (Count == 0 || size == 0) return;
+        if (Count == 0 || size == 0 || !MayHold(address, size)) return;
         lock (_gate)
         {
             for (var page = address & ~(pageBytes - 1); page < address + size; page += pageBytes)
@@ -214,6 +242,7 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
                 return false;
             }
 
+            NoteFilter(page);
             _pages.Add(page, new Shadow(owner, gpuPage.ToArray()) { StagedTick = tick });
             Volatile.Write(ref _count, _pages.Count);
             return true;
@@ -239,6 +268,7 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
                 return false;
             }
 
+            NoteFilter(page);
             _pages.Add(page, new Shadow(Unsynchronized, new byte[pageBytes]));
             Volatile.Write(ref _count, _pages.Count);
             return true;

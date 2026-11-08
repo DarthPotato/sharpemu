@@ -13,6 +13,23 @@ public sealed class SharedPageShadowsTests
     private const ulong Page = 0x1000;
 
     [Fact]
+    public void MembershipChecksSeeOnlyShadowedPagesIncludingOnesSharingAFilterBit()
+    {
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        // 2^18 pages further on hashes to the same filter bit as Page.
+        var alias = Page + (1UL << 18) * PageBytes;
+        Assert.False(shadows.Overlaps(Page, PageBytes));
+        Assert.True(shadows.Adopt(Page, new object(), Fill(0)));
+
+        Assert.True(shadows.Contains(Page));
+        Assert.True(shadows.Overlaps(Page - PageBytes, 2 * PageBytes));
+        Assert.False(shadows.Contains(Page + PageBytes));
+        Assert.False(shadows.Overlaps(Page + PageBytes, 4 * PageBytes));
+        Assert.False(shadows.Contains(alias));
+        Assert.False(shadows.Overlaps(alias, PageBytes));
+    }
+
+    [Fact]
     public void UploadCopiesOnlyTheBytesTheCpuChanged()
     {
         var owner = new object();
