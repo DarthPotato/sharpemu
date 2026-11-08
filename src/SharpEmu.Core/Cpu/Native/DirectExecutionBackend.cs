@@ -6554,7 +6554,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return GuestNativeCallExitReason.Exception;
 		}
 		const uint stubSize = 512u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
+		// The trampoline runs once, up to its ret into guest code, on this thread, so each host thread
+		// rewrites one execute-read-write page instead of allocating, sealing and freeing one per resume
+		// (thousands per second: each seal and free of executable memory is a syscall and a TLB shootdown
+		// on every core). A tbb thread's stub runs on another worker and keeps its own page.
+		var reusedStub = name != "tbb_thead";
+		void* ptr = reusedStub ? ThreadContinuationStub(stubSize) : VirtualAlloc(null, stubSize, 12288u, 4u);
 		if (ptr == null)
 		{
 			reason = "failed to allocate executable memory for guest thread stub";
@@ -6563,7 +6568,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)HostStackStateBytes);
 		if (hostRspStorage == null)
 		{
-			VirtualFree(ptr, 0u, 32768u);
+			if (!reusedStub) VirtualFree(ptr, 0u, 32768u);
 			reason = "failed to allocate writable host-RSP storage for guest continuation stub";
 			return GuestNativeCallExitReason.Exception;
 		}
@@ -6640,7 +6645,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return GuestNativeCallExitReason.Exception;
 			}
 			uint oldProtect = default(uint);
-			if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
+			if (!reusedStub && !VirtualProtect(ptr, stubSize, 32u, &oldProtect))
 			{
 				reason = "failed to seal guest continuation stub execute-read";
 				return GuestNativeCallExitReason.Exception;
@@ -6701,8 +6706,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousYieldRequested,
 				previousYieldReason);
 			NativeMemory.Free(hostRspStorage);
-			VirtualFree(ptr, 0u, 32768u);
+			if (!reusedStub) VirtualFree(ptr, 0u, 32768u);
 		}
+	}
+
+	[ThreadStatic] private static nint _threadContinuationStub;
+
+	// One execute-read-write page per host thread for continuation trampolines; it lives as long as the thread.
+	private static unsafe void* ThreadContinuationStub(uint size)
+	{
+		if (_threadContinuationStub == 0)
+		{
+			_threadContinuationStub = (nint)VirtualAlloc(null, size, 12288u, 64u);
+		}
+
+		return (void*)_threadContinuationStub;
 	}
 
 	// The continuation trampoline is rebuilt on every blocked-thread resume.
