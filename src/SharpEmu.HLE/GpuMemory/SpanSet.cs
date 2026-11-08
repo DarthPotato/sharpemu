@@ -3,12 +3,35 @@
 
 namespace SharpEmu.HLE.GpuMemory;
 
-public sealed class SpanSnapshot(ulong[] starts, ulong[] ends)
+// Sorted, disjoint spans read without a lock: copied arrays (SpanSet) or an immutable tree root (AvlSpanSet).
+public sealed class SpanSnapshot
 {
     public static readonly SpanSnapshot Empty = new([], []);
 
+    private readonly ulong[] starts;
+    private readonly ulong[] ends;
+    private readonly SpanNode? _root;
+
+    public SpanSnapshot(ulong[] starts, ulong[] ends)
+    {
+        this.starts = starts;
+        this.ends = ends;
+    }
+
+    internal SpanSnapshot(SpanNode root)
+    {
+        starts = ends = [];
+        _root = root;
+    }
+
     public bool Contains(ulong address, ulong size)
     {
+        if (_root is not null)
+        {
+            var node = SpanNode.FindAtOrBelow(_root, address);
+            return node is not null && node.End >= address + size;
+        }
+
         var index = Array.BinarySearch(starts, address);
         if (index < 0)
         {
@@ -20,6 +43,20 @@ public sealed class SpanSnapshot(ulong[] starts, ulong[] ends)
 
     public bool TryGetContaining(ulong address, out ulong start, out ulong end)
     {
+        if (_root is not null)
+        {
+            if (SpanNode.FindAtOrBelow(_root, address) is { } node && node.End > address)
+            {
+                start = node.Start;
+                end = node.End;
+                return true;
+            }
+
+            start = 0;
+            end = 0;
+            return false;
+        }
+
         var index = Array.BinarySearch(starts, address);
         if (index < 0)
         {
@@ -40,6 +77,11 @@ public sealed class SpanSnapshot(ulong[] starts, ulong[] ends)
 
     public bool Overlaps(ulong address, ulong size)
     {
+        if (_root is not null)
+        {
+            return SpanNode.Overlaps(_root, address, address + size);
+        }
+
         var index = Array.BinarySearch(starts, address + size);
         if (index < 0)
         {

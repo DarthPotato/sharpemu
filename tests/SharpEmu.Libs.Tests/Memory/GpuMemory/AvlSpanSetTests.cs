@@ -37,6 +37,10 @@ public sealed class AvlSpanSetTests
             var snapshot = actual.Snapshot();
             Assert.Equal(expected.Contains(address, size), snapshot.Contains(address, size));
             Assert.Equal(expected.Overlaps(address, size), snapshot.Overlaps(address, size));
+            var arrays = expected.Snapshot();
+            Assert.Equal(arrays.TryGetContaining(address, out var expectedStart, out var expectedEnd),
+                snapshot.TryGetContaining(address, out var actualStart, out var actualEnd));
+            Assert.Equal((expectedStart, expectedEnd), (actualStart, actualEnd));
             Assert.Equal(expected.GetOverlappingRanges(address, size), actual.GetOverlappingRanges(address, size));
             Assert.Equal(expected.GetOverlappingRanges(0, ulong.MaxValue), actual.GetOverlappingRanges(0, ulong.MaxValue));
             Assert.Equal(expected.IsEmpty, actual.IsEmpty);
@@ -103,19 +107,25 @@ public sealed class AvlSpanSetTests
         }
     }
 
+    // A change copies only the tree path it touches and a snapshot wraps the root (copying every span into new
+    // arrays cost 2047 * 16 bytes here, on every change of a set the render thread changes per draw).
     [Fact]
-    public void ChangedSnapshotAllocatesOnlyItsExactArraysAndSnapshot()
+    public void ChangesCopyOnlyTheirPathAndSnapshotsKeepTheirSpans()
     {
         var set = new AvlSpanSet();
         for (ulong index = 0; index < 2048; index++) set.Add(index * 4, 2);
-        set.Snapshot();
+        var before = set.Snapshot();
+        var allocated = GC.GetAllocatedBytesForCurrentThread();
         set.Remove(0, 2);
-        var before = GC.GetAllocatedBytesForCurrentThread();
         var snapshot = set.Snapshot();
-        var bytes = GC.GetAllocatedBytesForCurrentThread() - before;
-        Assert.InRange(bytes, 2047 * 16L, 2047 * 16L + 256);
+        var bytes = GC.GetAllocatedBytesForCurrentThread() - allocated;
+        Assert.InRange(bytes, 1, 2048);
         Assert.False(snapshot.Overlaps(0, 4));
         Assert.True(snapshot.Contains(8188, 2));
+        Assert.True(before.Contains(0, 2));
+        Assert.True(before.TryGetContaining(1, out var start, out var end));
+        Assert.Equal((0UL, 2UL), (start, end));
+        Assert.False(snapshot.TryGetContaining(1, out _, out _));
     }
 
     [Fact]
@@ -138,6 +148,49 @@ public sealed class AvlSpanSetTests
         set.Remove(ulong.MaxValue - 50, 50);
         Assert.False(set.Overlaps(ulong.MaxValue - 50, 50));
         Assert.Equal(new[] { new GuestSpan(ulong.MaxValue - 100, 50) }, set.GetOverlappingRanges(ulong.MaxValue - 100, 100));
+    }
+
+    // GuestBufferCache publishes a snapshot after every change and other threads read it with no lock.
+    [Fact]
+    public void PublishedSnapshotsReadWithoutALockDuringChanges()
+    {
+        var set = new AvlSpanSet();
+        const ulong kept = 0x10_0000;
+        set.Add(kept, 0x1000);
+        var published = set.Snapshot();
+        var stop = 0;
+        var failures = 0;
+        var writer = new Thread(() =>
+        {
+            var random = new System.Random(9);
+            while (Volatile.Read(ref stop) == 0)
+            {
+                var low = random.Next(2) == 0;
+                var address = low ? (ulong)random.Next(0, 0xF_0000) : 0x20_0000 + (ulong)random.Next(0, 0xF_0000);
+                var size = (ulong)random.Next(1, 0x1000);
+                if (random.Next(2) == 0) set.Add(address, size);
+                else set.Remove(address, size);
+                Volatile.Write(ref published, set.Snapshot());
+            }
+        });
+        var readers = Enumerable.Range(0, 3).Select(_ => new Thread(() =>
+        {
+            for (var read = 0; read < 200_000; read++)
+            {
+                var snapshot = Volatile.Read(ref published);
+                if (!snapshot.Contains(kept, 0x1000) || !snapshot.Overlaps(kept + 0x800, 8) ||
+                    snapshot.Overlaps(0x18_0000, 0x1000) || !snapshot.TryGetContaining(kept + 1, out var start, out ulong _) || start != kept)
+                {
+                    Interlocked.Increment(ref failures);
+                }
+            }
+        })).ToArray();
+        writer.Start();
+        foreach (var reader in readers) reader.Start();
+        foreach (var reader in readers) Assert.True(reader.Join(TimeSpan.FromSeconds(60)));
+        Volatile.Write(ref stop, 1);
+        Assert.True(writer.Join(TimeSpan.FromSeconds(60)));
+        Assert.Equal(0, failures);
     }
 
     // Readers walk the tree without its lock while a writer merges and splits spans elsewhere: they

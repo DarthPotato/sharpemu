@@ -3,20 +3,56 @@
 
 namespace SharpEmu.HLE.GpuMemory;
 
-// Callers serialize access. The tree does not change range ownership or locking.
-public sealed class AvlSpanSet
+// One span of a persistent AVL tree. Nodes never change once built: an insertion or deletion copies the path it
+// changes, so a root, once published, describes the same spans forever and can be read without a lock.
+internal sealed class SpanNode(ulong start, ulong end, SpanNode? left, SpanNode? right)
 {
-    private sealed class Node(ulong start, ulong end)
+    public readonly ulong Start = start;
+    public readonly ulong End = end;
+    public readonly SpanNode? Left = left;
+    public readonly SpanNode? Right = right;
+    public readonly int Height = Math.Max(left?.Height ?? 0, right?.Height ?? 0) + 1;
+
+    public static SpanNode? FindAtOrBelow(SpanNode? root, ulong address)
     {
-        public ulong Start = start;
-        public ulong End = end;
-        public Node? Left;
-        public Node? Right;
-        public int Height = 1;
-        public int Count = 1;
+        SpanNode? result = null;
+        for (var node = root; node is not null;)
+        {
+            if (node.Start <= address) { result = node; node = node.Right; }
+            else node = node.Left;
+        }
+        return result;
     }
 
-    private Node? _root;
+    public static SpanNode? FindAtOrAbove(SpanNode? root, ulong address)
+    {
+        SpanNode? result = null;
+        for (var node = root; node is not null;)
+        {
+            if (node.Start >= address) { result = node; node = node.Left; }
+            else node = node.Right;
+        }
+        return result;
+    }
+
+    public static bool Overlaps(SpanNode? root, ulong start, ulong end)
+    {
+        var node = root;
+        while (node is not null)
+        {
+            if (node.Start >= end) node = node.Left;
+            else if (node.End <= start) node = node.Right;
+            else return true;
+        }
+        return false;
+    }
+}
+
+// Callers serialize changes. The tree does not change range ownership or locking. Snapshot() is O(1): it wraps the
+// current root, which no later change can alter (each change used to copy every span into new arrays).
+public sealed class AvlSpanSet
+{
+    private SpanNode? _root;
     private SpanSnapshot? _snapshot = SpanSnapshot.Empty;
     public bool IsEmpty => _root is null;
     public void Clear()
@@ -30,7 +66,7 @@ public sealed class AvlSpanSet
         ValidateRange(address, size);
         var start = address;
         var end = address + size;
-        var previous = FindAtOrBelow(start);
+        var previous = SpanNode.FindAtOrBelow(_root, start);
         if (previous is not null && previous.End >= start)
         {
             if (previous.End >= end) return;
@@ -38,7 +74,7 @@ public sealed class AvlSpanSet
             _root = Delete(_root, start);
         }
         _snapshot = null;
-        for (var next = FindAtOrAbove(start); next is not null && next.Start <= end; next = FindAtOrAbove(start))
+        for (var next = SpanNode.FindAtOrAbove(_root, start); next is not null && next.Start <= end; next = SpanNode.FindAtOrAbove(_root, start))
         {
             end = Math.Max(end, next.End);
             _root = Delete(_root, next.Start);
@@ -50,8 +86,8 @@ public sealed class AvlSpanSet
     {
         ValidateRange(address, size);
         var end = address + size;
-        var current = FindAtOrBelow(address);
-        if (current is null || current.End <= address) current = FindAtOrAbove(address);
+        var current = SpanNode.FindAtOrBelow(_root, address);
+        if (current is null || current.End <= address) current = SpanNode.FindAtOrAbove(_root, address);
         if (current is null || current.Start >= end) return;
         _snapshot = null;
         while (current is not null && current.Start < end)
@@ -65,40 +101,27 @@ public sealed class AvlSpanSet
                 _root = Insert(_root, end, spanEnd);
                 break;
             }
-            current = FindAtOrAbove(address);
+            current = SpanNode.FindAtOrAbove(_root, address);
         }
     }
 
     public bool Contains(ulong address, ulong size)
     {
         ValidateRange(address, size);
-        var node = FindAtOrBelow(address);
+        var node = SpanNode.FindAtOrBelow(_root, address);
         return node is not null && node.End >= address + size;
     }
 
     public bool Overlaps(ulong address, ulong size)
     {
         ValidateRange(address, size);
-        var end = address + size;
-        var node = _root;
-        while (node is not null)
-        {
-            if (node.Start >= end) node = node.Left;
-            else if (node.End <= address) node = node.Right;
-            else return true;
-        }
-        return false;
+        return SpanNode.Overlaps(_root, address, address + size);
     }
 
     public SpanSnapshot Snapshot()
     {
         if (_snapshot is { } snapshot) return snapshot;
-        if (_root is null) return _snapshot = SpanSnapshot.Empty;
-        var starts = new ulong[_root.Count];
-        var ends = new ulong[starts.Length];
-        var index = 0;
-        Collect(_root, starts, ends, ref index);
-        return _snapshot = new SpanSnapshot(starts, ends);
+        return _snapshot = _root is null ? SpanSnapshot.Empty : new SpanSnapshot(_root);
     }
 
     public List<GuestSpan> GetOverlappingRanges(ulong address, ulong size)
@@ -109,7 +132,7 @@ public sealed class AvlSpanSet
         return result;
     }
 
-    private static void VisitOverlaps(Node? node, ulong start, ulong end, List<GuestSpan> result)
+    private static void VisitOverlaps(SpanNode? node, ulong start, ulong end, List<GuestSpan> result)
     {
         if (node is null) return;
         if (node.End <= start)
@@ -129,106 +152,49 @@ public sealed class AvlSpanSet
         VisitOverlaps(node.Right, start, end, result);
     }
 
-    private static void Collect(Node? node, ulong[] starts, ulong[] ends, ref int index)
-    {
-        if (node is null) return;
-        Collect(node.Left, starts, ends, ref index);
-        starts[index] = node.Start;
-        ends[index++] = node.End;
-        Collect(node.Right, starts, ends, ref index);
-    }
+    private static int Height(SpanNode? node) => node?.Height ?? 0;
 
-    private Node? FindAtOrBelow(ulong address)
+    // A node over the given children, rotated once or twice when their heights differ by more than one.
+    private static SpanNode Balance(ulong start, ulong end, SpanNode? left, SpanNode? right)
     {
-        Node? result = null;
-        for (var node = _root; node is not null;)
-        {
-            if (node.Start <= address) { result = node; node = node.Right; }
-            else node = node.Left;
-        }
-        return result;
-    }
-
-    private Node? FindAtOrAbove(ulong address)
-    {
-        Node? result = null;
-        for (var node = _root; node is not null;)
-        {
-            if (node.Start >= address) { result = node; node = node.Left; }
-            else node = node.Right;
-        }
-        return result;
-    }
-
-    private static int Height(Node? node) => node?.Height ?? 0;
-    private static void UpdateHeight(Node node)
-    {
-        node.Height = Math.Max(Height(node.Left), Height(node.Right)) + 1;
-        node.Count = (node.Left?.Count ?? 0) + (node.Right?.Count ?? 0) + 1;
-    }
-
-    private static Node RotateRight(Node node)
-    {
-        var left = node.Left!;
-        node.Left = left.Right;
-        left.Right = node;
-        UpdateHeight(node);
-        UpdateHeight(left);
-        return left;
-    }
-
-    private static Node RotateLeft(Node node)
-    {
-        var right = node.Right!;
-        node.Right = right.Left;
-        right.Left = node;
-        UpdateHeight(node);
-        UpdateHeight(right);
-        return right;
-    }
-
-    private static Node Balance(Node node)
-    {
-        UpdateHeight(node);
-        var difference = Height(node.Left) - Height(node.Right);
+        var difference = Height(left) - Height(right);
         if (difference > 1)
         {
-            if (Height(node.Left!.Left) < Height(node.Left.Right)) node.Left = RotateLeft(node.Left);
-            return RotateRight(node);
+            if (Height(left!.Left) >= Height(left.Right))
+                return new SpanNode(left.Start, left.End, left.Left, new SpanNode(start, end, left.Right, right));
+            var middle = left.Right!;
+            return new SpanNode(middle.Start, middle.End,
+                new SpanNode(left.Start, left.End, left.Left, middle.Left), new SpanNode(start, end, middle.Right, right));
         }
         if (difference < -1)
         {
-            if (Height(node.Right!.Right) < Height(node.Right.Left)) node.Right = RotateRight(node.Right);
-            return RotateLeft(node);
+            if (Height(right!.Right) >= Height(right.Left))
+                return new SpanNode(right.Start, right.End, new SpanNode(start, end, left, right.Left), right.Right);
+            var middle = right.Left!;
+            return new SpanNode(middle.Start, middle.End,
+                new SpanNode(start, end, left, middle.Left), new SpanNode(right.Start, right.End, middle.Right, right.Right));
         }
-        return node;
+        return new SpanNode(start, end, left, right);
     }
 
-    private static Node Insert(Node? node, ulong start, ulong end)
+    private static SpanNode Insert(SpanNode? node, ulong start, ulong end)
     {
-        if (node is null) return new Node(start, end);
-        if (start < node.Start) node.Left = Insert(node.Left, start, end);
-        else if (start > node.Start) node.Right = Insert(node.Right, start, end);
-        else node.End = end;
-        return Balance(node);
+        if (node is null) return new SpanNode(start, end, null, null);
+        if (start < node.Start) return Balance(node.Start, node.End, Insert(node.Left, start, end), node.Right);
+        if (start > node.Start) return Balance(node.Start, node.End, node.Left, Insert(node.Right, start, end));
+        return new SpanNode(start, end, node.Left, node.Right);
     }
 
-    private static Node? Delete(Node? node, ulong start)
+    private static SpanNode? Delete(SpanNode? node, ulong start)
     {
         if (node is null) return null;
-        if (start < node.Start) node.Left = Delete(node.Left, start);
-        else if (start > node.Start) node.Right = Delete(node.Right, start);
-        else
-        {
-            if (node.Left is null) return node.Right;
-            if (node.Right is null) return node.Left;
-            var successor = node.Right;
-            while (successor.Left is not null) successor = successor.Left;
-            node.Start = successor.Start;
-            node.End = successor.End;
-            node.Right = Delete(node.Right, successor.Start);
-        }
-        return Balance(node);
+        if (start < node.Start) return Balance(node.Start, node.End, Delete(node.Left, start), node.Right);
+        if (start > node.Start) return Balance(node.Start, node.End, node.Left, Delete(node.Right, start));
+        if (node.Left is null) return node.Right;
+        if (node.Right is null) return node.Left;
+        var successor = node.Right;
+        while (successor.Left is not null) successor = successor.Left;
+        return Balance(successor.Start, successor.End, node.Left, Delete(node.Right, successor.Start));
     }
 
     private static void ValidateRange(ulong address, ulong size)
