@@ -1312,8 +1312,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 var descriptor = BufferDescriptorWords.From(words);
                 var requested = descriptor.Footprint() ?? throw SubmissionScheduler.Fatal(
                     $"A storage buffer descriptor footprint overflows: buffer={index} stride={descriptor.Stride} records={descriptor.RecordCount} hash=0x{program.Hash:X16}.");
-                if (descriptor.Address == 0 || requested == 0 || IsUnresidentPrtPage(descriptor.Address) ||
-                    IsUnmappedBufferStart(prepared, index, descriptor.Address))
+                // Both checks bind a null buffer only for an unreadable start; one CanRead (a locked lookup)
+                // decides, and they run only to pick the warning.
+                if (descriptor.Address == 0 || requested == 0 || (!_guestMemory.CanRead(descriptor.Address, 1) &&
+                    (IsUnresidentPrtPage(descriptor.Address) || IsUnmappedBufferStart(prepared, index, descriptor.Address))))
                 {
                     sources[index] = (descriptor, default, 0);
                     continue;
@@ -1483,8 +1485,9 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             memoryOffset = 0;
             var address = descriptor.Address;
-            if (address == 0 || size == 0 || IsUnresidentPrtPage(address) || !_guestMemory.CanRead(address, 1))
+            if (address == 0 || size == 0 || !_guestMemory.CanRead(address, 1))
             {
+                if (address != 0 && size != 0) _ = IsUnresidentPrtPage(address); // reports an unresident PRT start once
                 return NullStorageBuffer();
             }
 
