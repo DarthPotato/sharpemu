@@ -51,6 +51,13 @@ termination/control, so those checks cannot establish memory-output equivalence.
 Passing samples do not establish equivalence for other inputs, helper lanes,
 different coverage/sample patterns, unmodeled resources or driver execution.
 
+An optional final hexadecimal helper mask (for example `AAAAAAAA`) applies to
+fragment stages. Four consecutive lanes form one 2x2 quad (x is bit 0, y is
+bit 1). Helpers are excluded from ballots but still supply values to f32 fine
+derivatives and quad operations. Only non-helper outputs are compared. Other
+collectives with helpers, divergent traces, and texture operations reject the
+sample. This models one permitted participation policy, not the device's choice.
+
 ## Translation replay
 
 Build this project in Release, then run the generated executable with two arguments:

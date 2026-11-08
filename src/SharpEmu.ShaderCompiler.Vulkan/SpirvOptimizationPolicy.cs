@@ -7,7 +7,8 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 public static class SpirvOptimizationPolicy
 {
     // Off unless SHARPEMU_SPIRV_OPTIMIZE=1: with the builder optimizations on, Ghost of
-    // Yotei renders smeared characters and striped terrain (cause not found yet).
+    // Yotei renders smeared characters and striped terrain; keep opt-in until
+    // the hoisting/ballot correction has also been verified in game.
     public static bool Enabled { get; } = Environment.GetEnvironmentVariable("SHARPEMU_SPIRV_OPTIMIZE") == "1";
     public static bool Forward { get; } = ReadSwitch("FORWARD");
     public static bool StoreElision { get; } = ReadSwitch("STORE_ELISION");
@@ -15,6 +16,9 @@ public static class SpirvOptimizationPolicy
     public static bool Dce { get; } = ReadSwitch("DCE");
     public static bool LaneMask { get; } = ReadSwitch("LANE_MASK");
     public static bool Hoist { get; } = ReadSwitch("HOIST");
+    // Halves of Hoist, for bisecting: input loads vs invariant expressions.
+    public static bool HoistLoads { get; } = ReadSwitch("HOIST_LOADS");
+    public static bool HoistExpressions { get; } = ReadSwitch("HOIST_EXPRESSIONS");
     public static bool Inherit { get; } = ReadSwitch("INHERIT");
     public static bool Expressions { get; } = ReadSwitch("EXPRESSIONS");
     // A guest instruction can expand into many guarded SPIR-V blocks. The replay
@@ -22,8 +26,8 @@ public static class SpirvOptimizationPolicy
     // Keep the cheap local passes for those requests, without speculative inheritance.
     public static int MaxInheritedInstructions { get; } = ReadLimit("SHARPEMU_SPIRV_MAX_INHERIT_INSTRUCTIONS");
     public static int MaxExpressionInstructions { get; } = ReadLimit("SHARPEMU_SPIRV_MAX_EXPRESSION_INSTRUCTIONS");
-    public static string CacheIdentity => $"spirv-opt-v4:{Enabled}:inherit-max={MaxInheritedInstructions}:expression-max={MaxExpressionInstructions}" +
-        $":forward={Forward}:store-elision={StoreElision}:unread={Unread}:dce={Dce}:lane-mask={LaneMask}:hoist={Hoist}:inherit={Inherit}:expressions={Expressions}";
+    public static string CacheIdentity => $"spirv-opt-v5:{Enabled}:inherit-max={MaxInheritedInstructions}:expression-max={MaxExpressionInstructions}" +
+        $":forward={Forward}:store-elision={StoreElision}:unread={Unread}:dce={Dce}:lane-mask={LaneMask}:hoist={Hoist}:hoist-loads={HoistLoads}:hoist-expressions={HoistExpressions}:inherit={Inherit}:expressions={Expressions}";
 
     public static bool AllowsInheritance(int guestInstructionCount) => Enabled && Inherit && guestInstructionCount <= MaxInheritedInstructions;
     public static bool AllowsExpressions(int guestInstructionCount) => Enabled && guestInstructionCount <= MaxExpressionInstructions;

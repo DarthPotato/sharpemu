@@ -10,9 +10,10 @@ internal static class SemanticCheck
 
     public static void Run(string[] args)
     {
-        if (args.Length is < 4 or > 6) throw new ArgumentException("--semantic-check <left-dump> <right-dump> <output-prefix> [samples=16] [max-bytes=131072]");
+        if (args.Length is < 4 or > 7) throw new ArgumentException("--semantic-check <left-dump> <right-dump> <output-prefix> [samples=16] [max-bytes=131072] [fragment-helper-mask-hex=0]");
         var samples = args.Length > 4 ? int.Parse(args[4]) : 16;
         var maxBytes = args.Length > 5 ? int.Parse(args[5]) : 131072;
+        var helperMask = args.Length > 6 ? Convert.ToUInt32(args[6], 16) : 0u;
         if (samples < 1 || maxBytes < 1) throw new ArgumentException("positive sample and byte limits required");
         var left = JsonSerializer.Deserialize<DumpManifest>(File.ReadAllText(Path.Combine(args[1], "manifest.json")))!;
         var right = JsonSerializer.Deserialize<DumpManifest>(File.ReadAllText(Path.Combine(args[2], "manifest.json")))!;
@@ -38,8 +39,9 @@ internal static class SemanticCheck
                     if (Convert.ToHexString(SHA256.HashData(bytes)) != blob.Sha256) throw new InvalidDataException("SHA mismatch");
                     return bytes;
                 }
-                var cpuA = new SpirvCpu(Read(args[1], a));
-                var cpuB = new SpirvCpu(Read(args[2], b));
+                var stageHelpers = a.Kind == "Pixel" ? helperMask : 0u;
+                var cpuA = new SpirvCpu(Read(args[1], a), stageHelpers);
+                var cpuB = new SpirvCpu(Read(args[2], b), stageHelpers);
                 for (var seed = 0; seed < samples; seed++)
                 {
                     var x = cpuA.Execute(seed);
@@ -59,6 +61,7 @@ internal static class SemanticCheck
         using var report = new StreamWriter(prefix + ".md");
         void Write(string text) { report.WriteLine(text); Console.WriteLine(text); }
         Write($"Bounded CPU interpretation, {samples} deterministic random inputs/stage; byte limit {maxBytes}.");
+        Write($"Fragment helper mask 0x{helperMask:X8}; helpers excluded from ballots, retained for fine derivatives and quad operations. Other helper collectives reject the sample.");
         Write($"Stages {results.Count}; fully compared {results.Count(r => r.Passed == samples)}; matching samples {results.Sum(r => r.Passed)}; mismatches {results.Count(r => r.MismatchSeed.HasValue)}.");
         foreach (var group in results.GroupBy(r => r.Kind))
             Write($"{group.Key}: {group.Count(r => r.Passed == samples)}/{group.Count()} fully compared; {group.Count(r => r.MismatchSeed.HasValue)} mismatches.");

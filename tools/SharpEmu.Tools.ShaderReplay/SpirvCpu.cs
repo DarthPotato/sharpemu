@@ -7,7 +7,11 @@ using System.Text;
 // observed undefined values, invalid indices and undefined arithmetic reject the sample; they
 // never turn into zeroes or an equivalence claim. Subgroups use 32 actual interpreter
 // lanes with identical control traces at collectives, never guessed participation.
-// Texture and derivative operations are unsupported. External inputs use stable keys.
+// Textures are unsupported. Fine f32 derivatives and quad operations use four
+// consecutive lanes per 2x2 quad. An optional fragment helper mask tests the
+// permitted policy that excludes helpers from ballots but retains them for
+// derivatives/quad operations. Other helper collectives reject the sample.
+// External inputs use stable keys.
 internal sealed class SpirvCpu
 {
     private readonly record struct Instruction(ushort Op, uint[] A);
@@ -22,6 +26,7 @@ internal sealed class SpirvCpu
     private readonly List<uint[]> globals = [];
     private readonly Dictionary<uint, int> functions = [];
     private uint entry;
+    private readonly uint fragmentHelperMask;
     private sealed class Collective(int pc, ushort op, ulong trace, ulong[] value, ulong argument) : Exception
     {
         public int Pc = pc;
@@ -31,8 +36,9 @@ internal sealed class SpirvCpu
         public ulong Argument = argument;
     }
 
-    public SpirvCpu(byte[] source)
+    public SpirvCpu(byte[] source, uint fragmentHelperMask = 0)
     {
+        this.fragmentHelperMask = fragmentHelperMask;
         var words = SpirvNonce.Read(source);
         var inFunction = false;
         for (var i = 5; i < words.Length; i += (int)(words[i] >> 16))
@@ -96,7 +102,8 @@ internal sealed class SpirvCpu
 
     public SortedDictionary<string, string> Execute(int seed, int maxSteps = 100000)
     {
-        if (!code.Any(i => i.Op is >= 333 and <= 366)) return ExecuteLane(seed, 0, [], maxSteps);
+        if (fragmentHelperMask == 0 && !code.Any(i => i.Op is >= 333 and <= 366 or >= 207 and <= 215))
+            return ExecuteLane(seed, 0, [], maxSteps);
         var history = new List<ulong[][]>();
         for (var round = 0; round < 64; round++)
         {
@@ -109,13 +116,16 @@ internal sealed class SpirvCpu
             {
                 var result = new SortedDictionary<string, string>();
                 for (var lane = 0; lane < 32; lane++)
+                {
+                    if ((fragmentHelperMask & (1u << lane)) != 0) continue;
                     foreach (var (key, value) in outputs[lane]!) result[$"lane:{lane}:{key}"] = value;
+                }
                 return result;
             }
             var first = events[0];
             if (first is null || events.Any(e => e is null || e.Pc != first.Pc || e.Op != first.Op || e.Trace != first.Trace))
                 throw new NotSupportedException("divergent collective/control trace");
-            var ballot = events.Select((e, lane) => e!.Value[0] != 0 ? 1u << lane : 0).Aggregate(0u, (a, b) => a | b);
+            var ballot = events.Select((e, lane) => e!.Value[0] != 0 && (fragmentHelperMask & (1u << lane)) == 0 ? 1u << lane : 0).Aggregate(0u, (a, b) => a | b);
             var results = new ulong[32][];
             for (var lane = 0; lane < 32; lane++)
             {
@@ -127,12 +137,23 @@ internal sealed class SpirvCpu
                     336 => [events.All(x => x!.Value.SequenceEqual(first.Value)) ? 1UL : 0],
                     338 => first.Value,
                     337 or 345 when e.Argument < 32 => events[(int)e.Argument]!.Value,
+                    365 when e.Argument < 4 => events[(lane & ~3) | (int)e.Argument]!.Value,
+                    366 when e.Argument < 3 => events[lane ^ (e.Argument == 0 ? 1 : e.Argument == 1 ? 2 : 3)]!.Value,
+                    210 or 211 => Difference(events, lane, e.Op == 210 ? 1 : 2),
                     _ => throw new NotSupportedException($"subgroup opcode {e.Op}"),
                 };
             }
             history.Add(results);
         }
         throw new NotSupportedException("collective limit");
+    }
+
+    private static ulong[] Difference(Collective?[] events, int lane, int axis)
+    {
+        var low = events[lane & ~axis]!.Value;
+        var high = events[lane | axis]!.Value;
+        return low.Select((v, i) => (ulong)BitConverter.SingleToUInt32Bits(
+            BitConverter.UInt32BitsToSingle((uint)high[i]) - BitConverter.UInt32BitsToSingle((uint)v))).ToArray();
     }
 
     private SortedDictionary<string, string> ExecuteLane(int seed, int lane, IReadOnlyList<ulong[][]> collectives, int maxSteps)
@@ -215,15 +236,17 @@ internal sealed class SpirvCpu
                 if (decorations.TryGetValue((p.Root, 11), out var builtin))
                 {
                     if (builtin == 23) // HelperInvocation
-                        result[i] = 0;
+                        result[i] = (fragmentHelperMask >> lane) & 1u;
+                    var pixelX = (lane / 4 % 4) * 2 + lane % 2;
+                    var pixelY = lane / 16 * 2 + lane / 2 % 2;
                     if (builtin == 15) // FragCoord; pixel centers, positive w.
-                        result[i] = BitConverter.SingleToUInt32Bits(i == 0 ? (seed % 8) * 8 + lane % 8 + .5f : i == 1 ? (seed / 8 % 8) * 4 + lane / 8 + .5f : i == 3 ? 1f : .5f);
+                        result[i] = BitConverter.SingleToUInt32Bits(i == 0 ? (seed % 8) * 8 + pixelX + .5f : i == 1 ? (seed / 8 % 8) * 4 + pixelY + .5f : i == 3 ? 1f : .5f);
                     if (builtin == 18) result[i] = 0; // One sample at the pixel center.
                     if (builtin is 5286 or 5287)
                     {
                         // Triangle (0,0), (256,0), (0,256), with equal clip w.
-                        var bx = ((seed % 8) * 8 + lane % 8 + .5f) / 256f;
-                        var by = ((seed / 8 % 8) * 4 + lane / 8 + .5f) / 256f;
+                        var bx = ((seed % 8) * 8 + pixelX + .5f) / 256f;
+                        var by = ((seed / 8 % 8) * 4 + pixelY + .5f) / 256f;
                         result[i] = BitConverter.SingleToUInt32Bits(i == 0 ? 1f - bx - by : i == 1 ? bx : by);
                     }
                     if (builtin is 29 or 41) result[i] = (uint)lane; // LocalInvocationIndex/SubgroupLocalInvocationId
@@ -349,12 +372,17 @@ internal sealed class SpirvCpu
                         foreach (var item in pending) { values[item.Id] = item.Value; valueTypes[item.Id] = item.Type; uniform.Remove(item.Id); }
                         continue;
                     }
-                    if (op is >= 333 and <= 366)
+                    if (op is >= 333 and <= 366 or 210 or 211)
                     {
-                        if (op is not (334 or 335 or 336 or 337 or 338 or 339 or 345)) throw new NotSupportedException($"subgroup opcode {op}");
-                        if (U(a[2]) != 3) throw new NotSupportedException("non-subgroup collective");
+                        var derivative = op is 210 or 211;
+                        if (derivative && (types[Scalar(type)].Op != 22 || Width(type) != 32))
+                            throw new NotSupportedException("only f32 fine derivatives modeled");
+                        if (!derivative && op is not (334 or 335 or 336 or 337 or 338 or 339 or 345 or 365 or 366)) throw new NotSupportedException($"subgroup opcode {op}");
+                        if (!derivative && U(a[2]) != 3) throw new NotSupportedException("non-subgroup collective");
+                        if (fragmentHelperMask != 0 && op is not (339 or 365 or 366 or 210 or 211))
+                            throw new NotSupportedException("helper participation only modeled for ballot and quad/derivative operations");
                         if (collectiveIndex == collectives.Count)
-                            throw new Collective(pc - 1, op, controlTrace, V(a[3]), a.Length > 4 ? U(a[4]) : 0);
+                            throw new Collective(pc - 1, op, controlTrace, V(a[derivative ? 2 : 3]), !derivative && a.Length > 4 ? U(a[4]) : 0);
                         values[id] = collectives[collectiveIndex++][lane]; continue;
                     }
                     if (op == 80) { values[id] = a.Skip(2).SelectMany(V).ToArray(); if (a.Skip(2).All(uniform.Contains)) uniform.Add(id); continue; }

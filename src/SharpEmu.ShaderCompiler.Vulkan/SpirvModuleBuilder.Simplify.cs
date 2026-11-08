@@ -8,7 +8,6 @@ public sealed partial class SpirvModuleBuilder
     private const int MaxWordSplitDepth = 6;
     private const uint GlslModf = 35;
     private const uint GlslFrexp = 51;
-    private const uint SubgroupScope = 3;
     private static readonly uint[] GlslMinMax = [37, 38, 39, 40, 41, 42, 79, 80];
 
     private uint[] _resultTypes = new uint[256];
@@ -30,8 +29,6 @@ public sealed partial class SpirvModuleBuilder
     private readonly HashSet<uint> _changingInputs = [];
     private readonly Dictionary<uint, uint> _entryValues = [];
     private readonly Dictionary<InstructionKey, uint> _entryOperations = [];
-    private readonly HashSet<uint> _laneIdInputs = [];
-    private readonly HashSet<uint> _laneIdValues = [];
     private readonly Dictionary<uint, int> _predecessorCounts = [];
     private readonly HashSet<uint> _emittedLabels = [];
     private readonly Dictionary<uint, List<(uint Block, BlockState State)>> _incomingStates = [];
@@ -167,7 +164,7 @@ public sealed partial class SpirvModuleBuilder
             return effect;
         }
 
-        if (HoistEntry && FoldExpressions && ReusesValues && CanHoistToEntry(opcode, operands))
+        if (HoistEntry && SpirvOptimizationPolicy.HoistExpressions && FoldExpressions && ReusesValues && CanHoistToEntry(opcode, operands))
         {
             return EntryOperation(opcode, resultType, operands);
         }
@@ -270,7 +267,7 @@ public sealed partial class SpirvModuleBuilder
     private uint AddLoad(uint resultType, uint[] operands)
     {
         var pointer = operands[0];
-        if (HoistEntry && operands.Length == 1 && _inputVariables.Contains(pointer) && !_changingInputs.Contains(pointer) &&
+        if (HoistEntry && SpirvOptimizationPolicy.HoistLoads && operands.Length == 1 && _inputVariables.Contains(pointer) && !_changingInputs.Contains(pointer) &&
             IsEntryAvailable())
         {
             return EntryLoad(resultType, pointer);
@@ -362,11 +359,6 @@ public sealed partial class SpirvModuleBuilder
 
         var result = AppendToEntry(SpirvOp.Load, resultType, [pointer]);
         _entryValues[pointer] = result;
-        if (_laneIdInputs.Contains(pointer))
-        {
-            _laneIdValues.Add(result);
-        }
-
         return result;
     }
 
@@ -905,12 +897,11 @@ public sealed partial class SpirvModuleBuilder
             return true;
         }
 
-        if (FoldLaneMasks && Defines(tested, SpirvOp.BitwiseAnd, out var masked) &&
-            TryOwnLaneBallotTest(masked.Operands[0], masked.Operands[1], out var ownLane))
-        {
-            result = notEqual ? ownLane : AddInstruction(SpirvOp.LogicalNot, resultType, ownLane);
-            return true;
-        }
+        // Keep own-lane ballot tests as well: ballot participation is an implicit
+        // operand. Fragment helpers may be excluded from the vote while still
+        // supplying values to derivatives/quad operations. Replacing the test
+        // with the voted predicate loses that distinction. Hoisting a lane-ID
+        // load must not enable this participation-dependent rewrite.
 
         if (FoldLaneMasks && IntegerWidth(TypeOf(tested)) == 64 && _integerTypes.TryGetValue((32, false), out var word) &&
             TrySplitHighWord(tested, word, 0, out var high) && IsIntegerConstant(high, out var highValue) &&
@@ -921,69 +912,6 @@ public sealed partial class SpirvModuleBuilder
         }
 
         return false;
-    }
-
-    private bool TryOwnLaneBallotTest(uint left, uint right, out uint condition)
-    {
-        condition = 0;
-        foreach (var (ballotWord, laneBit) in new[] { (left, right), (right, left) })
-        {
-            if (!Defines(ballotWord, SpirvOp.CompositeExtract, out var extract) || extract.Operands is not [var vote, 0] ||
-                !Defines(vote, SpirvOp.GroupNonUniformBallot, out var ballot) ||
-                !IsIntegerConstant(ballot.Operands[0], out var scope) || scope != SubgroupScope ||
-                !TryOwnLaneBit(laneBit, out var guard))
-            {
-                continue;
-            }
-
-            var voted = ballot.Operands[1];
-            condition = guard == 0 ? voted : AddInstruction(SpirvOp.LogicalAnd, TypeOf(voted), guard, voted);
-            return true;
-        }
-
-        return false;
-    }
-
-    private bool TryOwnLaneBit(uint value, out uint guard)
-    {
-        guard = 0;
-        if (IsShiftedOne(value, out var amount) && _laneIdValues.Contains(amount))
-        {
-            return true;
-        }
-
-        if (!Defines(value, SpirvOp.Select, out var selection) ||
-            !IsIntegerConstant(selection.Operands[2], out var otherwise) || otherwise != 0 ||
-            !Defines(selection.Operands[0], SpirvOp.ULessThan, out var bound) ||
-            !_laneIdValues.Contains(bound.Operands[0]) ||
-            !IsIntegerConstant(bound.Operands[1], out var laneLimit) || laneLimit != 32 ||
-            !IsShiftedOne(selection.Operands[1], out var shifted))
-        {
-            return false;
-        }
-
-        var lane = bound.Operands[0];
-        if (shifted != lane && !(Defines(shifted, SpirvOp.BitwiseAnd, out var wrapped) &&
-                wrapped.Operands[0] == lane && IsIntegerConstant(wrapped.Operands[1], out var wrapMask) && wrapMask == 31))
-        {
-            return false;
-        }
-
-        guard = selection.Operands[0];
-        return true;
-    }
-
-    private bool IsShiftedOne(uint value, out uint amount)
-    {
-        amount = 0;
-        if (!Defines(value, SpirvOp.ShiftLeftLogical, out var shift) || IntegerWidth(shift.Type) != 32 ||
-            !IsIntegerConstant(shift.Operands[0], out var one) || one != 1)
-        {
-            return false;
-        }
-
-        amount = shift.Operands[1];
-        return true;
     }
 
     private ulong MaxIntegerValue(uint value, int depth = 0)
