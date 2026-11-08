@@ -5,6 +5,10 @@ namespace SharpEmu.Libs.Diagnostics;
 
 public static class DispatchRunTally
 {
+    // Diagnostics only (the DISPATCH_RUNS report of SHARPEMU_PROFILE_RENDER): unprofiled runs hashed user data and
+    // descriptor words per dispatch and locked a dictionary per consume candidate for a report nobody printed.
+    public static readonly bool Enabled = VideoOut.RenderPhaseProfile.Enabled;
+
     public enum End
     {
         Sync,
@@ -64,6 +68,7 @@ public static class DispatchRunTally
     public static void NoteDispatch(object queue, ulong address, uint threadsX, uint threadsY, uint threadsZ, uint localDataShare,
         ReadOnlySpan<uint> userData, uint groupsX, uint groupsY, uint groupsZ, bool indirect)
     {
+        if (!Enabled) return;
         _dispatches++;
         if (indirect)
         {
@@ -127,6 +132,7 @@ public static class DispatchRunTally
 
     public static void NoteResolved(ulong programId, uint[][] images, uint[][] samplers, bool tableBlock, bool globalDataShare, bool consumeCandidate, bool knownWrite)
     {
+        if (!Enabled) return;
         if (!_memberPending)
         {
             return;
@@ -166,6 +172,7 @@ public static class DispatchRunTally
 
     public static void NoteConsume(ulong programHash, int kinds, bool consumed)
     {
+        if (!Enabled) return;
         for (var kind = 0; kind < ConsumeKindNames.Length; kind++)
         {
             if ((kinds & (1 << kind)) != 0)
@@ -210,6 +217,7 @@ public static class DispatchRunTally
 
     private static void Break(End reason)
     {
+        if (!Enabled) return;
         if (_length != 0 && _pendingEnd == End.Program)
         {
             _pendingEnd = reason;
