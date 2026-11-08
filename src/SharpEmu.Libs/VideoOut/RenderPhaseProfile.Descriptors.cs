@@ -193,6 +193,7 @@ internal static partial class RenderPhaseProfile
     {
         private readonly bool _active;
         private readonly DescriptorStep _previous;
+        private readonly SampleSlot? _sampled;
         internal DescriptorStepScope(DescriptorStep step)
         {
             Charge(_current);
@@ -201,8 +202,18 @@ internal static partial class RenderPhaseProfile
             _descriptorStep = step;
             DescriptorStorage.Counters.StepCalls[(int)step]++;
         }
+
+        // SHARPEMU_PROFILE_SAMPLE: only publishes the step for the sampler.
+        internal DescriptorStepScope(DescriptorStep step, SampleSlot slot)
+        {
+            _sampled = slot;
+            _previous = (DescriptorStep)slot.Step;
+            slot.Step = (int)step;
+        }
+
         public void Dispose()
         {
+            if (_sampled is not null) _sampled.Step = (int)_previous;
             if (!_active) return;
             Charge(_current);
             _descriptorStep = _previous;
@@ -215,7 +226,8 @@ internal static partial class RenderPhaseProfile
         (worker || _threadTicks is null && _scopeDepth > 0) ? new(kind, bind, reason, worker) : default;
 
     internal static DescriptorStepScope MeasureDescriptorStep(DescriptorStep step) =>
-        MovableEnabled && _descriptorActive ? new(step) : default;
+        MovableEnabled && _descriptorActive ? new(step) :
+        SampleEnabled && _sampleSlot is { } slot ? new(step, slot) : default;
 
     internal static void DescriptorMemo(DescriptorMemoKind kind)
     {

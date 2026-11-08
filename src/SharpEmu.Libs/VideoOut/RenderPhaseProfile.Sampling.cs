@@ -27,7 +27,10 @@ internal static partial class RenderPhaseProfile
     internal sealed class SampleSlot
     {
         public volatile int Phase;
+        public volatile int Step;
         public readonly long[] Counts = new long[(int)RenderPhaseProfile.Phase.Count];
+        // Samples in DescriptorPreparation by its step (SHARPEMU_PROFILE_RENDER's descriptor steps, self time).
+        public readonly long[] StepCounts = new long[(int)DescriptorStep.Count];
         public long Total;
 
         public Phase Enter(Phase phase)
@@ -82,7 +85,13 @@ internal static partial class RenderPhaseProfile
                     continue;
                 }
 
-                Interlocked.Increment(ref slot.Counts[slot.Phase]);
+                var phase = slot.Phase;
+                Interlocked.Increment(ref slot.Counts[phase]);
+                if (phase == (int)RenderPhaseProfile.Phase.DescriptorPreparation)
+                {
+                    Interlocked.Increment(ref slot.StepCounts[slot.Step]);
+                }
+
                 Interlocked.Increment(ref slot.Total);
             }
         }
@@ -131,6 +140,18 @@ internal static partial class RenderPhaseProfile
             }
 
             Console.Error.WriteLine(text.ToString());
+
+            var steps = new StringBuilder(FormattableString.Invariant($"[PERF][SAMPLED_DESC] thread={(SampledThread)index}"));
+            for (var step = 0; step < slot.StepCounts.Length; step++)
+            {
+                var stepCount = Interlocked.Exchange(ref slot.StepCounts[step], 0);
+                if (stepCount != 0)
+                {
+                    steps.Append(FormattableString.Invariant($" {(DescriptorStep)step}={stepCount / (double)total * windowMilliseconds / frames:F1}"));
+                }
+            }
+
+            Console.Error.WriteLine(steps.ToString());
         }
     }
 
