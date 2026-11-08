@@ -1284,11 +1284,14 @@ internal static unsafe partial class VulkanVideoPresenter
             return ref box.Value;
         }
 
+        // The label names a buffer the lookup creates; hits ignore it, so it is built once per caller.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _findBufferCallers = new();
+
         private ResourceSlotIdentifier FindBuffer(ulong address, ulong size, [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
         {
             if (!_worker)
             {
-                return _bufferCache.FindBuffer(address, size, "RecordingHost." + caller);
+                return _bufferCache.FindBuffer(address, size, _findBufferCallers.GetOrAdd(caller, static name => "RecordingHost." + name));
             }
 
             if (address == 0)

@@ -1102,13 +1102,7 @@ public static class KernelPthreadCompatExports
         }
 
         if (canCooperativelyBlock && waiter is not null &&
-            GuestThreadExecution.RequestCurrentThreadBlock(
-                ctx,
-                "pthread_mutex_lock",
-                waiter.WakeKey,
-                () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
-                () => TryGrantBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
-                deadlineTimestamp))
+            RequestBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter, deadlineTimestamp))
         {
             TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -2415,13 +2409,15 @@ public static class KernelPthreadCompatExports
         ulong mutexAddress,
         ulong resolvedAddress,
         PthreadMutexState state,
-        PthreadMutexWaiter waiter) =>
+        PthreadMutexWaiter waiter,
+        long deadlineTimestamp) =>
         GuestThreadExecution.RequestCurrentThreadBlock(
             ctx,
             "pthread_mutex_lock",
             waiter.WakeKey,
             () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
-            () => TryGrantBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter));
+            () => TryGrantBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
+            deadlineTimestamp);
 
     private static bool TryGrantBlockedMutexLock(
         CpuContext ctx,
