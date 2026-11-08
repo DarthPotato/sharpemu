@@ -102,7 +102,7 @@ result filters, mutex warning sampling, and diagnostic selection.
 | Group | Variables |
 | --- | --- |
 | Behavior switches | 17 |
-| GPU and Vulkan | 61 |
+| GPU and Vulkan | 63 |
 | GnmMode | 4 (plus 2 shared switches listed below; trophy key also exposed in GUI) |
 | Audio and video | 6 |
 | Input | 5 |
@@ -188,6 +188,8 @@ These variables change the GPU path or the Vulkan presenter.
 | --- | --- | --- | --- |
 | `SHARPEMU_ASYNC_COMPUTE_PIPELINES` | `0` | `0` compiles a compute pipeline inline, inside the pipeline cache's lock. By default the host shader compiler runs on worker threads (half the processor count, at least two), so a long compile does not stop other queues from creating their own pipelines. | `VulkanVideoPresenter.Pipelines.cs` |
 | `SHARPEMU_ASYNC_GUEST_READBACK` | `0` | `0` makes a guest thread that reads GPU-written buffer memory wait until the render thread has copied the data back. The default starts the copy on the render thread and lets the guest thread wait for it on a separate readback slot, so the render thread continues. | `GuestBufferCache.cs` |
+| `SHARPEMU_CONTENT_ARENA_HALF_BYTES` | decimal bytes | Capacity of each of the two content upload arena halves, read at construction. Default 33554432 (32 MiB); positive values clamp to 4096–268435456 (4 KiB–256 MiB). Unset, zero, negative, malformed or overflowing values use the default. Small values exercise table upload overflow; entries larger than a half use the next upload path. | `UploadBufferCapacities.cs`, `ContentUploadArena.cs` |
+| `SHARPEMU_STREAM_RING_BYTES` | decimal bytes | Stream ring capacity, read at construction. Default 67108864 (64 MiB); positive values clamp to 4096–536870912 (4 KiB–512 MiB). Invalid values use the default as above. For pressure repro, try both capacity variables at 1048576 (1 MiB), plus `SHARPEMU_PROFILE_RENDER=1`. Table fallbacks log `[GPU][WARN][TABLE_UPLOAD_OVERFLOW]` on the first and every 256th occurrence, and `table_overflows` in the per-window table report. | `UploadBufferCapacities.cs`, `GuestBufferCache.cs` |
 | `SHARPEMU_CAPTURE_PIXEL_EXEC_PCS` | list (`pc:register` pairs) | At each given instruction PC, the pixel shader writes the execution flag to the given VGPR register. The value is 1.0 when the flag is set and 0.0 when it is not. `SHARPEMU_CAPTURE_PIXEL_VGPR_ADDRESS` must match the shader address. | `Gen5SpirvTranslator.cs` |
 | `SHARPEMU_CAPTURE_PIXEL_IMAGE_ADDRESS` | hex address | Selects the pixel shader for the image capture by its program address. The default is no capture. Use it with `SHARPEMU_CAPTURE_PIXEL_IMAGE_PC`. | `Gen5SpirvTranslator.cs` |
 | `SHARPEMU_CAPTURE_PIXEL_IMAGE_PC` | number (instruction PC) | Sets the image instruction whose result the SPIR-V translator copies to four VGPR registers. `SHARPEMU_CAPTURE_PIXEL_IMAGE_ADDRESS` must match the shader address. | `Gen5SpirvTranslator.cs` |

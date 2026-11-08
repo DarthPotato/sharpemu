@@ -145,13 +145,13 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
     private sealed class FixedProgramProvider(IShaderPipelineHost host, ulong vertexAddress, bool pushData = false,
         byte[]? interpolationShader = null, uint vertexCount = VertexCount,
         byte[]? vertexShader = null, uint vertexComponents = 2, uint vertexStride = VertexStride,
-        BindingLayout? pixelBindings = null) : IShaderPipelineProvider
+        BindingLayout? pixelBindings = null, uint[]? flattenedTable = null) : IShaderPipelineProvider
     {
         private const uint Float2Format = 64;
         private static readonly uint[] UserRegisters = [0, 1];
         private readonly ShaderProgramInfo _vertex = EmptyProgram(ShaderStageKind.Vertex, 1, fetchComponents: vertexComponents, userDataRegisters: pushData ? UserRegisters : null, pushDataStart: 2);
         private readonly ShaderProgramInfo _pixel = EmptyProgram(ShaderStageKind.Pixel, 2, userDataRegisters: pushData ? UserRegisters : null, bindings: pixelBindings);
-        private readonly ResourceSnapshot _snapshot = new() { UserData = pushData ? [0x11, 0x22] : [] };
+        private readonly ResourceSnapshot _snapshot = new() { UserData = pushData ? [0x11, 0x22] : [], FlattenedResourceTable = flattenedTable ?? [] };
         private ShaderProgram _vertexProgram;
         private ShaderProgram _pixelProgram;
 

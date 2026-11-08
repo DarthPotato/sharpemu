@@ -12,13 +12,12 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 
 public sealed class ContentUploadArena : IDisposable
 {
-    private const ulong ArenaBytes = 32UL * 1024 * 1024;
     private const int MaxContentBytes = 64 * 1024;
 
     private sealed class Arena(GpuBuffer buffer)
     {
         public readonly GpuBuffer Buffer = buffer;
-        public readonly byte[] Mirror = GC.AllocateUninitializedArray<byte>((int)ArenaBytes);
+        public readonly byte[] Mirror = GC.AllocateUninitializedArray<byte>(checked((int)buffer.Size));
         public readonly Dictionary<ulong, (ulong Offset, int Size)> Entries = new();
         public readonly Dictionary<uint[], (ulong Offset, int Size)> IdentityEntries = new(ReferenceEqualityComparer.Instance);
         public ulong Offset;
@@ -27,6 +26,7 @@ public sealed class ContentUploadArena : IDisposable
 
     private readonly SubmissionScheduler _scheduler;
     private readonly Arena[] _arenas;
+    private readonly ulong _halfBytes;
     private int _active;
 
     private static readonly ThreadCounter _hits = new();
@@ -40,10 +40,11 @@ public sealed class ContentUploadArena : IDisposable
     public ContentUploadArena(GpuDeviceInfo device, SubmissionScheduler scheduler)
     {
         _scheduler = scheduler;
+        _halfBytes = UploadBufferCapacities.ArenaHalfBytes;
         _arenas =
         [
-            new Arena(new GpuBuffer(device, scheduler, GpuMemoryPlacement.StreamRing, 0, GpuBuffer.AddressedFlags, ArenaBytes)),
-            new Arena(new GpuBuffer(device, scheduler, GpuMemoryPlacement.StreamRing, 0, GpuBuffer.AddressedFlags, ArenaBytes)),
+            new Arena(new GpuBuffer(device, scheduler, GpuMemoryPlacement.StreamRing, 0, GpuBuffer.AddressedFlags, _halfBytes)),
+            new Arena(new GpuBuffer(device, scheduler, GpuMemoryPlacement.StreamRing, 0, GpuBuffer.AddressedFlags, _halfBytes)),
         ];
     }
 
@@ -51,7 +52,7 @@ public sealed class ContentUploadArena : IDisposable
     {
         buffer = default;
         offset = 0;
-        if (words.Length == 0 || words.Length * sizeof(uint) > MaxContentBytes || alignment == 0)
+        if (words.Length == 0 || (ulong)words.Length * sizeof(uint) > Math.Min((ulong)MaxContentBytes, _halfBytes) || alignment == 0)
         {
             return false;
         }
@@ -85,7 +86,7 @@ public sealed class ContentUploadArena : IDisposable
     {
         buffer = default;
         offset = 0;
-        if (data.Length == 0 || data.Length > MaxContentBytes || alignment == 0)
+        if (data.Length == 0 || (ulong)data.Length > Math.Min((ulong)MaxContentBytes, _halfBytes) || alignment == 0)
         {
             return false;
         }
@@ -148,7 +149,7 @@ public sealed class ContentUploadArena : IDisposable
     {
         var active = _arenas[_active];
         var aligned = (active.Offset + alignment - 1) / alignment * alignment;
-        if (aligned + (ulong)data.Length > ArenaBytes)
+        if (aligned + (ulong)data.Length > _halfBytes)
         {
             var other = _arenas[1 - _active];
             // A use of the other half in the current (unsubmitted) tick, or a wait from a completion
@@ -192,6 +193,9 @@ public sealed class ContentUploadArena : IDisposable
     public static string TakeReport() =>
         FormattableString.Invariant($"[PERF][CONTENT_UPLOADS] hits={_hits.Take()} identity_hits={_identityHits.Take()} stores={_stores.Take()} recycles={_recycles.Take()} ") +
         FormattableString.Invariant($"refused={_refused.Take()} collisions={_collisions.Take()} waits={_waits.Take()}");
+
+    internal string DescribePressure() => FormattableString.Invariant(
+        $"arena_active={_active} arena_half_bytes={_halfBytes} arena0_offset={_arenas[0].Offset} arena0_last_use_tick={_arenas[0].LastUseTick} arena1_offset={_arenas[1].Offset} arena1_last_use_tick={_arenas[1].LastUseTick}");
 
     public void Dispose()
     {

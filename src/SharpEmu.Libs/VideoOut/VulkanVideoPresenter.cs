@@ -354,7 +354,8 @@ internal static unsafe partial class VulkanVideoPresenter
             BufferUsageFlags usage,
             MemoryPropertyFlags memoryFlags,
             out DeviceMemory memory,
-            MemoryPropertyFlags preferredMemoryFlags = 0)
+            MemoryPropertyFlags preferredMemoryFlags = 0,
+            bool allowAllocationRecovery = true)
         {
             var bufferInfo = new BufferCreateInfo
             {
@@ -381,8 +382,22 @@ internal static unsafe partial class VulkanVideoPresenter
                     memoryFlags,
                     preferredMemoryFlags),
             };
-            Check(AllocateMemoryWithRecovery(memoryInfo, out memory), "vkAllocateMemory");
-            Check(_vk.BindBufferMemory(_device, buffer, memory, 0), "vkBindBufferMemory");
+            var result = allowAllocationRecovery
+                ? AllocateMemoryWithRecovery(memoryInfo, out memory)
+                : _deviceInfo.AllocateMemory(memoryInfo, out memory);
+            if (result != Result.Success)
+            {
+                _vk.DestroyBuffer(_device, buffer, null);
+                Check(result, "vkAllocateMemory");
+            }
+
+            result = _vk.BindBufferMemory(_device, buffer, memory, 0);
+            if (result != Result.Success)
+            {
+                _vk.DestroyBuffer(_device, buffer, null);
+                _deviceInfo.FreeMemory(memory);
+                Check(result, "vkBindBufferMemory");
+            }
             return buffer;
         }
 

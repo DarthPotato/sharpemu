@@ -18,7 +18,8 @@ internal static unsafe partial class VulkanVideoPresenter
             ReadOnlySpan<byte> data,
             BufferUsageFlags usage,
             out DeviceMemory memory,
-            out nint mapped)
+            out nint mapped,
+            bool allowAllocationRecovery = true)
         {
             var size = (ulong)Math.Max(data.Length, sizeof(uint));
             var capacity = BitOperations.RoundUpToPowerOf2(size);
@@ -35,20 +36,31 @@ internal static unsafe partial class VulkanVideoPresenter
                     capacity,
                     usage,
                     MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
-                    out var allocatedMemory);
+                    out var allocatedMemory,
+                    allowAllocationRecovery: allowAllocationRecovery);
                 // Persistently mapped: map/unmap per draw was a measurable
                 // share of the per-draw fixed cost, and HOST_COHERENT memory
                 // may legally stay mapped for its lifetime.
-                void* persistentMapping;
-                Check(
-                    _vk.MapMemory(_device, allocatedMemory, 0, capacity, 0, &persistentMapping),
-                    "vkMapMemory(host persistent)");
-                allocation = new VulkanHostBufferAllocation(
-                    buffer,
-                    allocatedMemory,
-                    key,
-                    (nint)persistentMapping);
-                _hostBufferPool.Register(allocation);
+                void* persistentMapping = null;
+                try
+                {
+                    Check(
+                        _vk.MapMemory(_device, allocatedMemory, 0, capacity, 0, &persistentMapping),
+                        "vkMapMemory(host persistent)");
+                    allocation = new VulkanHostBufferAllocation(
+                        buffer,
+                        allocatedMemory,
+                        key,
+                        (nint)persistentMapping);
+                    _hostBufferPool.Register(allocation);
+                }
+                catch
+                {
+                    if (persistentMapping != null) _vk.UnmapMemory(_device, allocatedMemory);
+                    _vk.DestroyBuffer(_device, buffer, null);
+                    _deviceInfo.FreeMemory(allocatedMemory);
+                    throw;
+                }
             }
 
             memory = allocation.Memory;

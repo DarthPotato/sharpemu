@@ -44,7 +44,7 @@ internal sealed class PresenterUnderTest : IDisposable
     public static readonly Type PresenterType = typeof(VulkanVideoPresenter).GetNestedType("Presenter", BindingFlags.NonPublic)!;
     public static readonly Type RecordingHostType = typeof(VulkanVideoPresenter).GetNestedType("RecordingHost", BindingFlags.NonPublic)!;
 
-    public PresenterUnderTest(HeadlessVulkan vulkan, bool startScheduler = true)
+    public PresenterUnderTest(HeadlessVulkan vulkan, bool startScheduler = true, ulong hostBufferCacheBytes = 128UL * 1024 * 1024)
     {
         var forwarder = new SchedulerForwarder();
         Harness = new CacheHarness(vulkan, hooks: new SchedulerHooks(forwarder, forwarder.Prepare, forwarder.Complete), startScheduler: startScheduler);
@@ -80,7 +80,11 @@ internal sealed class PresenterUnderTest : IDisposable
         vulkan.Vk.GetPhysicalDeviceProperties(vulkan.Physical, out var deviceProperties);
         SetField("_shaderDescriptorLimits", deviceProperties.Limits);
         SetField("_noAttachmentSampleCounts", SampleCountFlags.Count1Bit);
-        HostBuffers = new VulkanHostBufferPool(128UL * 1024 * 1024, allocation => InvokeMethod("DestroyHostBufferAllocation", allocation));
+        HostBuffers = new VulkanHostBufferPool(hostBufferCacheBytes, allocation =>
+        {
+            HostBufferDestructions.Add(allocation);
+            InvokeMethod("DestroyHostBufferAllocation", allocation);
+        });
         SetField("_hostBufferPool", HostBuffers);
         SetField("_maxColorAttachments", 8u);
         SetField("_renderHostLimits", new RenderHostLimits(16384, 16384, 16384, 16384));
@@ -109,6 +113,8 @@ internal sealed class PresenterUnderTest : IDisposable
     public SamplerStore Samplers { get; }
 
     public VulkanHostBufferPool HostBuffers { get; }
+
+    public List<VulkanHostBufferAllocation> HostBufferDestructions { get; } = [];
 
     public object Instance { get; }
 

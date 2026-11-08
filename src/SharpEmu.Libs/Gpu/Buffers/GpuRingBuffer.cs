@@ -98,6 +98,15 @@ public sealed class GpuRingBuffer : GpuBuffer
         return false;
     }
 
+    internal string DescribePressure()
+    {
+        lock (_allocationRetentions)
+        {
+            return FormattableString.Invariant(
+                $"stream_bytes={Size} stream_head={_offset} stream_tail={_waitBound} stream_wait_cursor={_waitCursor} stream_pending_ranges={_invalidationMark ?? 0} stream_content_retentions={Volatile.Read(ref _retainedContents)} stream_allocation_retentions={_allocationRetentions.Count}");
+        }
+    }
+
     // Preparation can submit the upload before recording its consumer on a later tick.
     private void RecordRetainedAllocationUse(ulong startingReservation)
     {

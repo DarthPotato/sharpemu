@@ -1539,6 +1539,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private uint[] _tableBlockWords = new uint[64];
         private static long _tableBlocks;
+        private static readonly ThreadCounter _tableOverflowUploads = new();
+        private ulong _tableOverflowCount;
         private static long _descriptorsShadowed;
         private static readonly ThreadCounter _foundSetsHit = new();
         private static readonly ThreadCounter _sliceUseHits = new();
@@ -1546,7 +1548,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly ThreadCounter _sliceUseStale = new();
 
         internal static string TakeTableReport() =>
-            FormattableString.Invariant($"table_blocks={Interlocked.Exchange(ref _tableBlocks, 0)} descriptors_shadowed={Interlocked.Exchange(ref _descriptorsShadowed, 0)} ") +
+            FormattableString.Invariant($"table_blocks={Interlocked.Exchange(ref _tableBlocks, 0)} table_overflows={_tableOverflowUploads.Take()} descriptors_shadowed={Interlocked.Exchange(ref _descriptorsShadowed, 0)} ") +
             FormattableString.Invariant($"vsharp_cache=hit:{_sliceUseHits.Take()},miss:{_sliceUseMisses.Take()},stale:{_sliceUseStale.Take()} found_sets_hit={_foundSetsHit.Take()} ");
 
         private ulong NullBufferAddress => _nullBufferAddress != 0 ? _nullBufferAddress : _nullBufferAddress = _bufferCache.GetBuffer(GuestBufferCache.NullBufferId).DeviceAddress;
@@ -1637,7 +1639,44 @@ internal static unsafe partial class VulkanVideoPresenter
                 return address;
             }
 
-            throw SubmissionScheduler.Fatal($"No upload ring could take a table block: bytes={bytes.Length} hash=0x{program.Hash:X16}.");
+            // The inactive arena half can be pinned by a cache hit in this very preparation,
+            // while retained stream bytes prevent wrapping. Neither can safely be waited on or
+            // released yet: the consumer has not been recorded. Follow mesh-index overflow
+            // ownership instead; CommitBindings transfers the buffer to submission retirement.
+            // Image-cache OOM recovery can finish the current tick too, so disable it here.
+            var preparation = RequirePreparation();
+            var buffer = _presenter.CreateHostBuffer(bytes,
+                BufferUsageFlags.StorageBufferBit | BufferUsageFlags.ShaderDeviceAddressBit,
+                out var memory, out _, allowAllocationRecovery: false);
+            try
+            {
+                preparation.OverflowBuffers.Add((buffer, memory));
+            }
+            catch
+            {
+                _presenter.RecycleHostBuffer(buffer, memory);
+                throw;
+            }
+
+            var addressInfo = new BufferDeviceAddressInfo
+            {
+                SType = StructureType.BufferDeviceAddressInfo,
+                Buffer = buffer,
+            };
+            address = _vk.GetBufferDeviceAddress(_device, &addressInfo);
+            if (address == 0 || address % TableBlockAlignment != 0)
+                throw new InvalidOperationException("The table overflow buffer has no aligned device address.");
+
+            _tableOverflowUploads.Increment();
+            var count = ++_tableOverflowCount;
+            if (count == 1 || count % 256 == 0)
+            {
+                Console.Error.WriteLine(FormattableString.Invariant(
+                    $"[GPU][WARN][TABLE_UPLOAD_OVERFLOW] count={count} bytes={bytes.Length} alignment={TableBlockAlignment} hash=0x{program.Hash:X16} current_tick={_scheduler.CurrentTick} completed_tick={_scheduler.CompletedTick} ") +
+                    (_contentUploads?.DescribePressure() ?? "arena=unavailable") + " " + stream.DescribePressure());
+            }
+
+            return address;
         }
 
         private const uint TableBlockAlignment = 16;
