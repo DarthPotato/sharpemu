@@ -26,8 +26,8 @@ public sealed unsafe partial class GuestImageCache
 
     internal void ApplyNativeColorClear(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
-        var description = request.Description;
-        var metadata = description.Metadata;
+        ref readonly var description = ref request.Description;
+        ref readonly var metadata = ref description.Metadata;
         if (!metadata.NativeColorClear) return;
         var metadataKind = metadata.Kind == MetadataKind.Cmask ? SurfaceMetadataKind.CMask : SurfaceMetadataKind.Dcc;
         var view = request.View;
@@ -83,8 +83,8 @@ public sealed unsafe partial class GuestImageCache
     // True when ApplyNativeColorClear would change nothing: the registration is current and no slice holds a clear code.
     internal bool NativeColorClearSettled(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
-        var description = request.Description;
-        var metadata = description.Metadata;
+        ref readonly var description = ref request.Description;
+        ref readonly var metadata = ref description.Metadata;
         if (!metadata.NativeColorClear) return true;
         var metadataKind = metadata.Kind == MetadataKind.Cmask ? SurfaceMetadataKind.CMask : SurfaceMetadataKind.Dcc;
         var view = request.View;

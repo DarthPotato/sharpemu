@@ -390,7 +390,7 @@ public sealed partial class GuestImageCache
 
     private bool DccClearMaterializationIsNoop(CachedImage image, in ImageRequest request)
     {
-        var description = request.Description;
+        ref readonly var description = ref request.Description;
         if (description.Metadata.Kind != MetadataKind.Dcc)
         {
             return true;

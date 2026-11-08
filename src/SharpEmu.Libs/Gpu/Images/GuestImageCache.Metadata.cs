@@ -31,7 +31,7 @@ public sealed partial class GuestImageCache
             return;
         }
 
-        var description = request.Description;
+        ref readonly var description = ref request.Description;
         var range = description.Metadata.Range;
         using (var held = _lock.Hold())
         {
