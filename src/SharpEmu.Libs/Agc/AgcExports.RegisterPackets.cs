@@ -1,6 +1,8 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers;
+using System.Runtime.InteropServices;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Diagnostics;
 using SharpEmu.Libs.Kernel;
@@ -20,6 +22,7 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int CbSetShRegistersDirect(CpuContext ctx)
     {
+
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var registersAddress = ctx[CpuRegister.Rsi];
         var registerCount = (uint)ctx[CpuRegister.Rdx];
@@ -33,57 +36,69 @@ public static partial class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        var registers = new RegisterDefaultValue[registerCount];
-        for (uint index = 0; index < registerCount; index++)
+        // The game calls this for nearly every draw, and every guest memory access pays the GPU write
+        // tracking: the (offset, value) pairs are read at once and each packet is written at once.
+        var rentedRegisters = registerCount > StackRegisterCount ? ArrayPool<RegisterDefaultValue>.Shared.Rent((int)registerCount) : null;
+        var rentedPacket = registerCount + 2 > StackRegisterCount ? ArrayPool<uint>.Shared.Rent((int)registerCount + 2) : null;
+        try
         {
-            var entryAddress = registersAddress + ((ulong)index * 8);
-            if (!TryReadUInt32(ctx, entryAddress, out var offset) ||
-                !TryReadUInt32(ctx, entryAddress + sizeof(uint), out var value))
+            var registers = rentedRegisters is null
+                ? stackalloc RegisterDefaultValue[(int)registerCount]
+                : rentedRegisters.AsSpan(0, (int)registerCount);
+            var packet = rentedPacket is null ? stackalloc uint[(int)registerCount + 2] : rentedPacket.AsSpan(0, (int)registerCount + 2);
+            if (!ctx.Memory.TryRead(registersAddress, MemoryMarshal.AsBytes(registers)))
             {
                 return ReturnPointer(ctx, 0);
             }
 
-            registers[index] = new RegisterDefaultValue(offset, value);
-        }
-
-        Array.Sort(registers, static (left, right) => left.Offset.CompareTo(right.Offset));
-        ulong firstCommandAddress = 0;
-        var startIndex = 0;
-        while (startIndex < registers.Length)
-        {
-            var endIndex = startIndex + 1;
-            while (endIndex < registers.Length &&
-                   registers[endIndex].Offset == registers[endIndex - 1].Offset + 1)
+            registers.Sort(static (left, right) => left.Offset.CompareTo(right.Offset));
+            ulong firstCommandAddress = 0;
+            var startIndex = 0;
+            while (startIndex < registers.Length)
             {
-                endIndex++;
-            }
+                var endIndex = startIndex + 1;
+                while (endIndex < registers.Length &&
+                       registers[endIndex].Offset == registers[endIndex - 1].Offset + 1)
+                {
+                    endIndex++;
+                }
 
-            var valueCount = (uint)(endIndex - startIndex);
-            var packetDwords = valueCount + 2;
-            if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress) ||
-                !TryWriteUInt32(ctx, commandAddress, Pm4(packetDwords, ItSetShReg, 0)) ||
-                !TryWriteUInt32(ctx, commandAddress + 4, registers[startIndex].Offset & 0xFFFFu))
-            {
-                return ReturnPointer(ctx, 0);
-            }
+                var valueCount = (uint)(endIndex - startIndex);
+                var packetDwords = valueCount + 2;
+                packet[0] = Pm4(packetDwords, ItSetShReg, 0);
+                packet[1] = registers[startIndex].Offset & 0xFFFFu;
+                for (var index = startIndex; index < endIndex; index++)
+                {
+                    packet[2 + index - startIndex] = registers[index].Value;
+                }
 
-            firstCommandAddress = firstCommandAddress == 0 ? commandAddress : firstCommandAddress;
-            for (var index = startIndex; index < endIndex; index++)
-            {
-                if (!TryWriteUInt32(
-                        ctx,
-                        commandAddress + 8 + ((ulong)(index - startIndex) * sizeof(uint)),
-                        registers[index].Value))
+                if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress) ||
+                    !TryWriteCommandDwords(ctx, commandAddress, packet[..(int)packetDwords]))
                 {
                     return ReturnPointer(ctx, 0);
                 }
+
+                firstCommandAddress = firstCommandAddress == 0 ? commandAddress : firstCommandAddress;
+                startIndex = endIndex;
             }
 
-            startIndex = endIndex;
+            return ReturnPointer(ctx, firstCommandAddress);
         }
+        finally
+        {
+            if (rentedRegisters is not null)
+            {
+                ArrayPool<RegisterDefaultValue>.Shared.Return(rentedRegisters);
+            }
 
-        return ReturnPointer(ctx, firstCommandAddress);
+            if (rentedPacket is not null)
+            {
+                ArrayPool<uint>.Shared.Return(rentedPacket);
+            }
+        }
     }
+
+    private const int StackRegisterCount = 128;
 
     [SysAbiExport(
         Nid = "n2fD4A+pb+g",
