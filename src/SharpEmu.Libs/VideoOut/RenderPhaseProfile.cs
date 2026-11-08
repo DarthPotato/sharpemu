@@ -174,6 +174,12 @@ internal static partial class RenderPhaseProfile
         OrderedGuestRead,
         OrderedBarrierDecision,
         OrderedMetadata,
+        /// <summary>Command thread: waiting for a synchronous render-thread item (operand reads, flips).</summary>
+        ProducerRoundTrip,
+        /// <summary>Command thread: waiting for the render thread to run a queued writer the stream reads.</summary>
+        ProducerPendingWait,
+        /// <summary>Command thread: no runnable submission (idle, or every queue blocked).</summary>
+        ProducerIdle,
         Count,
     }
 

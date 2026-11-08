@@ -223,7 +223,11 @@ internal static partial class VulkanVideoPresenter
             Enqueue(item);
             var previous = _producerState;
             _producerState = ProducerRunWait;
-            WaitFor(item);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProducerRoundTrip))
+            {
+                WaitFor(item);
+            }
+
             _producerState = previous;
             var elapsed = Stopwatch.GetTimestamp() - started;
             Diagnostics.PacketHandlerTally.WaitedTicks += elapsed;
@@ -608,6 +612,7 @@ internal static partial class VulkanVideoPresenter
 
             var started = Diagnostics.CommandThreadTally.Enabled ? Stopwatch.GetTimestamp() : 0;
             var context = started != 0 ? QueueContext() : null;
+            using var waitPhase = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProducerPendingWait);
             var spinner = new SpinWait();
             for (var spin = 0; spin < 100 && Volatile.Read(ref _executed) < sequence; spin++)
             {
@@ -1224,7 +1229,11 @@ internal static partial class VulkanVideoPresenter
                     {
                         case SliceResult.NoWork:
                             _producerState = ProducerIdle;
-                            _ = _queue.WaitForWork(8);
+                            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProducerIdle))
+                            {
+                                _ = _queue.WaitForWork(8);
+                            }
+
                             if (tally)
                             {
                                 Diagnostics.CommandThreadTally.NoteIdle(Stopwatch.GetTimestamp() - started);
@@ -1269,6 +1278,7 @@ internal static partial class VulkanVideoPresenter
         // retry interval without progress.
         private void WaitBlocked(ref long lastProgress)
         {
+            using var idle = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProducerIdle);
             if (_queue.HasUnresolvedSpeculation)
             {
                 // Its escape read must not wait for the idle retry interval.
