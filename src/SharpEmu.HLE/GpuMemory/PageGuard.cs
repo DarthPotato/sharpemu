@@ -346,6 +346,11 @@ public sealed class PageGuard : IDisposable
         if (GuestGpuMemoryHook.Traces(address, size))
             GuestGpuMemoryHook.Trace(address, size, $"host-protect derived={allowedAccess}");
         var protectionStarted = RegionLockTrace.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (Diagnostics.HostProtectCounters.Enabled)
+        {
+            Diagnostics.HostProtectCounters.NotePageGuard(address, size, (allowedAccess & GuestPageProtection.Write) != 0);
+        }
+
         if (!_addressSpace.TryProtect(address, size, allowedAccess))
         {
             OnFatal($"Could not change page access at 0x{address:X16}, new=0x{(uint)allowedAccess:X8}.");

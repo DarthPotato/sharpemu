@@ -75,6 +75,7 @@ public static unsafe class HostMemory
 
     public static bool Protect(void* address, nuint size, uint newProtect, out uint oldProtect)
     {
+        Diagnostics.HostProtectCounters.Note(size);
         if (OperatingSystem.IsWindows())
         {
             return Win32VirtualProtect(address, size, newProtect, out oldProtect);

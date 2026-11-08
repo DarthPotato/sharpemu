@@ -48,11 +48,13 @@ internal sealed unsafe partial class WindowsHostMemory : IHostMemory
 
     public bool Protect(ulong address, ulong size, HostPageProtection protection, out uint rawOldProtection)
     {
+        Diagnostics.HostProtectCounters.Note(size);
         return VirtualProtect((void*)address, (nuint)size, ToNativeProtection(protection), out rawOldProtection);
     }
 
     public bool ProtectRaw(ulong address, ulong size, uint rawProtection, out uint rawOldProtection)
     {
+        Diagnostics.HostProtectCounters.Note(size);
         return VirtualProtect((void*)address, (nuint)size, rawProtection, out rawOldProtection);
     }
 

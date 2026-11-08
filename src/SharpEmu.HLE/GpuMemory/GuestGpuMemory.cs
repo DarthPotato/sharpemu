@@ -96,6 +96,11 @@ public sealed class GuestGpuMemory : IDisposable
     // Retry after recovery, including a watch removed before the fault reached its store.
     public bool TryResolveFault(FaultKind kind, ulong address)
     {
+        if (Diagnostics.HostProtectCounters.Enabled)
+        {
+            Interlocked.Increment(ref Diagnostics.HostProtectCounters.Faults);
+            Diagnostics.HostProtectCounters.NoteGranule(address, 1, "fault:" + kind);
+        }
         using var profile = GpuMemoryAccessProfile.MeasureFault(kind);
         // The fault names a byte in the page whose protection stopped the access, so the range ends
         // with that page: a store to the last bytes of a span is still the span's, and an access

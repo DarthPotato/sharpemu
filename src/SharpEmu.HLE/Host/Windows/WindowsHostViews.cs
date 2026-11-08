@@ -242,8 +242,11 @@ internal sealed unsafe partial class WindowsHostViews : IHostViewMemory
     public bool ReleasePrivate(ulong address, ulong size) =>
         VirtualFree((void*)address, (nuint)size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
 
-    public bool ChangeAccess(ulong address, ulong size, HostPageProtection protection) =>
-        VirtualProtect((void*)address, (nuint)size, GetNativeProtection(protection), out _);
+    public bool ChangeAccess(ulong address, ulong size, HostPageProtection protection)
+    {
+        Diagnostics.HostProtectCounters.Note(size);
+        return VirtualProtect((void*)address, (nuint)size, GetNativeProtection(protection), out _);
+    }
 
     public bool FreeOwnedRange(ulong address, ulong size)
     {

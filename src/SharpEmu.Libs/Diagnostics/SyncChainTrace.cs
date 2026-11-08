@@ -40,6 +40,18 @@ internal static class SyncChainTrace
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, ParkStart> Parks = new();
     private static long _resumes;
+    private static long _protectCallsAtStart;
+    private static long _protectPagesAtStart;
+    private static long[] _guardAtStart = new long[5];
+
+    private static long[] GuardCounters() =>
+    [
+        Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.GuardRelaxCalls),
+        Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.GuardRelaxPages),
+        Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.GuardRestrictCalls),
+        Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.GuardRestrictPages),
+        Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.Faults),
+    ];
 
     // A guest thread yields its host thread for a blocking wait, and resumes later (possibly elsewhere).
     public static void NotePark(object context, string export, string wakeKey)
@@ -167,6 +179,10 @@ internal static class SyncChainTrace
         {
             if (Stopwatch.GetTimestamp() >= StartAfter)
             {
+                _protectCallsAtStart = Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.Calls);
+                _protectPagesAtStart = Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.Pages);
+                _guardAtStart = GuardCounters();
+                SharpEmu.HLE.Diagnostics.HostProtectCounters.Recording = true;
                 Volatile.Write(ref _state, 2);
                 Note(Kind.Flip, Stopwatch.GetTimestamp());
             }
@@ -246,7 +262,18 @@ internal static class SyncChainTrace
 
         Console.Error.Write(text.ToString());
         var seconds = events.Length > 1 ? (events[^1].Start - origin) / (double)Stopwatch.Frequency : 0;
-        Console.Error.WriteLine(FormattableString.Invariant(
-            $"[SYNC_CHAIN] done events={count} resumes={Volatile.Read(ref _resumes)} resumes_per_s={(seconds > 0 ? Volatile.Read(ref _resumes) / seconds : 0):F0}"));
+        Console.Error.WriteLine(string.Create(CultureInfo.InvariantCulture,
+            $"[SYNC_CHAIN] done events={count} resumes={Volatile.Read(ref _resumes)} resumes_per_s={(seconds > 0 ? Volatile.Read(ref _resumes) / seconds : 0):F0}" +
+            $" protect_calls_per_s={(seconds > 0 ? (Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.Calls) - _protectCallsAtStart) / seconds : 0):F0}" +
+            $" protect_pages_per_s={(seconds > 0 ? (Interlocked.Read(ref SharpEmu.HLE.Diagnostics.HostProtectCounters.Pages) - _protectPagesAtStart) / seconds : 0):F0}"));
+        SharpEmu.HLE.Diagnostics.HostProtectCounters.Recording = false;
+        foreach (var ((granule, kind), pages) in SharpEmu.HLE.Diagnostics.HostProtectCounters.Histogram.OrderByDescending(pair => pair.Value).Take(40))
+        {
+            Console.Error.WriteLine(string.Create(CultureInfo.InvariantCulture, $"[SYNC_CHAIN] protect_granule mib=0x{granule:X} kind={kind} pages={pages}"));
+        }
+
+        var guard = GuardCounters();
+        Console.Error.WriteLine(string.Create(CultureInfo.InvariantCulture,
+            $"[SYNC_CHAIN] guard_per_s relax_calls={(guard[0] - _guardAtStart[0]) / seconds:F0} relax_pages={(guard[1] - _guardAtStart[1]) / seconds:F0} restrict_calls={(guard[2] - _guardAtStart[2]) / seconds:F0} restrict_pages={(guard[3] - _guardAtStart[3]) / seconds:F0} gpu_faults={(guard[4] - _guardAtStart[4]) / seconds:F0}"));
     }
 }
