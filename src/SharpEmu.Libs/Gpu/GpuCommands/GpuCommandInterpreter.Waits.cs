@@ -279,16 +279,20 @@ public sealed partial class GpuCommandInterpreter
         return value;
     }
 
-    // SHARPEMU_SPECULATE_COND_EXEC (default on; 0 = off): a COND_EXEC whose predicate GPU work may still write, and
+    // SHARPEMU_SPECULATE_COND_EXEC=1 (opt-in): a COND_EXEC whose predicate GPU work may still write, and
     // whose block holds only markers and memory waits, runs the block without reading the predicate. Markers and
     // waits change no state, so running a block the predicate would skip ends the same way, only later. What must
     // not happen is a wait that never passes because its block should have been skipped: a wait of such a block
     // that stays unmet for SHARPEMU_COND_EXEC_ESCAPE_MS (default 4) reads the predicate, and on 0 the block's
     // remaining waits pass. Ghost of Yotei: one per frame on the graphics queue ("Wait for Async Dir Shadow
     // Combine", "SSR wait for compute ring"), predicate 1 in play; reading it cost the command thread a pending
-    // wait plus a GPU round trip every frame while the compute queues had work ready.
-    private static readonly bool SpeculateConditions =
-        Environment.GetEnvironmentVariable("SHARPEMU_SPECULATE_COND_EXEC") != "0";
+    // wait plus a GPU round trip every frame while the compute queues had work ready. Off by default: an in-run A/B
+    // (SHARPEMU_AB_TOGGLE_S=20, 21 period pairs) measured +1.1% time per draw with it, t=6.0. The wait moves to
+    // the compute queue's next GPU-written reads and grows.
+    private static readonly bool DefaultSpeculateConditions =
+        Environment.GetEnvironmentVariable("SHARPEMU_SPECULATE_COND_EXEC") == "1";
+
+    internal bool SpeculateConditions { get; set; } = DefaultSpeculateConditions;
     private static readonly long ConditionEscapeTicks =
         (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_COND_EXEC_ESCAPE_MS"), out var escapeMilliseconds) &&
          escapeMilliseconds >= 0 ? escapeMilliseconds : 4) * System.Diagnostics.Stopwatch.Frequency / 1000;

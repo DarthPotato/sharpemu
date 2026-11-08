@@ -219,6 +219,7 @@ public sealed class GpuCommandInterpreterWaitTests
     public void ConditionalExecute_SpeculatesAWaitOnlyBlockAndEscapesWhenThePredicateIsZero()
     {
         var runner = new StreamRunner();
+        runner.Interpreter.SpeculateConditions = true;
         runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
         runner.Host.WriteDword(Label, 0);
         runner.Host.WriteDword(Data, 0);
@@ -237,6 +238,7 @@ public sealed class GpuCommandInterpreterWaitTests
     public void ConditionalExecute_SpeculatedBlockKeepsWaitingWhenThePredicateIsSet()
     {
         var runner = new StreamRunner();
+        runner.Interpreter.SpeculateConditions = true;
         runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
         runner.Host.WriteDword(Label, 1);
         runner.Host.WriteDword(Data, 0);
@@ -256,6 +258,7 @@ public sealed class GpuCommandInterpreterWaitTests
     public void ConditionalExecute_SpeculatesOnlyBlocksOfMarkersAndWaits()
     {
         var runner = new StreamRunner();
+        runner.Interpreter.SpeculateConditions = true;
         runner.Host.GpuWrittenCommandData = (address, _) => address == Label;
         runner.Host.WriteDword(Label, 0);
         runner.Host.WriteDword(Data, 1);
