@@ -540,6 +540,7 @@ public sealed partial class GpuCommandInterpreter
 
     internal void SubmitFlip()
     {
+        if (Diagnostics.MarkerCensus.Enabled) Diagnostics.MarkerCensus.NoteFlip();
         if (!TryReserveFlipSlot())
         {
             return;

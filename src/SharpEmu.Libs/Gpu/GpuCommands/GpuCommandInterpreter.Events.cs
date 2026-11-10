@@ -242,9 +242,40 @@ public sealed partial class GpuCommandInterpreter
         }
     }
 
-    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+    // Marker names of this queue's stream, for SHARPEMU_MARKER_CENSUS only.
+    private readonly List<Diagnostics.MarkerCensus.Entry> _markerStack = [];
+    private Diagnostics.MarkerCensus.Entry _marker = Diagnostics.MarkerCensus.Root;
 
-    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (Diagnostics.MarkerCensus.Enabled)
+        {
+            var text = System.Runtime.InteropServices.MemoryMarshal.AsBytes(payload);
+            var end = text.IndexOf((byte)0);
+            var name = System.Text.Encoding.ASCII.GetString(end < 0 ? text : text[..end]);
+            if (_markerStack.Count >= 24)
+            {
+                _markerStack.Clear();
+                _marker = Diagnostics.MarkerCensus.Root;
+            }
+
+            _marker = Diagnostics.MarkerCensus.Child(_marker, name);
+            _markerStack.Add(_marker);
+        }
+
+        return packet.Length - 1;
+    }
+
+    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (Diagnostics.MarkerCensus.Enabled && _markerStack.Count > 0)
+        {
+            _markerStack.RemoveAt(_markerStack.Count - 1);
+            _marker = _markerStack.Count > 0 ? _markerStack[^1] : Diagnostics.MarkerCensus.Root;
+        }
+
+        return packet.Length - 1;
+    }
 
     internal uint FlipPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {

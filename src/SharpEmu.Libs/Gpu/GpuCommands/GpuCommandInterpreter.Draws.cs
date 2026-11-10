@@ -67,6 +67,7 @@ public sealed partial class GpuCommandInterpreter
         }
         if (Rendering.ScissorTrace.Instance is { Active: true } trace)
             trace.DrawIssued(TypedRegisters, SubmitId, QueueId, packetAddress);
+        if (Diagnostics.MarkerCensus.Enabled && Diagnostics.MarkerCensus.Note(_marker, false)) return;
         _host.DrawIndexed(SubmitId, new DrawIndexedArguments(packetAddress, opcode, indexCount, indexAddress, IndexTypeAndSize, instanceCount, baseVertex, firstInstance, offsetSource, StartInstanceUserData: startInstanceUserData, GpuInstances: inheritedInstanceCount && _gpuInstanceCount ? new(_gpuInstanceRegister, Inherit: true) : default));
     }
 
@@ -87,6 +88,7 @@ public sealed partial class GpuCommandInterpreter
         if (Rendering.ScissorTrace.Instance is { Active: true } trace)
             trace.DrawIssued(TypedRegisters, SubmitId, QueueId, packetAddress);
         WarnLargeInstanceCount(packetAddress, opcode, vertexCount, instanceCount, offsetSource, 0, inheritedInstanceCount);
+        if (Diagnostics.MarkerCensus.Enabled && Diagnostics.MarkerCensus.Note(_marker, false)) return;
         _host.DrawAuto(SubmitId, new DrawAutoArguments(packetAddress, opcode, vertexCount, instanceCount, firstVertex, firstInstance, offsetSource, startInstanceUserData, GpuInstances: inheritedInstanceCount && _gpuInstanceCount ? new(_gpuInstanceRegister, Inherit: true) : default));
     }
 
@@ -162,6 +164,7 @@ public sealed partial class GpuCommandInterpreter
             if (IndirectInstanceInherit && gpuInstances.Register is null) SetIndirectInstanceCount(ReadDword(argumentsAddress + 4), packetAddress, opcode, argumentsAddress);
             if (Rendering.ScissorTrace.Instance is { Active: true } gpuTrace)
                 gpuTrace.DrawIssued(TypedRegisters, SubmitId, QueueId, packetAddress);
+            if (Diagnostics.MarkerCensus.Enabled && Diagnostics.MarkerCensus.Note(_marker, false)) return;
             _host.DrawAuto(SubmitId, new DrawAutoArguments(packetAddress, opcode, uint.MaxValue, 1, 0, 0,
                 DrawOffsetSource.IndirectArguments, startInstanceUserData, argumentsAddress, gpuInstances));
             return;
@@ -194,6 +197,7 @@ public sealed partial class GpuCommandInterpreter
             if (IndirectInstanceInherit && gpuInstances.Register is null) SetIndirectInstanceCount(ReadDword(argumentsAddress + 4), packetAddress, opcode, argumentsAddress);
             if (Rendering.ScissorTrace.Instance is { Active: true } trace)
                 trace.DrawIssued(TypedRegisters, SubmitId, QueueId, packetAddress);
+            if (Diagnostics.MarkerCensus.Enabled && Diagnostics.MarkerCensus.Note(_marker, false)) return;
             _host.DrawIndexed(SubmitId, new DrawIndexedArguments(
                 packetAddress, opcode, gpuIndexCount, IndexBaseAddress, IndexTypeAndSize, 1, 0, 0,
                 DrawOffsetSource.IndirectArguments, argumentsAddress, UnboundedIndexBuffer: !HasBindableIndexSize, StartInstanceUserData: startInstanceUserData, GpuInstances: gpuInstances));
@@ -324,8 +328,11 @@ public sealed partial class GpuCommandInterpreter
         _indexExtents[IndexBaseAddress] = extentBytes;
     }
 
-    internal void DispatchDirect(uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0) =>
+    internal void DispatchDirect(uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
+    {
+        if (Diagnostics.MarkerCensus.Enabled && Diagnostics.MarkerCensus.Note(_marker, true)) return;
         _host.DispatchDirect(SubmitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
+    }
 
     internal void DispatchIndirect(uint dataOffset, uint dispatchInitiator)
     {
