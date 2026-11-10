@@ -541,6 +541,7 @@ public sealed partial class GpuCommandInterpreter
     internal void SubmitFlip()
     {
         if (Diagnostics.MarkerCensus.Enabled) Diagnostics.MarkerCensus.NoteFlip();
+        if (Diagnostics.YoteiLadder.Enabled) Diagnostics.YoteiLadder.OnFlip(_host);
         if (!TryReserveFlipSlot())
         {
             return;
