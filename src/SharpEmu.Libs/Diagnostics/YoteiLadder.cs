@@ -6,25 +6,30 @@ using SharpEmu.Libs.Gpu.GpuCommands;
 
 namespace SharpEmu.Libs.Diagnostics;
 
-// Ghost of Yotei 01.512 only, off unless set. The game keeps the row of its own scalability ladder (level of detail
-// scale, number of sun shadow views, ...) in one int that its code only reads; the static initializer leaves it at 0,
-// the full-quality row. Writing a higher row makes the game itself send fewer draws.
-// SHARPEMU_YOTEI_LADDER=<1..15>: hold that row for the whole run.
-// SHARPEMU_AB_YOTEI_LADDER=<1..15> (measurement only): that row while the in-run A/B toggle is on, the
-// SHARPEMU_YOTEI_LADDER row (0 when unset) while it is off.
+// Ghost of Yotei 01.512 only. The game keeps the row of its own scalability ladder (level of detail scale, number of
+// sun shadow views, small shadow caster culling, ...) in one int that its code only reads; the static initializer
+// leaves it at 0, the full-quality row. Writing a higher row makes the game itself send fewer draws: row 15 sends
+// about 45% fewer draws and dispatches per frame than row 0 (+39% frames per second in an in-run A/B).
+// SHARPEMU_YOTEI_LADDER=<0..21>: hold that row for the whole run. Unset means row 15, the last row that only lowers
+// detail; 0 restores full quality. Rows 16..21 also stop drawing the player character's body.
+// SHARPEMU_AB_YOTEI_LADDER=<1..21> (measurement only): that row while the in-run A/B toggle is on, the held row
+// while it is off.
 // Nothing is written unless the initializer's bytes are found at their 01.512 address, so another title or build is
 // left alone. No game code or file is changed.
 public static unsafe class YoteiLadder
 {
     private const ulong InitializerAddress = 0x8_00D6_4E1B;
     private const ulong LevelAddress = 0x8_04FE_5B70;
-    private const int MaximumLevel = 15;
+    private const int MaximumLevel = 21;
 
     // mov qword ptr [app+0x4FE5B70], 0
     private static ReadOnlySpan<byte> Initializer => [0x48, 0xC7, 0x05, 0x4A, 0x0D, 0x28, 0x04, 0x00, 0x00, 0x00, 0x00];
 
-    private static readonly int HeldLevel = ReadLevel("SHARPEMU_YOTEI_LADDER");
-    private static readonly int ToggledLevel = ReadLevel("SHARPEMU_AB_YOTEI_LADDER");
+    private const int DefaultLevel = 15;
+
+    private static readonly bool HeldLevelSet = Environment.GetEnvironmentVariable("SHARPEMU_YOTEI_LADDER") is not null;
+    private static readonly int HeldLevel = ReadLevel("SHARPEMU_YOTEI_LADDER", DefaultLevel);
+    private static readonly int ToggledLevel = ReadLevel("SHARPEMU_AB_YOTEI_LADDER", 0);
 
     public static readonly bool Enabled = HeldLevel > 0 || ToggledLevel > 0;
 
@@ -45,7 +50,11 @@ public static unsafe class YoteiLadder
             if (!host.TryReadGuestOperand(InitializerAddress, found) || !found.SequenceEqual(Initializer))
             {
                 _state = -1;
-                Console.Error.WriteLine("[LOADER][WARN] Yotei ladder: the 01.512 initializer was not found; nothing is written.");
+                if (HeldLevelSet || ToggledLevel > 0)
+                {
+                    Console.Error.WriteLine("[LOADER][WARN] Yotei ladder: the 01.512 initializer was not found; nothing is written.");
+                }
+
                 return;
             }
 
@@ -74,9 +83,9 @@ public static unsafe class YoteiLadder
         _written = wanted;
     }
 
-    private static int ReadLevel(string name) =>
+    private static int ReadLevel(string name, int fallback) =>
         int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var level) &&
-        level is > 0 and <= MaximumLevel
+        level is >= 0 and <= MaximumLevel
             ? level
-            : 0;
+            : fallback;
 }
