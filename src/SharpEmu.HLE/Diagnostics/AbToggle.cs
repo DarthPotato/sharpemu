@@ -22,4 +22,8 @@ public static class AbToggle
 
     // The second half of each period: the variant under test.
     public static bool On => Enabled && ((Stopwatch.GetTimestamp() - Start) / PeriodTicks & 1) == 1;
+
+    // Index of the current period (0, 1, 2, ...); the odd ones are On. One run can cycle through several variants
+    // by giving each odd period its own; the videoout fps line reports it (abn=<index>).
+    public static long Period => Enabled ? (Stopwatch.GetTimestamp() - Start) / PeriodTicks : 0;
 }

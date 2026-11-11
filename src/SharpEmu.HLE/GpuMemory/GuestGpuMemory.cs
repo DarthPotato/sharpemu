@@ -93,6 +93,17 @@ public sealed class GuestGpuMemory : IDisposable
         return true;
     }
 
+    // CPU read faults on GPU-written data and the time their downloads took, for SHARPEMU_MARKER_CENSUS.
+    public static long ReadFaults;
+    public static long ReadFaultTicks;
+
+    // SHARPEMU_AB_READ_FAULT_DELAY_US=<microseconds> (measurement only): each CPU read fault on GPU-written data
+    // busy-waits that long while the in-run A/B toggle is on.
+    private static readonly long ReadFaultDelayTicks =
+        long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_AB_READ_FAULT_DELAY_US"), out var microseconds) && microseconds > 0
+            ? microseconds * System.Diagnostics.Stopwatch.Frequency / 1_000_000
+            : 0;
+
     // Retry after recovery, including a watch removed before the fault reached its store.
     public bool TryResolveFault(FaultKind kind, ulong address)
     {
@@ -132,7 +143,16 @@ public sealed class GuestGpuMemory : IDisposable
         }
         else
         {
+            var readStart = System.Diagnostics.Stopwatch.GetTimestamp();
             handled = buffers?.DownloadToCpu(address, faultSize) ?? false;
+            Interlocked.Increment(ref ReadFaults);
+            Interlocked.Add(ref ReadFaultTicks, System.Diagnostics.Stopwatch.GetTimestamp() - readStart);
+            if (ReadFaultDelayTicks > 0 && Diagnostics.AbToggle.On)
+            {
+                // Measurement only: how much of the read-fault time is on the path that paces a frame.
+                var until = System.Diagnostics.Stopwatch.GetTimestamp() + ReadFaultDelayTicks;
+                while (System.Diagnostics.Stopwatch.GetTimestamp() < until) Thread.SpinWait(20);
+            }
         }
 
         if (!handled && kind == FaultKind.Write && TryRetryReleasedWrite(address, faultSize))

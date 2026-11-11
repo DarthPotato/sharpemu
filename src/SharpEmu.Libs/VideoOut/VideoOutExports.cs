@@ -1701,7 +1701,7 @@ public static partial class VideoOutExports
             $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles} " +
             $"pool_leases={poolLeases} pool_cached_mb={poolCachedBytes / 1024.0 / 1024.0:F1} {TakeFrameTimes()}{TakeRelaxedWaits()}" +
             (SharpEmu.HLE.Diagnostics.AbToggle.Enabled
-                ? FormattableString.Invariant($" ab={(SharpEmu.HLE.Diagnostics.AbToggle.On ? 1 : 0)} submitted={submitted} elapsed_ms={elapsedSeconds * 1000:F1}")
+                ? FormattableString.Invariant($" ab={(SharpEmu.HLE.Diagnostics.AbToggle.On ? 1 : 0)} submitted={submitted} elapsed_ms={elapsedSeconds * 1000:F1} abn={SharpEmu.HLE.Diagnostics.AbToggle.Period}")
                 : ""));
     }
 

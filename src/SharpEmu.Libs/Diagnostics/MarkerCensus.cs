@@ -11,8 +11,12 @@ namespace SharpEmu.Libs.Diagnostics;
 // SHARPEMU_MARKER_CENSUS=<seconds> (off unless set): draws and dispatches per frame under each command-stream marker
 // path (the names the game pushes with sceAgcDcbPushMarker), reported every <seconds> as [PERF][MARKER_CENSUS] lines.
 // It answers which of the game's render passes the draws of a frame belong to.
-// SHARPEMU_AB_SKIP_MARKER=<text;text> (measurement only): while the in-run A/B toggle is on, draws and dispatches
+// SHARPEMU_AB_SKIP_MARKER=<text,text> (measurement only): while the in-run A/B toggle is on, draws and dispatches
 // under a marker path containing one of the texts are dropped, which gives the frame-time share of that pass.
+// "*" matches every path; a "draw:" or "dispatch:" prefix limits a text to that kind of item. Groups separated by
+// "|" take turns, one per on period (the fps line's abn=<period>, group = (period / 2) % groups), so one run measures
+// several passes. Nothing is dropped in the first SHARPEMU_AB_SKIP_START_S seconds (default 120): dropping
+// dispatches while the game loads ended a run.
 public static class MarkerCensus
 {
     private const int MaximumEntries = 4096;
@@ -24,23 +28,34 @@ public static class MarkerCensus
             ? (long)(seconds * Stopwatch.Frequency)
             : 0;
 
-    private static readonly string[] SkipTexts =
+    private const int MaximumGroups = 64;
+
+    private static readonly string[][] SkipGroups =
         (Environment.GetEnvironmentVariable("SHARPEMU_AB_SKIP_MARKER") ?? string.Empty)
-        .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        .Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Take(MaximumGroups)
+        .Select(static group => group.Split([';', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        .ToArray();
 
-    public static readonly bool Enabled = IntervalTicks > 0 || SkipTexts.Length > 0;
+    private static readonly long SkipStart = Stopwatch.GetTimestamp() + (long)(Stopwatch.Frequency *
+        (double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_AB_SKIP_START_S"), NumberStyles.Float,
+            CultureInfo.InvariantCulture, out var start) && start >= 0 ? start : 120));
 
-    public sealed class Entry(string path, bool skip)
+    public static readonly bool Enabled = IntervalTicks > 0 || SkipGroups.Length > 0;
+
+    public sealed class Entry(string path)
     {
         public readonly string Path = path;
-        public readonly bool Skip = skip;
+        // One bit per skip group.
+        public readonly ulong SkipDraws = MatchingGroups(path, false);
+        public readonly ulong SkipDispatches = MatchingGroups(path, true);
         public long Draws;
         public long Dispatches;
         public long Skipped;
     }
 
-    public static readonly Entry Root = new("(no marker)", MatchesSkip("(no marker)"));
-    private static readonly Entry Overflow = new("(overflow)", false);
+    public static readonly Entry Root = new("(no marker)");
+    private static readonly Entry Overflow = new("(overflow)");
     private static readonly ConcurrentDictionary<string, Entry> Entries = new(StringComparer.Ordinal);
     private static readonly object ReportGate = new();
     private static long _lastReport = Stopwatch.GetTimestamp();
@@ -54,13 +69,14 @@ public static class MarkerCensus
             return entry;
         }
 
-        return Entries.Count >= MaximumEntries ? Overflow : Entries.GetOrAdd(path, static key => new Entry(key, MatchesSkip(key)));
+        return Entries.Count >= MaximumEntries ? Overflow : Entries.GetOrAdd(path, static key => new Entry(key));
     }
 
     // True when the item must be dropped (skip text matched and the in-run toggle is on).
     public static bool Note(Entry entry, bool dispatch)
     {
-        if (entry.Skip && SharpEmu.HLE.Diagnostics.AbToggle.On)
+        var groups = dispatch ? entry.SkipDispatches : entry.SkipDraws;
+        if (groups != 0 && SkipsNow(groups))
         {
             Interlocked.Increment(ref entry.Skipped);
             return true;
@@ -113,9 +129,11 @@ public static class MarkerCensus
                 skipped += row.Skipped;
             }
 
+            var readFaults = Interlocked.Exchange(ref SharpEmu.HLE.GpuMemory.GuestGpuMemory.ReadFaults, 0);
+            var readFaultTicks = Interlocked.Exchange(ref SharpEmu.HLE.GpuMemory.GuestGpuMemory.ReadFaultTicks, 0);
             var text = new StringBuilder();
             text.Append(CultureInfo.InvariantCulture,
-                $"[PERF][MARKER_CENSUS] frames={frames} draws_per_frame={(double)draws / frames:F1} dispatches_per_frame={(double)dispatches / frames:F1} skipped_per_frame={(double)skipped / frames:F1} paths={rows.Count}");
+                $"[PERF][MARKER_CENSUS] frames={frames} draws_per_frame={(double)draws / frames:F1} dispatches_per_frame={(double)dispatches / frames:F1} skipped_per_frame={(double)skipped / frames:F1} read_faults_per_frame={(double)readFaults / frames:F1} read_fault_ms_per_frame={readFaultTicks * 1000.0 / Stopwatch.Frequency / frames:F1} paths={rows.Count}");
             for (var index = 0; index < rows.Count && index < ReportedPaths; index++)
             {
                 var row = rows[index];
@@ -138,11 +156,53 @@ public static class MarkerCensus
         }
     }
 
-    private static bool MatchesSkip(string path)
+    private static bool SkipsNow(ulong groups)
     {
-        foreach (var text in SkipTexts)
+        var period = SharpEmu.HLE.Diagnostics.AbToggle.Period;
+        return (period & 1) != 0 &&
+            (groups >> (int)((period >> 1) % SkipGroups.Length) & 1) != 0 &&
+            Stopwatch.GetTimestamp() >= SkipStart;
+    }
+
+    private static ulong MatchingGroups(string path, bool dispatch)
+    {
+        ulong groups = 0;
+        for (var index = 0; index < SkipGroups.Length; index++)
         {
-            if (path.Contains(text, StringComparison.OrdinalIgnoreCase))
+            if (MatchesSkip(SkipGroups[index], path, dispatch))
+            {
+                groups |= 1UL << index;
+            }
+        }
+
+        return groups;
+    }
+
+    private static bool MatchesSkip(string[] texts, string path, bool dispatch)
+    {
+        foreach (var entry in texts)
+        {
+            var text = entry;
+            if (text.StartsWith("draw:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (dispatch)
+                {
+                    continue;
+                }
+
+                text = text[5..];
+            }
+            else if (text.StartsWith("dispatch:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!dispatch)
+                {
+                    continue;
+                }
+
+                text = text[9..];
+            }
+
+            if (text == "*" || path.Contains(text, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
