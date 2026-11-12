@@ -144,7 +144,8 @@ public sealed class EndOfPipe
             case EndOfPipeCompletion.Flip:
             {
                 var requestId = signal.CompletionData;
-                scheduler.QueuePriorityCompletionAction(() => _flips.CompleteFlip(requestId));
+                EagerFlip.NoteQueued(requestId);
+                scheduler.QueuePriorityCompletionAction(() => _flips.CompleteFlip(requestId), scheduler.TakeFlipCompletionTick(deferred: false));
                 return;
             }
 
@@ -152,11 +153,12 @@ public sealed class EndOfPipe
             {
                 var requestId = signal.CompletionData;
                 var eventId = signal.InterruptEventId;
+                EagerFlip.NoteQueued(requestId);
                 scheduler.QueuePriorityCompletionAction(() =>
                 {
                     _flips.CompleteFlip(requestId);
                     _sink.TriggerInterrupt(eventId, 0);
-                });
+                }, scheduler.TakeFlipCompletionTick(deferred: false));
                 return;
             }
         }

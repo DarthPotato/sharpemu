@@ -75,6 +75,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private bool _publishingMemory;
     private ulong _pendingTailTick;
     private ulong _enqueueSequence;
+    private ulong _previousFlipTick;
+    private ulong _lastSignalTick;
     private const int MaxDeferredSubmissions = 8;
     private readonly List<nint> _deferredBuffers = new();
     private readonly List<ulong> _deferredTicks = new();
@@ -728,14 +730,52 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
-    public void QueuePriorityCompletionAction(Action operation)
+    // The tick a flip completion queued now waits for: the current tick, or an earlier one under EagerFlip.
+    internal ulong TakeFlipCompletionTick(bool deferred)
+    {
+        lock (_operationLock)
+        {
+            var current = CurrentTick;
+            var previous = _previousFlipTick;
+            _previousFlipTick = current;
+            var tick = EagerFlip.Mode switch
+            {
+                1 => Math.Min(current, Math.Max(previous, _lastSignalTick)),
+                2 => Math.Min(current, previous),
+                _ => current,
+            };
+            EagerFlip.NoteFlip(deferred, current, tick);
+            return tick;
+        }
+    }
+
+    // A guest-visible completion other than a flip was queued at the current tick; an ordered eager flip stays behind it.
+    internal void NoteGuestSignal()
+    {
+        lock (_operationLock) _lastSignalTick = CurrentTick;
+    }
+
+    public void QueuePriorityCompletionAction(Action operation) => QueuePriorityCompletionAction(operation, ulong.MaxValue);
+
+    // tick: the submission the action waits for; ulong.MaxValue means the current one.
+    internal void QueuePriorityCompletionAction(Action operation, ulong tick)
     {
         RequireActiveScheduler();
         lock (_operationLock)
         {
             if (_state == OperationState.Open)
             {
-                EnqueuePriority(new TickWork(operation, CurrentTick));
+                if (tick == ulong.MaxValue)
+                {
+                    tick = CurrentTick;
+                    _lastSignalTick = tick;
+                }
+                else if (tick > CurrentTick)
+                {
+                    throw Fatal("Cannot queue a completion for an unknown submission tick.");
+                }
+
+                EnqueuePriority(new TickWork(operation, tick));
                 Monitor.Pulse(_operationLock);
                 return;
             }

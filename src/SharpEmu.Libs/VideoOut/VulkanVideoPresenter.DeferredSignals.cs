@@ -243,7 +243,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (hasSignal || write.WaitForGpu)
                 {
                     EnsureBatchedGuestCommands();
-                    dependency = _scheduler.CurrentTick;
+                    if (write.FlipRequestId != 0)
+                    {
+                        // Under EagerFlip the flip stays behind the earlier entries of its queue only.
+                        EagerFlip.NoteQueued(write.FlipRequestId);
+                        dependency = Math.Max(dependency, _scheduler.TakeFlipCompletionTick(deferred: true));
+                    }
+                    else
+                    {
+                        dependency = _scheduler.CurrentTick;
+                        if (hasSignal) _scheduler.NoteGuestSignal();
+                    }
                 }
                 var isFlip = write.FlipRequestId != 0;
                 Action publication = () => PublishDeferredSignal(entry, isFlip, () =>

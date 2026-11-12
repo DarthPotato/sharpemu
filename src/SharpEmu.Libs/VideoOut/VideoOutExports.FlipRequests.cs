@@ -38,6 +38,7 @@ public static partial class VideoOutExports
         public long FlipArg;
         public bool GpuQueued;
         public long? ReadyTimestamp;
+        public long ReservedTimestamp;
         public ulong EventHint;
         public FlipEventRegistration[]? FlipEvents;
         public int FlipEventCount;
@@ -128,6 +129,7 @@ public static partial class VideoOutExports
                 FlipMode = flipMode,
                 FlipArg = flipArg,
                 GpuQueued = gpuQueued,
+                ReservedTimestamp = submittedAt,
                 EventHint = SceVideoOutInternalEventFlip |
                     ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16),
                 FlipEventCount = port.FlipEvents.Count,
@@ -209,6 +211,7 @@ public static partial class VideoOutExports
             }
 
             request.State = FlipRequestState.Completed;
+            Gpu.Scheduling.EagerFlip.NoteCompletion(requestId, request.ReservedTimestamp);
             if (FrameTimeline.Enabled) FrameTimeline.Flip(requestId);
             if (ReuseProbe.Enabled) ReuseProbe.Flip();
             if (ImageAcquisitionProfile.Enabled) ImageAcquisitionProfile.RecordFrame();
@@ -370,6 +373,7 @@ public static partial class VideoOutExports
         }
         // Completed requests leave event-array ownership with the completion caller.
         request.Outcome = FlipOutcome.Cancelled;
+        Gpu.Scheduling.EagerFlip.Forget(request.RequestId);
         _flipRequests.Remove(request.RequestId);
     }
 
