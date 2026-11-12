@@ -742,8 +742,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 $"[LOADER][INFO] Vulkan shaderSignedZeroInfNanPreserveFloat32 " +
                 $"enabled={_supportsShaderSignedZeroInfNanPreserveFloat32}");
             Console.Error.WriteLine(
-                $"[LOADER][INFO] Vulkan exact float16 conversion enabled={_supportsExactFloat16Conversion}");
-            Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan graphics subgroup operations " +
                 $"enabled={GraphicsSubgroupOperationsEnabled} " +
                 $"mode={graphicsSubgroupMode} compute_subgroups=unchanged");
@@ -1115,6 +1113,8 @@ internal static unsafe partial class VulkanVideoPresenter
             // Shaders convert f16 natively only when the device rounds to nearest even and keeps
             // denormals at 16 bits, so the conversion is exact; otherwise they emulate it in integers.
             _supportsExactFloat16Conversion = _floatControlsExactFloat16Conversion && vulkan12Features.ShaderFloat16;
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Vulkan exact float16 conversion enabled={_supportsExactFloat16Conversion}");
             var supportsTimelineSemaphore = vulkan12Features.TimelineSemaphore;
             var supportsBufferDeviceAddress = vulkan12Features.BufferDeviceAddress;
             var supportsSharedInt64Atomics = vulkan12Features.ShaderSharedInt64Atomics;
