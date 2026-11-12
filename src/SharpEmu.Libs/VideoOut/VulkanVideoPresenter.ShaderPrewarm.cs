@@ -267,6 +267,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Environment.GetEnvironmentVariable("SHARPEMU_EXEC_SELECT_ELIMINATION"),
                 Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS"),
                 Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS_ONLY"),
+                ShaderProgramCache.ComputeTableBlocks,
                 driverSignature.TrimEnd('\n'));
 
         private bool PrewarmComputePipeline(

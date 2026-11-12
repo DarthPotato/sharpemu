@@ -1704,6 +1704,7 @@ internal sealed class ShaderProgramCache
             (_host.SharedInt64AtomicsEnabled, _host.ExecGuardElisionEnabled, _host.ShaderSignedZeroInfNanPreserveFloat32Supported,
                 _host.ComputeWave64SubgroupNative, _host.ImageInt64AtomicsEnabled);
         var subgroup32 = _host.ComputeRunsOn32LaneSubgroups(current);
+        var tableBlocks = UsesTableBlocks(ShaderStage.Compute);
         var usesBufferLengths = source.Registered.Frontend?.RequiresExplicitBufferLengths ?? false;
         var tessellationHull = options.TessellationHull;
         var usesTessellationData = options.Tessellation is not null || tessellationHull is not null;
@@ -1712,7 +1713,7 @@ internal sealed class ShaderProgramCache
         {
             var resources = ResourceMaterializer.ApplyTo(plan, specialization);
             var layout = AllocateLayout(program, plan, resources, userDataBase, userDataCount, pushDataCursor, info.DispatchThreadDimensions,
-                usesBufferLengths: usesBufferLengths, usesTessellationData: usesTessellationData);
+                usesBufferLengths: usesBufferLengths, usesTessellationData: usesTessellationData, tableBlocks: tableBlocks);
             var request = BuildComputeRequest(plan, resources, layout, info, systemRegisters, sharedInt64Atomics, execGuardElision,
                 signedZeroInfNanPreserve, wave64Native, subgroup32, imageInt64Atomics, tessellationHull, _host.ExactFloat16ConversionSupported);
             var translated = compiler.TryCompileProgram(request, out var compiled, out var error);
@@ -1723,7 +1724,12 @@ internal sealed class ShaderProgramCache
 
     // Table blocks are for graphics stages: compute programs that read their buffers through them gave wrong results
     // or stalled, so compute programs keep descriptor buffer bindings.
-    private bool UsesTableBlocks(ShaderStage stage) => _host.TableBlocks && stage is not (ShaderStage.Compute or ShaderStage.Mesh);
+    // SHARPEMU_COMPUTE_TABLE_BLOCKS=1 gives compute programs table blocks again (the behaviour before upstream #1141).
+    internal static readonly bool ComputeTableBlocks =
+        Environment.GetEnvironmentVariable("SHARPEMU_COMPUTE_TABLE_BLOCKS") == "1";
+
+    private bool UsesTableBlocks(ShaderStage stage) =>
+        _host.TableBlocks && stage != ShaderStage.Mesh && (stage != ShaderStage.Compute || ComputeTableBlocks);
 
     private ProgramPermutation CompilePermutation(
         ShaderSource source,
