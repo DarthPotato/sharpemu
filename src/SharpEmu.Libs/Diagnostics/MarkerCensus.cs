@@ -10,7 +10,8 @@ namespace SharpEmu.Libs.Diagnostics;
 
 // SHARPEMU_MARKER_CENSUS=<seconds> (off unless set): draws and dispatches per frame under each command-stream marker
 // path (the names the game pushes with sceAgcDcbPushMarker), reported every <seconds> as [PERF][MARKER_CENSUS] lines.
-// It answers which of the game's render passes the draws of a frame belong to.
+// It answers which of the game's render passes the draws of a frame belong to. A row's viewport= is the viewport of
+// the last draw under that path, which shows the resolution the pass renders at.
 // SHARPEMU_AB_SKIP_MARKER=<text,text> (measurement only): while the in-run A/B toggle is on, draws and dispatches
 // under a marker path containing one of the texts are dropped, which gives the frame-time share of that pass.
 // "*" matches every path; a "draw:" or "dispatch:" prefix limits a text to that kind of item. Groups separated by
@@ -52,6 +53,8 @@ public static class MarkerCensus
         public long Draws;
         public long Dispatches;
         public long Skipped;
+        public int ViewportWidth;
+        public int ViewportHeight;
     }
 
     public static readonly Entry Root = new("(no marker)");
@@ -94,6 +97,13 @@ public static class MarkerCensus
         return false;
     }
 
+    public static bool NoteDraw(Entry entry, SharpEmu.Libs.Gpu.GpuCommands.Registers.ScreenViewportRegisters screen)
+    {
+        entry.ViewportWidth = (int)(2 * MathF.Abs(screen.Primary.XScale) + 0.5f);
+        entry.ViewportHeight = (int)(2 * MathF.Abs(screen.Primary.YScale) + 0.5f);
+        return Note(entry, false);
+    }
+
     public static void NoteFlip()
     {
         Interlocked.Increment(ref _flips);
@@ -112,7 +122,7 @@ public static class MarkerCensus
 
             _lastReport = now;
             var frames = Math.Max(Interlocked.Exchange(ref _flips, 0), 1);
-            var rows = new List<(string Path, long Draws, long Dispatches, long Skipped)>();
+            var rows = new List<(string Path, long Draws, long Dispatches, long Skipped, int Width, int Height)>();
             AddRow(rows, Root);
             AddRow(rows, Overflow);
             foreach (var entry in Entries.Values)
@@ -139,20 +149,24 @@ public static class MarkerCensus
                 var row = rows[index];
                 text.Append(CultureInfo.InvariantCulture,
                     $"\n[PERF][MARKER_CENSUS]   draws={(double)row.Draws / frames:F1} dispatches={(double)row.Dispatches / frames:F1} skipped={(double)row.Skipped / frames:F1} path=\"{row.Path}\"");
+                if (row.Draws > 0)
+                {
+                    text.Append(CultureInfo.InvariantCulture, $" viewport={row.Width}x{row.Height}");
+                }
             }
 
             Console.Error.WriteLine(text.ToString());
         }
     }
 
-    private static void AddRow(List<(string Path, long Draws, long Dispatches, long Skipped)> rows, Entry entry)
+    private static void AddRow(List<(string Path, long Draws, long Dispatches, long Skipped, int Width, int Height)> rows, Entry entry)
     {
         var draws = Interlocked.Exchange(ref entry.Draws, 0);
         var dispatches = Interlocked.Exchange(ref entry.Dispatches, 0);
         var skipped = Interlocked.Exchange(ref entry.Skipped, 0);
         if (draws + dispatches + skipped > 0)
         {
-            rows.Add((entry.Path, draws, dispatches, skipped));
+            rows.Add((entry.Path, draws, dispatches, skipped, entry.ViewportWidth, entry.ViewportHeight));
         }
     }
 
