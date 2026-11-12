@@ -330,7 +330,7 @@ public sealed partial class GpuCommandInterpreter
 
     internal void DispatchDirect(uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
     {
-        if (Diagnostics.MarkerCensus.Enabled && Diagnostics.MarkerCensus.Note(_marker, true)) return;
+        if (Diagnostics.MarkerCensus.Enabled && Diagnostics.MarkerCensus.NoteDispatch(_marker, groupsX, groupsY, groupsZ)) return;
         _host.DispatchDirect(SubmitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
     }
 

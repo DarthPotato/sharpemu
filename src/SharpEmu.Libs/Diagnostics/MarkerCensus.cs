@@ -16,7 +16,8 @@ namespace SharpEmu.Libs.Diagnostics;
 // under a marker path containing one of the texts are dropped, which gives the frame-time share of that pass.
 // "*" matches every path; a "draw:" or "dispatch:" prefix limits a text to that kind of item. Groups separated by
 // "|" take turns, one per on period (the fps line's abn=<period>, group = (period / 2) % groups), so one run measures
-// several passes. Nothing is dropped in the first SHARPEMU_AB_SKIP_START_S seconds (default 120): dropping
+// several passes. A text "groups:<X>x<Y>x<Z>" matches direct dispatches with those group counts under any path,
+// which singles out one compute pass that has no marker of its own. Nothing is dropped in the first SHARPEMU_AB_SKIP_START_S seconds (default 120): dropping
 // dispatches while the game loads ended a run.
 public static class MarkerCensus
 {
@@ -30,6 +31,7 @@ public static class MarkerCensus
             : 0;
 
     private const int MaximumGroups = 64;
+    private const string SizePrefix = "groups:";
 
     private static readonly string[][] SkipGroups =
         (Environment.GetEnvironmentVariable("SHARPEMU_AB_SKIP_MARKER") ?? string.Empty)
@@ -41,6 +43,9 @@ public static class MarkerCensus
     private static readonly long SkipStart = Stopwatch.GetTimestamp() + (long)(Stopwatch.Frequency *
         (double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_AB_SKIP_START_S"), NumberStyles.Float,
             CultureInfo.InvariantCulture, out var start) && start >= 0 ? start : 120));
+
+    // One bit per skip group, as in Entry.
+    private static readonly (ulong Groups, uint X, uint Y, uint Z)[] SkipSizes = ReadSkipSizes();
 
     public static readonly bool Enabled = IntervalTicks > 0 || SkipGroups.Length > 0;
 
@@ -95,6 +100,20 @@ public static class MarkerCensus
         }
 
         return false;
+    }
+
+    public static bool NoteDispatch(Entry entry, uint groupsX, uint groupsY, uint groupsZ)
+    {
+        foreach (var size in SkipSizes)
+        {
+            if (size.X == groupsX && size.Y == groupsY && size.Z == groupsZ && SkipsNow(size.Groups))
+            {
+                Interlocked.Increment(ref entry.Skipped);
+                return true;
+            }
+        }
+
+        return Note(entry, true);
     }
 
     public static bool NoteDraw(Entry entry, SharpEmu.Libs.Gpu.GpuCommands.Registers.ScreenViewportRegisters screen)
@@ -178,6 +197,36 @@ public static class MarkerCensus
             Stopwatch.GetTimestamp() >= SkipStart;
     }
 
+    private static (ulong Groups, uint X, uint Y, uint Z)[] ReadSkipSizes()
+    {
+        var sizes = new List<(ulong Groups, uint X, uint Y, uint Z)>();
+        for (var index = 0; index < SkipGroups.Length; index++)
+        {
+            foreach (var text in SkipGroups[index])
+            {
+                if (!text.StartsWith(SizePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var parts = text[SizePrefix.Length..].Split('x', 'X');
+                if (parts.Length == 3 &&
+                    uint.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out var x) &&
+                    uint.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var y) &&
+                    uint.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var z))
+                {
+                    sizes.Add((1UL << index, x, y, z));
+                }
+                else
+                {
+                    Console.Error.WriteLine($"[PERF][MARKER_CENSUS] SHARPEMU_AB_SKIP_MARKER: \"{text}\" is not groups:<X>x<Y>x<Z>; ignored.");
+                }
+            }
+        }
+
+        return [.. sizes];
+    }
+
     private static ulong MatchingGroups(string path, bool dispatch)
     {
         ulong groups = 0;
@@ -197,6 +246,11 @@ public static class MarkerCensus
         foreach (var entry in texts)
         {
             var text = entry;
+            if (text.StartsWith(SizePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             if (text.StartsWith("draw:", StringComparison.OrdinalIgnoreCase))
             {
                 if (dispatch)
