@@ -299,9 +299,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 var heaps = PipelineLayoutHeaps.For(layout);
                 pipelineLayout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, heaps.Bindless, heaps.Runtime);
                 module = CreateShaderModule(payload);
+                _shaderModuleSpirvBytes[module.Handle] = payload.Length;
                 using var compilePermit = Gpu.Pipelines.PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Enter() : null;
                 var pipeline = CompileComputePipeline(_vk, _device, _pipelineCache, module, pipelineLayout,
-                    ComputeRequiredSubgroupSize(record.Info), result => nativeResult = result);
+                    ComputeRequiredSubgroupSize(record.Info), hash: record.Hash, prewarm: 1, creationResultObserver: result => nativeResult = result);
                 _vk.DestroyPipeline(_device, pipeline, null);
                 _prewarmedShaderIdentities![VulkanPipelineCacheStorage.CompiledShaderIdentity(payload)] = 0;
                 Interlocked.Increment(ref _shaderPrewarmCompiled);
@@ -318,6 +319,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (module.Handle != 0)
                 {
+                    _shaderModuleSpirvBytes.TryRemove(module.Handle, out _);
                     _vk.DestroyShaderModule(_device, module, null);
                 }
 

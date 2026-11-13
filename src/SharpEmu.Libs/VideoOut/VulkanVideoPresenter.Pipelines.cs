@@ -1574,43 +1574,22 @@ internal static unsafe partial class VulkanVideoPresenter
                 try
                 {
                     var pin = ComputeRequiredSubgroupSize(description.Input);
-                    var requiredSubgroupSize = new PipelineShaderStageRequiredSubgroupSizeCreateInfo
-                    {
-                        SType = StructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
-                        RequiredSubgroupSize = pin,
-                    };
-                    var stageInfo = new PipelineShaderStageCreateInfo
-                    {
-                        SType = StructureType.PipelineShaderStageCreateInfo,
-                        PNext = pin != 0 ? &requiredSubgroupSize : null,
-                        Stage = ShaderStageFlags.ComputeBit,
-                        Module = computeModule,
-                        PName = entryPoint,
-                    };
-                    var pipelineInfo = new ComputePipelineCreateInfo
-                    {
-                        SType = StructureType.ComputePipelineCreateInfo,
-                        Stage = stageInfo,
-                        Layout = layout,
-                    };
                     var reportStart = Stopwatch.GetTimestamp();
                     var cache = GetGuestPipelineCache(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
                     var creationStart = Stopwatch.GetTimestamp();
                     Result creationResult;
                     using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ComputePipelineDriver))
                     {
-                        AsyncPipelineProfile.Start();
-                        try { creationResult = _vk.CreateComputePipelines(_device, cache, 1, &pipelineInfo, null, out pipeline); }
-                        finally { AsyncPipelineProfile.Finish(); }
+                        pipeline = CompileComputePipeline(_vk, _device, cache, computeModule, layout, pin,
+                            hash: description.Stage.Hash);
+                        creationResult = Result.Success;
                     }
-                    AsyncPipelineProfile.Driver(RenderPhaseProfile.Enabled ? creationStart : 0, Thread.CurrentThread == _thread, OnCommandThread);
                     var creationMilliseconds = Stopwatch.GetElapsedTime(creationStart).TotalMilliseconds;
                     if (RenderPhaseProfile.Enabled)
                     {
                         Console.Error.WriteLine($"[PERF][PIPELINE_DRIVER] kind=compute compute=0x{description.Stage.Hash:X16} driver_ms={creationMilliseconds:F3} result={creationResult}");
                     }
                     Check(creationResult, $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
-                    NotePipelineCompile((long)creationMilliseconds);
                     ReportPipelineCreation(
                         (long)Stopwatch.GetElapsedTime(reportStart).TotalMilliseconds,
                         "compute",
@@ -1810,7 +1789,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         try { cache = ResolveGuestPipelineCache(cacheSource); }
                         finally { ComputeCompileProfile.Record(ComputeCompileProfile.Part.CacheLoad, cacheStart); }
                         var driverStart = ComputeCompileProfile.Start();
-                        try { return CompileComputePipeline(vk, device, cache, computeModule, layout, requiredSubgroupSize); }
+                        try { return CompileComputePipeline(vk, device, cache, computeModule, layout, requiredSubgroupSize,
+                            hash: started.Hash, cacheKind: linkedCache is not null && cache.Handle != _pipelineCache.Handle ? "linked" : "shared"); }
                         finally { ComputeCompileProfile.Record(ComputeCompileProfile.Part.DriverCompile, driverStart); }
                     }
                     finally
@@ -1846,6 +1826,20 @@ internal static unsafe partial class VulkanVideoPresenter
             uint requiredSubgroupSize,
             Action<Result>? creationResultObserver = null)
         {
+            return CompileComputePipeline(vk, device, cache, module, layout, requiredSubgroupSize,
+                hash: 0, creationResultObserver: creationResultObserver);
+        }
+
+        private Pipeline CompileComputePipeline(
+            Vk vk,
+            Device device,
+            PipelineCache cache,
+            ShaderModule module,
+            PipelineLayout layout,
+            uint requiredSubgroupSize,
+            ulong hash, string cacheKind = "shared", int prewarm = -1,
+            Action<Result>? creationResultObserver = null)
+        {
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
             try
             {
@@ -1868,18 +1862,37 @@ internal static unsafe partial class VulkanVideoPresenter
                     Stage = stageInfo,
                     Layout = layout,
                 };
+                // Instance creation and physical device selection require Vulkan 1.3, where feedback is core.
+                PipelineCreationFeedback feedback = default;
+                PipelineCreationFeedback stageFeedback = default;
+                var feedbackInfo = new PipelineCreationFeedbackCreateInfo
+                {
+                    SType = StructureType.PipelineCreationFeedbackCreateInfo,
+                    PPipelineCreationFeedback = &feedback,
+                    PipelineStageCreationFeedbackCount = 1,
+                    PPipelineStageCreationFeedbacks = &stageFeedback,
+                };
+                pipelineInfo.PNext = &feedbackInfo;
                 var compileStart = Stopwatch.GetTimestamp();
                 Result result;
                 Pipeline pipeline;
                 AsyncPipelineProfile.Start();
                 try { result = vk.CreateComputePipelines(device, cache, 1, &pipelineInfo, null, out pipeline); }
                 finally { AsyncPipelineProfile.Finish(); }
-                AsyncPipelineProfile.Driver(RenderPhaseProfile.Enabled ? compileStart : 0, false);
+                AsyncPipelineProfile.Driver(RenderPhaseProfile.Enabled ? compileStart : 0, Thread.CurrentThread == _thread, OnCommandThread);
+                var milliseconds = Stopwatch.GetElapsedTime(compileStart).TotalMilliseconds;
+                var valid = (feedback.Flags & PipelineCreationFeedbackFlags.ValidBit) != 0;
+                var hit = valid && (feedback.Flags & PipelineCreationFeedbackFlags.ApplicationPipelineCacheHitBit) != 0;
+                Interlocked.Increment(ref _computeCreations);
+                if (hit) Interlocked.Increment(ref _computeCacheHits);
+                var accelerated = valid && (feedback.Flags & PipelineCreationFeedbackFlags.BasePipelineAccelerationBit) != 0;
+                if (milliseconds >= 1000)
+                    Console.Error.WriteLine($"[GPU][PIPELINE_SLOW] kind=compute hash=0x{hash:X16} ms={milliseconds:F0} spirv_bytes={SpirvBytesOf(module.Handle)} cache={cacheKind} feedback_valid={(valid ? 1 : 0)} cache_hit={(hit ? 1 : 0)} base_accel={(accelerated ? 1 : 0)} prewarm={prewarm}");
                 creationResultObserver?.Invoke(result);
                 if (result != Result.Success)
                 {
                     if (pipeline.Handle != 0) vk.DestroyPipeline(device, pipeline, null);
-                    throw SubmissionScheduler.Fatal($"vkCreateComputePipelines(async) failed: {result}.");
+                    throw SubmissionScheduler.Fatal($"vkCreateComputePipelines failed: {result} hash=0x{hash:X16}.");
                 }
 
                 NotePipelineCompile((long)Stopwatch.GetElapsedTime(compileStart).TotalMilliseconds);

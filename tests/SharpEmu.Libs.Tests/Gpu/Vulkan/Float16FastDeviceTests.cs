@@ -71,7 +71,7 @@ public sealed class Float16FastDeviceTests(HeadlessVulkanFixture fixture) : ICla
 
     [Theory]
     [MemberData(nameof(FmaCases))]
-    public void FusedArithmeticStaysWithinOneHalfUlp(string opcode, uint a, uint b, uint c, bool exact)
+    public void FusedArithmeticStaysWithinOneUnitInTheLastPlace(string opcode, uint a, uint b, uint c, bool exact)
         => Compare(opcode, a, b, c, Controls[0], exact, true);
 
     [Theory]

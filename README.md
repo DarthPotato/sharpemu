@@ -10,19 +10,19 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 It builds on SharpEmu `main` and on foufouadi's `yotei-good` branch, which first got the game into menus and gameplay. The working branch is `yotei-merge`.
 
-## State (2026-11-11)
+## State (2026-11-12)
 
 | | |
 |---|---|
 | Game version | 01.512.000 only (the two game-specific switches below check for it and do nothing on other versions) |
 | Test machine | Ryzen 5 3600, RTX 3080 10 GB, 24 GB RAM, Windows 11 |
 | Gets to | menus and gameplay; saves load |
-| Frame rate | about **10 fps** standing in the open world, warm shader cache |
+| Frame rate | about **10.7 fps** standing in the open world, warm shader cache |
 | Memory | about 15–16 GB of RAM and 9 GB of video memory while the game runs |
 
-Frame rate standing in the open world on this machine over time: about 4 fps (2026-10-25), 6.7 fps (11-08), 10 fps (11-11).
+Frame rate standing in the open world on this machine over time: about 4 fps (2026-10-25), 6.7 fps (11-08), 10 fps (11-11), 10.7 fps (11-12).
 
-The CPU is the limit. With every draw and compute dispatch dropped, the game's own code still needs about 30 ms a frame on this CPU, so roughly 34 fps is the ceiling here. The emulator's cost per draw and dispatch is what stands between 10 fps and that.
+The CPU is the limit. With every draw and compute dispatch dropped, the game's own code still needs about 30 ms a frame on this CPU, so roughly 34 fps is the ceiling here. The emulator's cost per draw and dispatch is what stands between 10.7 fps and that.
 
 ## What is different from SharpEmu
 
@@ -32,6 +32,7 @@ On by default, each with a switch (environment variable) that turns it off:
 |---|---|---|
 | `SHARPEMU_YOTEI_LADDER=<0..21>` | 15 | The game has its own quality ladder (level of detail, number of sun shadow views, small shadow caster culling). Row 15 makes the game send about 45% fewer draws and dispatches per frame (+39% fps measured). `0` is full quality. Rows 16–21 stop drawing the player's body. |
 | `SHARPEMU_YOTEI_RENDER_INDEX=<0..15>` | 15 | The size the game renders at before it upscales to 3840x2160: 0 is 3840x2160, 15 is 1920x1080. The game moves this by itself with load; holding 1920x1080 keeps it from climbing (3840x2160 measured 6.9 fps where 1920x1080 measured 10.1). `game` leaves the choice to the game. |
+| `SHARPEMU_FAST_FLOAT16=<0..2>` | 2 | Shader code that works in 16-bit floats (the upscaler's accumulate pass above all) uses the graphics card's own 16-bit arithmetic and one fused multiply-add, where the exact forms rebuilt the console's rounding and NaN bits step by step. Results can differ from the console in the last bit of a multiply-add or in a NaN payload; the picture looks the same. The accumulate pass went from 11.9 ms to 3.5 ms a frame (+7.5% fps measured). `0` restores the exact forms. Changing it rebuilds the shaders once, which can take 10–15 minutes on the "Warming up shaders" screen; the build is saved every two minutes, so it carries on where it stopped if the emulator is closed. |
 | `SHARPEMU_COMPUTE_TABLE_BLOCKS=1` | off | Restores the older buffer layout for compute shaders. Both layouts measured the same on this game. |
 | `SHARPEMU_YOTEI_RENDER_SIZE=<W>x<H>` | off | Renders below 1920x1080, for example `1280x720` (multiples of 8, down to 640x360). It measured no gain on the test machine, where the CPU sets the pace at 1920x1080 and below (1280x720 10.0 fps, 1920x1080 9.9, 2560x1440 9.2); it is meant for graphics cards that are the limit at 1920x1080. |
 
@@ -57,7 +58,7 @@ $env:SHARPEMU_VK_PIPELINE_CACHE = "file"
 .\artifacts\bin\Release\net10.0\win-x64\SharpEmu.exe "D:\path\to\PPSA26344\eboot.bin"
 ```
 
-The first run is very slow: every shader is compiled the first time it is needed, and some take the graphics driver 30–40 seconds. Compiled shaders are kept in `user\pipeline_cache` next to the exe, and later starts show a "Warming up shaders" screen for a few minutes and then run much smoother.
+The first run is very slow: every shader is compiled the first time it is needed, and some take the graphics driver 30–40 seconds. Compiled shaders are kept in `user\pipeline_cache` next to the exe, and later starts show a "Warming up shaders" screen for a few minutes and then run much smoother. A fast start also relies on the graphics driver's own shader cache: after a driver update, or if that cache is cleared, the next start builds the large shaders again, which took 15–20 minutes on an RTX 3080.
 
 ## Known issues
 

@@ -135,7 +135,8 @@ internal static unsafe partial class VulkanVideoPresenter
             if (writtenBytes != 0)
                 Console.Error.WriteLine(
                     $"[GPU][PIPELINE_CACHE] saved {when}: bytes={writtenBytes} " +
-                    $"ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} trigger_ms={trigger}");
+                    $"ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} trigger_ms={trigger} " +
+                    $"compute_created={Volatile.Read(ref _computeCreations)} compute_cache_hits={Volatile.Read(ref _computeCacheHits)}");
             return results.ToArray();
         }
 

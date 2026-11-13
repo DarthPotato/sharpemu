@@ -128,6 +128,12 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.DestroyPipelineCache(_device, cache, null);
         }
 
+        // Compute pipeline creations this session and application-cache hits reported by the driver.
+        // Hits happen within a session; on NVIDIA, a later session was seen to miss pipelines already held in its cache file.
+        // A fast launch therefore depends on the driver's own shader cache.
+        internal static long _computeCreations;
+        internal static long _computeCacheHits;
+
         private PipelineCache ResolveGuestPipelineCache(Lazy<PipelineCache>? source)
         {
             DriverCacheShard? shard = null;

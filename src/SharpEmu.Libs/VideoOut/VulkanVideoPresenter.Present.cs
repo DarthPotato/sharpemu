@@ -219,7 +219,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             Console.Error.WriteLine(string.Create(
                 System.Globalization.CultureInfo.InvariantCulture,
-                $"[LOADER][INFO] Shader prewarm: game released after {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds:F1}s."));
+                $"[LOADER][INFO] Shader prewarm: game released after {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds:F1}s. compute_created={Volatile.Read(ref Presenter._computeCreations)} cache_hits={Volatile.Read(ref Presenter._computeCacheHits)}"));
         }
     }
 
