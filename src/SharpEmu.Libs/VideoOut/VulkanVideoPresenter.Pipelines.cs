@@ -82,6 +82,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
 
         bool IShaderPipelineHost.ExactFloat16ConversionSupported => _supportsExactFloat16Conversion;
+        int IShaderPipelineHost.FastFloat16 => _supportsExactFloat16Conversion ? FastFloat16Setting : 0;
         bool IShaderPipelineHost.RuntimeDescriptorResolutionRequiresSerial => OnResolveWorker;
         bool IShaderPipelineHost.RuntimeImageDescriptorsSupported => _supportsRuntimeDescriptors;
 

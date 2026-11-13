@@ -50,6 +50,14 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _supportsShaderSignedZeroInfNanPreserveFloat32;
         private bool _floatControlsExactFloat16Conversion;
         private bool _supportsExactFloat16Conversion;
+
+        // SHARPEMU_FAST_FLOAT16=0|1|2 (default 2): ShaderCompileRequest.FastFloat16. Measured 2026-11-12 on Ghost of
+        // Yotei (RTX 3080): the upscaler's accumulate pass takes 3.5 ms at 2 and 11.9 ms at 0. A change of level
+        // rebuilds the shader prewarm.
+        private static readonly int FastFloat16Setting =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FAST_FLOAT16"), out var level)
+                ? Math.Clamp(level, 0, 2)
+                : 2;
         private uint _maxColorAttachments;
         internal Device _device;
         private PipelineCache _pipelineCache;
@@ -1114,7 +1122,8 @@ internal static unsafe partial class VulkanVideoPresenter
             // denormals at 16 bits, so the conversion is exact; otherwise they emulate it in integers.
             _supportsExactFloat16Conversion = _floatControlsExactFloat16Conversion && vulkan12Features.ShaderFloat16;
             Console.Error.WriteLine(
-                $"[LOADER][INFO] Vulkan exact float16 conversion enabled={_supportsExactFloat16Conversion}");
+                $"[LOADER][INFO] Vulkan exact float16 conversion enabled={_supportsExactFloat16Conversion} " +
+                $"fast={(_supportsExactFloat16Conversion ? FastFloat16Setting : 0)}");
             var supportsTimelineSemaphore = vulkan12Features.TimelineSemaphore;
             var supportsBufferDeviceAddress = vulkan12Features.BufferDeviceAddress;
             var supportsSharedInt64Atomics = vulkan12Features.ShaderSharedInt64Atomics;

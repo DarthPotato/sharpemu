@@ -17,7 +17,8 @@ internal sealed class ShaderPrewarmHost(IShaderPipelineHost inner, Func<IGuestCo
         host.ComputeWave64SubgroupNative, host.MipStatisticsSubgroupReduction, host.RuntimeCallRecordsSupported,
         host.CallMarksSupported, host.TableBlocks, host.GraphicsSubgroupOperationsEnabled,
         host.SharedInt64AtomicsEnabled, host.ImageInt64AtomicsEnabled, host.ShaderSignedZeroInfNanPreserveFloat32Supported,
-        host.ExactFloat16ConversionSupported, host.ExecGuardElisionEnabled, host.PerVertexPixelInputsSupported,
+        host.ExactFloat16ConversionSupported, host.FastFloat16, host.ExecGuardElisionEnabled,
+        host.PerVertexPixelInputsSupported,
         host.ClipDistanceEnabled, host.ShaderDrawParametersSupported, host.MeshShadersSupported, host.MeshLimits,
         host.MeshSubgroupSize, host.Limits, host.SupportsDualSourceBlend, host.NoAttachmentSampleCounts);
 
@@ -38,6 +39,7 @@ internal sealed class ShaderPrewarmHost(IShaderPipelineHost inner, Func<IGuestCo
     public bool ImageInt64AtomicsEnabled => inner.ImageInt64AtomicsEnabled;
     public bool ShaderSignedZeroInfNanPreserveFloat32Supported => inner.ShaderSignedZeroInfNanPreserveFloat32Supported;
     public bool ExactFloat16ConversionSupported => inner.ExactFloat16ConversionSupported;
+    public int FastFloat16 => inner.FastFloat16;
     public bool ExecGuardElisionEnabled => inner.ExecGuardElisionEnabled;
     public bool PerVertexPixelInputsSupported => inner.PerVertexPixelInputsSupported;
     public bool ClipDistanceEnabled => inner.ClipDistanceEnabled;

@@ -1715,7 +1715,8 @@ internal sealed class ShaderProgramCache
             var layout = AllocateLayout(program, plan, resources, userDataBase, userDataCount, pushDataCursor, info.DispatchThreadDimensions,
                 usesBufferLengths: usesBufferLengths, usesTessellationData: usesTessellationData, tableBlocks: tableBlocks);
             var request = BuildComputeRequest(plan, resources, layout, info, systemRegisters, sharedInt64Atomics, execGuardElision,
-                signedZeroInfNanPreserve, wave64Native, subgroup32, imageInt64Atomics, tessellationHull, _host.ExactFloat16ConversionSupported);
+                signedZeroInfNanPreserve, wave64Native, subgroup32, imageInt64Atomics, tessellationHull, _host.ExactFloat16ConversionSupported,
+                _host.FastFloat16);
             var translated = compiler.TryCompileProgram(request, out var compiled, out var error);
             return new DeferredTranslation(resources, layout, request, translated, compiled, error);
         }));
@@ -1956,6 +1957,7 @@ internal sealed class ShaderProgramCache
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
                     ExactFloat16ConversionSupported = _host.ExactFloat16ConversionSupported,
+                    FastFloat16 = _host.FastFloat16,
                     WaveSize = 32,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     IeeeMode = info.IeeeMode,
@@ -1990,6 +1992,7 @@ internal sealed class ShaderProgramCache
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
                     ExactFloat16ConversionSupported = _host.ExactFloat16ConversionSupported,
+                    FastFloat16 = _host.FastFloat16,
                     WaveSize = 32,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     IeeeMode = info.IeeeMode,
@@ -2016,6 +2019,7 @@ internal sealed class ShaderProgramCache
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
                     ExactFloat16ConversionSupported = _host.ExactFloat16ConversionSupported,
+                    FastFloat16 = _host.FastFloat16,
                     WaveSize = info.Geometry.WaveSize,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     IeeeMode = info.Geometry.IeeeMode,
@@ -2044,7 +2048,8 @@ internal sealed class ShaderProgramCache
             default:
                 return BuildComputeRequest(entry.Plan, resources, layout, options.ComputeInfo!, options.ComputeSystemRegisters,
                     sharedInt64Atomics, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve, _host.ComputeWave64SubgroupNative,
-                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!), imageInt64Atomics, options.TessellationHull, _host.ExactFloat16ConversionSupported);
+                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!), imageInt64Atomics, options.TessellationHull, _host.ExactFloat16ConversionSupported,
+                    _host.FastFloat16);
         }
     }
 
@@ -2068,10 +2073,12 @@ internal sealed class ShaderProgramCache
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool execGuardElision,
         bool signedZeroInfNanPreserve, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
-        bool imageInt64Atomics = false, Gen5TessellationHullInfo? tessellationHull = null, bool exactFloat16 = false) =>
+        bool imageInt64Atomics = false, Gen5TessellationHullInfo? tessellationHull = null, bool exactFloat16 = false,
+        int fastFloat16 = 0) =>
         new(plan, resources, layout)
         {
             ExactFloat16ConversionSupported = exactFloat16,
+            FastFloat16 = fastFloat16,
             WaveSize = info.WaveSize,
             TessellationHull = tessellationHull,
             CooperativeWave64Workgroup = tessellationHull is not null,

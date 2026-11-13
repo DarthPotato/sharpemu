@@ -2077,10 +2077,94 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            if (FastFloat16Vectors)
+            {
+                result = EmitPackedF16Vector(instruction, control);
+                return true;
+            }
+
             var low = EmitPackedF16Lane(instruction, control, highLane: false);
             var high = EmitPackedF16Lane(instruction, control, highLane: true);
             result = BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
             return true;
+        }
+
+        // Fast form of a packed f16 instruction: the register is a vector of two native halves and the op runs once on
+        // the pair. Add, multiply, minimum and maximum give the bits of the exact form for numbers; the multiply-add
+        // is whatever the driver makes of a 16-bit Fma (the last bit can differ), and NaN payloads are the driver's.
+        private uint EmitPackedF16Vector(Gen5ShaderInstruction instruction, Gen5Vop3pControl control)
+        {
+            var pairType = HalfVector2Type();
+            var left = EmitPackedF16VectorOperand(instruction, control, 0);
+            var right = EmitPackedF16VectorOperand(instruction, control, 1);
+            var value = instruction.Opcode switch
+            {
+                "VPkAddF16" => _module.AddInstruction(SpirvOp.FAdd, pairType, left, right),
+                "VPkMulF16" => _module.AddInstruction(SpirvOp.FMul, pairType, left, right),
+                "VPkMinF16" => EmitPackedF16VectorMinMax(left, right, isMax: false),
+                "VPkMaxF16" => EmitPackedF16VectorMinMax(left, right, isMax: true),
+                "VPkFmaF16" => Ext(50, pairType, left, right, EmitPackedF16VectorOperand(instruction, control, 2)),
+                _ => left,
+            };
+            if (control.Clamp)
+            {
+                // Below 0 and NaN become 0, above 1 becomes 1, as EmitClampToUnitInterval does.
+                var halfType = _module.TypeFloat(16);
+                var boolPair = _module.TypeVector(_boolType, 2);
+                var zero = _module.Constant(halfType, 0);
+                var one = _module.Constant(halfType, 0x3C00);
+                var zeros = _module.ConstantComposite(pairType, zero, zero);
+                var ones = _module.ConstantComposite(pairType, one, one);
+                var aboveZero = _module.AddInstruction(SpirvOp.FOrdGreaterThan, boolPair, value, zeros);
+                value = _module.AddInstruction(SpirvOp.Select, pairType, aboveZero, value, zeros);
+                var belowOne = _module.AddInstruction(SpirvOp.FOrdLessThan, boolPair, value, ones);
+                value = _module.AddInstruction(SpirvOp.Select, pairType, belowOne, value, ones);
+            }
+
+            return Bitcast(_uintType, value);
+        }
+
+        // Source `index` as a pair of halves: op_sel / op_sel_hi pick the half that feeds each lane and neg_lo / neg_hi
+        // flip its sign, both on the 32-bit pattern, so a NaN passes through untouched.
+        private uint EmitPackedF16VectorOperand(Gen5ShaderInstruction instruction, Gen5Vop3pControl control, int index)
+        {
+            var raw = GetPackedF16Source(instruction, index);
+            var lowFromHigh = ((control.OpSelMask >> index) & 1) != 0;
+            var highFromHigh = ((control.OpSelHiMask >> index) & 1) != 0;
+            if (lowFromHigh && !highFromHigh)
+            {
+                raw = BitwiseOr(ShiftRightLogical(raw, UInt(16)), ShiftLeftLogical(raw, UInt(16)));
+            }
+            else if (lowFromHigh)
+            {
+                raw = BitwiseOr(ShiftRightLogical(raw, UInt(16)), BitwiseAnd(raw, UInt(0xFFFF_0000)));
+            }
+            else if (!highFromHigh)
+            {
+                raw = BitwiseOr(BitwiseAnd(raw, UInt(0xFFFF)), ShiftLeftLogical(raw, UInt(16)));
+            }
+
+            var signs = ((control.NegLoMask >> index) & 1) * 0x8000u | ((control.NegHiMask >> index) & 1) * 0x8000_0000u;
+            if (signs != 0)
+            {
+                raw = BitwiseXor(raw, UInt(signs));
+            }
+
+            return Bitcast(HalfVector2Type(), raw);
+        }
+
+        // EmitPackedF16MinMax on both lanes at once.
+        private uint EmitPackedF16VectorMinMax(uint left, uint right, bool isMax)
+        {
+            var pairType = HalfVector2Type();
+            var boolPair = _module.TypeVector(_boolType, 2);
+            var compare = _module.AddInstruction(
+                isMax ? SpirvOp.FOrdGreaterThan : SpirvOp.FOrdLessThan, boolPair, left, right);
+            var numeric = _module.AddInstruction(SpirvOp.Select, pairType, compare, left, right);
+            var leftNan = _module.AddInstruction(SpirvOp.IsNan, boolPair, left);
+            var rightNan = _module.AddInstruction(SpirvOp.IsNan, boolPair, right);
+            var withRight = _module.AddInstruction(SpirvOp.Select, pairType, rightNan, left, numeric);
+            return _module.AddInstruction(SpirvOp.Select, pairType, leftNan, right, withRight);
         }
 
         // The packed 16-bit integer ops (V_PK_MAD/MUL_LO/ADD/SUB/LSHLREV/LSHRREV/ASHRREV/MAX/MIN_x16) operate
@@ -2306,6 +2390,17 @@ public static partial class Gen5SpirvTranslator
             uint destination)
         {
             var accumulator = LoadV(destination);
+            if (FastFloat16Vectors)
+            {
+                var pairType = HalfVector2Type();
+                return Bitcast(_uintType, Ext(
+                    50,
+                    pairType,
+                    Bitcast(pairType, GetPackedF16Source(instruction, 0)),
+                    Bitcast(pairType, GetPackedF16Source(instruction, 1)),
+                    Bitcast(pairType, accumulator)));
+            }
+
             var low = EmitPackedF16FmacLane(instruction, accumulator, highLane: false);
             var high = EmitPackedF16FmacLane(instruction, accumulator, highLane: true);
             return BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
@@ -2386,6 +2481,13 @@ public static partial class Gen5SpirvTranslator
         // parity fix must not fire. Returns the round-to-odd f32 bit pattern.
         private uint EmitPackedF16FusedMultiplyAdd(uint left, uint right, uint addend)
         {
+            if (FastFloat16)
+            {
+                // The f32 product of two widened halves is exact, so one f32 multiply-add rounds once to f32 and the
+                // narrowing rounds once more: the last bit of the half can differ from the fused result.
+                return Bitcast(_uintType, Ext(50, _floatType, left, right, addend));
+            }
+
             var product = EmitPreciseFloat(SpirvOp.FMul, left, right);
             var sum = EmitPreciseFloat(SpirvOp.FAdd, product, addend);
 
@@ -2615,6 +2717,7 @@ public static partial class Gen5SpirvTranslator
                 var pair = _module.AddInstruction(
                     SpirvOp.CompositeConstruct, HalfVector2Type(), half, _module.Constant(halfType, 0));
                 var narrowed = Bitcast(_uintType, pair);
+                if (FastFloat16) return narrowed;
                 var quietNan = BitwiseOr(BitwiseAnd(ShiftRightLogical(bits, UInt(16)), UInt(0x8000)), UInt(0x7E00));
                 return SelectU(_module.AddInstruction(SpirvOp.IsNan, _boolType, value), quietNan, narrowed);
             }
@@ -2666,6 +2769,10 @@ public static partial class Gen5SpirvTranslator
             var finite = SelectU(isSubnormal, subnormal, normal);
             return SelectU(isInfinityNan, infinityNan, BitwiseOr(sign, finite));
         }
+
+        // The levels of ShaderCompileRequest.FastFloat16.
+        private bool FastFloat16 => _request.ExactFloat16ConversionSupported && _request.FastFloat16 >= 1;
+        private bool FastFloat16Vectors => _request.ExactFloat16ConversionSupported && _request.FastFloat16 >= 2;
 
         private uint HalfVector2Type() => _module.TypeVector(_module.TypeFloat(16), 2);
 

@@ -111,6 +111,9 @@ internal interface IShaderPipelineHost
     // The device rounds f16 conversions to nearest even and preserves 16-bit denormals, so a shader
     // converts f16 natively instead of through the integer emulation.
     bool ExactFloat16ConversionSupported => false;
+
+    // ShaderCompileRequest.FastFloat16 for the shaders of this host.
+    int FastFloat16 => 0;
     bool ExecGuardElisionEnabled => true;
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;

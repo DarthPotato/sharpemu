@@ -306,6 +306,14 @@ public sealed class ShaderCompileRequest
     // The device enables shaderFloat16 and guarantees round-to-nearest-even and denormal
     // preservation for 16-bit floats, so f16<->f32 conversions are emitted as OpFConvert.
     public bool ExactFloat16ConversionSupported { get; init; }
+
+    // Faster forms of 16-bit float arithmetic; only read when ExactFloat16ConversionSupported is set.
+    //   0: every result has the bits the console produces.
+    //   1: a 16-bit multiply-add is one 32-bit multiply-add and a narrowing, not the exactly-once-rounded
+    //      sequence, and a NaN that is narrowed keeps the bits the driver gives it.
+    //   2: as 1, and the packed instructions run on a native vector of two halves.
+    // 1 and 2 differ from the console in the last bit of a multiply-add or in a NaN payload only.
+    public int FastFloat16 { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];
