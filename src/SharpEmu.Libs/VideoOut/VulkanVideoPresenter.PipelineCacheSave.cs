@@ -16,6 +16,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Environment.GetEnvironmentVariable("SHARPEMU_PIPELINE_CACHE_SAVE_AFTER_MS")));
         private Task<PipelineCacheSaveResult[]>? _expensiveCompileSaveTask;
         private long _expensiveCompileSaveTrigger;
+        private const long PrewarmCheckpointIntervalMs = 120_000;
 
         private sealed record PipelineCacheSaveRequest(PipelineCache Cache, string Path,
             nuint SavedBytes, DriverCacheShard? Shard, long Generation, long CompileGeneration, bool CanSkipUnchanged);
@@ -33,7 +34,12 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             FinishExpensiveCompileSave(wait: false);
             if (_expensiveCompileSaveTask is not null || _pipelineCachePath is null || _deviceLost ||
-                _shaderPrewarmRunning || _expensiveCompileSave is null) return;
+                _expensiveCompileSave is null) return;
+            if (_shaderPrewarmRunning)
+            {
+                CheckpointShaderPrewarm();
+                return;
+            }
             if (!_expensiveCompileSave.IsDue(Environment.TickCount64, _lastPipelineCacheSaveTick))
             {
                 CheckpointPipelineCache();
@@ -74,7 +80,32 @@ internal static unsafe partial class VulkanVideoPresenter
             catch { pause?.Dispose(); throw; }
         }
 
-        private PipelineCacheSaveResult[] SaveAfterExpensiveCompile(List<PipelineCacheSaveRequest> requests, long trigger)
+        // A shader build can run for many minutes and nothing else saves the driver cache before it ends, so a build
+        // that is cut short (crash, kill, power loss) would start over. The prewarm stamp is still written only when
+        // the build is done: the next launch runs the list again and finds these pipelines in the driver cache.
+        private void CheckpointShaderPrewarm()
+        {
+            var now = Environment.TickCount64;
+            if (now - _lastPipelineCacheSaveTick < PrewarmCheckpointIntervalMs) return;
+            PipelineCacheSaveRequest request;
+            lock (_pipelineCacheShards)
+            {
+                if (_pipelineCache.Handle == 0) return;
+                request = new(_pipelineCache, _pipelineCachePath!, _pipelineCacheSavedBytes, null,
+                    _pipelineCacheGeneration, 0, CanSkipUnchanged: false);
+            }
+            _lastPipelineCacheSaveTick = now;
+            _expensiveCompileSaveTrigger = 0;
+            _expensiveCompileSaveTask = Task.Run(() =>
+            {
+                // One prewarm pipeline can compile for seconds: wait for the compiles in flight off the window loop.
+                using var pause = PipelineCompileScheduler.Enabled ? _pipelineCompileBudget.Pause() : null;
+                return SaveAfterExpensiveCompile([request], 0, "during shader prewarm");
+            });
+        }
+
+        private PipelineCacheSaveResult[] SaveAfterExpensiveCompile(List<PipelineCacheSaveRequest> requests, long trigger,
+            string when = "after expensive compile")
         {
             var started = Stopwatch.GetTimestamp();
             var results = new List<PipelineCacheSaveResult>();
@@ -103,7 +134,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             if (writtenBytes != 0)
                 Console.Error.WriteLine(
-                    $"[GPU][PIPELINE_CACHE] saved after expensive compile: bytes={writtenBytes} " +
+                    $"[GPU][PIPELINE_CACHE] saved {when}: bytes={writtenBytes} " +
                     $"ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} trigger_ms={trigger}");
             return results.ToArray();
         }
