@@ -574,7 +574,7 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private PreparedStageBindings ReuseStagePreparation(RenderPreparation preparation, ShaderStageResources stage, ShaderProgramInfo program,
-            StagePreparationMemo memo, RenderPhaseProfile.DescriptorMemoKind kind, DescriptorPreparationPlan? plan)
+            StagePreparationMemo memo, RenderPhaseProfile.DescriptorMemoKind kind, DescriptorPreparationPlan? plan, ReadOnlySpan<uint> heapViews)
         {
             var prepared = RentStage(stage, program, plan);
             prepared.Memoized = true;
@@ -615,6 +615,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var layout = program.Bindings!;
             prepared.ShaderData = AssembleShaderData(stage, program, layout, plan);
+            heapViews.CopyTo(prepared.ShaderData.AsSpan((int)layout.HeapViewsDword));
             if (plan?.GlobalDataShare ?? (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null))
             {
                 descriptors.GlobalDataShare = new BufferView(_bufferCache.GdsBuffer.Handle, 0, Vk.WholeSize);
@@ -1180,7 +1181,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out var memo, out var kind))
             {
                 RenderPhaseProfile.DescriptorMemo(kind);
-                return ReuseStagePreparation(preparation, stage, program, memo, kind, plan);
+                return ReuseStagePreparation(preparation, stage, program, memo, kind, plan, heapViews);
             }
 
             Interlocked.Increment(ref _stageMemoMisses);
@@ -1229,7 +1230,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 FindBuffers(prepared);
             using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ValidateImages, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                 ValidateDrawImageTypes(prepared);
-            if ((!info.UsesRuntimeDescriptors || DescriptorPreparationOptions.Fast) && !movieActive && !layout.UsesBindlessHeap &&
+            // A stage that reads the bindless heap is kept like any other: the heap and its views were prepared above, before
+            // the memo is looked up, and a reuse writes this draw's views. Call records are made per draw, so their stages are not.
+            if ((!info.UsesRuntimeDescriptors || DescriptorPreparationOptions.Fast) && !movieActive &&
+                (!layout.UsesBindlessHeap || program.CallRecordCallees.Count == 0) &&
                 (DescriptorPreparationOptions.Fast
                     ? program.CallRecordCallees.Count == 0 && !(plan?.CallRecords ?? false)
                     : layout.CallTargetCount == 0 && layout.CallArgumentCount == 0))
