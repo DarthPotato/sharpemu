@@ -22,7 +22,8 @@ internal static partial class VulkanVideoPresenter
         // The thread runs this far ahead of the render thread at most. Operand reads only drain the
         // queue when a queued write targets them, so the depth mostly costs memory; too shallow and the
         // two threads take turns waiting on each other (128 did, with draws resolving on the pool).
-        private const int MaxOutstanding = 1024;
+        private static readonly int MaxOutstanding =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_COMMAND_QUEUE_DEPTH"), out var depth) && depth >= 128 ? depth : 1024;
         private const int ShadowSweepCount = 64;
         private const int StorePageShift = 12;
 
@@ -120,6 +121,8 @@ internal static partial class VulkanVideoPresenter
         private readonly object _writeLock = new();
         private readonly Queue<Item> _pendingWrites = new();
         private readonly ConcurrentDictionary<ulong, int> _pendingStorePages = new();
+        private readonly Dictionary<ulong, Queue<Item>> _storesByPage = new();
+        private readonly Stack<Queue<Item>> _spareStoreQueues = new();
         private volatile int _pendingWriteCount;
 
         // The destinations of queued fills and copies; a read on this thread that overlaps one waits
@@ -178,11 +181,39 @@ internal static partial class VulkanVideoPresenter
             return false;
         }
 
-        private void NotePendingStorePages(ulong address, int length, int delta)
+        private void NotePendingStorePages(Item item, int delta)
         {
-            var last = (address + (ulong)length - 1) >> StorePageShift;
+            var address = item.Address;
+            var last = (address + (ulong)item.Data!.Length - 1) >> StorePageShift;
             for (var page = address >> StorePageShift; page <= last; page++)
             {
+                if (delta > 0)
+                {
+                    if (!_storesByPage.TryGetValue(page, out var queued))
+                    {
+                        queued = _spareStoreQueues.Count != 0 ? _spareStoreQueues.Pop() : new Queue<Item>();
+                        _storesByPage.Add(page, queued);
+                    }
+
+                    queued.Enqueue(item);
+                }
+                else if (_storesByPage.TryGetValue(page, out var queued))
+                {
+                    if (!ReferenceEquals(queued.Dequeue(), item))
+                    {
+                        throw SubmissionScheduler.Fatal("The command stream store index ran out of order.");
+                    }
+
+                    if (queued.Count == 0)
+                    {
+                        _storesByPage.Remove(page);
+                        if (_spareStoreQueues.Count < 4096)
+                        {
+                            _spareStoreQueues.Push(queued);
+                        }
+                    }
+                }
+
                 if (_pendingStorePages.AddOrUpdate(page, delta, (_, count) => count + delta) == 0)
                 {
                     _pendingStorePages.TryRemove(new KeyValuePair<ulong, int>(page, 0));
@@ -262,13 +293,15 @@ internal static partial class VulkanVideoPresenter
         internal const int ProducerRunWait = 4;
         private volatile int _producerState;
 
-        public void PostWrite(ulong address, ReadOnlySpan<byte> data, bool kernel = false)
+        public void PostWrite(ulong address, ReadOnlySpan<byte> data, bool kernel = false) => PostOwnedWrite(address, data.ToArray(), kernel);
+
+        public void PostOwnedWrite(ulong address, byte[] data, bool kernel)
         {
-            var item = new Item { Kind = Kind.Write, DirectSubtype = 1, Address = address, Data = data.ToArray(), Kernel = kernel };
+            var item = new Item { Kind = Kind.Write, DirectSubtype = 1, Address = address, Data = data, Kernel = kernel };
             lock (_writeLock)
             {
                 _pendingWrites.Enqueue(item);
-                NotePendingStorePages(address, item.Data.Length, 1);
+                NotePendingStorePages(item, 1);
                 _pendingWriteCount = _pendingWrites.Count;
             }
 
@@ -512,20 +545,39 @@ internal static partial class VulkanVideoPresenter
         private void ApplyPendingStoresLocked(ulong address, Span<byte> destination, long afterSequence, long beforeSequence = long.MaxValue)
         {
             var end = address + (ulong)destination.Length;
-            foreach (var write in _pendingWrites)
+            var page = address >> StorePageShift;
+            if (page == (end - 1) >> StorePageShift)
             {
-                var writeEnd = write.Address + (ulong)write.Data!.Length;
-                if (write.Sequence <= afterSequence || write.Address >= end || writeEnd <= address ||
-                    (beforeSequence != long.MaxValue && (write.Sequence == 0 || write.Sequence >= beforeSequence)))
+                if (_storesByPage.TryGetValue(page, out var queued))
                 {
-                    continue;
+                    foreach (var write in queued)
+                    {
+                        ApplyPendingStore(write, address, end, destination, afterSequence, beforeSequence);
+                    }
                 }
 
-                var start = Math.Max(address, write.Address);
-                var stop = Math.Min(end, writeEnd);
-                write.Data.AsSpan((int)(start - write.Address), (int)(stop - start))
-                    .CopyTo(destination[(int)(start - address)..]);
+                return;
             }
+
+            foreach (var write in _pendingWrites)
+            {
+                ApplyPendingStore(write, address, end, destination, afterSequence, beforeSequence);
+            }
+        }
+
+        private static void ApplyPendingStore(Item write, ulong address, ulong end, Span<byte> destination, long afterSequence, long beforeSequence)
+        {
+            var writeEnd = write.Address + (ulong)write.Data!.Length;
+            if (write.Sequence <= afterSequence || write.Address >= end || writeEnd <= address ||
+                (beforeSequence != long.MaxValue && (write.Sequence == 0 || write.Sequence >= beforeSequence)))
+            {
+                return;
+            }
+
+            var start = Math.Max(address, write.Address);
+            var stop = Math.Min(end, writeEnd);
+            write.Data.AsSpan((int)(start - write.Address), (int)(stop - start))
+                .CopyTo(destination[(int)(start - address)..]);
         }
 
         private void Enqueue(Item item)
@@ -1168,7 +1220,7 @@ internal static partial class VulkanVideoPresenter
                 }
 
                 _pendingWrites.Dequeue();
-                NotePendingStorePages(item.Address, item.Data!.Length, -1);
+                NotePendingStorePages(item, -1);
                 _pendingWriteCount = _pendingWrites.Count;
                 if (!written)
                 {

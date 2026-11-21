@@ -2064,5 +2064,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
             return _bufferCache.TryCopyWordsOnHost(destination, source, sourceWords, words);
         }
+
+        public bool TryPostWordCopy(ulong destination, ulong source, ulong sourceWords, ulong words) =>
+            !_worker && _presenter.TryPostWordCopy(destination, source, sourceWords, words);
     }
 }
