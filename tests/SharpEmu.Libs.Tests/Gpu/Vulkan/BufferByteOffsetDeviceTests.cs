@@ -46,7 +46,7 @@ public sealed class BufferByteOffsetDeviceTests(HeadlessVulkanFixture fixture) :
         Assert.True(plan.Info.Buffers[1].DwordAddressed);
 
         var specialization = ResourceSpecialization.Default(plan.Info);
-        specialization.Buffers[0] = new BufferSpecialization(0, Format32x4Float, IdentitySwizzle);
+        specialization.Buffers[0] = new BufferSpecialization(Format32x4Float, IdentitySwizzle);
         var resources = ResourceMaterializer.ApplyTo(plan, specialization);
         var layout = BindingLayout.Allocate(
             resources.Info,

@@ -678,7 +678,7 @@ public sealed partial class DirectExecutionBackend
 	}
 
 	// Read once: the check runs inside the vectored handler, on every guest fault.
-	private static readonly bool _disableGuestAllocatorHoleRecovery = string.Equals(
+	private static readonly bool GuestAllocatorHoleRecoveryDisabled = string.Equals(
 		Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_ALLOCATOR_HOLE_RECOVERY"),
 		"1",
 		StringComparison.Ordinal);
@@ -688,7 +688,7 @@ public sealed partial class DirectExecutionBackend
 		void* contextRecord,
 		ulong rip)
 	{
-		if (_disableGuestAllocatorHoleRecovery ||
+		if (GuestAllocatorHoleRecoveryDisabled ||
 			exceptionRecord->NumberParameters < 2 ||
 			exceptionRecord->ExceptionInformation[0] != 0 ||
 			exceptionRecord->ExceptionInformation[1] != 8 ||

@@ -47,6 +47,14 @@ public sealed class StageCompileOptions
     public uint PixelInputAddress { get; init; }
     public ComputeInputInfo? ComputeInfo { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
+    public DispatchBufferFootprint.Dispatch? ComputeDispatch { get; init; }
+    public bool DeviceRecordCounts { get; private set; } = true;
+    public StageCompileOptions WithoutDeviceRecordCounts()
+    {
+        var copy = (StageCompileOptions)MemberwiseClone();
+        copy.DeviceRecordCounts = false;
+        return copy;
+    }
     public MeshDrawConfiguration? MeshInfo { get; init; }
     public Gen5TessellationInfo? Tessellation { get; init; }
     public Gen5TessellationHullInfo? TessellationHull { get; init; }
@@ -127,7 +135,6 @@ internal sealed class ProgramPermutation
     public required ResourceSpecialization Specialization { get; init; }
     public required ShaderProgramInfo Program { get; init; }
     public required ShaderProgram Handle { get; init; }
-    public required IGuestCompiledShader Compiled { get; init; }
 
     public BindingLayout Bindings => Program.Bindings!;
 }
@@ -147,10 +154,17 @@ internal sealed class ProgramSourceEntry
 
     // The order of its link among all linked programs: a newer program of a caller replaces an older one as its fallback.
     public long Generation { get; init; }
+    public string LibraryIdentity { get; init; } = string.Empty;
 
     // With RuntimeCallRecords, the hash of the code linked for each of CallTargets, and each site's callees with their code.
     public byte[][] CallTargetCodes { get; init; } = [];
     public Dictionary<uint, UnitedCallee[]>? RuntimeCallees { get; init; }
+    public LinkedShaderPrewarm? LinkedPrewarm { get; init; }
+
+    // With RuntimeCallRecords, the permutation whose pipeline was still compiling at this program's last full resolution, with
+    // that resolution's stage resources (RuntimePipelineReady polls it with them, as it polls older compiles). Null once it is
+    // ready. See SkipPendingPass.
+    public (ShaderProgram Handle, ShaderStageResources Stage)? PendingPipeline { get; set; }
     public ConstantFill? ConstantFill { get; init; }
     public BoundedFill? BoundedFill { get; init; }
     public BoundedCopy? BoundedCopy { get; init; }
@@ -184,15 +198,18 @@ internal sealed class ProgramSourceEntry
 
 // Programs keyed by identity and static state; each draw materializes its resources and reuses
 // the permutation whose specialization and push-data start match, else compiles one more.
-internal sealed class ShaderProgramCache
+internal sealed partial class ShaderProgramCache
 {
     private readonly ImageDescriptorTrace _imageDescriptorTrace = new();
     private const uint MaxInstructionScan = 16384;
 
     private readonly CpuContext _context;
+    private readonly Func<ulong, ulong, bool> _isRangeMapped;
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
+    // A plan depends only on its key, and planning a large program takes seconds, so a rejected key stays rejected.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ProgramKey, string> _rejectedPrograms = new(ProgramKeyComparer.Instance);
     private readonly Dictionary<(ProgramKey Key, string Library), ProgramSourceEntry> _linkedPrograms = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Hash, uint CodeSize, ulong ContinuationAddressOffset), Gen5ShaderProgram> _decoded = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Hash, uint CodeSize, ulong ContinuationAddressOffset), ShaderCodeCapture> _codeCaptures = new();
@@ -216,6 +233,57 @@ internal sealed class ShaderProgramCache
     // heap slots and table buffers are still prepared in stream order by recording.
     internal bool RuntimeResolveWorkers { get; init; } =
         Environment.GetEnvironmentVariable("SHARPEMU_RUNTIME_RESOLVE_WORKERS") != "0";
+
+    // While the newest program of a runtime-record caller compiles and an older ready program serves its dispatches, a
+    // dispatch whose resolution selects the permutation still compiling (PendingPermutationServes) polls that compile and,
+    // while it still compiles, serves the fallback without the newest program's record ranges and stage resources, which
+    // the fallback would discard: it resolves its own. On by default; SHARPEMU_PENDING_PASS_SKIP=0, or any value but 1,
+    // turns it off.
+    // PendingPassSkips counts the dispatches it served.
+    internal bool SkipPendingPass { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPEMU_PENDING_PASS_SKIP") is null or "" or "1";
+    internal long PendingPassSkips { get; private set; }
+
+    // The pending-pass skip is decided before the newest program's targets, records and linked materialization. When that
+    // program has exactly one permutation and it is the one still compiling, every selection serves the fallback: the same
+    // selection polls that compile, and a new one cannot compile while the stage's linked module compiles
+    // (TryCreateComputePipeline admits one at a time) and is served by the fallback meanwhile. So the compile is polled
+    // first, exactly as the late check polls it, and while it still compiles the fallback serves without the
+    // materialization the late check would have discarded. A new specialization's translation then starts at the first
+    // full resolution after the compile, not before it; what is served is unchanged. SHARPEMU_PENDING_PASS_EARLY=0 leaves
+    // the decision to the late check.
+    internal bool SkipPendingPassEarly { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPEMU_PENDING_PASS_EARLY") != "0";
+    internal long PendingPassEarlySkips { get; private set; }
+
+    // Whether a layout starts its push data where BindingLayout.Allocate would start it at this cursor.
+    private static bool StartsAt(BindingLayout layout, uint pushDataCursor) => layout.PushDataStartDword == layout.PushStartFor(pushDataCursor);
+
+    // Whether the stage step serves this permutation for the push-data cursor and specialization (it takes the first that does).
+    internal static bool Selects(ProgramPermutation candidate, uint pushDataCursor, ResourceSpecialization specialization) =>
+        StartsAt(candidate.Bindings, pushDataCursor) && candidate.Specialization.Equals(specialization);
+
+    // SHARPEMU_VERTEX_PUSH_AT_TOP (on by default; =0 turns it off): a graphics pipeline's pixel stage takes the push
+    // range first, and its vertex or mesh stage takes the top of the rest (PushData.TopFor), not the place after the
+    // pixel stage's data. The vertex module then reads its push data at one place for every pixel stage it is paired
+    // with, so one translation and one pre-rasterization part serve every pairing; a stage whose data does not fit
+    // beside the pixel stage's uses the shader data block.
+    internal static readonly bool VertexPushAtTop = Environment.GetEnvironmentVariable("SHARPEMU_VERTEX_PUSH_AT_TOP") != "0";
+
+    private static bool PushDataAtTop(ShaderStage stage) => VertexPushAtTop && stage is ShaderStage.Vertex or ShaderStage.Mesh;
+
+    // Whether the stage step would select the pending permutation: then it would poll that compile and, while it compiles,
+    // serve the caller's fallback. Any other selection, or none, is left to the stage step.
+    internal static bool PendingPermutationServes(IReadOnlyList<ProgramPermutation> permutations, ShaderProgram pending,
+        uint pushDataCursor, ResourceSpecialization specialization)
+    {
+        foreach (var candidate in permutations)
+        {
+            if (Selects(candidate, pushDataCursor, specialization)) return candidate.Handle.Id == pending.Id;
+        }
+
+        return false;
+    }
     private readonly Dictionary<ulong, ((ProgramKey Key, string Library) LinkedKey, Task<ProgramSourceEntry?> Link)> _pendingLinks = new();
 
     // Callers whose callees cannot read their records at run time: they link a copy per record.
@@ -322,7 +390,15 @@ internal sealed class ShaderProgramCache
     // The functions the call tables name, decoded once while their code stays the same.
     private readonly ShaderFunctionCache _functions;
 
+    // Call-library reuse (SHARPEMU_CALL_LIBRARY_REUSE), on by default. Null on a cache made without its initializers.
+    private ShaderCallLibraryMemo? _libraryMemo = ShaderCallLibraryMemo.Enabled ? new() : null;
+
     private static readonly bool PrefetchEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_PREFETCH") != "0";
+
+    // An image or sampler descriptor loaded at an index the host cannot evaluate (a bindless heap entry) reads as a null
+    // descriptor, so the draw or dispatch that uses it still runs. SHARPEMU_BINDLESS_NULL=0 skips that work instead; it is
+    // read whenever a program is planned.
+    private static bool BindlessNullDescriptors => Environment.GetEnvironmentVariable("SHARPEMU_BINDLESS_NULL") != "0";
 
     // On a host that reads call records at run time (descriptor set 1), a linked program keeps one copy of each callee per
     // call site and reads its records' images and samplers at run time, so tables that gain or lose records, or move their
@@ -335,6 +411,7 @@ internal sealed class ShaderProgramCache
     public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host)
     {
         _context = context;
+        _isRangeMapped = context.Memory.CanRead;
         _compiler = compiler;
         _host = host;
         _readGuestWord = host.TryReadGuestWord;
@@ -452,6 +529,8 @@ internal sealed class ShaderProgramCache
     {
         var entry = CreateEntry(source, options);
         if (runtimeDescriptors == RuntimeDescriptorMode.Preferred) PreferRuntimeDescriptors(source, options, ref entry);
+        // A record's storage image selects as the session keeps them (RuntimeImageSwizzle.Canonical).
+        specialization = RuntimeImageSwizzle.Canonical(entry.Plan, specialization);
         var permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, KeyFor(source, options),
             sourceWasCached: false, snapshot: null!);
         return (permutation.Handle, permutation.Program);
@@ -538,15 +617,19 @@ internal sealed class ShaderProgramCache
         }
     }
 
-    // With runtimeFallback, the caller's dispatch runs that ready program of it (see _runtimeFallbacks).
+    // With runtimeFallback, the caller's dispatch runs that ready program of it (see _runtimeFallbacks). With preparation, it
+    // continues from the caller's own preparation (CallDispatchPreparation) instead of redoing it.
     private ShaderProgram GetOrCompileCore(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor, out ShaderStageResources stage,
-        bool deferLinking, ProgramSourceEntry? runtimeFallback = null)
+        bool deferLinking, ProgramSourceEntry? runtimeFallback = null, CallDispatchPreparation? preparation = null)
     {
-        ProgramKey? key = null;
-        ProgramSourceEntry? entry;
-        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCacheLookup))
+        var key = preparation?.Key;
+        var entry = preparation?.Entry;
+        if (preparation is null)
         {
-            entry = FindEntry(source, options, out key);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCacheLookup))
+            {
+                entry = FindEntry(source, options, out key);
+            }
         }
 
         var sourceWasCached = entry is not null;
@@ -563,7 +646,16 @@ internal sealed class ShaderProgramCache
                 sourceWasCached = entry is not null;
                 if (entry is null)
                 {
-                    entry = CreateEntry(source, options);
+                    try
+                    {
+                        entry = CreateEntry(source, options);
+                    }
+                    catch (ShaderProgramRejectedException exception)
+                    {
+                        _rejectedPrograms.TryAdd(KeyFor(source, options), exception.Message);
+                        throw;
+                    }
+
                     BuildStaticState(source.Stage, options);
                     key = BuildProgramKey(source);
                     _programs.TryAdd(key, entry);
@@ -572,9 +664,10 @@ internal sealed class ShaderProgramCache
             }
         }
 
-        return CompleteProgram(entry, sourceWasCached, key, source, options, ref pushDataCursor, out stage, deferLinking, runtimeFallback);
+        return CompleteProgram(entry, sourceWasCached, key, source, options, ref pushDataCursor, out stage, deferLinking, runtimeFallback, preparation);
     }
 
+    // The entry of this source and static state, or null; a key whose plan was rejected throws its rejection again.
     private ProgramSourceEntry? FindEntry(ShaderSource source, StageCompileOptions options, out ProgramKey? key)
     {
         BuildStaticState(source.Stage, options);
@@ -586,19 +679,26 @@ internal sealed class ShaderProgramCache
             return entry;
         }
 
+        if (_rejectedPrograms.GetAlternateLookup<ProgramKeyProbe>().TryGetValue(probe, out _, out var rejection))
+        {
+            throw new ShaderProgramRejectedException(rejection);
+        }
+
         key = null;
         return null;
     }
 
     private ShaderProgram CompleteProgram(ProgramSourceEntry entry, bool sourceWasCached, ProgramKey? key, ShaderSource source, StageCompileOptions options,
-        ref uint pushDataCursor, out ShaderStageResources stage, bool deferLinking, ProgramSourceEntry? runtimeFallback = null)
+        ref uint pushDataCursor, out ShaderStageResources stage, bool deferLinking, ProgramSourceEntry? runtimeFallback = null,
+        CallDispatchPreparation? preparation = null)
     {
         if (runtimeFallback is null)
         {
             _lastEntry = entry;
         }
 
-        var inputs = new ResourceRuntimeInputs
+        var callPreparation = preparation;
+        var inputs = preparation?.Inputs ?? new ResourceRuntimeInputs
         {
             UserData = source.UserData,
             ShaderBase = source.Address,
@@ -609,22 +709,30 @@ internal sealed class ShaderProgramCache
                     _imageDescriptorTrace.RecordCandidate(source.Hash, descriptorSource, candidateKey, heap, address, words.Span)
                 : null,
             ReadResidentMemory = _prefetchResidentGuestBytes,
-            ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
-                ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
-                    Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,
-                    computeState.LocalDataShareDwords, computeState.ThreadIdCount)
-                : null,
+            ComputeState = ComputeStateOf(source, options),
+            IsRangeMapped = _isRangeMapped,
         };
         if (entry.Plan.Info.UsesRuntimeDescriptors && _host.RuntimeDescriptorResolutionRequiresSerial && !RuntimeResolveWorkers)
             throw new SerialResolveRequiredException("runtime image descriptors");
+        if (entry.Plan.DeviceRecordCounts is { } counts && !counts.SupportsDescriptors(entry.Plan, inputs))
+        {
+            var handle = GetOrCompileCore(source, options.WithoutDeviceRecordCounts(), ref pushDataCursor, out stage, deferLinking);
+            if (runtimeFallback is null)
+            {
+                _lastEntry = entry;
+            }
+
+            return handle;
+        }
+
         var hasShaderCalls = entry.HasShaderCalls;
         if (hasShaderCalls && !_compiler.LinkedShaderCallsSupported)
             throw new ShaderProgramRejectedException(
                 $"The backend does not support linked shader calls: backend={_compiler.BackendName} stage={source.Label} hash=0x{source.Hash:X16}.");
 
         // Both are assigned by the materialization that follows; a failed one throws.
-        ResourceSnapshot snapshot = null!;
-        ResourceSpecialization specialization = null!;
+        ResourceSnapshot snapshot = preparation?.Snapshot!;
+        ResourceSpecialization specialization = preparation?.Specialization!;
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
         if (Diagnostics.GpuReadTrace.Enabled)
         {
@@ -637,51 +745,58 @@ internal sealed class ShaderProgramCache
             GpuWrittenDataReads.Clear();
         }
 
-        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
+        if (preparation is null)
         {
-            // Failure capture needs the full walk, so a dump run bypasses the cache.
-            ResourceMaterializationFailure materializationFailure;
-            var started = System.Diagnostics.Stopwatch.GetTimestamp();
-            bool materialized;
-            MaterializationTally.Outcome outcome;
-            if (captureIndirectImageFailure is null && ResourceMaterializer.CanMaterializeFast(entry.Plan))
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
             {
-                materialized = ResourceMaterializer.MaterializeFast(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure);
-                outcome = ResourceMaterializer.LastFastOutcome;
-            }
-            else if (Materializations is { } materializations && captureIndirectImageFailure is null)
-            {
-                materialized = materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
-                    out materializationFailure);
-                outcome = MaterializationTally.FromCache(materializations.LastOutcome);
-            }
-            else
-            {
-                materialized = ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
-                    captureIndirectImageFailure);
-                outcome = MaterializationTally.Outcome.Full;
-            }
+                // Failure capture needs the full walk, so a dump run bypasses the cache.
+                ResourceMaterializationFailure materializationFailure;
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                bool materialized;
+                MaterializationTally.Outcome outcome;
+                if (captureIndirectImageFailure is null && ResourceMaterializer.CanMaterializeFast(entry.Plan))
+                {
+                    materialized = ResourceMaterializer.MaterializeFast(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure);
+                    outcome = ResourceMaterializer.LastFastOutcome;
+                }
+                else if (Materializations is { } materializations && captureIndirectImageFailure is null)
+                {
+                    materialized = materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
+                        out materializationFailure);
+                    outcome = MaterializationTally.FromCache(materializations.LastOutcome);
+                }
+                else
+                {
+                    materialized = ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
+                        captureIndirectImageFailure);
+                    outcome = MaterializationTally.Outcome.Full;
+                }
 
-            if (!materialized && materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or
-                ResourceMaterializationFailure.ImageCapacityExceeded or ResourceMaterializationFailure.UnreadableImageCandidates &&
-                PreferRuntimeDescriptors(source, options, ref entry))
-            {
-                if (_host.RuntimeDescriptorResolutionRequiresSerial) throw new SerialResolveRequiredException("runtime image descriptors");
-                materialized = ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization,
-                    out materializationFailure, captureIndirectImageFailure);
-                outcome = MaterializationTally.Outcome.Full;
+                if (!materialized && materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or
+                    ResourceMaterializationFailure.ImageCapacityExceeded or ResourceMaterializationFailure.UnreadableImageCandidates &&
+                    PreferRuntimeDescriptors(source, options, ref entry))
+                {
+                    if (_host.RuntimeDescriptorResolutionRequiresSerial) throw new SerialResolveRequiredException("runtime image descriptors");
+                    materialized = ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization,
+                        out materializationFailure, captureIndirectImageFailure);
+                    outcome = MaterializationTally.Outcome.Full;
+                }
+                MaterializationTally.Note(materialized ? outcome : MaterializationTally.Outcome.Failed,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - started, materialized ? snapshot : null);
+                if (!materialized)
+                {
+                    var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";
+                    if (ResourceMaterializer.LastFailureDetail is { } detail)
+                        message = message[..^1] + $" detail={detail}.";
+                    if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
+                        throw new ShaderProgramRejectedException(message);
+                    throw SubmissionScheduler.Fatal(message);
+                }
             }
-            MaterializationTally.Note(materialized ? outcome : MaterializationTally.Outcome.Failed,
-                System.Diagnostics.Stopwatch.GetTimestamp() - started, materialized ? snapshot : null);
-            if (!materialized)
-            {
-                var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";
-                if (ResourceMaterializer.LastFailureDetail is { } detail)
-                    message = message[..^1] + $" detail={detail}.";
-                if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
-                    throw new ShaderProgramRejectedException(message);
-                throw SubmissionScheduler.Fatal(message);
-            }
+        }
+        else
+        {
+            CallDispatchReuses++;
         }
 
         if (DeviceDataReadsSync && entry.Plan.DeviceDataReads.Count != 0)
@@ -711,8 +826,12 @@ internal sealed class ShaderProgramCache
                     var caller = entry.Program with { Address = source.Address };
                     // Tables and function code are read like the caller's code: a stale image over reused memory must not hide them.
                     var runtimeRecords = runtimeFallback is not null || (RuntimeCallRecords && !_perRecordCallers.Contains(source.Hash));
-                    var library = ShaderCallLibrary.Read(caller, entry.Plan.Memory, snapshot, _readGuestWord, _functions, runtimeRecords);
-                    if (runtimeRecords)
+                    var library = preparation?.Library ?? (_libraryMemo is { } readMemo
+                        ? readMemo.Read(caller, entry.Plan.Memory, snapshot, _readGuestWord, _functions, runtimeRecords, source.UserDataBase,
+                            _readResidentGuestBytes)
+                        : ShaderCallLibrary.Read(caller, entry.Plan.Memory, snapshot, _readGuestWord, _functions, runtimeRecords,
+                            source.UserDataBase, _readResidentGuestBytes));
+                    if (runtimeRecords && preparation is null)
                     {
                         if (!_calleeUnions.TryGetValue(programKey, out var union))
                         {
@@ -726,14 +845,35 @@ internal sealed class ShaderProgramCache
                             }
                         }
 
-                        library = library.Unite(caller.Address, union, MaxUnitedCallees);
+                        bool unionChanged;
+                        try
+                        {
+                            library = _libraryMemo is { } uniteMemo
+                                ? uniteMemo.Unite(library, caller.Address, union, MaxUnitedCallees, out unionChanged)
+                                : library.Unite(caller.Address, union, MaxUnitedCallees, out unionChanged);
+                        }
+                        catch
+                        {
+                            // A failed unite may have changed the union, so no earlier scan of it stands.
+                            if (_calleeTiers.TryGetValue(programKey, out var failedTiers)) failedTiers.NoteUnionChanged();
+                            throw;
+                        }
+
+                        if (unionChanged && _calleeTiers.TryGetValue(programKey, out var changedTiers)) changedTiers.NoteUnionChanged();
+                        if (runtimeFallback is null && ReuseCallDispatch && captureIndirectImageFailure is null && !captureLinkedImages)
+                        {
+                            callPreparation = new(programKey, entry, inputs, snapshot, specialization, library);
+                        }
+
                         if (_calleeTiers.TryGetValue(programKey, out var tiers))
                         {
                             if (runtimeFallback is null)
                             {
                                 tiers.Observe(library, programKey.Hash, _host);
-                                library = library.WithSiteCallees(caller.Address,
-                                    tiers.Choose(union, FallbackGeneration(programKey), _host.CallMarkSnapshots));
+                                var chosen = tiers.Choose(union, FallbackGeneration(programKey), _host.CallMarkSnapshots);
+                                library = _libraryMemo is { } chosenMemo
+                                    ? chosenMemo.WithSiteCallees(library, caller.Address, chosen)
+                                    : library.WithSiteCallees(caller.Address, chosen);
                             }
                         }
                         else if (runtimeFallback is null && !_runtimeFallbacks.ContainsKey(programKey))
@@ -741,7 +881,9 @@ internal sealed class ShaderProgramCache
                             // A caller with no ready program first links the callees an earlier session kept for it, whose pipeline
                             // the linked cache holds, or none, so its dispatches run within seconds instead of being skipped until
                             // the driver has compiled the callees' code.
-                            library = library.WithSiteCallees(caller.Address, _keptCallees[programKey]);
+                            library = _libraryMemo is { } keptMemo
+                                ? keptMemo.WithSiteCallees(library, caller.Address, _keptCallees[programKey])
+                                : library.WithSiteCallees(caller.Address, _keptCallees[programKey]);
                         }
                     }
 
@@ -759,14 +901,15 @@ internal sealed class ShaderProgramCache
                             }
                             catch (ShaderProgramPendingException) when (runtimeRecords && _runtimeFallbacks.TryGetValue(programKey, out var ready))
                             {
-                                return GetOrCompileCore(source, options, ref pushDataCursor, out stage, deferLinking, ready);
+                                return GetOrCompileFallback(source, options, ref pushDataCursor, out stage, deferLinking, ready,
+                                    null, library.LayoutIdentity, "link", callPreparation);
                             }
                         }
                         else
                         {
                             linked = LinkProgram(caller, library, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
                                 waveSize, captureLinkedImages ? plan => failedLinkedPlan = plan : null, runtimeRecords, runtimeRecords && CalleeTiering,
-                                source.Registered.Frontend) ??
+                                _host.SupportsBindlessHeap, _host.ShaderPrewarm is not null, source.Registered.Frontend) ??
                                 RefuseRuntimeCallRecords(source.Hash);
                             failedLinkedPlan = null;
                         }
@@ -778,6 +921,25 @@ internal sealed class ShaderProgramCache
                     if (runtimeFallback is null && linked.RuntimeCallRecords && _calleeTiers.TryGetValue(programKey, out var linkedTiers))
                     {
                         linkedTiers.LinkedGeneration = linked.Generation;
+                    }
+
+                    if (runtimeFallback is null && SkipPendingPassEarly && SkipPendingPass &&
+                        linked.RuntimeCallRecords && linked.PendingPipeline is { } earlyPending && linked.Permutations.Count == 1 &&
+                        linked.Permutations[0].Handle.Id == earlyPending.Handle.Id &&
+                        _runtimeFallbacks.TryGetValue(programKey, out var earlyFallback) && !ReferenceEquals(earlyFallback, linked))
+                    {
+                        if (RuntimePipelineReady(programKey, linked, earlyPending.Handle, earlyPending.Stage, options, null))
+                        {
+                            linked.PendingPipeline = null;
+                        }
+                        // The poll can promote an older compile that finished meanwhile; the fallback it leaves serves.
+                        else if (_runtimeFallbacks.TryGetValue(programKey, out var earlyServing) && !ReferenceEquals(earlyServing, linked))
+                        {
+                            PendingPassSkips++;
+                            PendingPassEarlySkips++;
+                            return GetOrCompileFallback(source, options, ref pushDataCursor, out stage, deferLinking, earlyServing,
+                                linked.Generation, linked.LibraryIdentity, "pipeline", callPreparation);
+                        }
                     }
 
                     callArguments = library.Arguments;
@@ -805,6 +967,24 @@ internal sealed class ShaderProgramCache
                         : ResourceMaterializer.Materialize(entry.Plan, linkedInputs, ref snapshot, ref specialization);
                     if (!linkedMaterialized)
                         throw new InvalidOperationException("The linked shader resources could not be materialized.");
+                    if (runtimeFallback is null && linked.PendingPipeline is { } pending && SkipPendingPass &&
+                        PendingPermutationServes(linked.Permutations, pending.Handle, pushDataCursor, specialization) &&
+                        _runtimeFallbacks.TryGetValue(programKey, out var fallbackBefore) && !ReferenceEquals(fallbackBefore, linked))
+                    {
+                        if (RuntimePipelineReady(programKey, linked, pending.Handle, pending.Stage, options, null))
+                        {
+                            linked.PendingPipeline = null;
+                        }
+                        // The poll can promote an older compile that finished meanwhile; the fallback it leaves serves, as after
+                        // the stage step's own poll.
+                        else if (_runtimeFallbacks.TryGetValue(programKey, out var servingWhilePending) && !ReferenceEquals(servingWhilePending, linked))
+                        {
+                            PendingPassSkips++;
+                            return GetOrCompileFallback(source, options, ref pushDataCursor, out stage, deferLinking, servingWhilePending,
+                                linked.Generation, linked.LibraryIdentity, "pipeline", callPreparation);
+                        }
+                    }
+
                     if (linked.RuntimeCallRecords)
                         (callRecords, callRecordRanges) = CallRecordRanges(entry.Plan, callRecords!, callTargets, linkedInputs, source.UserDataBase);
                 }
@@ -823,7 +1003,7 @@ internal sealed class ShaderProgramCache
 
         _imageDescriptorTrace.Record(source, entry.Plan, snapshot);
         var permutation = Volatile.Read(ref entry.LastPermutation) is { } last && ReferenceEquals(last.Specialization, specialization) &&
-            last.Bindings.PushDataStartDword == PushData.StartFor(pushDataCursor, last.Bindings.ShaderDataDwordCount)
+            StartsAt(last.Bindings, pushDataCursor)
             ? last
             : FindPermutation(entry, specialization, pushDataCursor);
         if (permutation is null)
@@ -841,7 +1021,8 @@ internal sealed class ShaderProgramCache
                 var ready = ReadyFallback(key!, entry);
                 if (ready is null)
                     throw;
-                return GetOrCompileCore(source, options, ref pushDataCursor, out stage, deferLinking, ready);
+                return GetOrCompileFallback(source, options, ref pushDataCursor, out stage, deferLinking, ready,
+                    entry.Generation, entry.LibraryIdentity, "permutation", callPreparation);
             }
         }
         else if (RenderTrace.Enabled && RenderTrace.Pipeline())
@@ -859,12 +1040,19 @@ internal sealed class ShaderProgramCache
         {
             lock (_callGate)
             {
-                if (!RuntimePipelineReady(key!, entry, permutation.Handle, stage, options, runtimeFallback))
+                var pipelineReady = RuntimePipelineReady(key!, entry, permutation.Handle, stage, options, runtimeFallback);
+                if (runtimeFallback is null)
+                {
+                    entry.PendingPipeline = pipelineReady ? null : (permutation.Handle, stage);
+                }
+
+                if (!pipelineReady)
                 {
                     if (runtimeFallback is not null)
                         throw new ShaderProgramPendingException();
                     if (ReadyFallback(key!, entry) is { } ready)
-                        return GetOrCompileCore(source, options, ref pushDataCursor, out stage, deferLinking, ready);
+                        return GetOrCompileFallback(source, options, ref pushDataCursor, out stage, deferLinking, ready,
+                            entry.Generation, entry.LibraryIdentity, "pipeline", callPreparation);
                 }
             }
         }
@@ -912,8 +1100,7 @@ internal sealed class ShaderProgramCache
         {
             foreach (var candidate in entry.Permutations)
             {
-                var layout = candidate.Bindings;
-                if (layout.PushDataStartDword == (layout.UsesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount)) && candidate.Specialization.Equals(specialization))
+                if (Selects(candidate, pushDataCursor, specialization))
                 {
                     return candidate;
                 }
@@ -931,24 +1118,51 @@ internal sealed class ShaderProgramCache
         }
     }
 
+    // A recursive GetOrCompileCore that serves a ready program; its stage names the fallback (CompileFallback).
+    private ShaderProgram GetOrCompileFallback(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
+        out ShaderStageResources stage, bool deferLinking, ProgramSourceEntry fallback,
+        long? requestedGeneration, string requestedLibrary, string reason, CallDispatchPreparation? preparation)
+    {
+        var handle = GetOrCompileCore(source, options, ref pushDataCursor, out stage, deferLinking, fallback, preparation);
+        var selection = new LinkedCompileFallback(source.Hash, requestedGeneration, fallback.Generation,
+            requestedLibrary, fallback.LibraryIdentity, reason);
+        stage = stage with { CompileFallback = selection };
+        return handle;
+    }
+
     // The key of the entry the static state was just built for.
     private ProgramKey BuildProgramKey(ShaderSource source) =>
         new(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize,
             source.ContinuationAddressOffset, StaticState.ToArray());
 
+    // The compute selector state of a compute stage's inputs, with the dispatch its record counts are proven against.
+    private static ComputeSelectorState? ComputeStateOf(ShaderSource source, StageCompileOptions options) =>
+        source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
+            ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
+                Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,
+                computeState.LocalDataShareDwords, computeState.ThreadIdCount)
+            {
+                Dispatch = options.ComputeDispatch,
+                DeviceCountProof = DeviceRecordCountPlan.Enabled,
+            }
+            : null;
+
     // With runtimeRecords, a program whose callees cannot read their records at run time is refused (null), and its caller
     // links a copy per record from then on (RefuseRuntimeCallRecords).
     private ProgramSourceEntry? LinkProgram(Gen5ShaderProgram caller, ShaderCallLibrary library, ShaderStage stage, ulong hash,
         uint userDataBase, uint userDataCount, uint waveSize, Action<ShaderResourcePlan>? beforeResourceTracking, bool runtimeRecords = false,
-        bool callMarks = false, IShaderFrontend? frontend = null)
+        bool callMarks = false, bool bindlessHeap = false, bool capturePrewarm = false, IShaderFrontend? frontend = null)
     {
         Gen5ShaderProgram program;
         ShaderResourcePlan plan;
         try
         {
-            program = Gen5ShaderCallLinker.Link(caller, library.Calls, runtimeRecords);
+            program = runtimeRecords
+                ? ShaderCallLibrary.LinkLeavingOutUnlinkable(caller, ref library, failure => ReportLeftOutCallee(hash, failure))
+                : Gen5ShaderCallLinker.Link(caller, library.Calls, runtimeRecords);
             plan = ShaderResourcePlan.Extract(program, stage, hash, userDataBase, userDataCount,
-                beforeResourceTracking: beforeResourceTracking, waveSize: waveSize, callRecords: runtimeRecords, callMarks: callMarks,
+                beforeResourceTracking: beforeResourceTracking, waveSize: waveSize, bindlessNullDescriptors: BindlessNullDescriptors,
+                bindlessHeap: bindlessHeap, callRecords: runtimeRecords, callMarks: callMarks,
                 normalizeBufferDescriptor: frontend?.NormalizeBufferDescriptor,
                 normalizeImageDescriptor: ImageNormalizer(frontend),
                 imageNormalizationVersion: frontend?.ImageNormalizationVersion,
@@ -966,9 +1180,23 @@ internal sealed class ShaderProgramCache
             CallTargets = callTargets,
             CallTargetCodes = [.. callTargets.Select(address => library.CodeHashes[address])],
             RuntimeCallees = runtimeRecords ? library.SiteCallees() : null,
+            LinkedPrewarm = capturePrewarm && stage == ShaderStage.Compute
+                ? LinkedShaderPrewarm.Capture(library, runtimeRecords, callMarks, bindlessHeap) : null,
             Generation = Interlocked.Increment(ref _linkGenerations),
+            LibraryIdentity = library.LayoutIdentity,
             HasShaderCalls = program.Instructions.Any(instruction => instruction.Opcode == "SSwappcB64"),
             HasBitwiseExclusiveOr = program.Instructions.Any(instruction => instruction.Opcode.Contains("Xor", StringComparison.Ordinal)) };
+    }
+
+    private static int _leftOutCalleeReports;
+
+    private static void ReportLeftOutCallee(ulong hash, ShaderCallLinkException failure)
+    {
+        if (Interlocked.Increment(ref _leftOutCalleeReports) <= 16)
+        {
+            Console.Error.WriteLine($"[GPU][WARN][LINKED_PROGRAM] A callee cannot be linked and is left out; its calls return at once: " +
+                $"hash=0x{hash:X16} {failure.Message}");
+        }
     }
 
     // The program linked for linkedKey once its worker is done; until then the program is pending. A finished link of
@@ -997,7 +1225,9 @@ internal sealed class ShaderProgramCache
         {
             var first = ranges.Count;
             if (slotOf.TryGetValue(record.Target, out var slot) &&
-                !CallRecordPlanner.AddRecordRanges(plan, slot, record.Argument, inputs, userDataBase, ranges))
+                (!CallRecordPlanner.AddRecordRanges(plan, slot, record.Argument, inputs, userDataBase, ranges) ||
+                 ranges.Skip(first).Any(static range =>
+                     ClassifyRecordBuffer(range.Base, range.Size, range.Written) == RecordBuffer.LeaveRecordOut)))
             {
                 ranges.RemoveRange(first, ranges.Count - first);
                 if (_invalidRecordReports++ < 8)
@@ -1009,6 +1239,14 @@ internal sealed class ShaderProgramCache
                 continue;
             }
 
+            for (var index = ranges.Count - 1; index >= first; index--)
+            {
+                if (ClassifyRecordBuffer(ranges[index].Base, ranges[index].Size, ranges[index].Written) != RecordBuffer.Resident)
+                {
+                    ranges.RemoveAt(index);
+                }
+            }
+
             kept.Add(record);
         }
 
@@ -1016,6 +1254,28 @@ internal sealed class ShaderProgramCache
     }
 
     private static int _invalidRecordReports;
+
+    // A record names a buffer of at most 4 GiB inside the address space the device-address cache maps (PageOwnerTable). Other
+    // words in its place (material constants, say, on a record whose callee does not read the buffer) describe no buffer.
+    internal static bool DescribesRecordBuffer(ulong address, ulong size) =>
+        size <= 1UL << 32 && address < Buffers.PageOwnerTable.AddressSpaceSize &&
+        size <= Buffers.PageOwnerTable.AddressSpaceSize - address;
+
+    internal enum RecordBuffer
+    {
+        Resident,
+        NotResident,
+        LeaveRecordOut,
+    }
+
+    // What a buffer a callee reads through its record's argument needs at a dispatch. A buffer is made resident. Words that
+    // describe no buffer are not, and a read through them returns zeros, as through any page the cache does not hold; when the
+    // callee writes the buffer, its record is left out instead (its call returns at once), so no store lands through them.
+    internal static RecordBuffer ClassifyRecordBuffer(ulong address, ulong size, bool written) =>
+        address == 0 || size == 0 ? RecordBuffer.NotResident
+        : DescribesRecordBuffer(address, size) ? RecordBuffer.Resident
+        : written ? RecordBuffer.LeaveRecordOut
+        : RecordBuffer.NotResident;
 
     // Whether a runtime-record program's pipeline is ready for this compute dispatch; its compile starts or is polled here, and a
     // ready program becomes the caller's fallback. Without a pipeline host every pipeline counts as ready.
@@ -1140,7 +1400,7 @@ internal sealed class ShaderProgramCache
             {
                 if (!served.Contains(address))
                 {
-                    var key = Convert.ToHexString(code);
+                    var key = ShaderCallLibrary.CodeKey(code);
                     if (!byCode.TryGetValue(key, out var addresses))
                     {
                         byCode.Add(key, addresses = []);
@@ -1153,7 +1413,7 @@ internal sealed class ShaderProgramCache
             for (var slot = 0; slot < targets.Length; slot++)
             {
                 if (targets[slot] != NoTarget || slot >= program.CallTargetCodes.Length ||
-                    !byCode.TryGetValue(Convert.ToHexString(program.CallTargetCodes[slot]), out var candidates))
+                    !byCode.TryGetValue(ShaderCallLibrary.CodeKey(program.CallTargetCodes[slot]), out var candidates))
                 {
                     continue;
                 }
@@ -1179,9 +1439,9 @@ internal sealed class ShaderProgramCache
             }
         }
 
-        var codes = program.CallTargetCodes.Select(Convert.ToHexString).ToHashSet();
+        var codes = program.CallTargetCodes.Select(ShaderCallLibrary.CodeKey).ToHashSet();
         var unservedCopy = library.CurrentCodeHashes.Any(named =>
-            !served.Contains(named.Key) && codes.Contains(Convert.ToHexString(named.Value)));
+            !served.Contains(named.Key) && codes.Contains(ShaderCallLibrary.CodeKey(named.Value)));
         return (targets, [.. library.Records.Where(record => served.Contains(record.Target))], unservedCopy);
     }
 
@@ -1214,10 +1474,13 @@ internal sealed class ShaderProgramCache
 
         var (stage, hash, userDataBase, userDataCount) = (source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length);
         var callMarks = runtimeRecords && CalleeTiering;
+        var bindlessHeap = _host.SupportsBindlessHeap;
+        var capturePrewarm = _host.ShaderPrewarm is not null;
         var frontend = source.Registered.Frontend;
         ObjectDisposedException.ThrowIf(_stoppingBackgroundWork, this);
         _pendingLinks.Add(source.Hash, (linkedKey, Task.Run(() =>
-            LinkProgram(caller, library, stage, hash, userDataBase, userDataCount, waveSize, null, runtimeRecords, callMarks, frontend))));
+            LinkProgram(caller, library, stage, hash, userDataBase, userDataCount, waveSize, null, runtimeRecords, callMarks, bindlessHeap,
+                capturePrewarm, frontend))));
         throw new ShaderProgramPendingException();
     }
 
@@ -1232,55 +1495,62 @@ internal sealed class ShaderProgramCache
             CallTargets = callTargets,
             CallRecords = callRecords,
             CallRecordRanges = callRecordRanges,
-            ThreadLimits = source.Stage == ShaderStage.Compute && options.ComputeInfo is { DispatchThreadDimensions: true } compute
+            ThreadLimits = source.Stage == ShaderStage.Compute &&
+                options.ComputeInfo is { DispatchThreadDimensions: true, IndirectThreadCounts: false } compute
                 ? new DispatchThreadLimits(compute.DispatchThreadsX, compute.DispatchThreadsY, compute.DispatchThreadsZ)
                 : null,
+            GpuThreadLimits = source.Stage == ShaderStage.Compute && options.ComputeInfo is { IndirectThreadCounts: true },
         };
     }
 
-    private void BuildStaticState(ShaderStage stage, StageCompileOptions options)
+    private static void BuildStaticState(ShaderStage stage, StageCompileOptions options) => BuildStaticState(stage, options, StaticState);
+
+    // Into a list of the caller's: the prewarm builds its own.
+    private static void BuildStaticState(ShaderStage stage, StageCompileOptions options, List<uint> state)
     {
         switch (stage)
         {
             case ShaderStage.Vertex:
             case ShaderStage.TessellationEvaluation:
-                StageStaticKey.Build(options.VertexInfo ?? throw new ArgumentException("The vertex lookup has no vertex input info."), options.RequiredVertexOutputCount, StaticState);
+                StageStaticKey.Build(options.VertexInfo ?? throw new ArgumentException("The vertex lookup has no vertex input info."), options.RequiredVertexOutputCount, state);
                 break;
             case ShaderStage.Pixel:
-                StageStaticKey.Build(options.PixelInfo ?? throw new ArgumentException("The pixel lookup has no pixel input info."), StaticState);
+                StageStaticKey.Build(options.PixelInfo ?? throw new ArgumentException("The pixel lookup has no pixel input info."), state);
                 foreach (var output in options.PixelOutputs)
                 {
-                    StaticState.Add(output.GuestSlot);
-                    StaticState.Add(output.HostLocation);
-                    StaticState.Add(output.ExportTarget);
-                    StaticState.Add(output.Index);
-                    StaticState.Add(output.DualSourceAlpha ? 1u : 0u);
+                    state.Add(output.GuestSlot);
+                    state.Add(output.HostLocation);
+                    state.Add(output.ExportTarget);
+                    state.Add(output.Index);
+                    state.Add(output.DualSourceAlpha ? 1u : 0u);
                 }
                 break;
             case ShaderStage.Mesh:
-                StageStaticKey.Build(options.MeshInfo ?? throw new ArgumentException("The mesh lookup has no mesh input info."), options.RequiredVertexOutputCount, StaticState);
-                StaticState.Add(options.MeshOutputLocationMask.HasValue ? 1u : 0u);
-                StaticState.Add(options.MeshOutputLocationMask.GetValueOrDefault());
+                StageStaticKey.Build(options.MeshInfo ?? throw new ArgumentException("The mesh lookup has no mesh input info."), options.RequiredVertexOutputCount, state);
+                state.Add(options.MeshOutputLocationMask.HasValue ? 1u : 0u);
+                state.Add(options.MeshOutputLocationMask.GetValueOrDefault());
                 break;
             default:
-                StageStaticKey.Build(options.ComputeInfo ?? throw new ArgumentException("The compute lookup has no compute input info."), StaticState);
+                StageStaticKey.Build(options.ComputeInfo ?? throw new ArgumentException("The compute lookup has no compute input info."), state);
+                if (ScalarDataReadPolicy.Enabled) state.Add(ScalarDataReadPolicy.CacheIdentity);
+                if (DeviceRecordCountPlan.Enabled && options.DeviceRecordCounts) state.Add(DeviceRecordCountPlan.CacheIdentity);
                 break;
         }
 
         if (options.Tessellation is { } tessellation)
         {
-            StaticState.Add((uint)tessellation.Domain);
-            StaticState.Add((uint)tessellation.Spacing);
-            StaticState.Add(tessellation.PointMode ? 1u : 0);
-            StaticState.Add(tessellation.Clockwise ? 1u : 0);
+            state.Add((uint)tessellation.Domain);
+            state.Add((uint)tessellation.Spacing);
+            state.Add(tessellation.PointMode ? 1u : 0);
+            state.Add(tessellation.Clockwise ? 1u : 0);
         }
 
         if (options.TessellationHull is { } hull)
         {
-            StaticState.Add(hull.InputControlPoints);
-            StaticState.Add(hull.OutputControlPoints);
-            StaticState.Add(hull.PatchesPerGroup);
-            StaticState.Add(hull.HullEntryPc);
+            state.Add(hull.InputControlPoints);
+            state.Add(hull.OutputControlPoints);
+            state.Add(hull.PatchesPerGroup);
+            state.Add(hull.HullEntryPc);
         }
     }
 
@@ -1300,15 +1570,8 @@ internal sealed class ShaderProgramCache
         ShaderVertexInput[] vertexInputs = [];
         if (source.Stage == ShaderStage.Vertex && options.VertexInfo is { FetchEmbedded: true } vertexInfo)
         {
-            fetch = EmbeddedVertexFetchDetector.Detect(
-                program,
-                (int)source.UserDataBase + vertexInfo.FetchAttributeRegister,
-                (int)source.UserDataBase + vertexInfo.FetchBufferRegister,
-                source.UserDataBase,
-                (uint)source.UserData.Length,
-                waveSize: 32);
-            vertexInputs = BuildVertexInputs(fetch, vertexInfo, source);
-            program = fetch.RemoveReplacedTableLoads(program);
+            (fetch, vertexInputs, program) = PrepareEmbeddedFetch(program, vertexInfo, source.UserDataBase,
+                (uint)source.UserData.Length, source.Hash, source.Address);
         }
 
         ShaderResourcePlan plan;
@@ -1324,6 +1587,9 @@ internal sealed class ShaderProgramCache
                     ShaderStage.Compute => options.ComputeInfo?.WaveSize ?? 64u,
                     _ => 32u,
                 }, dynamicUserData: options.VertexInfo?.StartInstanceUserData ?? -1,
+                bindlessNullDescriptors: BindlessNullDescriptors, bindlessHeap: _host.SupportsBindlessHeap,
+                stableImageLimits: StableImageLimits(_host, source.Stage),
+                deviceRecordCounts: DeviceRecordCountPlan.Enabled && options.DeviceRecordCounts,
                 normalizeBufferDescriptor: source.Registered.Frontend?.NormalizeBufferDescriptor,
                 normalizeImageDescriptor: ImageNormalizer(source.Registered.Frontend),
                 imageNormalizationVersion: source.Registered.Frontend?.ImageNormalizationVersion,
@@ -1340,6 +1606,13 @@ internal sealed class ShaderProgramCache
         {
             Console.Error.WriteLine($"[GPU][DEVICE_DATA_READS] kept stage={source.Label} hash=0x{source.Hash:X16} " +
                 $"pcs={plan.DeviceDataReads.Count} table_words={plan.TableReads.Count} ranges={DescribeRanges(plan)}");
+        }
+
+        if (plan.NullBindlessDescriptorPcs.Count != 0)
+        {
+            Console.Error.WriteLine(
+                $"[GPU][WARN] Bindless descriptors read as null: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} " +
+                $"pcs={string.Join(',', plan.NullBindlessDescriptorPcs.Select(pc => $"0x{pc:X}"))}");
         }
 
         var exclusiveOr = false;
@@ -1548,8 +1821,18 @@ internal sealed class ShaderProgramCache
         return true;
     }
 
+    // The embedded vertex fetch of a vertex program: its plan, the fixed-function inputs it becomes, and the program
+    // without the table loads they replace. The graphics prewarm prepares a recorded program the same way.
+    private static (EmbeddedVertexFetchPlan Fetch, ShaderVertexInput[] Inputs, Gen5ShaderProgram Program) PrepareEmbeddedFetch(
+        Gen5ShaderProgram program, VertexInputInfo info, uint userDataBase, uint userDataCount, ulong hash, ulong address)
+    {
+        var fetch = EmbeddedVertexFetchDetector.Detect(program, (int)userDataBase + info.FetchAttributeRegister,
+            (int)userDataBase + info.FetchBufferRegister, userDataBase, userDataCount, waveSize: 32);
+        return (fetch, BuildVertexInputs(fetch, info, hash, address), fetch.RemoveReplacedTableLoads(program));
+    }
+
     // One fixed-function input per fetched attribute; later loads of the same attribute alias the first.
-    private static ShaderVertexInput[] BuildVertexInputs(EmbeddedVertexFetchPlan fetch, VertexInputInfo info, ShaderSource source)
+    private static ShaderVertexInput[] BuildVertexInputs(EmbeddedVertexFetchPlan fetch, VertexInputInfo info, ulong hash, ulong address)
     {
         var inputs = new List<ShaderVertexInput>();
         var inputByLocation = new Dictionary<int, int>();
@@ -1590,7 +1873,7 @@ internal sealed class ShaderProgramCache
             if (location < 0)
             {
                 throw SubmissionScheduler.Fatal(
-                    $"The vertex program fetches an attribute the tables do not declare: hash=0x{source.Hash:X16} shader=0x{source.Address:X16} attribute={load.AttributeId} pc=0x{load.Pc:X}.");
+                    $"The vertex program fetches an attribute the tables do not declare: hash=0x{hash:X16} shader=0x{address:X16} attribute={load.AttributeId} pc=0x{load.Pc:X}.");
             }
 
             var attribute = info.Attributes[location];
@@ -1617,13 +1900,13 @@ internal sealed class ShaderProgramCache
                 }
 
                 throw SubmissionScheduler.Fatal(
-                    $"The vertex program uses an unsupported attribute destination selector: hash=0x{source.Hash:X16} shader=0x{source.Address:X16} attribute={load.AttributeId} pc=0x{load.Pc:X} component={component} selector={selector}.");
+                    $"The vertex program uses an unsupported attribute destination selector: hash=0x{hash:X16} shader=0x{address:X16} attribute={load.AttributeId} pc=0x{load.Pc:X} component={component} selector={selector}.");
             }
 
             if (requiredComponents == 0)
             {
                 throw SubmissionScheduler.Fatal(
-                    $"The vertex program fetches an attribute without a memory component: hash=0x{source.Hash:X16} shader=0x{source.Address:X16} attribute={load.AttributeId} pc=0x{load.Pc:X}.");
+                    $"The vertex program fetches an attribute without a memory component: hash=0x{hash:X16} shader=0x{address:X16} attribute={load.AttributeId} pc=0x{load.Pc:X}.");
             }
 
             if (inputByLocation.TryGetValue(location, out var existingIndex))
@@ -1703,6 +1986,10 @@ internal sealed class ShaderProgramCache
         var (sharedInt64Atomics, execGuardElision, signedZeroInfNanPreserve, wave64Native, imageInt64Atomics) =
             (_host.SharedInt64AtomicsEnabled, _host.ExecGuardElisionEnabled, _host.ShaderSignedZeroInfNanPreserveFloat32Supported,
                 _host.ComputeWave64SubgroupNative, _host.ImageInt64AtomicsEnabled);
+        var bufferInt64Atomics = _host.BufferInt64AtomicsEnabled;
+        var robustBufferAccess2 = _host.RobustBufferAccess2Enabled;
+        var nativeFloat16 = _host.NativeFloat16Conversions;
+        var (exactFloat16, fastFloat16) = (_host.ExactFloat16ConversionSupported, _host.FastFloat16);
         var subgroup32 = _host.ComputeRunsOn32LaneSubgroups(current);
         var tableBlocks = UsesTableBlocks(ShaderStage.Compute);
         var usesBufferLengths = source.Registered.Frontend?.RequiresExplicitBufferLengths ?? false;
@@ -1715,9 +2002,11 @@ internal sealed class ShaderProgramCache
             var layout = AllocateLayout(program, plan, resources, userDataBase, userDataCount, pushDataCursor, info.DispatchThreadDimensions,
                 usesBufferLengths: usesBufferLengths, usesTessellationData: usesTessellationData, tableBlocks: tableBlocks);
             var request = BuildComputeRequest(plan, resources, layout, info, systemRegisters, sharedInt64Atomics, execGuardElision,
-                signedZeroInfNanPreserve, wave64Native, subgroup32, imageInt64Atomics, tessellationHull, _host.ExactFloat16ConversionSupported,
-                _host.FastFloat16);
-            var translated = compiler.TryCompileProgram(request, out var compiled, out var error);
+                signedZeroInfNanPreserve, wave64Native, subgroup32, imageInt64Atomics, bufferInt64Atomics: bufferInt64Atomics,
+                robustBufferAccess2: robustBufferAccess2, nativeFloat16Conversions: nativeFloat16, tessellationHull: tessellationHull,
+                exactFloat16: exactFloat16, fastFloat16: fastFloat16);
+            var translated = TranslationDiskCache.TryTranslate(compiler, request,
+                TranslationDiskCache.Key(key, userDataBase, specialization, pushDataCursor, request), out var compiled, out var error);
             return new DeferredTranslation(resources, layout, request, translated, compiled, error);
         }));
         throw new ShaderProgramPendingException();
@@ -1729,8 +2018,10 @@ internal sealed class ShaderProgramCache
     internal static readonly bool ComputeTableBlocks =
         Environment.GetEnvironmentVariable("SHARPEMU_COMPUTE_TABLE_BLOCKS") == "1";
 
-    private bool UsesTableBlocks(ShaderStage stage) =>
-        _host.TableBlocks && stage != ShaderStage.Mesh && (stage != ShaderStage.Compute || ComputeTableBlocks);
+    private bool UsesTableBlocks(ShaderStage stage) => UsesTableBlocks(_host, stage);
+
+    private static bool UsesTableBlocks(IShaderPipelineHost host, ShaderStage stage) =>
+        host.TableBlocks && stage != ShaderStage.Mesh && (stage != ShaderStage.Compute || ComputeTableBlocks);
 
     private ProgramPermutation CompilePermutation(
         ShaderSource source,
@@ -1759,7 +2050,8 @@ internal sealed class ShaderProgramCache
                 resources = ResourceMaterializer.ApplyTo(plan, specialization);
                 layout = AllocateLayout(program, plan, resources, source.UserDataBase, (uint)source.UserData.Length, pushDataCursor,
                     source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
-                    usesMeshDrawParameters: source.Stage == ShaderStage.Mesh, tableBlocks: UsesTableBlocks(source.Stage),
+                    usesMeshDrawParameters: source.Stage == ShaderStage.Mesh, pushDataAtTop: PushDataAtTop(source.Stage),
+                    tableBlocks: UsesTableBlocks(source.Stage),
                     usesBufferLengths: source.Registered.Frontend?.RequiresExplicitBufferLengths ?? false,
                     usesTessellationData: options.Tessellation is not null || options.TessellationHull is not null,
                     usesObjectId: source.Stage == ShaderStage.Pixel && options.PixelOutputs.Any(output => output.ObjectPrimitiveId));
@@ -1786,8 +2078,10 @@ internal sealed class ShaderProgramCache
                     $"components={outputLocations * 4} limit={limits.MaxOutputComponents}.");
             var outputBytes = mesh.OutputMemoryBytes(parameterCount,
                 limits.OutputPerVertexGranularity, limits.OutputPerPrimitiveGranularity);
-            if (outputBytes > limits.MaxOutputMemoryBytes || outputBytes > limits.MaxPayloadAndOutputMemoryBytes)
-                throw new ShaderProgramRejectedException($"The mesh output exceeds device memory limits: bytes={outputBytes} " +
+            // A task-launched program's payload counts in the payload-and-output limit.
+            var payloadBytes = mesh.TaskLaunched ? SharpEmu.ShaderCompiler.Vulkan.SpirvMeshTask.PayloadWordCount * 4 : 0u;
+            if (outputBytes > limits.MaxOutputMemoryBytes || outputBytes + payloadBytes > limits.MaxPayloadAndOutputMemoryBytes)
+                throw new ShaderProgramRejectedException($"The mesh output exceeds device memory limits: bytes={outputBytes} payload={payloadBytes} " +
                     $"output_limit={limits.MaxOutputMemoryBytes} payload_output_limit={limits.MaxPayloadAndOutputMemoryBytes}.");
         }
         var permutationDump = ShaderPermutationDump.WriteInputs(
@@ -1804,7 +2098,8 @@ internal sealed class ShaderProgramCache
         {
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramTranslation))
             {
-                translated = _compiler.TryCompileProgram(request, out compiled, out error);
+                translated = TranslationDiskCache.TryTranslate(_compiler, request,
+                    TranslationDiskCache.Key(key, source.UserDataBase, specialization, layout.AllocationCursor, request), out compiled, out error);
             }
         }
 
@@ -1884,8 +2179,61 @@ internal sealed class ShaderProgramCache
         var id = (ulong)Interlocked.Increment(ref _nextProgramId);
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
         var info = CreateProgramInfo(source, entry, resources, layout, request, compiled.InputLocationMask);
+        if (source.Stage == ShaderStage.Pixel)
+        {
+            _host.PixelProgramCreated(info, module);
+            if (_host.ShaderPrewarm is { } pixelPrewarm && options.PixelInfo is { } pixelInfo && !entry.HasShaderCalls &&
+                _codeCaptures.TryGetValue((source.Hash, source.CodeSize, source.ContinuationAddressOffset), out var pixelCapture))
+            {
+                var pixelRecord = new PixelPrewarmRecord
+                {
+                    Hash = source.Hash,
+                    CodeSize = source.CodeSize,
+                    Address = pixelCapture.Address,
+                    ContinuationAddressOffset = source.ContinuationAddressOffset,
+                    UserDataBase = source.UserDataBase,
+                    UserDataCount = (uint)source.UserData.Length,
+                    PushDataCursor = pushDataCursor,
+                    Info = pixelInfo,
+                    Outputs = [.. options.PixelOutputs],
+                    InputEnable = options.PixelInputEnable,
+                    InputAddress = options.PixelInputAddress,
+                    Specialization = specialization.Clone(),
+                    DeviceRecordCounts = plan.DeviceRecordCounts is not null,
+                };
+                pixelPrewarm.RecordPixel(pixelCapture, pixelRecord);
+            }
+        }
+
+        // Vertex and mesh programs, for the graphics prewarm; the host records their parts' states under the identity. The
+        // part of a task-launched mesh program also takes the generic task stage, which its record determines (TaskLaunch).
+        if (source.Stage is ShaderStage.Vertex or ShaderStage.Mesh && _host.ShaderPrewarm is { } vertexPrewarm &&
+            !entry.HasShaderCalls &&
+            _codeCaptures.TryGetValue((source.Hash, source.CodeSize, source.ContinuationAddressOffset), out var vertexCapture))
+        {
+            var identity = vertexPrewarm.RecordVertex(vertexCapture, new VertexPrewarmRecord
+            {
+                Mesh = source.Stage == ShaderStage.Mesh,
+                Hash = source.Hash,
+                CodeSize = source.CodeSize,
+                Address = vertexCapture.Address,
+                ContinuationAddressOffset = source.ContinuationAddressOffset,
+                UserDataBase = source.UserDataBase,
+                UserDataCount = (uint)source.UserData.Length,
+                PushDataCursor = layout.AllocationCursor,
+                VertexInfo = options.VertexInfo,
+                MeshInfo = options.MeshInfo,
+                RequiredVertexOutputCount = options.RequiredVertexOutputCount,
+                MeshOutputLocationMask = options.MeshOutputLocationMask,
+                Specialization = specialization.Clone(),
+                DeviceRecordCounts = plan.DeviceRecordCounts is not null,
+            });
+            _host.VertexProgramRecorded(module, identity);
+        }
+
         if (source.Stage == ShaderStage.Compute && options.TessellationHull is null &&
             _host.ShaderPrewarm is { } prewarm &&
+            (!Gen5ShaderCallLinker.IsLinked(program) || entry.LinkedPrewarm is not null) &&
             _codeCaptures.TryGetValue((source.Hash, source.CodeSize, source.ContinuationAddressOffset), out var capture))
         {
             prewarm.RecordCompute(capture, new ComputePrewarmRecord
@@ -1901,6 +2249,8 @@ internal sealed class ShaderProgramCache
                 SystemRegisters = options.ComputeSystemRegisters,
                 Specialization = specialization.Clone(),
                 RuntimeDescriptors = entry.Plan.RuntimeDescriptors,
+                Linked = entry.LinkedPrewarm,
+                DeviceRecordCounts = plan.DeviceRecordCounts is not null,
             });
         }
 
@@ -1933,7 +2283,120 @@ internal sealed class ShaderProgramCache
             Specialization = specialization,
             Program = info,
             Handle = new ShaderProgram(id, module),
-            Compiled = compiled,
+        };
+    }
+
+    // The vertex or domain request of a program; the prewarm (TryCompileVertexPrewarm) builds the same one.
+    private static ShaderCompileRequest BuildVertexRequest(IShaderPipelineHost host, ShaderResourcePlan plan,
+        SpecializedResourceInfo resources, BindingLayout layout, StageCompileOptions options, ShaderVertexInput[] vertexInputs,
+        bool tessellationEvaluation = false)
+    {
+        var info = options.VertexInfo!;
+        return new ShaderCompileRequest(plan, resources, layout)
+        {
+            ExactFloat16ConversionSupported = host.ExactFloat16ConversionSupported,
+            FastFloat16 = host.FastFloat16,
+            WaveSize = 32,
+            TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
+            IeeeMode = info.IeeeMode,
+            ScratchDwords = info.ScratchDwords,
+            EnableGraphicsSubgroupOperations = !tessellationEvaluation && host.GraphicsSubgroupOperationsEnabled,
+            SupportsSharedInt64Atomics = host.SharedInt64AtomicsEnabled,
+            SupportsImageInt64Atomics = host.ImageInt64AtomicsEnabled,
+            SupportsBufferInt64Atomics = host.BufferInt64AtomicsEnabled,
+            SupportsShaderDeviceClock = host.ShaderDeviceClockEnabled,
+            ShaderSignedZeroInfNanPreserveFloat32Supported = host.ShaderSignedZeroInfNanPreserveFloat32Supported,
+            RobustBufferAccess2 = host.RobustBufferAccess2Enabled,
+            NativeFloat16Conversions = host.NativeFloat16Conversions,
+            RequiredVertexOutputCount = options.RequiredVertexOutputCount,
+            Tessellation = options.Tessellation,
+            VertexInputs = vertexInputs,
+            PositionExportControl = info.PositionExportControl,
+            SupportsClipDistance = host.ClipDistanceEnabled,
+            SupportsDrawParameters = host.ShaderDrawParametersSupported,
+            StartInstanceUserData = info.StartInstanceUserData,
+            ClipSpace = new ShaderClipSpaceTransform(
+                info.ClipSpace.Enabled,
+                info.ClipSpace.ScaleX,
+                info.ClipSpace.ScaleY,
+                info.ClipSpace.OffsetX,
+                info.ClipSpace.OffsetY,
+                info.ClipSpace.HalfExtentX,
+                info.ClipSpace.HalfExtentY),
+        };
+    }
+
+    // The mesh request of a program; the prewarm (TryCompileVertexPrewarm) builds the same one.
+    private static ShaderCompileRequest BuildMeshRequest(IShaderPipelineHost host, ShaderResourcePlan plan,
+        SpecializedResourceInfo resources, BindingLayout layout, StageCompileOptions options)
+    {
+        var info = options.MeshInfo!;
+        return new ShaderCompileRequest(plan, resources, layout)
+        {
+            ExactFloat16ConversionSupported = host.ExactFloat16ConversionSupported,
+            FastFloat16 = host.FastFloat16,
+            WaveSize = info.Geometry.WaveSize,
+            TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
+            IeeeMode = info.Geometry.IeeeMode,
+            ScratchDwords = info.Geometry.ScratchDwords,
+            EnableGraphicsSubgroupOperations = host.GraphicsSubgroupOperationsEnabled,
+            SupportsImageInt64Atomics = host.ImageInt64AtomicsEnabled,
+            SupportsBufferInt64Atomics = host.BufferInt64AtomicsEnabled,
+            SupportsShaderDeviceClock = host.ShaderDeviceClockEnabled,
+            RobustBufferAccess2 = host.RobustBufferAccess2Enabled,
+            NativeFloat16Conversions = host.NativeFloat16Conversions,
+            RequiredVertexOutputCount = options.RequiredVertexOutputCount,
+            PositionExportControl = info.Geometry.PositionExportControl,
+            MeshOutputLocationMask = options.MeshOutputLocationMask,
+            ClipSpace = new ShaderClipSpaceTransform(
+                info.Geometry.ClipSpace.Enabled,
+                info.Geometry.ClipSpace.ScaleX,
+                info.Geometry.ClipSpace.ScaleY,
+                info.Geometry.ClipSpace.OffsetX,
+                info.Geometry.ClipSpace.OffsetY,
+                info.Geometry.ClipSpace.HalfExtentX,
+                info.Geometry.ClipSpace.HalfExtentY),
+            LocalSizeX = info.Geometry.ThreadsPerGroup,
+            Mesh = new MeshShaderConfiguration(info.Geometry.OutputVertexCapacity, info.Geometry.OutputPrimitiveCapacity,
+                info.Geometry.ProvokingVertex, info.Geometry.InputPrimitiveCountPerWorkgroup, info.Geometry.InputVertexCountPerWorkgroup,
+                info.Geometry.LocalDataShareDwords, info.Geometry.InputTriangleStrip, info.Execution.DeviceSubgroupLaneCount,
+                info.Geometry.InputPointList, info.Geometry.InputLineList, TaskLaunched: info.Geometry.TaskLaunched),
+        };
+    }
+
+    // The pixel request of a program; the prewarm (TryCompilePixelPrewarm) builds the same one.
+    private static ShaderCompileRequest BuildPixelRequest(IShaderPipelineHost host, ShaderResourcePlan plan,
+        SpecializedResourceInfo resources, BindingLayout layout, StageCompileOptions options)
+    {
+        var info = options.PixelInfo!;
+        var interpolators = new uint[info.InputCount];
+        Array.Copy(info.InterpolatorSettings, interpolators, interpolators.Length);
+        return new ShaderCompileRequest(plan, resources, layout)
+        {
+            ExactFloat16ConversionSupported = host.ExactFloat16ConversionSupported,
+            FastFloat16 = host.FastFloat16,
+            WaveSize = 32,
+            TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
+            IeeeMode = info.IeeeMode,
+            ScratchDwords = info.ScratchDwords,
+            EnableGraphicsSubgroupOperations = host.GraphicsSubgroupOperationsEnabled,
+            SupportsSharedInt64Atomics = host.SharedInt64AtomicsEnabled,
+            SupportsImageInt64Atomics = host.ImageInt64AtomicsEnabled,
+            SupportsBufferInt64Atomics = host.BufferInt64AtomicsEnabled,
+            SupportsShaderDeviceClock = host.ShaderDeviceClockEnabled,
+            ShaderSignedZeroInfNanPreserveFloat32Supported = host.ShaderSignedZeroInfNanPreserveFloat32Supported,
+            RobustBufferAccess2 = host.RobustBufferAccess2Enabled,
+            NativeFloat16Conversions = host.NativeFloat16Conversions,
+            PixelOutputs = options.PixelOutputs,
+            PixelDepthExportEnable = info.DepthExportEnable,
+            PixelInputEnable = options.PixelInputEnable,
+            PixelCustomInterpolationMask = info.CustomInterpolationMask,
+            SupportsPerVertexPixelInputs = host.PerVertexPixelInputsSupported,
+            PixelInputAddress = options.PixelInputAddress,
+            PixelFrontFaceAllBits = info.FrontFaceAllBits,
+            PixelInputCntl = interpolators,
+            MipStatisticsSubgroupReduction = host.MipStatisticsSubgroupReduction,
+            SubgroupArithmetic = host.PixelSubgroupArithmetic,
         };
     }
 
@@ -1944,118 +2407,41 @@ internal sealed class ShaderProgramCache
         SpecializedResourceInfo resources,
         BindingLayout layout)
     {
-        var enableGraphicsSubgroups = _host.GraphicsSubgroupOperationsEnabled;
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
         var imageInt64Atomics = _host.ImageInt64AtomicsEnabled;
+        var bufferInt64Atomics = _host.BufferInt64AtomicsEnabled;
+        var shaderDeviceClock = _host.ShaderDeviceClockEnabled;
         var signedZeroInfNanPreserve = _host.ShaderSignedZeroInfNanPreserveFloat32Supported;
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
             case ShaderStage.TessellationEvaluation:
-            {
-                var info = options.VertexInfo!;
-                return new ShaderCompileRequest(entry.Plan, resources, layout)
-                {
-                    ExactFloat16ConversionSupported = _host.ExactFloat16ConversionSupported,
-                    FastFloat16 = _host.FastFloat16,
-                    WaveSize = 32,
-                    TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
-                    IeeeMode = info.IeeeMode,
-                    ScratchDwords = info.ScratchDwords,
-                    EnableGraphicsSubgroupOperations = source.Stage != ShaderStage.TessellationEvaluation && enableGraphicsSubgroups,
-                    SupportsSharedInt64Atomics = sharedInt64Atomics,
-                    SupportsImageInt64Atomics = imageInt64Atomics,
-                    ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
-                    RequiredVertexOutputCount = options.RequiredVertexOutputCount,
-                    Tessellation = options.Tessellation,
-                    VertexInputs = entry.VertexInputs,
-                    PositionExportControl = info.PositionExportControl,
-                    SupportsClipDistance = _host.ClipDistanceEnabled,
-                    SupportsDrawParameters = _host.ShaderDrawParametersSupported,
-                    StartInstanceUserData = info.StartInstanceUserData,
-                    ClipSpace = new ShaderClipSpaceTransform(
-                        info.ClipSpace.Enabled,
-                        info.ClipSpace.ScaleX,
-                        info.ClipSpace.ScaleY,
-                        info.ClipSpace.OffsetX,
-                        info.ClipSpace.OffsetY,
-                        info.ClipSpace.HalfExtentX,
-                        info.ClipSpace.HalfExtentY),
-                };
-            }
+                return BuildVertexRequest(_host, entry.Plan, resources, layout, options, entry.VertexInputs,
+                    tessellationEvaluation: source.Stage == ShaderStage.TessellationEvaluation);
 
             case ShaderStage.Pixel:
-            {
-                var info = options.PixelInfo!;
-                var interpolators = new uint[info.InputCount];
-                Array.Copy(info.InterpolatorSettings, interpolators, interpolators.Length);
-                return new ShaderCompileRequest(entry.Plan, resources, layout)
-                {
-                    ExactFloat16ConversionSupported = _host.ExactFloat16ConversionSupported,
-                    FastFloat16 = _host.FastFloat16,
-                    WaveSize = 32,
-                    TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
-                    IeeeMode = info.IeeeMode,
-                    ScratchDwords = info.ScratchDwords,
-                    EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
-                    SupportsSharedInt64Atomics = sharedInt64Atomics,
-                    SupportsImageInt64Atomics = imageInt64Atomics,
-                    ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
-                    PixelOutputs = options.PixelOutputs,
-                    PixelDepthExportEnable = info.DepthExportEnable,
-                    PixelInputEnable = options.PixelInputEnable,
-                    PixelCustomInterpolationMask = info.CustomInterpolationMask,
-                    SupportsPerVertexPixelInputs = _host.PerVertexPixelInputsSupported,
-                    PixelInputAddress = options.PixelInputAddress,
-                    PixelFrontFaceAllBits = info.FrontFaceAllBits,
-                    PixelInputCntl = interpolators,
-                    MipStatisticsSubgroupReduction = _host.MipStatisticsSubgroupReduction,
-                };
-            }
+                return BuildPixelRequest(_host, entry.Plan, resources, layout, options);
 
             case ShaderStage.Mesh:
-            {
-                var info = options.MeshInfo!;
-                return new ShaderCompileRequest(entry.Plan, resources, layout)
-                {
-                    ExactFloat16ConversionSupported = _host.ExactFloat16ConversionSupported,
-                    FastFloat16 = _host.FastFloat16,
-                    WaveSize = info.Geometry.WaveSize,
-                    TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
-                    IeeeMode = info.Geometry.IeeeMode,
-                    ScratchDwords = info.Geometry.ScratchDwords,
-                    EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
-                    SupportsImageInt64Atomics = imageInt64Atomics,
-                    RequiredVertexOutputCount = options.RequiredVertexOutputCount,
-                    PositionExportControl = info.Geometry.PositionExportControl,
-                    MeshOutputLocationMask = options.MeshOutputLocationMask,
-                    ClipSpace = new ShaderClipSpaceTransform(
-                        info.Geometry.ClipSpace.Enabled,
-                        info.Geometry.ClipSpace.ScaleX,
-                        info.Geometry.ClipSpace.ScaleY,
-                        info.Geometry.ClipSpace.OffsetX,
-                        info.Geometry.ClipSpace.OffsetY,
-                        info.Geometry.ClipSpace.HalfExtentX,
-                        info.Geometry.ClipSpace.HalfExtentY),
-                    LocalSizeX = info.Geometry.ThreadsPerGroup,
-                    Mesh = new MeshShaderConfiguration(info.Geometry.OutputVertexCapacity, info.Geometry.OutputPrimitiveCapacity,
-                        info.Geometry.ProvokingVertex, info.Geometry.InputPrimitiveCountPerWorkgroup, info.Geometry.InputVertexCountPerWorkgroup,
-                        info.Geometry.LocalDataShareDwords, info.Geometry.InputTriangleStrip, info.Execution.DeviceSubgroupLaneCount,
-                        info.Geometry.InputPointList, info.Geometry.InputLineList),
-                };
-            }
+                return BuildMeshRequest(_host, entry.Plan, resources, layout, options);
 
             default:
                 return BuildComputeRequest(entry.Plan, resources, layout, options.ComputeInfo!, options.ComputeSystemRegisters,
                     sharedInt64Atomics, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve, _host.ComputeWave64SubgroupNative,
-                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!), imageInt64Atomics, options.TessellationHull, _host.ExactFloat16ConversionSupported,
-                    _host.FastFloat16);
+                    _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!), imageInt64Atomics, shaderDeviceClock,
+                    bufferInt64Atomics, _host.RobustBufferAccess2Enabled, _host.NativeFloat16Conversions, options.TessellationHull,
+                    _host.ExactFloat16ConversionSupported, _host.FastFloat16);
         }
     }
 
+    // The budget within which a program's images bind one per slot, whatever descriptors a draw repeats (StableImageBindings).
+    private static StableImageDescriptorLimits StableImageLimits(IShaderPipelineHost host, ShaderStage stage) =>
+        stage == ShaderStage.Compute ? host.ComputeImageDescriptorLimits : host.GraphicsImageDescriptorLimits;
+
     private static BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
         uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, bool usesMeshDrawParameters = false,
-        bool usesBufferLengths = false, bool usesTessellationData = false, bool tableBlocks = false, bool usesObjectId = false) =>
+        bool pushDataAtTop = false, bool usesBufferLengths = false, bool usesTessellationData = false, bool tableBlocks = false,
+        bool usesObjectId = false) =>
         BindingLayout.Allocate(
             resources.Info,
             BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount, plan.Graph.ExcludedUserDataRegisters),
@@ -2067,14 +2453,16 @@ internal sealed class ShaderProgramCache
             usesMeshDrawParameters: usesMeshDrawParameters,
             callArgumentCount: BindingLayout.CountCallArguments(program),
             callTargetCount: BindingLayout.CountCallTargets(program),
+            pushDataAtTop: pushDataAtTop,
             usesBufferLengths: usesBufferLengths,
             usesTessellationData: usesTessellationData, tableBlock: tableBlocks, usesObjectId: usesObjectId);
 
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool execGuardElision,
         bool signedZeroInfNanPreserve, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
-        bool imageInt64Atomics = false, Gen5TessellationHullInfo? tessellationHull = null, bool exactFloat16 = false,
-        int fastFloat16 = 0) =>
+        bool imageInt64Atomics = false, bool shaderDeviceClock = false, bool bufferInt64Atomics = false,
+        bool robustBufferAccess2 = false, bool nativeFloat16Conversions = false, Gen5TessellationHullInfo? tessellationHull = null,
+        bool exactFloat16 = false, int fastFloat16 = 0) =>
         new(plan, resources, layout)
         {
             ExactFloat16ConversionSupported = exactFloat16,
@@ -2090,7 +2478,11 @@ internal sealed class ShaderProgramCache
             ScratchDwords = info.ScratchDwords,
             SupportsSharedInt64Atomics = sharedInt64Atomics,
             SupportsImageInt64Atomics = imageInt64Atomics,
+            SupportsBufferInt64Atomics = bufferInt64Atomics,
+            SupportsShaderDeviceClock = shaderDeviceClock,
             ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
+            RobustBufferAccess2 = robustBufferAccess2,
+            NativeFloat16Conversions = nativeFloat16Conversions,
             ComputeSystemRegisters = systemRegisters,
             LocalDataShareDwords = info.LocalDataShareDwords,
             LocalSizeX = Math.Max(info.ThreadsX, 1),
@@ -2106,6 +2498,20 @@ internal sealed class ShaderProgramCache
     {
         compiled = null;
         layout = null;
+        // A linked record replays through the plan-direct path, which links the recorded callees first (the runtime
+        // planner here only sees the caller); it compiles with the runtime host's capabilities.
+        if (record.Linked is not null)
+        {
+            return TryCompilePrewarmDirect(record, code, compiler, runtimeHost.SharedInt64AtomicsEnabled,
+                runtimeHost.ExecGuardElisionEnabled, runtimeHost.ShaderSignedZeroInfNanPreserveFloat32Supported,
+                out compiled, out layout, out error, runtimeHost.ComputeWave64SubgroupNative,
+                runtimeHost.ComputeRunsOn32LaneSubgroups(record.Info), runtimeHost.ImageInt64AtomicsEnabled,
+                runtimeHost.ShaderDeviceClockEnabled, runtimeHost.SupportsBindlessHeap, runtimeHost.ComputeImageDescriptorLimits,
+                runtimeHost.BufferInt64AtomicsEnabled, runtimeHost.RobustBufferAccess2Enabled, runtimeHost.NativeFloat16Conversions,
+                UsesTableBlocks(runtimeHost, ShaderStage.Compute), frontendOf, runtimeHost.ExactFloat16ConversionSupported,
+                runtimeHost.FastFloat16);
+        }
+
         try
         {
             IShaderFrontend? frontend = null;
@@ -2125,13 +2531,224 @@ internal sealed class ShaderProgramCache
             IGuestCompiledShader? replayed = null;
             var host = new ShaderPrewarmHost(runtimeHost, shader => { replayed = shader; return 1; });
             var programs = new ShaderProgramCache(code.CreateContext(), compiler, host);
-            var (_, program) = programs.CompilePrewarmStage(source,
-                new StageCompileOptions { ComputeInfo = record.Info, ComputeSystemRegisters = record.SystemRegisters },
+            var options = new StageCompileOptions { ComputeInfo = record.Info, ComputeSystemRegisters = record.SystemRegisters };
+            // The session planned device record counts only where its record says so.
+            if (!record.DeviceRecordCounts) options = options.WithoutDeviceRecordCounts();
+            var (_, program) = programs.CompilePrewarmStage(source, options,
                 record.Specialization, record.PushDataCursor, record.RuntimeDescriptors);
             compiled = replayed;
             layout = program.Bindings;
             error = "";
             return compiled is not null && layout is not null;
+        }
+        catch (Exception exception)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    // Upstream's plan-direct replay with explicit capabilities (the 16-bit float forms stay exact).
+    internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
+        bool sharedInt64Atomics, bool execGuardElision, bool signedZeroInfNanPreserve, out IGuestCompiledShader? compiled,
+        out BindingLayout? layout, out string error, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false,
+        bool imageInt64Atomics = false, bool shaderDeviceClock = false, bool bindlessHeap = false,
+        StableImageDescriptorLimits stableImageLimits = default, bool bufferInt64Atomics = false, bool robustBufferAccess2 = false,
+        bool nativeFloat16Conversions = false, bool tableBlocks = false, Func<ulong, IShaderFrontend?>? frontendOf = null) =>
+        TryCompilePrewarmDirect(record, code, compiler, sharedInt64Atomics, execGuardElision, signedZeroInfNanPreserve,
+            out compiled, out layout, out error, hostWave64Supported, hostComputeSubgroup32, imageInt64Atomics, shaderDeviceClock,
+            bindlessHeap, stableImageLimits, bufferInt64Atomics, robustBufferAccess2, nativeFloat16Conversions, tableBlocks,
+            frontendOf, exactFloat16: false, fastFloat16: 0);
+
+    private static bool TryCompilePrewarmDirect(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
+        bool sharedInt64Atomics, bool execGuardElision, bool signedZeroInfNanPreserve, out IGuestCompiledShader? compiled,
+        out BindingLayout? layout, out string error, bool hostWave64Supported, bool hostComputeSubgroup32,
+        bool imageInt64Atomics, bool shaderDeviceClock, bool bindlessHeap,
+        StableImageDescriptorLimits stableImageLimits, bool bufferInt64Atomics, bool robustBufferAccess2,
+        bool nativeFloat16Conversions, bool tableBlocks, Func<ulong, IShaderFrontend?>? frontendOf, bool exactFloat16,
+        int fastFloat16)
+    {
+        compiled = null;
+        layout = null;
+        try
+        {
+            IShaderFrontend? frontend = null;
+            Gen5ShaderProgram program;
+            if (code.FrontendDomain != 0)
+            {
+                frontend = frontendOf?.Invoke(code.FrontendDomain);
+                if (frontend is null)
+                {
+                    error = $"The shader frontend 0x{code.FrontendDomain:X16} is not registered.";
+                    return false;
+                }
+
+                var shader = new RegisteredShader(code.Address, 0, code.CodeSize, 0, 0, 0, 0, 0, 0)
+                {
+                    Frontend = frontend,
+                    FrontendUserData = code.FrontendUserData,
+                };
+                if (!frontend.TryDecode(code.CreateContext(), shader, ShaderStage.Compute, out program, out error))
+                {
+                    return false;
+                }
+            }
+            else if (!Gen5ShaderTranslator.TryDecodeProgram(code.CreateContext(), code.Address, out program, out error))
+            {
+                return false;
+            }
+
+            var linked = record.Linked;
+            if (linked is not null)
+            {
+                if (linked.BindlessHeap != bindlessHeap)
+                    throw new InvalidOperationException("The linked prewarm binding policy differs from the host.");
+                program = linked.Link(program);
+            }
+            if (program.Instructions.Any(instruction => instruction.Opcode == "SSwappcB64"))
+                throw new InvalidOperationException("The prewarm program has unresolved shader calls.");
+            var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, record.Hash, record.UserDataBase, record.UserDataCount,
+                waveSize: record.Info.WaveSize, bindlessNullDescriptors: BindlessNullDescriptors, bindlessHeap: bindlessHeap,
+                // Match LinkProgram's extraction policy; linked plans currently do not use stable image tables.
+                stableImageLimits: linked is null ? stableImageLimits : default,
+                callRecords: linked?.RuntimeRecords ?? false, callMarks: linked?.CallMarks ?? false,
+                deviceRecordCounts: record.DeviceRecordCounts,
+                normalizeBufferDescriptor: frontend?.NormalizeBufferDescriptor,
+                normalizeImageDescriptor: frontend?.NormalizeImageDescriptor,
+                imageNormalizationVersion: frontend?.ImageNormalizationVersion);
+            // A record's storage image selects as the session keeps them (RuntimeImageSwizzle.Canonical).
+            var specialization = RuntimeImageSwizzle.Canonical(plan, record.Specialization);
+            var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+            layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
+                record.Info.DispatchThreadDimensions, usesBufferLengths: frontend?.RequiresExplicitBufferLengths ?? false,
+                tableBlocks: tableBlocks);
+            var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
+                sharedInt64Atomics, execGuardElision, signedZeroInfNanPreserve, hostWave64Supported, hostComputeSubgroup32,
+                imageInt64Atomics, shaderDeviceClock, bufferInt64Atomics, robustBufferAccess2, nativeFloat16Conversions,
+                exactFloat16: exactFloat16, fastFloat16: fastFloat16);
+            return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
+        }
+        catch (Exception exception)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    // A recorded pixel program translated again as its session translated it (CreateEntry, then the specialized
+    // translation through the translation cache); the caller compiles its pixel library.
+    internal static bool TryCompilePixelPrewarm(PixelPrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
+        IShaderPipelineHost host, out IGuestCompiledShader? compiled, out BindingLayout? layout, out string error)
+    {
+        compiled = null;
+        layout = null;
+        try
+        {
+            if (!Gen5ShaderTranslator.TryDecodeProgram(code.CreateContext(), code.Address, out var program, out error))
+            {
+                return false;
+            }
+
+            if (program.Instructions.Any(static instruction => instruction.Opcode == "SSwappcB64"))
+            {
+                error = "the recorded pixel program has shader calls";
+                return false;
+            }
+
+            var plan = ShaderResourcePlan.Extract(program, ShaderStage.Pixel, record.Hash, record.UserDataBase, record.UserDataCount,
+                waveSize: 32, bindlessNullDescriptors: BindlessNullDescriptors, bindlessHeap: host.SupportsBindlessHeap,
+                stableImageLimits: host.GraphicsImageDescriptorLimits,
+                deviceRecordCounts: DeviceRecordCountPlan.Enabled && record.DeviceRecordCounts);
+            // A record's storage image selects as the session keeps them (RuntimeImageSwizzle.Canonical).
+            var specialization = RuntimeImageSwizzle.Canonical(plan, record.Specialization);
+            var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+            layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor, false,
+                tableBlocks: UsesTableBlocks(host, ShaderStage.Pixel),
+                usesObjectId: record.Outputs.Any(output => output.ObjectPrimitiveId));
+            var options = new StageCompileOptions
+            {
+                PixelInfo = record.Info,
+                PixelOutputs = record.Outputs,
+                PixelInputEnable = record.InputEnable,
+                PixelInputAddress = record.InputAddress,
+            };
+            var request = BuildPixelRequest(host, plan, resources, layout, options);
+            var state = new List<uint>();
+            BuildStaticState(ShaderStage.Pixel, options, state);
+            var key = new ProgramKey(ShaderStage.Pixel, record.Hash, record.UserDataCount, record.CodeSize,
+                record.ContinuationAddressOffset, [.. state]);
+            return TranslationDiskCache.TryTranslate(compiler, request,
+                    TranslationDiskCache.Key(key, record.UserDataBase, specialization, record.PushDataCursor, request),
+                    out compiled, out error) && compiled is not null;
+        }
+        catch (Exception exception)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    // A recorded vertex or mesh program translated again as its session translated it (CreateEntry, then the specialized
+    // translation through the translation cache), with the task launch of a task-launched mesh program; the caller compiles
+    // its pre-rasterization libraries.
+    internal static bool TryCompileVertexPrewarm(VertexPrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
+        IShaderPipelineHost host, out IGuestCompiledShader? compiled, out BindingLayout? layout, out MeshTaskLaunchInfo? task,
+        out string error)
+    {
+        compiled = null;
+        layout = null;
+        task = null;
+        try
+        {
+            if (!Gen5ShaderTranslator.TryDecodeProgram(code.CreateContext(), code.Address, out var program, out error))
+            {
+                return false;
+            }
+
+            if (program.Instructions.Any(static instruction => instruction.Opcode == "SSwappcB64"))
+            {
+                error = "the recorded vertex program has shader calls";
+                return false;
+            }
+
+            var stage = record.Mesh ? ShaderStage.Mesh : ShaderStage.Vertex;
+            var options = new StageCompileOptions
+            {
+                VertexInfo = record.VertexInfo,
+                MeshInfo = record.MeshInfo,
+                RequiredVertexOutputCount = record.RequiredVertexOutputCount,
+                MeshOutputLocationMask = record.MeshOutputLocationMask,
+            };
+            EmbeddedVertexFetchPlan? fetch = null;
+            ShaderVertexInput[] vertexInputs = [];
+            if (!record.Mesh && record.VertexInfo is { FetchEmbedded: true } vertexInfo)
+            {
+                (fetch, vertexInputs, program) = PrepareEmbeddedFetch(program, vertexInfo, record.UserDataBase, record.UserDataCount,
+                    record.Hash, record.Address);
+            }
+
+            var plan = ShaderResourcePlan.Extract(program, stage, record.Hash, record.UserDataBase, record.UserDataCount,
+                fetch?.Loads.Select(load => load.Pc).ToHashSet(), waveSize: record.Mesh ? record.MeshInfo!.Geometry.WaveSize : 32u,
+                dynamicUserData: record.VertexInfo?.StartInstanceUserData ?? -1,
+                bindlessNullDescriptors: BindlessNullDescriptors, bindlessHeap: host.SupportsBindlessHeap,
+                stableImageLimits: host.GraphicsImageDescriptorLimits,
+                deviceRecordCounts: DeviceRecordCountPlan.Enabled && record.DeviceRecordCounts);
+            // A record's storage image selects as the session keeps them (RuntimeImageSwizzle.Canonical).
+            var specialization = RuntimeImageSwizzle.Canonical(plan, record.Specialization);
+            var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+            layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor, false,
+                usesMeshDrawParameters: record.Mesh, pushDataAtTop: PushDataAtTop(stage), tableBlocks: UsesTableBlocks(host, stage));
+            var request = record.Mesh
+                ? BuildMeshRequest(host, plan, resources, layout, options)
+                : BuildVertexRequest(host, plan, resources, layout, options, vertexInputs);
+            task = TaskLaunch(request);
+            var state = new List<uint>();
+            BuildStaticState(stage, options, state);
+            var key = new ProgramKey(stage, record.Hash, record.UserDataCount, record.CodeSize, record.ContinuationAddressOffset,
+                [.. state]);
+            return TranslationDiskCache.TryTranslate(compiler, request,
+                    TranslationDiskCache.Key(key, record.UserDataBase, specialization, layout.AllocationCursor, request),
+                    out compiled, out error) && compiled is not null;
         }
         catch (Exception exception)
         {
@@ -2233,7 +2850,7 @@ internal sealed class ShaderProgramCache
         for (var index = 0; index < buffers.Length; index++)
         {
             var buffer = info.Buffers[index];
-            buffers[index] = new BufferResourceInfo(buffer.Read, buffer.Written, buffer.Atomic, buffer.Formatted, buffer.Scalar, buffer.MaxByteExtent, buffer.PackedStride);
+            buffers[index] = new BufferResourceInfo(buffer.Read, buffer.Written, buffer.Atomic, buffer.Formatted, buffer.Scalar, buffer.MaxByteExtent);
         }
 
         var images = new ImageResourceInfo[info.Images.Count];
@@ -2297,8 +2914,14 @@ internal sealed class ShaderProgramCache
             Resources = resources,
             Bindings = layout,
             CallRecordCallees = request.CallRecordCallees,
+            MeshTask = TaskLaunch(request),
         };
     }
+
+    // What a task-launched mesh program's pipelines specialize the generic task stage with; the prewarm takes the same.
+    internal static MeshTaskLaunchInfo? TaskLaunch(ShaderCompileRequest request) => request.Mesh is { TaskLaunched: true } mesh
+        ? new MeshTaskLaunchInfo(mesh.InputPrimitiveCountPerWorkgroup, mesh.InputPointList)
+        : null;
 }
 
 // Writes each compiled module and its decoded listing when the dump switch is on.

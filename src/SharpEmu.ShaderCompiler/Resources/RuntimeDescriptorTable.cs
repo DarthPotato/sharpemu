@@ -70,8 +70,9 @@ public static class RuntimeDescriptorTable
     public const uint MissBufferDwords = SamplerSeenOffset + SeenDwords;
 
     // The descriptor set that holds the heap, and its bindings: sampled images, then samplers. Slot 0
-    // of both is the null image and the default sampler.
-    public const uint HeapDescriptorSet = 1;
+    // of both is the null image and the default sampler. Set 3: set 1 is the bindless heap (BindlessHeap.DescriptorSet) and
+    // set 2 the pixel set of a pipeline linked from libraries (VulkanVideoPresenter.PixelDescriptorSet).
+    public const uint HeapDescriptorSet = 3;
     public const uint HeapSampledImageBinding = 0;
     public const uint HeapSamplerBinding = 1;
 

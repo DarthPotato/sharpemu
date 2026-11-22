@@ -94,14 +94,16 @@ internal sealed class PresenterUnderTest : IDisposable
             "_pipelineCompileInitGate", "_pipelineProducers", "_linkedComputeCompiles",
             "_batchResources", "_batchRetireBuffers", "_pendingGuestSubmissions",
             "_deferredGuestImageVersionDestroys",
-            "_pendingComputePipelines", "_pipelineEntries", "_shaderModules", "_shaderModuleSpirvBytes", "_rectangleStageCode",
+            "_pipelineEntries", "_shaderModules", "_shaderModuleSpirvBytes", "_rectangleStageCode",
+            "_sharedPipelineBinaries", "_pipelineBuilds", "_pendingGraphicsPipelines", "_graphicsLibraries", "_graphicsLibraryLock",
+            "_graphicsLibraryCompiles", "_earlyPixelLibraryTasks", "_pendingComputePipelines", "_prewarmedComputePipelines",
         })
         {
             var field = PresenterType.GetField(name, InstanceMembers)!;
             field.SetValue(Instance, Activator.CreateInstance(field.FieldType, nonPublic: true));
         }
 
-        SetField("_shaderModuleCacheIdentities", new Dictionary<ulong, string>());
+        SetField("_shaderModuleCacheIdentities", new System.Collections.Concurrent.ConcurrentDictionary<ulong, string>());
         SetField("_pipelineCompileBudget", new SharpEmu.Libs.Gpu.Pipelines.PipelineCompileBudget(4));
         var cacheShards = PresenterType.GetField("_pipelineCacheShards", InstanceMembers)!;
         cacheShards.SetValue(Instance, Activator.CreateInstance(cacheShards.FieldType, nonPublic: true));

@@ -20,7 +20,10 @@ internal sealed class ShaderPrewarmHost(IShaderPipelineHost inner, Func<IGuestCo
         host.ExactFloat16ConversionSupported, host.FastFloat16, host.ExecGuardElisionEnabled,
         host.PerVertexPixelInputsSupported,
         host.ClipDistanceEnabled, host.ShaderDrawParametersSupported, host.MeshShadersSupported, host.MeshLimits,
-        host.MeshSubgroupSize, host.Limits, host.SupportsDualSourceBlend, host.NoAttachmentSampleCounts);
+        host.MeshSubgroupSize, host.Limits, host.SupportsDualSourceBlend, host.NoAttachmentSampleCounts,
+        host.ComputeImageDescriptorLimits, host.GraphicsImageDescriptorLimits, host.PixelSubgroupArithmetic,
+        host.BufferInt64AtomicsEnabled, host.ShaderDeviceClockEnabled, host.RobustBufferAccess2Enabled,
+        host.NativeFloat16Conversions, host.SupportsBindlessHeap);
 
     public uint MaxPushDescriptors => inner.MaxPushDescriptors;
     public bool RuntimeImageDescriptorsSupported => inner.RuntimeImageDescriptorsSupported;
@@ -50,6 +53,14 @@ internal sealed class ShaderPrewarmHost(IShaderPipelineHost inner, Func<IGuestCo
     public RenderHostLimits Limits => inner.Limits;
     public bool SupportsDualSourceBlend => inner.SupportsDualSourceBlend;
     public SampleCountFlags NoAttachmentSampleCounts => inner.NoAttachmentSampleCounts;
+    public StableImageDescriptorLimits ComputeImageDescriptorLimits => inner.ComputeImageDescriptorLimits;
+    public StableImageDescriptorLimits GraphicsImageDescriptorLimits => inner.GraphicsImageDescriptorLimits;
+    public bool PixelSubgroupArithmetic => inner.PixelSubgroupArithmetic;
+    public bool BufferInt64AtomicsEnabled => inner.BufferInt64AtomicsEnabled;
+    public bool ShaderDeviceClockEnabled => inner.ShaderDeviceClockEnabled;
+    public bool RobustBufferAccess2Enabled => inner.RobustBufferAccess2Enabled;
+    public bool NativeFloat16Conversions => inner.NativeFloat16Conversions;
+    public bool SupportsBindlessHeap => inner.SupportsBindlessHeap;
 
     public bool TryResolveColorOutput(uint dataFormat, uint numberType, uint componentSwap, out Gen5PixelOutputKind outputKind,
         out Gen5ColorComponentMapping componentMapping) =>

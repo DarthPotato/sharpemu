@@ -167,18 +167,22 @@ internal static class ResourceTestProgram
 
     public static Gen5ShaderProgram Program(params Gen5ShaderInstruction[] instructions) => new(0, instructions);
 
+    // The helpers plan scalar data reads into the host-flattened table unless a test asks for device reads, whatever the
+    // process default (ScalarDataReadPolicy).
     public static ShaderResourcePlan Extract(Gen5ShaderProgram program, uint userDataBase = 0, uint userDataCount = 64, ShaderStage stage = ShaderStage.Compute,
-        uint waveSize = 64) =>
-        ShaderResourcePlan.Extract(program, stage, Hash, userDataBase, userDataCount, waveSize: waveSize);
+        uint waveSize = 64, bool bindlessNullDescriptors = false, bool bindlessHeap = false) =>
+        ShaderResourcePlan.Extract(program, stage, Hash, userDataBase, userDataCount, waveSize: waveSize,
+            bindlessNullDescriptors: bindlessNullDescriptors, bindlessHeap: bindlessHeap, scalarDataOnDevice: false);
 
     // The plan, its default specialization applied, and the layout of one program.
     public static (ShaderResourcePlan Plan, SpecializedResourceInfo Resources, BindingLayout Layout) Prepare(
         Gen5ShaderProgram program, ShaderStage stage = ShaderStage.Compute, uint userDataBase = 0, uint userDataCount = 64, uint pushDataStartDword = 0,
         bool usesDispatchThreadLimits = false, bool callRecords = false, bool callMarks = false, bool tableBlock = false,
-        IReadOnlySet<uint>? deviceDataReads = null)
+        IReadOnlySet<uint>? deviceDataReads = null, bool bindlessNullDescriptors = false, bool bindlessHeap = false, bool scalarDataOnDevice = false)
     {
         var plan = ShaderResourcePlan.Extract(program, stage, Hash, userDataBase, userDataCount,
-            callRecords: callRecords, callMarks: callMarks, deviceDataReads: deviceDataReads);
+            callRecords: callRecords, callMarks: callMarks, deviceDataReads: deviceDataReads,
+            bindlessNullDescriptors: bindlessNullDescriptors, bindlessHeap: bindlessHeap, scalarDataOnDevice: scalarDataOnDevice);
         var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
         var layout = BindingLayout.Allocate(
             resources.Info,
@@ -196,10 +200,12 @@ internal static class ResourceTestProgram
     }
 
     public static ShaderCompileRequest Request(Gen5ShaderProgram program, ShaderStage stage = ShaderStage.Compute, uint userDataBase = 0, uint userDataCount = 64, uint pushDataStartDword = 0,
-        bool callRecords = false, bool callMarks = false, bool tableBlock = false, IReadOnlySet<uint>? deviceDataReads = null)
+        bool callRecords = false, bool callMarks = false, bool tableBlock = false, IReadOnlySet<uint>? deviceDataReads = null,
+        bool bindlessNullDescriptors = false, bool bindlessHeap = false, bool scalarDataOnDevice = false)
     {
         var (plan, resources, layout) = Prepare(program, stage, userDataBase, userDataCount, pushDataStartDword,
-            callRecords: callRecords, callMarks: callMarks, tableBlock: tableBlock, deviceDataReads: deviceDataReads);
+            callRecords: callRecords, callMarks: callMarks, tableBlock: tableBlock, deviceDataReads: deviceDataReads,
+            bindlessNullDescriptors: bindlessNullDescriptors, bindlessHeap: bindlessHeap, scalarDataOnDevice: scalarDataOnDevice);
         return new ShaderCompileRequest(plan, resources, layout)
         {
             PixelOutputs = stage == ShaderStage.Pixel ? [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)] : [],

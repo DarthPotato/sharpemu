@@ -80,7 +80,8 @@ public sealed partial class GuestImageCache
         image.HeapChanged?.Invoke(image);
     }
 
-    // Removes the image and its stencil associations; the slot is freed after the current tick.
+    // Removes the image and its stencil associations; the slot is freed after the current tick, or for an image the bindless
+    // heap names, after the tick in which the heap lets go of it.
     // A depth image holds the only copy of what the GPU wrote to its stencil plane, so that plane
     // reaches guest memory first unless the guest unmapped it (publishStencil false): the next
     // depth image over the plane loads it from there instead of stale bytes.
@@ -118,6 +119,12 @@ public sealed partial class GuestImageCache
         {
             image.Parked = false;
             _parked.Remove(imageIdentifier);
+        }
+
+        if (image.DimensionTwin is { } twin)
+        {
+            twin.DimensionTwin = null;
+            image.DimensionTwin = null;
         }
 
         if (!image.DepthOwner.IsValid)
@@ -188,9 +195,23 @@ public sealed partial class GuestImageCache
 
         var retiredBytes = checked((long)image.AccountedSize);
         RemoveFromIndex(imageIdentifier, reason);
+        // Descriptor set 1 still names a view of this image until the heap rewrites the element. A wait before that
+        // can complete this tick and run its erase, and a draw recorded after it would read a destroyed view.
+        if (image.HeapChanged is not null)
+        {
+            image.DeferredErase = () => EraseAfterCurrentTick(imageIdentifier, retiredBytes, callerHoldsLock: false);
+            return retiredImages;
+        }
+
+        EraseAfterCurrentTick(imageIdentifier, retiredBytes, callerHoldsLock: true);
+        return retiredImages;
+    }
+
+    // Frees the slot once the current tick completes, or at once when no tick is recording.
+    private void EraseAfterCurrentTick(ResourceSlotIdentifier imageIdentifier, long bytes, bool callerHoldsLock)
+    {
         if (_scheduler.Active)
         {
-            var bytes = retiredBytes;
             var retirementTick = _scheduler.CurrentTick;
             NoteRetired(retirementTick, bytes);
             Interlocked.Add(ref _pendingDestroyBytes, bytes);
@@ -201,12 +222,15 @@ public sealed partial class GuestImageCache
                 NoteRetired(retirementTick, -bytes);
             });
         }
-        else
+        else if (callerHoldsLock)
         {
             _slots.Erase(imageIdentifier);
         }
-
-        return retiredImages;
+        else
+        {
+            using var held = _lock.Hold();
+            _slots.Erase(imageIdentifier);
+        }
     }
 
     private void ReleaseImage(ResourceSlotIdentifier imageIdentifier, [System.Runtime.CompilerServices.CallerMemberName] string reason = "")
@@ -466,9 +490,30 @@ public sealed partial class GuestImageCache
         }
     }
 
+    private const ulong CpuReadbackFrames = 1;
+
+    private void ScheduleReadbackAfterCpuWrite(ResourceSlotIdentifier imageIdentifier, CachedImage image, bool cpuWritten)
+    {
+        if (!_readbackLinearImages || image.Description.IsTiled)
+        {
+            return;
+        }
+
+        if (cpuWritten || !image.HasReadbackWindow)
+        {
+            image.ReadbackUntilFrame = _collectionTick + CpuReadbackFrames;
+        }
+
+        if (_collectionTick <= image.ReadbackUntilFrame)
+        {
+            ScheduleReadback(imageIdentifier, image);
+        }
+    }
+
     private void ScheduleReadback(ResourceSlotIdentifier imageIdentifier, CachedImage image)
     {
-        if (_readbackLinearImages && !image.Description.IsTiled && !ImageDescription.IsEmptyRange(image.Description.Data))
+        if (_readbackLinearImages && !image.Description.IsTiled && !ImageDescription.IsEmptyRange(image.Description.Data) &&
+            !HostLayoutTargets.Holds(image.Description.Data.Address))
         {
             if (!image.IsGpuModified)
             {

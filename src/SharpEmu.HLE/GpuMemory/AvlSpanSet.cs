@@ -46,6 +46,21 @@ internal sealed class SpanNode(ulong start, ulong end, SpanNode? left, SpanNode?
         }
         return false;
     }
+
+    // In order, the parts of [start, end) the spans under node cover; SpanSnapshot.ForEachOverlap on a tree root.
+    public static void ForEachOverlap<TState>(SpanNode? node, ulong start, ulong end, TState state, Action<TState, ulong, ulong> visit)
+    {
+        while (node is not null)
+        {
+            if (node.End <= start) { node = node.Right; continue; }
+            if (node.Start >= end) { node = node.Left; continue; }
+            ForEachOverlap(node.Left, start, end, state, visit);
+            var first = Math.Max(start, node.Start);
+            var last = Math.Min(end, node.End);
+            if (first < last) visit(state, first, last - first);
+            node = node.Right;
+        }
+    }
 }
 
 // Callers serialize changes. The tree does not change range ownership or locking. Snapshot() is O(1): it wraps the

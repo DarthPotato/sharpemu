@@ -110,6 +110,9 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     // Set while descriptor set 1 holds a view of this image: told when its layout, contents or registration change.
     public Action<CachedImage>? HeapChanged;
+    // Set when the image is deleted while descriptor set 1 still holds its view; frees the slot after the current tick.
+    // The heap runs it once it has rewritten the last element that names the image.
+    public Action? DeferredErase;
     public bool Registered;
     public uint QueryEpoch;
     public ulong WatchBegin;
@@ -119,6 +122,11 @@ public sealed unsafe partial class CachedImage : IDisposable
     public int RecencyEntryIndex;
     public bool Parked;
     public ulong ParkedTick;
+
+    // The image of the other dimensional type (1D or 2D) over the same single-row memory. Both are kept while they hold the
+    // same contents; a GPU write to either leaves the other stale, and the cache replaces the stale one on its next lookup.
+    public CachedImage? DimensionTwin;
+    public bool DimensionTwinStale;
 
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
         ImageBackingPool? pool = null, OptimalImageMemoryPool? memoryPool = null, Action? reportAllocationFailure = null)
@@ -211,33 +219,45 @@ public sealed unsafe partial class CachedImage : IDisposable
         };
         var allocated = Result.ErrorOutOfDeviceMemory;
         var allocationAttempted = false;
-        for (uint index = 0; index < device.MemoryTypeCount; index++)
+        // Device-local memory first. When it is exhausted the cache first frees images and tries again (ImageOutOfMemoryException);
+        // that retry (AllowSystemMemory) also takes any other type the image allows: system memory the device reads over the
+        // bus is slow but keeps the run going, as GpuBuffer.RankMemoryTypes does for buffers.
+        var systemMemoryFallback = t_systemMemoryFallback;
+        for (var deviceLocalPass = 1; deviceLocalPass >= (systemMemoryFallback ? 0 : 1) && allocated != Result.Success; deviceLocalPass--)
         {
-            if ((requirements.MemoryTypeBits & (1u << (int)index)) == 0 ||
-                (device.GetMemoryTypeFlags(index) & MemoryPropertyFlags.DeviceLocalBit) == 0)
+            for (uint index = 0; index < device.MemoryTypeCount; index++)
             {
-                continue;
-            }
+                var deviceLocal = (device.GetMemoryTypeFlags(index) & MemoryPropertyFlags.DeviceLocalBit) != 0;
+                if ((requirements.MemoryTypeBits & (1u << (int)index)) == 0 || deviceLocal != (deviceLocalPass == 1))
+                {
+                    continue;
+                }
 
-            allocateInfo.MemoryTypeIndex = index;
-            allocationAttempted = true;
-            if (_memoryPool is not null && !dedicated.RequiresDedicatedAllocation)
-            {
-                allocated = _memoryPool.Allocate(requirements, index, out var placement);
+                allocateInfo.MemoryTypeIndex = index;
+                allocationAttempted = true;
+                if (deviceLocal && _memoryPool is not null && !dedicated.RequiresDedicatedAllocation)
+                {
+                    allocated = _memoryPool.Allocate(requirements, index, out var placement);
+                    if (allocated == Result.Success)
+                    {
+                        _memoryPlacement = placement;
+                        Backing.Memory = placement.Memory;
+                    }
+                }
+                else
+                {
+                    allocated = device.AllocateMemory(allocateInfo, out Backing.Memory);
+                }
+
                 if (allocated == Result.Success)
                 {
-                    _memoryPlacement = placement;
-                    Backing.Memory = placement.Memory;
-                }
-            }
-            else
-            {
-                allocated = device.AllocateMemory(allocateInfo, out Backing.Memory);
-            }
+                    if (!deviceLocal)
+                    {
+                        ReportSystemMemoryImage(create, requirements.Size, index);
+                    }
 
-            if (allocated == Result.Success)
-            {
-                break;
+                    break;
+                }
             }
         }
 
@@ -247,9 +267,11 @@ public sealed unsafe partial class CachedImage : IDisposable
             Backing.Handle = default;
             Backing.Memory = default;
             reportAllocationFailure?.Invoke();
-            var operation = allocationAttempted ? "vkAllocateMemory" : "select_device_local_memory_type";
-            // Running out of memory is recoverable: the cache can free images and try again.
-            if (allocated is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
+            var operation = allocationAttempted ? "vkAllocateMemory"
+                : systemMemoryFallback ? "select_memory_type" : "select_device_local_memory_type";
+            // Running out of device-local memory is recoverable: the cache can free images and try again, with every
+            // allowed memory type. Failing that retry too is fatal.
+            if (!systemMemoryFallback && allocated is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
             {
                 throw new ImageOutOfMemoryException(CreateFailureMessage(create, operation, allocated, requirements.Size, requirements.MemoryTypeBits));
             }
@@ -302,6 +324,38 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     // The device ran out of memory for the image's backing. Nothing was left allocated.
     internal sealed class ImageOutOfMemoryException(string message) : Exception(message);
+
+    private static int _systemMemoryImageReports;
+
+    private static void ReportSystemMemoryImage(in ImageCreateInfo create, ulong size, uint memoryType)
+    {
+        if (Interlocked.Increment(ref _systemMemoryImageReports) <= 16)
+        {
+            Console.Error.WriteLine(
+                $"[GPU][WARN] Device-local memory is exhausted; the image is in system memory: extent={create.Extent.Width}x" +
+                $"{create.Extent.Height}x{create.Extent.Depth} format={create.Format} layers={create.ArrayLayers} " +
+                $"levels={create.MipLevels} bytes={size} memory_type={memoryType}");
+        }
+    }
+
+    // Set on this thread while the image cache retries an allocation after freeing images: device-local memory is still
+    // tried first, then any other memory type the image allows, and running out is then fatal.
+    [ThreadStatic] private static bool t_systemMemoryFallback;
+
+    internal static SystemMemoryFallbackScope AllowSystemMemory() => new(t_systemMemoryFallback);
+
+    internal readonly struct SystemMemoryFallbackScope : IDisposable
+    {
+        private readonly bool _previous;
+
+        internal SystemMemoryFallbackScope(bool previous)
+        {
+            _previous = previous;
+            t_systemMemoryFallback = true;
+        }
+
+        public void Dispose() => t_systemMemoryFallback = _previous;
+    }
 
     internal static bool TrySelectSupportedImageConfiguration(IImageFormatSupport device, ref ImageCreateInfo configuration)
     {
@@ -574,6 +628,11 @@ public sealed unsafe partial class CachedImage : IDisposable
         RawWriteAfterGpuWrite = false;
         var ownershipChanged = !_gpuModified || _bufferHoldsGpuContents;
         _gpuModified = true;
+        if (DimensionTwin is { } twin)
+        {
+            twin.DimensionTwinStale = true;
+        }
+
         _bufferHoldsGpuContents = false;
         if (ImageLifecycleTrace.Enabled && ownershipChanged) TraceLifecycleState("gpu-owner-acquire", reason);
         GpuWriteSequence = Interlocked.Increment(ref _gpuWriteCounter);
@@ -594,6 +653,20 @@ public sealed unsafe partial class CachedImage : IDisposable
         var changed = _gpuModified;
         _gpuModified = false;
         if (ImageLifecycleTrace.Enabled && changed) TraceLifecycleState("gpu-owner-release", reason);
+    }
+
+    private ulong _readbackUntilFrame;
+
+    internal bool HasReadbackWindow { get; private set; }
+
+    internal ulong ReadbackUntilFrame
+    {
+        get => _readbackUntilFrame;
+        set
+        {
+            _readbackUntilFrame = value;
+            HasReadbackWindow = true;
+        }
     }
 
     public bool IsBufferModified => _bufferModified;

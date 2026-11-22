@@ -9,6 +9,7 @@ public sealed partial class SpirvModuleBuilder
     private const uint GlslModf = 35;
     private const uint GlslFrexp = 51;
     private static readonly uint[] GlslMinMax = [37, 38, 39, 40, 41, 42, 79, 80];
+    private const uint GlslUMin = 38;
 
     private uint[] _resultTypes = new uint[256];
     private readonly Dictionary<uint, (uint Width, bool Signed)> _integerTypeInfo = [];
@@ -26,6 +27,8 @@ public sealed partial class SpirvModuleBuilder
     private readonly Dictionary<uint, uint> _elementBases = [];
     private readonly HashSet<uint> _scalarPointerTypes = [];
     private readonly HashSet<uint> _inputVariables = [];
+    // Variables nothing writes while the invocation runs: descriptors (UniformConstant) and push constants.
+    private readonly HashSet<uint> _immutableVariables = [];
     private readonly HashSet<uint> _changingInputs = [];
     private readonly Dictionary<uint, uint> _entryValues = [];
     private readonly Dictionary<InstructionKey, uint> _entryOperations = [];
@@ -146,14 +149,15 @@ public sealed partial class SpirvModuleBuilder
             return element;
         }
 
-        NoteVariableUses(operands);
+        // ExtInst's operation number is a literal, even when its value equals a variable id.
+        NoteVariableUses(operands, opcode == SpirvOp.ExtInst ? 1 : -1);
         if (FoldExpressions && (TryFold(opcode, resultType, operands, out var folded) ||
             (OptimizeExpressions && TrySimplify(opcode, resultType, operands, out folded))))
         {
             return folded;
         }
 
-        if (!IsValueOperation(opcode, operands))
+        if (!IsValueOperation(opcode, operands) || (IsSubgroupOperation(opcode) && !IsNumberedSubgroupOperation(opcode)))
         {
             var effect = EmitResult(_functions, opcode, resultType, operands);
             if (opcode == SpirvOp.FunctionCall)
@@ -184,8 +188,31 @@ public sealed partial class SpirvModuleBuilder
         return result;
     }
 
+    // Runs before a statement that ends the current block, or a call made through AddStatement, so the emitter can
+    // finish work it keeps for the block (deferred EXEC guards). A call made through AddInstruction does not run it: the
+    // emitter flushes before each call into guest code itself.
+    public Action? BeforeBlockExit { get; set; }
+    private bool _inBlockExit;
+
     public void AddStatement(SpirvOp opcode, params uint[] operands)
     {
+        // The block-exit hook is emitter work, not an optimization: it runs with Optimize off too.
+        if (BeforeBlockExit is not null && !_inBlockExit &&
+            opcode is SpirvOp.SelectionMerge or SpirvOp.LoopMerge or SpirvOp.Branch or SpirvOp.BranchConditional or
+                SpirvOp.Switch or SpirvOp.Return or SpirvOp.ReturnValue or SpirvOp.Kill or SpirvOp.Unreachable or
+                SpirvOp.FunctionCall)
+        {
+            _inBlockExit = true;
+            try
+            {
+                BeforeBlockExit();
+            }
+            finally
+            {
+                _inBlockExit = false;
+            }
+        }
+
         if (!Optimize)
         {
             Emit(_functions, opcode, operands);
@@ -273,11 +300,29 @@ public sealed partial class SpirvModuleBuilder
             return EntryLoad(resultType, pointer);
         }
 
+        // A load of memory nothing writes is a value: the block values reuse it like arithmetic.
+        if (operands.Length == 1 && OptimizeExpressions && FoldExpressions && ReusesValues && IsImmutablePointer(pointer))
+        {
+            var lookup = new InstructionKey(SpirvOp.Load, resultType, operands);
+            if (_blockValues.TryGetValue(lookup, out var loaded))
+            {
+                return loaded;
+            }
+
+            var value = EmitResult(_functions, SpirvOp.Load, resultType, operands);
+            _blockValues[lookup.Stored()] = value;
+            return value;
+        }
+
         if (operands.Length != 1 || !IsTrackedPointer(pointer))
         {
             // A memory-operand load must observe the store in memory, even when
             // a later ordinary store overwrites the same tracked location.
-            if (IsTrackedPointer(pointer)) ResetMemoryState();
+            if (operands.Length != 1)
+            {
+                InvalidateExplicitAccessMemoryState(pointer);
+            }
+
             return EmitResult(_functions, SpirvOp.Load, resultType, operands);
         }
 
@@ -311,8 +356,11 @@ public sealed partial class SpirvModuleBuilder
         var pointer = operands[0];
         if (operands.Length != 2 || !IsTrackedPointer(pointer))
         {
-            if (IsTrackedPointer(pointer)) ResetMemoryState();
-            if (IsLocalVariable(pointer))
+            if (operands.Length != 2)
+            {
+                InvalidateExplicitAccessMemoryState(pointer);
+            }
+            else if (IsLocalVariable(pointer))
             {
                 RemoveVariableValue(pointer);
                 RemovePendingStore(pointer);
@@ -362,7 +410,34 @@ public sealed partial class SpirvModuleBuilder
         return result;
     }
 
+    // A load, in the current function's entry block, of a word the invocation never writes (the host's shader data), through
+    // constant indices: operations of it and of constants then join the entry too (CanHoistToEntry), once per function.
+    // Zero when the entry block is not open, entry hoisting is off (SpirvOptimizationPolicy) or an index is not a constant.
+    public uint EntryWordLoad(uint resultType, uint pointerType, uint variable, params uint[] constantIndices)
+    {
+        if (!Optimize || !HoistEntry || !SpirvOptimizationPolicy.HoistLoads || !IsEntryAvailable() ||
+            constantIndices.Any(index => index >= (uint)_constantKinds.Length || _constantKinds[index] != ScalarConstant))
+        {
+            return 0;
+        }
+
+        uint[] chain = [variable, .. constantIndices];
+        var key = new InstructionKey(SpirvOp.AccessChain, pointerType, chain);
+        if (!_entryOperations.TryGetValue(key, out var pointer))
+        {
+            pointer = AppendToEntry(SpirvOp.AccessChain, pointerType, chain);
+            _entryOperations[key] = pointer;
+            if (OptimizeExpressions) _definitions[pointer] = new Definition(SpirvOp.AccessChain, pointerType, chain);
+        }
+
+        return EntryLoad(resultType, pointer);
+    }
+
     private bool IsEntryAvailable() => CurrentFunction != 0 && !_entryLabelPending && _entryLabelOffset >= 0;
+
+    private bool IsImmutablePointer(uint pointer) =>
+        _immutableVariables.Contains(pointer) ||
+        (Defines(pointer, SpirvOp.AccessChain, out var chain) && _immutableVariables.Contains(chain.Operands[0]));
 
     private bool CanHoistToEntry(SpirvOp opcode, uint[] operands)
     {
@@ -440,11 +515,12 @@ public sealed partial class SpirvModuleBuilder
         _variableOwners[pointer] = owner;
     }
 
-    private void NoteVariableUses(uint[] operands)
+    private void NoteVariableUses(uint[] operands, int literalIndex = -1)
     {
-        foreach (var operand in operands)
+        for (var index = 0; index < operands.Length; index++)
         {
-            var owner = VariableOwner(operand);
+            if (index == literalIndex) continue;
+            var owner = VariableOwner(operands[index]);
             if (owner != 0) EscapeVariable(owner);
         }
     }
@@ -592,6 +668,20 @@ public sealed partial class SpirvModuleBuilder
         _inheritedPointers.Clear();
     }
 
+    private void InvalidateExplicitAccessMemoryState(uint pointer)
+    {
+        if (!IsTrackedPointer(pointer) && !IsLocalVariable(pointer))
+        {
+            return;
+        }
+
+        // The access bypasses forwarding, but must still end pending-store eligibility.
+        // Preserve evidence of an inherited value already used in this block.
+        var inheritedValueUsed = _inheritedValueUsed;
+        ResetMemoryState();
+        _inheritedValueUsed = inheritedValueUsed;
+    }
+
     private void ResetMemoryState()
     {
         if (InheritBlockState) _variableValues = [];
@@ -640,6 +730,30 @@ public sealed partial class SpirvModuleBuilder
     {
         definition = id < (uint)_definitions.Length ? _definitions[id] : default;
         return definition.Operands is not null;
+    }
+
+    // The largest value a 32-bit unsigned id can hold, from its definition: a constant, a logical right shift by a constant
+    // or an AND with a constant.
+    private ulong UpperBound(uint id)
+    {
+        if (IsIntegerConstant(id, out var value))
+        {
+            return value;
+        }
+
+        if (Defines(id, SpirvOp.ShiftRightLogical, out var shift) && IsIntegerConstant(shift.Operands[1], out var amount) &&
+            amount < 32)
+        {
+            return uint.MaxValue >> (int)amount;
+        }
+
+        if (Defines(id, SpirvOp.BitwiseAnd, out var and))
+        {
+            return Math.Min(IsIntegerConstant(and.Operands[0], out var left) ? left : uint.MaxValue,
+                IsIntegerConstant(and.Operands[1], out var right) ? right : uint.MaxValue);
+        }
+
+        return uint.MaxValue;
     }
 
     private bool IsIntegerConstant(uint id, out ulong value)
@@ -693,6 +807,15 @@ public sealed partial class SpirvModuleBuilder
     // operand, so these cannot be hoisted or inherited across control flow.
     private static bool IsSubgroupOperation(SpirvOp opcode) => (ushort)opcode is >= 333 and <= 366;
 
+    // The subgroup operations that two identical instructions in one block may share (upstream's list). Any other
+    // subgroup operation, such as an arithmetic reduction, is emitted every time it is asked for.
+    private static bool IsNumberedSubgroupOperation(SpirvOp opcode) => opcode is
+        SpirvOp.GroupNonUniformElect or SpirvOp.GroupNonUniformAll or SpirvOp.GroupNonUniformAny or
+        SpirvOp.GroupNonUniformAllEqual or SpirvOp.GroupNonUniformBroadcast or SpirvOp.GroupNonUniformBroadcastFirst or
+        SpirvOp.GroupNonUniformBallot or SpirvOp.GroupNonUniformBallotBitCount or SpirvOp.GroupNonUniformShuffle or
+        SpirvOp.GroupNonUniformShuffleXor or SpirvOp.GroupNonUniformShuffleUp or SpirvOp.GroupNonUniformShuffleDown or
+        SpirvOp.GroupNonUniformUMin;
+
     private bool TrySimplify(SpirvOp opcode, uint resultType, uint[] operands, out uint result)
     {
         using var profile = new ShaderTranslationProfile.SimplificationScope();
@@ -740,6 +863,10 @@ public sealed partial class SpirvModuleBuilder
                 return true;
             case SpirvOp.ExtInst when operands.Length == 4 && GlslMinMax.Contains(operands[1]) &&
                 operands[2] == operands[3] && HasType(operands[2], resultType):
+                result = operands[2];
+                return true;
+            case SpirvOp.ExtInst when operands.Length == 4 && operands[1] == GlslUMin && IsUnsignedInteger(resultType, 32) &&
+                IsIntegerConstant(operands[3], out var limit) && UpperBound(operands[2]) <= limit:
                 result = operands[2];
                 return true;
             case SpirvOp.IEqual or SpirvOp.INotEqual when operands.Length == 2:
@@ -1135,7 +1262,8 @@ public sealed partial class SpirvModuleBuilder
         var opcode = (SpirvOp)(words[offset] & 0xFFFF);
         if (opcode == SpirvOp.Load)
         {
-            return wordCount == 4 && (_localVariables.Contains(words[offset + 3]) || _elementBases.ContainsKey(words[offset + 3]));
+            // A load without memory operands yields its value and nothing else; no module declares Volatile memory.
+            return wordCount == 4;
         }
 
         if (wordCount < 3)
@@ -1191,6 +1319,7 @@ public sealed partial class SpirvModuleBuilder
 
             for (var word = first; word < wordCount; word++)
             {
+                if (opcode == SpirvOp.ExtInst && word == 4) continue;
                 var id = words[offset + word];
                 if (id >= _nextId) continue;
                 if (local[id])
@@ -1315,6 +1444,7 @@ public sealed partial class SpirvModuleBuilder
 
             for (var word = first; word < wordCount; word++)
             {
+                if (opcode == SpirvOp.ExtInst && word == 4) continue;
                 var id = words[offset + word];
                 if (id < _nextId) uses[id]++;
             }
@@ -1340,9 +1470,11 @@ public sealed partial class SpirvModuleBuilder
             removed[index] = true;
             var offset = starts[index];
             var wordCount = (int)(words[offset] >> 16);
+            var opcode = (SpirvOp)(words[offset] & 0xFFFF);
             removedIds.Add(words[offset + 2]);
             for (var word = 3; word < wordCount; word++)
             {
+                if (opcode == SpirvOp.ExtInst && word == 4) continue;
                 var id = words[offset + word];
                 if (id >= _nextId)
                 {

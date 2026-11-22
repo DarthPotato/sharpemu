@@ -51,7 +51,11 @@ public readonly record struct DrawIndexedArguments(
     // must not clamp the count read from the arguments.
     bool UnboundedIndexBuffer = false,
     int StartInstanceUserData = -1,
-    GpuInstanceState GpuInstances = default);
+    GpuInstanceState GpuInstances = default,
+    // The indirect packet named a shader register for the base vertex or the start instance: the
+    // value is in that register, and BaseVertex or FirstInstance is 0.
+    bool BaseVertexInRegister = false,
+    bool FirstInstanceInRegister = false);
 
 // Arguments of a non-indexed draw as the packet stream describes them.
 public readonly record struct DrawAutoArguments(
@@ -63,8 +67,14 @@ public readonly record struct DrawAutoArguments(
     uint FirstInstance,
     DrawOffsetSource OffsetSource,
     int StartInstanceUserData = -1,
+    // Nonzero when the counts are still in guest memory at this address, laid out as
+    // (vertexCount, instanceCount, firstVertex, firstInstance).
     ulong IndirectArgumentsAddress = 0,
-    GpuInstanceState GpuInstances = default);
+    GpuInstanceState GpuInstances = default,
+    // The indirect packet named a shader register for the start vertex or the start instance: the
+    // value is in that register, and FirstVertex or FirstInstance is 0.
+    bool FirstVertexInRegister = false,
+    bool FirstInstanceInRegister = false);
 
 public enum EndOfPipeWriteKind
 {
@@ -101,7 +111,9 @@ public readonly record struct EndOfPipeWrite(
     int FlipMode = 0,
     long FlipArgument = 0,
     ulong FlipRequestId = 0,
-    bool WaitForGpu = false);
+    bool WaitForGpu = false,
+    // SHARPEMU_END_OF_PIPE_SOFT_WAITS: the host names the GPU tick that completes this write.
+    EndOfPipeLanding? Landing = null);
 
 // Everything a packet handler needs from the renderer, the caches, the scheduler and video out.
 public interface ICommandStreamHost
@@ -265,8 +277,12 @@ public interface ICommandStreamHost
     // GPU, so the interpreter need not wait for the GPU to read them back first.
     bool ResolvesIndirectDispatchOnGpu => false;
 
-    // True when an indirect draw may be handed over with its arguments still in guest memory
-    // (DrawIndexedArguments.IndirectArgumentsAddress, DrawAutoArguments.IndirectArgumentsAddress).
+    // True when an indirect dispatch whose arguments count threads (DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS) also keeps
+    // its counts on the GPU (IRenderHost.PrepareThreadDispatch).
+    bool ResolvesIndirectThreadDispatchOnGpu => false;
+
+    // True when an indirect draw may be handed over with its arguments still in guest
+    // memory (the IndirectArgumentsAddress of DrawIndexedArguments and DrawAutoArguments).
     bool ResolvesIndirectDrawOnGpu => false;
 
     // Called when a queue reset packet clears the processor.

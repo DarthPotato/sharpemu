@@ -135,7 +135,7 @@ internal static class GatePrerequisites
     public static bool DeviceRequired => Environment.GetEnvironmentVariable(RequireDeviceVariable) == "1";
 
     public static bool Ready([NotNullWhen(true)] HeadlessVulkan? vulkan, bool sampleRateShading = false, bool samplerAnisotropy = false, bool referenceSpirv = false, bool shaderInt64 = false,
-        bool runtimeDescriptors = false)
+        bool runtimeDescriptors = false, bool robustBufferAccess2 = false)
     {
         var missing = vulkan is null ? "a Vulkan device"
             : sampleRateShading && !vulkan.SampleRateShading ? "the sampleRateShading device feature"
@@ -143,6 +143,7 @@ internal static class GatePrerequisites
             : referenceSpirv && !vulkan.SupportsSpirv16 ? "a Vulkan 1.3 device for the SPIR-V 1.6 reference modules"
             : shaderInt64 && !vulkan.ShaderInt64 ? "the shaderInt64 device feature"
             : runtimeDescriptors && !vulkan.SupportsRuntimeDescriptors ? "the descriptor indexing and null descriptor features of the runtime descriptor heap"
+            : robustBufferAccess2 && !vulkan.RobustBufferAccess2 ? "the robustBufferAccess2 device feature"
             : null;
         if (missing is null)
         {
@@ -256,9 +257,19 @@ internal sealed unsafe class ImageTestHarness : IDisposable
     });
 
     // Images live until the harness has finished all recorded work; a failing assertion cannot destroy one early.
-    public CachedImage CreateImage(ImageDescription description)
+    // allowSystemMemory enters CachedImage.AllowSystemMemory on the worker thread, as the cache's retry after reclaiming does.
+    public CachedImage CreateImage(ImageDescription description, bool allowSystemMemory = false)
     {
-        var image = Run(() => new CachedImage(Device, Scheduler, Guest, description));
+        var image = Run(() =>
+        {
+            if (!allowSystemMemory)
+            {
+                return new CachedImage(Device, Scheduler, Guest, description);
+            }
+
+            using var scope = CachedImage.AllowSystemMemory();
+            return new CachedImage(Device, Scheduler, Guest, description);
+        });
         lock (_images)
         {
             _images.Add(image);

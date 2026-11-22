@@ -14,8 +14,10 @@ public sealed class Gen5PairedFlagInterfaceTests
     [Fact]
     public void PairedFlagsAreListedInTheEntryPointInterface()
     {
+        // Broadcasting the mask to the lanes keeps the program off the lane-local half-wave lowering (on by default), so
+        // it runs as paired lanes.
         var program = Program(Vopc(0, "VCmpEqU32", Gen5Operand.Vector(0), 1),
-            Sop1(4, "SMovB64", 4, Gen5Operand.Scalar(106)), EndProgram(8));
+            Sop1(4, "SMovB64", 4, Gen5Operand.Scalar(106)), Vop1(8, "VMovB32", 1, Gen5Operand.Scalar(4)), EndProgram(12));
         var (plan, resources, layout) = Prepare(program);
         var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = 64, HostComputeSubgroup32 = true, LocalSizeX = 64 };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);

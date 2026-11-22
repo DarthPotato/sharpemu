@@ -20,6 +20,7 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
     private readonly ImageTestHarness _harness;
     private readonly ShaderCompileRequest _request;
     private readonly DescriptorSetLayout _setLayout;
+    private readonly DescriptorSetLayout _emptySetLayout;
     private readonly PipelineLayout _pipelineLayout;
     private readonly DescriptorPool _pool;
     private readonly Pipeline _pipeline;
@@ -36,7 +37,8 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         : ImageDescriptorBinding.ResourceClass(kind) == ImageResourceClass.Storage ? DescriptorType.StorageImage
         : DescriptorType.StorageBuffer;
 
-    // heapLayout, when the request reads runtime descriptors, is set 1 of the pipeline layout.
+    // heapLayout, when the request reads runtime descriptors, is set RuntimeDescriptorTable.HeapDescriptorSet of the pipeline
+    // layout; the sets between (bindless heap, library pixel set) get an empty layout, as CreatePipelineLayout gives them.
     public LayoutComputeRunner(ImageTestHarness harness, ShaderCompileRequest request, byte[] spirv, DescriptorSetLayout heapLayout = default)
     {
         _harness = harness;
@@ -63,14 +65,26 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         };
         Require(vk.CreateDescriptorSetLayout(device, &layoutInfo, null, out _setLayout), "vkCreateDescriptorSetLayout");
         var push = new PushConstantRange(StageFlags, 0, PushData.ByteSize);
-        var setLayouts = stackalloc DescriptorSetLayout[2];
+        const int heapSet = (int)RuntimeDescriptorTable.HeapDescriptorSet;
+        var setLayouts = stackalloc DescriptorSetLayout[heapSet + 1];
         setLayouts[0] = _setLayout;
-        setLayouts[1] = heapLayout;
+        if (heapLayout.Handle != 0)
+        {
+            var emptyInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo };
+            Require(vk.CreateDescriptorSetLayout(device, &emptyInfo, null, out _emptySetLayout), "vkCreateDescriptorSetLayout");
+            for (var set = 1; set < heapSet; set++)
+            {
+                setLayouts[set] = _emptySetLayout;
+            }
+
+            setLayouts[heapSet] = heapLayout;
+        }
+
         {
             var pipelineLayoutInfo = new PipelineLayoutCreateInfo
             {
                 SType = StructureType.PipelineLayoutCreateInfo,
-                SetLayoutCount = heapLayout.Handle != 0 ? 2u : 1u,
+                SetLayoutCount = heapLayout.Handle != 0 ? (uint)heapSet + 1 : 1u,
                 PSetLayouts = setLayouts,
                 PushConstantRangeCount = request.Bindings.UsesPushData ? 1u : 0u,
                 PPushConstantRanges = &push,
@@ -223,6 +237,8 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         ulong[]? callArguments = null,
         ulong[]? callTargets = null,
         DescriptorSet heapSet = default,
+        uint[]? bufferStrides = null,
+        IReadOnlyList<uint[]>? imageDescriptors = null,
         uint[]? tessellationData = null)
     {
         var vk = _harness.Vk;
@@ -258,6 +274,20 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         {
             for (var index = 0; index < memoryOffsets.Length; index++)
                 shaderData[layout.MemoryOffsetDword + (uint)index / 4] |= (memoryOffsets[index] & 0xFF) << (index % 4 * 8);
+        }
+
+        // The V# stride of each buffer binding, as BindBuffers writes it, for indexed buffer accesses.
+        if (layout.BufferStrideCount != 0)
+        {
+            if (bufferStrides?.Length != layout.BufferStrideCount) throw new InvalidOperationException("The dispatch requires its buffer strides.");
+            for (var index = 0; index < bufferStrides.Length; index++)
+                shaderData[layout.BufferStridesDword + (uint)index / 2] |= (bufferStrides[index] & 0x3FFF) << (index % 2 * 16);
+        }
+
+        // Each written image's store channel map, as BindBuffers writes it from the bound T#s.
+        if (imageDescriptors is not null)
+        {
+            RuntimeImageSwizzle.WriteStoreMaps(shaderData, layout, _request.Resources.Info.Images, imageDescriptors);
         }
 
         if (layout.UsesDispatchThreadLimits)
@@ -477,5 +507,9 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         vk.DestroyDescriptorPool(device, _pool, null);
         vk.DestroyPipelineLayout(device, _pipelineLayout, null);
         vk.DestroyDescriptorSetLayout(device, _setLayout, null);
+        if (_emptySetLayout.Handle != 0)
+        {
+            vk.DestroyDescriptorSetLayout(device, _emptySetLayout, null);
+        }
     }
 }

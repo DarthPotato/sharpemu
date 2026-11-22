@@ -292,6 +292,7 @@ public sealed partial class ResourceMaterializationCache
                 FlattenedResourceTable = table ?? snapshot.FlattenedResourceTable,
                 UserData = snapshot.UserData,
                 DeviceAddressRanges = snapshot.DeviceAddressRanges,
+                Heaps = snapshot.Heaps,
             };
         }
 
@@ -513,6 +514,7 @@ public sealed partial class ResourceMaterializationCache
                     FlattenedResourceTable = snapshot.FlattenedResourceTable,
                     UserData = snapshot.UserData,
                     DeviceAddressRanges = snapshot.DeviceAddressRanges,
+                    Heaps = snapshot.Heaps,
                     Origin = snapshot.Origin,
                 };
         }
@@ -1203,6 +1205,8 @@ public sealed partial class ResourceMaterializationCache
         out ResourceMaterializationFailure failure,
         ref MaterializationTiming timing)
     {
+        if (plan.DeviceRecordCounts is { } counts && inputs.ComputeState is { } compute)
+            inputs = inputs.WithComputeState(compute with { DeviceCountProofRevision = counts.MaterializationRevision(inputs) });
         // A frontend image conversion can depend on GPU attachments or detile guest
         // texels. Unchanged descriptor bytes do not prove that its result is current.
         if (plan.NormalizeImageDescriptor is not null && plan.Info.Images.Count != 0 && plan.ImageNormalizationVersion is null)
@@ -1355,6 +1359,8 @@ public sealed partial class ResourceMaterializationCache
                         refreshed.Next = cached;
                         CountDiagnostic(Diagnostic.RefreshOlderVariant);
                     }
+                    // Learning history may still own this replaced entry, but not its variant chain.
+                    variant.Next = null;
                     Store(key, refreshed);
                     _outcome = MaterializeOutcome.TableRefresh;
                     TableRefreshes++;
@@ -1419,6 +1425,7 @@ public sealed partial class ResourceMaterializationCache
                 ReadsClean = inputs.ReadsClean,
                 ComputeState = inputs.ComputeState,
                 TablePhase = recorder.TablePhase,
+                IsRangeMapped = inputs.IsRangeMapped,
             };
             if (!ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure))
                 return false;
@@ -1541,6 +1548,7 @@ public sealed partial class ResourceMaterializationCache
                 ReadResidentMemory = recorder.WrapResident(inputs.ReadResidentMemory),
                 ReadsClean = inputs.ReadsClean,
                 ComputeState = inputs.ComputeState,
+                IsRangeMapped = inputs.IsRangeMapped,
             };
             var cachedTable = cached.Snapshot.FlattenedResourceTable;
             ReadingTable = true;
@@ -1600,6 +1608,7 @@ public sealed partial class ResourceMaterializationCache
                     FlattenedResourceTable = table,
                     UserData = previous.UserData,
                     DeviceAddressRanges = previous.DeviceAddressRanges,
+                    Heaps = previous.Heaps,
                 },
                 Specialization = cached.Specialization,
                 Next = cached.Next,
@@ -1774,6 +1783,7 @@ public sealed partial class ResourceMaterializationCache
             FlattenedResourceTable = cached.FlattenedResourceTable,
             UserData = current,
             DeviceAddressRanges = cached.DeviceAddressRanges,
+            Heaps = cached.Heaps,
             Origin = cached.Origin,
         };
     }
@@ -2095,6 +2105,7 @@ public sealed partial class ResourceMaterializationCache
                     FlattenedResourceTable = table,
                     UserData = patched.UserData,
                     DeviceAddressRanges = patched.DeviceAddressRanges,
+                    Heaps = patched.Heaps,
                 };
                 patches = found;
                 return true;
@@ -2122,6 +2133,7 @@ public sealed partial class ResourceMaterializationCache
                     ReadResidentMemory = recorder.WrapResident(inputs.ReadResidentMemory),
                     ReadsClean = inputs.ReadsClean,
                     ComputeState = inputs.ComputeState,
+                    IsRangeMapped = inputs.IsRangeMapped,
                 };
                 var cachedTable = entry.Snapshot.FlattenedResourceTable;
                 ReadingTable = true;
@@ -2162,6 +2174,7 @@ public sealed partial class ResourceMaterializationCache
                     FlattenedResourceTable = table,
                     UserData = patched.UserData,
                     DeviceAddressRanges = patched.DeviceAddressRanges,
+                    Heaps = patched.Heaps,
                 };
             }
             finally

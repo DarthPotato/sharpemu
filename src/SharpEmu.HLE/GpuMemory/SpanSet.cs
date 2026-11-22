@@ -11,6 +11,9 @@ public sealed class SpanSnapshot
     private readonly ulong[] starts;
     private readonly ulong[] ends;
     private readonly SpanNode? _root;
+    // A tree snapshot's spans as arrays, built on first use of Starts/Ends (tests and diagnostics only); one reference so
+    // a racing reader sees both arrays or neither.
+    private ulong[][]? _treeArrays;
 
     public SpanSnapshot(ulong[] starts, ulong[] ends)
     {
@@ -24,7 +27,68 @@ public sealed class SpanSnapshot
         _root = root;
     }
 
-    public bool Contains(ulong address, ulong size)
+    internal ReadOnlySpan<ulong> Starts => _root is null ? starts : TreeArrays()[0];
+    internal ReadOnlySpan<ulong> Ends => _root is null ? ends : TreeArrays()[1];
+
+    private ulong[][] TreeArrays()
+    {
+        if (Volatile.Read(ref _treeArrays) is { } arrays) return arrays;
+        var treeStarts = new List<ulong>();
+        var treeEnds = new List<ulong>();
+        SpanNode.ForEachOverlap(_root, 0, ulong.MaxValue, (treeStarts, treeEnds),
+            static (lists, start, size) => { lists.treeStarts.Add(start); lists.treeEnds.Add(start + size); });
+        arrays = [treeStarts.ToArray(), treeEnds.ToArray()];
+        Volatile.Write(ref _treeArrays, arrays);
+        return arrays;
+    }
+
+    // Contains remembers, per thread, the span of its last complete hit in a snapshot; SHARPEMU_SPAN_CONTAINS_CACHE=0
+    // searches every query. The span's bounds are remembered (not an array index) so tree snapshots cache the same way.
+    private static readonly bool CacheLastHit = Environment.GetEnvironmentVariable("SHARPEMU_SPAN_CONTAINS_CACHE") != "0";
+
+    [ThreadStatic] private static SpanSnapshot? _lastSnapshot;
+    [ThreadStatic] private static ulong _lastStart;
+    [ThreadStatic] private static ulong _lastEnd;
+
+    public bool Contains(ulong address, ulong size) => CacheLastHit
+        ? ContainsWithLastHit(address, size)
+        : ContainsUncached(address, size);
+
+    internal bool ContainsWithLastHit(ulong address, ulong size)
+    {
+        // Snapshot identity includes mapping changes. Only a complete positive range can hit; a zero-sized or
+        // overflowing request gives the answer ContainsUncached gives.
+        if (ReferenceEquals(_lastSnapshot, this) && size != 0 &&
+            address >= _lastStart && address < _lastEnd && size <= _lastEnd - address)
+            return true;
+
+        ulong spanStart, spanEnd;
+        if (_root is not null)
+        {
+            if (SpanNode.FindAtOrBelow(_root, address) is not { } node) return false;
+            spanStart = node.Start;
+            spanEnd = node.End;
+        }
+        else
+        {
+            var index = Array.BinarySearch(starts, address);
+            if (index < 0) index = ~index - 1;
+            if (index < 0) return false;
+            spanStart = starts[index];
+            spanEnd = ends[index];
+        }
+
+        var contained = spanEnd >= address + size;
+        if (contained && size != 0 && address < spanEnd && size <= spanEnd - address)
+        {
+            _lastStart = spanStart;
+            _lastEnd = spanEnd;
+            _lastSnapshot = this;
+        }
+        return contained;
+    }
+
+    private bool ContainsUncached(ulong address, ulong size)
     {
         if (_root is not null)
         {
@@ -39,6 +103,46 @@ public sealed class SpanSnapshot
         }
 
         return index >= 0 && ends[index] >= address + size;
+    }
+
+    // Immutable snapshot: callbacks may recover GPU data without holding the mapping lock.
+    internal void ForEachOverlap(ulong address, ulong size, Action<ulong, ulong> visit)
+    {
+        if (_root is not null)
+        {
+            SpanNode.ForEachOverlap(_root, address, address + size, visit, static (callback, part, partSize) => callback(part, partSize));
+            return;
+        }
+
+        var end = address + size;
+        var index = Array.BinarySearch(starts, address);
+        if (index < 0) index = Math.Max(0, ~index - 1);
+        for (; index < starts.Length && starts[index] < end; index++)
+        {
+            var first = Math.Max(address, starts[index]);
+            var last = Math.Min(end, ends[index]);
+            if (first < last) visit(first, last - first);
+        }
+    }
+
+    // The walk above with its state passed to a static callback; the same overlaps, in the same order.
+    internal void ForEachOverlap<TState>(ulong address, ulong size, TState state, Action<TState, ulong, ulong> visit)
+    {
+        if (_root is not null)
+        {
+            SpanNode.ForEachOverlap(_root, address, address + size, state, visit);
+            return;
+        }
+
+        var end = address + size;
+        var index = Array.BinarySearch(starts, address);
+        if (index < 0) index = Math.Max(0, ~index - 1);
+        for (; index < starts.Length && starts[index] < end; index++)
+        {
+            var first = Math.Max(address, starts[index]);
+            var last = Math.Min(end, ends[index]);
+            if (first < last) visit(state, first, last - first);
+        }
     }
 
     public bool TryGetContaining(ulong address, out ulong start, out ulong end)

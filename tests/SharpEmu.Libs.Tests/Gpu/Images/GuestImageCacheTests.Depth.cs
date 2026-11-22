@@ -227,6 +227,34 @@ public sealed unsafe partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // An image that starts two 1 MiB owner pages into a larger buffer is not the buffer's own image, but in this fork a buffer
+    // takes every GPU image it covers (BufferSynchronization_PublishesEveryCoveredGpuImage), at the image's offset. A buffer
+    // at the image's own address takes it as its image.
+    [Fact]
+    public void BufferSynchronization_TakesOnlyTheImageAtTheBuffersAddress()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const ulong page = 0x100000;
+        var address = harness.MapBacked(3 * page, ReadWrite);
+        var later = address + 2 * page;
+        harness.Write(later, Bytes(0x11223344u));
+        var request = LinearRequest(later, 4, Format.R32Uint, GuestPixelFormat.Bits32UInt, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1);
+        var imageIdentifier = harness.Acquire(ref request);
+        harness.MarkGpuWritten(imageIdentifier);
+        harness.Worker.Run(() =>
+        {
+            using var whole = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler, GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, 3 * page);
+            using var own = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler, GpuBufferUsage.DeviceLocal, later, GpuBuffer.AllFlags, page);
+            Assert.True(harness.Images.TrySynchronizeBufferFromImage(whole, address, 3 * page));
+            Assert.Equal(0x11223344u, BitConverter.ToUInt32(harness.CopyFromDevice(whole.Handle, 2 * page, 4)));
+            Assert.True(harness.Images.TrySynchronizeBufferFromImage(own, later, page));
+            Assert.Equal(0x11223344u, BitConverter.ToUInt32(harness.CopyFromDevice(own.Handle, 0, 4)));
+            harness.Scheduler.Finish();
+        });
+        harness.Shutdown();
+    }
+
     // A tiled array's mip layout ends before its tile plan does: each level spans its size times the layer count from
     // its offset in the first slice, while every 64 KiB slice holds a whole chain with the base level last. A buffer
     // over the whole image takes every tile; a buffer that ends inside the last tile keeps the guest bytes.
