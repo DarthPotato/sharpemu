@@ -116,6 +116,7 @@ internal sealed class ResolvedDraw
 
     public void Reset()
     {
+        var previous = Kind;
         Sequence = 0;
         Kind = ResolvedDrawKind.Skipped;
         Announce = false;
@@ -147,15 +148,26 @@ internal sealed class ResolvedDraw
         SetAutoDebug = false;
         IndexedTrace = null;
         PacketAddress = 0;
-        Clear = default;
-        ResolveSource = default;
-        ResolveDestination = default;
-        CopyRead = default;
-        CopyWrite = default;
-        CopyReadFormat = default;
-        CopyWriteFormat = default;
-        CopyExtent = default;
-        CopyAspects = default;
+        if (previous == ResolvedDrawKind.ClearColorTargets)
+        {
+            Clear = default;
+        }
+
+        if (previous == ResolvedDrawKind.MultisampleResolve)
+        {
+            ResolveSource = default;
+            ResolveDestination = default;
+        }
+
+        if (previous == ResolvedDrawKind.DepthStencilCopy)
+        {
+            CopyRead = default;
+            CopyWrite = default;
+            CopyReadFormat = default;
+            CopyWriteFormat = default;
+            CopyExtent = default;
+            CopyAspects = default;
+        }
     }
 }
 

@@ -271,6 +271,8 @@ public static partial class AgcExports
         return (int)ctx[CpuRegister.Rax];
     }
 
+    // The arguments are sceAgcDcbJump's without the jump mode, since an async command buffer always chains:
+    // (acb, cache policy, target, size).
     [SysAbiExport(
         Nid = "e1DFTg+Sd8U",
         ExportName = "sceAgcAcbJump",

@@ -212,7 +212,7 @@ internal static unsafe partial class VulkanVideoPresenter
         FormattableString.Invariant($"tess_bda_leases={_tessBdaLeases.Take()} tess_bda_fallbacks={TakeTessBdaFallbacks()} tess_bda_join_rejects={_tessBdaJoinRejects.Take()} ") +
         FormattableString.Invariant($"gpu_written_applied={_gpuWrittenApplied.Take()} gpu_written_conflicts={_gpuWrittenConflicts.Take()} gpu_written_overlap={_gpuWrittenOverlap.Take()} gpu_written_unrecorded_fallback={_gpuWrittenUnrecorded.Take()} gpu_written_mark_rejects={_gpuWrittenMarkRejects.Take()} ") +
         TakeSchedulingReport() + TakeRuntimeWorkerReport() + SharpEmu.Libs.Gpu.Rendering.RenderRecorder.TakeInPlaceReport() + FormattableString.Invariant($" textures_kept={RecordingHost.TakeTexturesKept()} ") + RecordingHost.TakeTableReport() +
-        FormattableString.Invariant($"bda_sweeps={Interlocked.Exchange(ref GuestBufferCache.BdaSweeps, 0)}/skipped:{Interlocked.Exchange(ref GuestBufferCache.BdaSweepsSkipped, 0)} ") +
+        FormattableString.Invariant($"bda_sweeps={Interlocked.Exchange(ref GuestBufferCache.BdaSweeps, 0)}/skipped:{Interlocked.Exchange(ref GuestBufferCache.BdaSweepsSkipped, 0)}/bounded:{Interlocked.Exchange(ref GuestBufferCache.BdaBoundedPreparations, 0)} ") + GuestBufferCache.TakeHeldSliceUseReport() + " " +
         FormattableString.Invariant($"serial_cuts={_slicesSerial.Take()} invalid={_slicesInvalid.Take()} frontend_textures_stale={_frontendTexturesStale.Take()} ") +
         FormattableString.Invariant($"slice_items={_sliceItems.Take()} serial_items={_serialItems.Take()} join_wait_ms={_sliceWaitTicks.Take() * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} ") +
         FormattableString.Invariant($"image_barriers={ImageAccessState.Barriers.Take()}/elided:{ImageAccessState.BarriersElided.Take()} ") +
@@ -371,6 +371,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public readonly List<(ulong Address, uint[] Words)> KnownWrites = new();
         public readonly List<SubmissionUploadResources> Resources = new();
         public bool NeedsBdaSweep;
+        public bool NeedsBdaTouch;
         public long BufferSerial;
         public long? ReadsVersion;
         public bool MixedReadsVersions;
@@ -580,7 +581,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _arenaPool = new SliceArenaPool(_deviceInfo, _scheduler);
             _descriptorPoolStock ??= new DescriptorPoolStock(_deviceInfo);
             _workers = new RenderWorkerPool(this, RenderWorkerCount);
-            Console.Error.WriteLine($"[LOADER][INFO] Render workers: {RenderWorkerCount}");
+            Console.Error.WriteLine($"[LOADER][INFO] Render workers: {RenderWorkerCount} {CommandThread.DescribeQueue()}");
         }
 
         private void StopRenderWorkers()
@@ -611,10 +612,10 @@ internal static unsafe partial class VulkanVideoPresenter
             _stealRecording[SchedulingBucket(_workers.Recording)].Increment();
         }
 
-        internal static void NoteStolen(RenderSlice slice)
+        internal static void NoteStolen(RenderSlice slice, int inlineItems)
         {
             _slicesStolen.Increment();
-            _stolenItems.Add(slice.Items.Count);
+            _stolenItems.Add(inlineItems);
             _stolenByOrigin[slice.Origin].Increment();
             var age = (System.Diagnostics.Stopwatch.GetTimestamp() - slice.DispatchedAt) * 1_000_000 / System.Diagnostics.Stopwatch.Frequency;
             _stolenByAge[age < 100 ? 0 : age < 1000 ? 1 : 2].Increment();
@@ -1011,6 +1012,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     _bufferCache.PrepareBda(spans, requests.BdaMapping);
                 }
+                else if (requests.NeedsBdaTouch && requests.BdaSpans is { } touched)
+                {
+                    _bufferCache.PrepareBoundedBda(touched, requests.BdaMapping);
+                }
 
                 foreach (var (address, size) in requests.SyncRanges)
                 {
@@ -1080,6 +1085,7 @@ internal static unsafe partial class VulkanVideoPresenter
         internal void RecordSlice(RenderSlice slice)
         {
             slice.Host = this;
+            _failedSliceLookups.Clear();
             _buffers = _bufferCache.Snapshot;
             SliceSegment? segment = null;
             slice.Resume = slice.Items.Count;

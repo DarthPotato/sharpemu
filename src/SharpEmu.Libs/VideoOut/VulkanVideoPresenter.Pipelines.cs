@@ -392,14 +392,33 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        private static readonly bool DirectPageReads = Environment.GetEnvironmentVariable("SHARPEMU_DIRECT_PAGE_READS") != "0";
+
         private bool ReadResidentBytesOnResolveWorker(ulong address, Span<byte> destination, bool clean)
         {
             var size = (ulong)destination.Length;
-            CompletePendingPublicationsForResourceRead(address, size);
             var worker = _resolveWorker!;
+            if (!clean && DirectPageReads && TryGetCleanReadPage(address, size, out var directPage, out _) && directPage == worker.DirectPage &&
+                ReferenceEquals(_guestBacking.BackingAliasSnapshot, worker.DirectSnapshot) && _guestBacking.TryEnterBackingAliasAccess())
+            {
+                try
+                {
+                    new ReadOnlySpan<byte>((byte*)(worker.DirectAlias + (nint)(address - directPage)), destination.Length).CopyTo(destination);
+                }
+                finally
+                {
+                    _guestBacking.ExitBackingAliasAccess();
+                }
+
+                worker.Reads.Add(address, destination);
+                return true;
+            }
+
+            CompletePendingPublicationsForResourceRead(address, size);
             if (!clean && IsCleanReadPage(address, size) && TryReadAliasBytes(address, destination))
             {
                 worker.Reads.Add(address, destination);
+                RememberDirectPage(worker, address, size);
                 return true;
             }
 
@@ -643,6 +662,20 @@ internal static unsafe partial class VulkanVideoPresenter
                 // Release the lease before a fallback can wait for a copy reservation.
                 _guestBacking.ExitBackingAliasAccess();
             }
+        }
+
+        private void RememberDirectPage(ResolveWorkerState worker, ulong address, ulong size)
+        {
+            if (!DirectPageReads || !TryGetCleanReadPage(address, size, out var page, out var slot) || Reads is not { } pages ||
+                pages.Tags[slot] != page + 1 || pages.Aliases[slot] == 0 || _guestBacking.BackingAliasSnapshot is not { } snapshot ||
+                !ReferenceEquals(pages.Snapshots[slot], snapshot))
+            {
+                return;
+            }
+
+            worker.DirectPage = page;
+            worker.DirectAlias = (nint)pages.Aliases[slot];
+            worker.DirectSnapshot = snapshot;
         }
 
         private bool TryGetAliasPointer(ulong address, ulong size, out byte* pointer)

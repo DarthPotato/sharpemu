@@ -145,7 +145,17 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         set => _tracker.DefersGpuWriteProtection = value;
     }
 
-    public void ApplyPendingGpuProtections() => _tracker.ApplyPendingGpuProtections();
+    public void ApplyPendingGpuProtections()
+    {
+        Volatile.Write(ref _copyWritesPending, 0);
+        _tracker.ApplyPendingGpuProtections();
+    }
+
+    private int _copyWritesPending;
+
+    public bool CopyWritesPending => Volatile.Read(ref _copyWritesPending) != 0;
+
+    public void NoteCopyWrite() => Volatile.Write(ref _copyWritesPending, 1);
 
     public GpuBuffer GdsBuffer => _gds;
 
@@ -500,6 +510,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             return null;
         }
 
+        NoteCopyWrite();
         var wasPublishing = _publishingImageContents;
         _publishingImageContents = true;
         try { return ObtainBuffer(guestAddress, size, isWritten: true).Buffer; }
@@ -666,7 +677,12 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     private void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds, bool publishFill)
     {
-        if (!isGds) CompleteGuestPublications?.Invoke(guestAddress, size, PublicationAccess.Write);
+        if (!isGds)
+        {
+            CompleteGuestPublications?.Invoke(guestAddress, size, PublicationAccess.Write);
+            NoteCopyWrite();
+        }
+
         if ((guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > ulong.MaxValue - guestAddress)
         {
             throw SubmissionScheduler.Fatal("The fill range must be aligned to four bytes.");
@@ -917,7 +933,12 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     public void CopyBuffer(ulong dstVaddr, ulong srcVaddr, ulong size, bool dstGds, bool srcGds)
     {
-        if (!dstGds) CompleteGuestPublications?.Invoke(dstVaddr, size, PublicationAccess.Write);
+        if (!dstGds)
+        {
+            CompleteGuestPublications?.Invoke(dstVaddr, size, PublicationAccess.Write);
+            NoteCopyWrite();
+        }
+
         if (!srcGds) CompleteGuestPublications?.Invoke(srcVaddr, size, PublicationAccess.Read);
         var dstMemory = !dstGds;
         var srcMemory = !srcGds;
@@ -1276,6 +1297,25 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         _faultProcessPending = true;
     }
 
+    public void PrepareBoundedBda(IReadOnlyList<GuestSpan> spans, ulong mapping)
+    {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("bda");
+        }
+
+        if (_retirementPolicy.CurrentTick != _bdaTouchTick || mapping != _bdaTouchMapping)
+        {
+            for (var index = 0; index < spans.Count; index++)
+                TouchBuffersInRange(spans[index].Address, spans[index].Size);
+            _bdaTouchTick = _retirementPolicy.CurrentTick;
+            _bdaTouchMapping = mapping;
+        }
+
+        _faultProcessPending = true;
+        Interlocked.Increment(ref BdaBoundedPreparations);
+    }
+
     private Action<ulong, ulong>? _uploadDirtyBuffersInRange;
     private bool _inDeviceAddressSweep;
     private int _uploadBatchDepth;
@@ -1415,6 +1455,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     private long _observation;
     public static long BdaSweeps;
     public static long BdaSweepsSkipped;
+    public static long BdaBoundedPreparations;
 
     // With the command stream on its own thread, guest CPU writes reach the GPU at the stream's
     // order points (a submission, a label, a write or copy the stream performs); a device-address

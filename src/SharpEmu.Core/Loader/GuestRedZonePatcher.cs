@@ -275,6 +275,7 @@ internal static partial class GuestRedZonePatcher
                 continue;
             }
 
+            segmentFunctions = AddDirectCallTargets(segmentBytes, segmentStart, segmentEnd, segmentFunctions);
             for (var functionIndex = 0; functionIndex < segmentFunctions.Length; functionIndex++)
             {
                 progress?.Report(scannedFunctions++);
@@ -395,6 +396,39 @@ internal static partial class GuestRedZonePatcher
             ExtractCandidates = extractCandidates,
         };
         return sites;
+    }
+
+    // .eh_frame_hdr lists only the functions that have unwind entries, so the span between two entries can hold many
+    // functions: one red-zone leaf among them sends every access of its neighbours to a trampoline, and one unresolved
+    // indirect jump among them leaves the leaf unprotected. Direct call targets are function entries too.
+    private static ulong[] AddDirectCallTargets(byte[] segmentBytes, ulong segmentStart, ulong segmentEnd, ulong[] functionStarts)
+    {
+        var starts = new HashSet<ulong>(functionStarts);
+        for (var index = 0; index < functionStarts.Length; index++)
+        {
+            var start = functionStarts[index];
+            var end = index + 1 < functionStarts.Length ? functionStarts[index + 1] : segmentEnd;
+            var reader = new ArraySliceCodeReader(segmentBytes, checked((int)(start - segmentStart)), checked((int)(end - start)));
+            var decoder = Decoder.Create(64, reader, DecoderOptions.None);
+            decoder.IP = start;
+            while (decoder.IP < end && reader.CanRead)
+            {
+                decoder.Decode(out var instruction);
+                if (instruction.Code == Code.INVALID)
+                {
+                    break;
+                }
+
+                if (instruction.FlowControl == FlowControl.Call &&
+                    instruction.Op0Kind == OpKind.NearBranch64 &&
+                    instruction.NearBranch64 >= segmentStart && instruction.NearBranch64 < segmentEnd)
+                {
+                    starts.Add(instruction.NearBranch64);
+                }
+            }
+        }
+
+        return starts.Count == functionStarts.Length ? functionStarts : starts.Order().ToArray();
     }
 
     private static List<DecodedInstruction> DecodeFunction(
@@ -747,6 +781,17 @@ internal static partial class GuestRedZonePatcher
                     TryGetSelectorCompareBound(decoded[predecessorIndex - 1].Instruction, state.Register, state.Bits, out var bound))
                 {
                     maximumIndex = Math.Max(maximumIndex, bound);
+                    bounded = true;
+                    continue;
+                }
+
+                if (predecessor.Mnemonic == Mnemonic.And && predecessor.OpCount == 2 &&
+                    predecessor.GetOpKind(0) == OpKind.Register &&
+                    predecessor.GetOpRegister(0).GetFullRegister() == state.Register.GetFullRegister() &&
+                    predecessor.GetOpRegister(0).GetSize() >= sizeof(int) &&
+                    TryGetNonNegativeImmediate(predecessor, 1, out var mask) && mask < MaximumJumpTableEntries)
+                {
+                    maximumIndex = Math.Max(maximumIndex, mask);
                     bounded = true;
                     continue;
                 }

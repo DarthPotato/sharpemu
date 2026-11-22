@@ -78,7 +78,8 @@ public sealed partial class GuestImageCache
         TakePublicationCutReport() +
         FormattableString.Invariant($"publication_cuts={Interlocked.Exchange(ref _publicationCuts, 0)} publication_attempts={Interlocked.Exchange(ref _publicationAttempts, 0)} publication_real={Interlocked.Exchange(ref _publicationReal, 0)} publication_downloads={Interlocked.Exchange(ref _publicationDownloads, 0)} dcc_memo_hits={Interlocked.Exchange(ref _dccMemoHits, 0)} dcc_memo_invalidations={Interlocked.Exchange(ref _dccMemoInvalidations, 0)} ") +
         "lookup_fail=" + TakeCounts(SliceLookupFailures, SliceLookupFailureNames) + " lookup_fail_role=" + TakeCounts(SliceLookupRoleFailures, SliceLookupRoleNames) +
-        FormattableString.Invariant($" parks={Interlocked.Exchange(ref _parks, 0)} park_releases={Interlocked.Exchange(ref _parkReleases, 0)} unparks={Interlocked.Exchange(ref _unparks, 0)} park_expiries={Interlocked.Exchange(ref _parkExpiries, 0)} stencil_planes_kept={Interlocked.Exchange(ref _stencilPlanesKept, 0)}");
+        FormattableString.Invariant($" parks={Interlocked.Exchange(ref _parks, 0)} park_releases={Interlocked.Exchange(ref _parkReleases, 0)} unparks={Interlocked.Exchange(ref _unparks, 0)} park_expiries={Interlocked.Exchange(ref _parkExpiries, 0)} stencil_planes_kept={Interlocked.Exchange(ref _stencilPlanesKept, 0)}") +
+        " metadata_changes=" + TakeMetadataChangeReport();
 
     private static string TakeCounts(long[] counters, string[] names)
     {
@@ -243,7 +244,8 @@ public sealed partial class GuestImageCache
 
         ref readonly var cachedInfo = ref cached.Description;
         var currentTick = _scheduler.CurrentTick;
-        var safeToDelete = currentTick - Math.Min(currentTick, cached.LastAccessTick) > TicksBeforeRemoval;
+        var usedThisFrame = cached.Registered && _recencyQueue.GetLastUseTick(cached.RecencyEntryIndex) >= _collectionTick;
+        var safeToDelete = !usedThisFrame && currentTick - Math.Min(currentTick, cached.LastAccessTick) > TicksBeforeRemoval;
         if (requested.Data.Address == cachedInfo.Data.Address &&
             requested.BlockExtent.Width == cachedInfo.BlockExtent.Width && requested.BlockExtent.Height == cachedInfo.BlockExtent.Height &&
             requested.BytesPerBlock * requested.Samples == cachedInfo.BytesPerBlock * cachedInfo.Samples)

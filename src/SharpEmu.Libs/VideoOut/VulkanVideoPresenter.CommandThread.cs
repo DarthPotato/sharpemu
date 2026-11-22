@@ -24,6 +24,12 @@ internal static partial class VulkanVideoPresenter
         // two threads take turns waiting on each other (128 did, with draws resolving on the pool).
         private static readonly int MaxOutstanding =
             int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_COMMAND_QUEUE_DEPTH"), out var depth) && depth >= 128 ? depth : 1024;
+
+        private static readonly int SlicesAheadPerWorker =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SLICES_AHEAD"), out var ahead) && ahead >= 1 ? ahead : 2;
+
+        internal static string DescribeQueue() =>
+            FormattableString.Invariant($"command queue depth={MaxOutstanding} slices ahead per worker={SlicesAheadPerWorker}");
         private const int ShadowSweepCount = 64;
         private const int StorePageShift = 12;
 
@@ -514,8 +520,19 @@ internal static partial class VulkanVideoPresenter
         public bool ReadOverlayBefore(ulong address, Span<byte> destination, long sequence)
         {
             var size = (ulong)destination.Length;
-            if (_pendingRangeCount == 0 && !HasPendingStores(address, size))
+            if (!HasPendingStores(address, size))
             {
+                if (_pendingRangeCount != 0)
+                {
+                    foreach (var pending in _pendingRangeSnapshot)
+                    {
+                        if (pending.Sequence != 0 && pending.Sequence < sequence && address < pending.Address + pending.RangeSize && pending.Address < address + size)
+                        {
+                            throw new SerialResolveRequiredException("pending range read");
+                        }
+                    }
+                }
+
                 return _memory.TryRead(address, destination);
             }
             lock (_writeLock)
@@ -828,7 +845,7 @@ internal static partial class VulkanVideoPresenter
                 }
             }
 
-            var limit = slicing ? 2 * _presenter.WorkerCount : 0;
+            var limit = slicing ? SlicesAheadPerWorker * _presenter.WorkerCount : 0;
             var pulled = 0;
             while (slicesAhead <= limit && pulled < maxItems)
             {
@@ -968,14 +985,21 @@ internal static partial class VulkanVideoPresenter
 
             if (slice.TryClaim())
             {
-                Presenter.NoteStolen(slice);
+                var stolenInline = slice.Items.Count;
+                if (SplitStolenSlices && _presenter.SlicesEnabled && stolenInline >= RestInlineItems + MinimumSliceItems)
+                {
+                    stolenInline = RestInlineItems;
+                    QueueRestChunks(slice, stolenInline);
+                }
+
+                Presenter.NoteStolen(slice, stolenInline);
                 _presenter.NoteStealState();
                 slice.Done.Set();
                 try
                 {
-                    foreach (var item in slice.Items)
+                    for (var position = 0; position < stolenInline; position++)
                     {
-                        RunInline(item, betweenItems);
+                        RunInline(slice.Items[position], betweenItems);
                         ran++;
                     }
                 }
@@ -1055,18 +1079,7 @@ internal static partial class VulkanVideoPresenter
             if (_presenter.SlicesEnabled && remaining >= RestInlineItems + MinimumSliceItems)
             {
                 inline = slice.Resume + RestInlineItems;
-                var chunks = (slice.Items.Count - inline + RestChunkItems - 1) / RestChunkItems;
-                var start = inline;
-                for (var chunk = 0; chunk < chunks; chunk++)
-                {
-                    var end = inline + (int)((long)(slice.Items.Count - inline) * (chunk + 1) / chunks);
-                    var rest = new RenderSlice { Origin = 2 };
-                    rest.Items.AddRange(slice.Items.GetRange(start, end - start));
-                    _units.Insert(_unitHead + chunk, new Unit { Slice = rest });
-                    _presenter.DispatchSlice(rest, urgent: true);
-                    Presenter.NoteRestChunk(rest.Items.Count);
-                    start = end;
-                }
+                QueueRestChunks(slice, inline);
             }
 
             for (var position = slice.Resume; position < inline; position++)
@@ -1076,6 +1089,24 @@ internal static partial class VulkanVideoPresenter
             }
 
             return ran;
+        }
+
+        private static readonly bool SplitStolenSlices = Environment.GetEnvironmentVariable("SHARPEMU_SPLIT_STOLEN_SLICES") != "0";
+
+        private void QueueRestChunks(RenderSlice slice, int inline)
+        {
+            var chunks = (slice.Items.Count - inline + RestChunkItems - 1) / RestChunkItems;
+            var start = inline;
+            for (var chunk = 0; chunk < chunks; chunk++)
+            {
+                var end = inline + (int)((long)(slice.Items.Count - inline) * (chunk + 1) / chunks);
+                var rest = new RenderSlice { Origin = 2 };
+                rest.Items.AddRange(slice.Items.GetRange(start, end - start));
+                _units.Insert(_unitHead + chunk, new Unit { Slice = rest });
+                _presenter.DispatchSlice(rest, urgent: true);
+                Presenter.NoteRestChunk(rest.Items.Count);
+                start = end;
+            }
         }
 
         private static void NoteItemCost(Item item, int stage, long started) =>
@@ -1160,6 +1191,9 @@ internal static partial class VulkanVideoPresenter
                         break;
                     case Kind.Write:
                         _presenter._bufferCache.NoteObservation();
+                        // The store can be an end-of-pipe label that tells the guest earlier GPU writes are done. Their
+                        // pages must block CPU reads before it lands, not only at the next submission.
+                        if (_presenter._bufferCache.CopyWritesPending) _presenter._bufferCache.ApplyPendingGpuProtections();
                         ApplyWrite(item);
                         break;
                 }

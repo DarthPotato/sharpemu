@@ -207,6 +207,20 @@ public interface IRenderHost
     // Changes whenever a buffer owner is unregistered; buffers bound before a change are bound again (RebindBuffers).
     long BufferOwnerGeneration => 0;
 
+    long CurrentItemSequence => 0;
+
+    void SealDrawReplay()
+    {
+    }
+
+    bool TryReplayDraw(in PipelineHandle pipeline, ReadOnlySpan<uint> vertexUserData, ReadOnlySpan<uint> pixelUserData) => false;
+
+    void SealDispatchReplay()
+    {
+    }
+
+    bool TryReplayDispatch(in PipelineHandle pipeline, in ShaderStageResources stage) => false;
+
     void RebindBuffers(IPreparedBindings prepared)
     {
     }
