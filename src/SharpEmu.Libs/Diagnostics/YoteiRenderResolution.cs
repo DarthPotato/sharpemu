@@ -7,7 +7,7 @@ using SharpEmu.Libs.Gpu.GpuCommands;
 
 namespace SharpEmu.Libs.Diagnostics;
 
-// Ghost of Yotei 01.512 only. The game renders at one of 16 sizes (index 0 = 3840x2160, each step 128x72 smaller,
+// Ghost of Yotei 01.512 and 02.002. The game renders at one of 16 sizes (index 0 = 3840x2160, each step 128x72 smaller,
 // index 15 = 1920x1080) and upscales the result to its 3840x2160 output. Its renderer picks the index from the
 // display mode, and then replaces it with one int of the renderer object whenever that int is not negative; the
 // game's code only reads that int. Writing an index there makes the game itself render at that size.
@@ -25,30 +25,30 @@ namespace SharpEmu.Libs.Diagnostics;
 // of 8, as all of the game's sizes are, from 640x360 to 1920x1080; the game's own steps continue as 1792x1008,
 // 1664x936, 1536x864, 1408x792, 1280x720, 1152x648, 1024x576, 896x504.
 // The game applies a new index within a frame or two; the log shows each change as a "renders at" line. Nothing is
-// written unless the code that reads the int is found at its 01.512 address, so another title or build is left
+// written unless the code that reads the int is found at the matching address, so another title or build is left
 // alone. No game code or file is changed.
 public static unsafe class YoteiRenderResolution
 {
-    private const ulong ReaderAddress = 0x8_00D5_E33C;
-    private const ulong RendererAddress = 0x8_04FD_B4A0;
-    private const ulong GameTableAddress = 0x8_01A7_85E0;
-    private const ulong RenderWidthAddress = RendererAddress + 0x327590;
-    private const ulong RenderHeightAddress = RendererAddress + 0x327594;
-    private const ulong TablePointerAddress = RendererAddress + 0x3277F8;
-    private const ulong CurrentIndexAddress = RendererAddress + 0x327840;
-    private const ulong OverrideAddress = RendererAddress + 0x327848;
+    private readonly record struct Version(string Name, ulong ReaderAddress, ulong RendererAddress, ulong GameTableAddress,
+        ulong RenderWidthOffset, ulong RenderHeightOffset, ulong TablePointerOffset, ulong TableCountOffset,
+        ulong CurrentIndexOffset, ulong OverrideOffset, byte[] Reader);
+
+    private static readonly Version[] Versions =
+    [
+        new("01.512", 0x8_00D5_E33C, 0x8_04FD_B4A0, 0x8_01A7_85E0,
+            0x327590, 0x327594, 0x3277F8, 0x327800, 0x327840, 0x327848,
+            [0x8B, 0x8B, 0x48, 0x78, 0x32, 0x00, 0x48, 0x8D, 0x15, 0xDB, 0x1C, 0xCF, 0x00,
+             0x4C, 0x8B, 0xA5, 0x00, 0xFE, 0xFF, 0xFF, 0x85, 0xC9, 0x0F, 0x49, 0xC1]),
+        new("02.002", 0x8_00DE_01EC, 0x8_0509_3580, 0x8_01AF_8190,
+            0x32EB70, 0x32EB74, 0x32EDC0, 0x32EDC8, 0x32EE08, 0x32EE10,
+            [0x8B, 0x8B, 0x10, 0xEE, 0x32, 0x00, 0x48, 0x8D, 0x15, 0xBB, 0xE0, 0xCE, 0x00,
+             0x8B, 0x73, 0x28, 0x85, 0xC9, 0x0F, 0x49, 0xC1]),
+    ];
     private const int TableEntries = 16;
     private const int MaximumIndex = 15;
     private const int DefaultIndex = 15;
     private const int MaximumReports = 64;
     private const int MaximumSteps = 4;
-
-    // mov ecx,[rbx+327848h]; lea rdx,[app+0x1A50024]; mov r12,[rbp-200h]; test ecx,ecx; cmovns eax,ecx
-    private static ReadOnlySpan<byte> Reader =>
-    [
-        0x8B, 0x8B, 0x48, 0x78, 0x32, 0x00, 0x48, 0x8D, 0x15, 0xDB, 0x1C, 0xCF, 0x00,
-        0x4C, 0x8B, 0xA5, 0x00, 0xFE, 0xFF, 0xFF, 0x85, 0xC9, 0x0F, 0x49, 0xC1,
-    ];
 
     private static readonly string? HeldText = Environment.GetEnvironmentVariable("SHARPEMU_YOTEI_RENDER_INDEX");
     private static readonly int HeldIndex = HeldText is null ? DefaultIndex : ReadIndex("SHARPEMU_YOTEI_RENDER_INDEX");
@@ -57,6 +57,7 @@ public static unsafe class YoteiRenderResolution
     private static readonly long CustomSize = ReadSize(SizeText);
 
     private static int _state;
+    private static Version _version;
     private static int _original;
     private static int _written = int.MinValue;
     private static int _foreignWrites;
@@ -74,24 +75,32 @@ public static unsafe class YoteiRenderResolution
             return;
         }
 
-        var field = (int*)OverrideAddress;
         if (_state == 0)
         {
-            Span<byte> found = stackalloc byte[Reader.Length];
-            if (!host.TryReadGuestOperand(ReaderAddress, found) || !found.SequenceEqual(Reader))
+            foreach (var version in Versions)
+            {
+                Span<byte> found = new byte[version.Reader.Length];
+                if (host.TryReadGuestOperand(version.ReaderAddress, found) && found.SequenceEqual(version.Reader))
+                {
+                    _version = version;
+                    _state = 1;
+                    break;
+                }
+            }
+
+            if (_state == 0)
             {
                 _state = -1;
                 if (HeldText is not null || ToggledIndex >= 0 || SizeText is not null)
                 {
-                    Console.Error.WriteLine("[LOADER][WARN] Yotei render resolution: the 01.512 code was not found; nothing is written.");
+                    Console.Error.WriteLine("[LOADER][WARN] Yotei render resolution: no 01.512 or 02.002 code was found; nothing is written.");
                 }
 
                 return;
             }
 
-            _state = 1;
-            _original = *field;
-            Console.Error.WriteLine($"[LOADER][INFO] Yotei render resolution: the game's override int holds {_original}.");
+            _original = *(int*)(_version.RendererAddress + _version.OverrideOffset);
+            Console.Error.WriteLine($"[LOADER][INFO] Yotei render resolution: {_version.Name} code found; the game's override int holds {_original}.");
             if (CustomSize != 0)
             {
                 UseOwnTable();
@@ -102,9 +111,10 @@ public static unsafe class YoteiRenderResolution
             }
         }
 
-        var index = *(int*)CurrentIndexAddress;
-        var width = *(int*)RenderWidthAddress;
-        var height = *(int*)RenderHeightAddress;
+        var field = (int*)(_version.RendererAddress + _version.OverrideOffset);
+        var index = *(int*)(_version.RendererAddress + _version.CurrentIndexOffset);
+        var width = *(int*)(_version.RendererAddress + _version.RenderWidthOffset);
+        var height = *(int*)(_version.RendererAddress + _version.RenderHeightOffset);
         if ((index != _reportedIndex || width != _reportedWidth || height != _reportedHeight) && _reports < MaximumReports)
         {
             _reports++;
@@ -160,11 +170,11 @@ public static unsafe class YoteiRenderResolution
     // game reads through the pointer for as long as it runs.
     private static void UseOwnTable()
     {
-        var pointer = (ulong*)TablePointerAddress;
-        var game = (long*)GameTableAddress;
-        if (*pointer != GameTableAddress || game[0] != Pack(3840, 2160) || game[MaximumIndex] != Pack(1920, 1080))
+        var pointer = (ulong*)(_version.RendererAddress + _version.TablePointerOffset);
+        var game = (long*)_version.GameTableAddress;
+        if (*pointer != _version.GameTableAddress || game[0] != Pack(3840, 2160) || game[MaximumIndex] != Pack(1920, 1080))
         {
-            Console.Error.WriteLine("[LOADER][WARN] Yotei render resolution: the game's size table is not where 01.512 has it; SHARPEMU_YOTEI_RENDER_SIZE is ignored.");
+            Console.Error.WriteLine($"[LOADER][WARN] Yotei render resolution: the game's size table is not where {_version.Name} has it; SHARPEMU_YOTEI_RENDER_SIZE is ignored.");
             return;
         }
 
