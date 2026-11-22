@@ -32,6 +32,11 @@ public sealed class VulkanPresentEncodeFormatTests
     [InlineData(13u, 5u, Format.R32G32B32A32Sint, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Sint)]
     [InlineData(14u, 5u, Format.R32G32B32A32Sint, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Sint)]
     [InlineData(14u, 7u, Format.R32G32B32A32Sfloat, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
+    // A game can bind an 8-bit sRGB colour target (slot 5, data format 1, number type 6). The pipeline
+    // declares the native sRGB format (the image path may stand a same-width UNORM in).
+    [InlineData(1u, 6u, Format.R8Srgb, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
+    [InlineData(1u, 9u, Format.R8Srgb, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
+    [InlineData(3u, 6u, Format.R8G8Srgb, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
     public void FullWidthTargetsFollowTheirNumberType(
         uint dataFormat,
         uint numberType,

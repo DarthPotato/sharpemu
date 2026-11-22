@@ -562,6 +562,14 @@ internal static unsafe partial class VulkanVideoPresenter
             using var movable = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.ImmutablePacking);
             var shaderData = Scratch.ShaderData.Rent(checked((int)layout.ShaderDataDwordCount));
             DescriptorShaderData.Write(stage, program, layout, shaderData, plan, DescriptorPreparationOptions.Fast);
+
+            // A stage prepared without its heap views reads the null element.
+            for (var view = 0u; view < layout.HeapViewCount; view++)
+            {
+                shaderData[layout.HeapViewsDword + view * HeapView.DwordCount] = HeapView.None.Word0;
+                shaderData[layout.HeapViewsDword + view * HeapView.DwordCount + 1] = HeapView.None.Word1;
+            }
+
             return shaderData;
         }
 
@@ -1097,7 +1105,20 @@ internal static unsafe partial class VulkanVideoPresenter
                     _presenter.ForgetHeapPreparation(preparation);
                 }
 
-                _presenter.PrepareBindlessHeap(preparation, snapshot.Heaps);
+                _presenter.PrepareBindlessHeap(preparation);
+            }
+
+            // Where the stage's heap views have their elements, found before the stage's own images: a run that moved
+            // to another heap gets the images of its records here.
+            Span<uint> heapViews = layout.HeapViewCount <= 32 ? stackalloc uint[(int)(layout.HeapViewCount * HeapView.DwordCount)] : new uint[layout.HeapViewCount * HeapView.DwordCount];
+            if (layout.HeapViewCount != 0)
+            {
+                if (snapshot.Heaps.Length != layout.HeapViewCount)
+                {
+                    throw SubmissionScheduler.Fatal($"The heap views do not match the layout: views={snapshot.Heaps.Length} layout={layout.HeapViewCount} hash=0x{program.Hash:X16}.");
+                }
+
+                _presenter.WriteHeapViews(snapshot.Heaps, heapViews);
             }
 
             if (plan?.CallMarks ?? (layout.Find(DescriptorBindingKind.CallMarks) is not null))
@@ -1183,6 +1204,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ResolveStageSamplers(prepared);
 
             var shaderData = AssembleShaderData(stage, program, layout, plan);
+            heapViews.CopyTo(shaderData.AsSpan((int)layout.HeapViewsDword));
             prepared.ShaderData = shaderData;
             if (plan?.GlobalDataShare ?? (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null))
             {
@@ -1610,7 +1632,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private long _bdaSpanVersion = -1;
         private ulong _bdaSpanMapping;
 
-        private List<GuestSpan> DeviceAddressSpans(GuestGpuMemory memory)
+        internal ulong DeviceAddressSpanMapping => _bdaSpanMapping;
+
+        internal List<GuestSpan> DeviceAddressSpans(GuestGpuMemory memory)
         {
             var version = memory.SpanVersion;
             if (_bdaSpans is { } cached && ReferenceEquals(_bdaSpanMemory, memory) && _bdaSpanVersion == version)
@@ -2172,7 +2196,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 static (state, index) =>
                 {
                     var image = state.Prepared.Descriptors.Images[index];
-                    return !image.IsHostMovie && state.Host.IsStaleImage(image.ImageIdentifier, out _);
+                    return !image.IsHostMovie && (state.Host.IsStaleImage(image.ImageIdentifier, out _) || state.Host.HoldsMovedStencilPlane(image));
                 },
                 static (state, index, asNull) =>
                 {

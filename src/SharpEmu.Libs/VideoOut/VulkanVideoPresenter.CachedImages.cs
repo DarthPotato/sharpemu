@@ -721,6 +721,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // A stencil storage binding whose depth image moved to another stencil plane after the binding was resolved, with
+        // no depth image holding the requested plane now: the binding is found again (the old plane is its own image then).
+        private bool HoldsMovedStencilPlane(TextureResource binding) =>
+            binding.IsStorage && ViewFormatRules.IsStencilViewFormat(binding.Request.View.Format) &&
+            _imageCache.TryGetImage(binding.ImageIdentifier, out var image) && image.Description.HasStencil &&
+            !FitsStencilPlane(binding.Request.Description, image) &&
+            !_imageCache.TryFindStencilOwner(binding.Request.Description.Data, out _);
+
         private static bool FitsStencilPlane(in ImageDescription request, CachedImage attachment) =>
             request.Data.Address == attachment.Description.Stencil.Address && request.Data.Size <= attachment.Description.Stencil.Size;
 
@@ -728,13 +736,13 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var ordered = RenderPhaseProfile.MeasureMovableDetail(RenderPhaseProfile.Phase.OrderedOwnership);
             RenderPhaseProfile.BlockPreparation(RenderPhaseProfile.PreparationBlock.StencilOwnership);
-            // The view can be smaller than the attachment (a dynamic-resolution pass writes only
-            // the region it renders); the storage image then has the view's size.
             if (_worker)
             {
                 throw Serial("stencil storage", resumable: true);
             }
 
+            // The view can be smaller than the attachment (a dynamic-resolution pass writes only
+            // the region it renders); the storage image then has the view's size.
             var description = binding.Request.Description;
             var attachmentIdentifier = binding.ImageIdentifier;
             if (!FitsStencilPlane(description, attachment) &&

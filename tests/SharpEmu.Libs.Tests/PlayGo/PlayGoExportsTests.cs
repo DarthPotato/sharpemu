@@ -27,6 +27,7 @@ public sealed class PlayGoExportsTests : IDisposable
     private const ulong HandleAddress = MemoryBase + 0x200;
     private const ulong ChunkIdsAddress = MemoryBase + 0x300;
     private const ulong LociAddress = MemoryBase + 0x400;
+    private const ulong ProgressAddress = MemoryBase + 0x500;
 
     private readonly string? _originalApp0Root;
     private readonly string? _originalDisableMetadataFallback;
@@ -68,66 +69,6 @@ public sealed class PlayGoExportsTests : IDisposable
 
         Assert.Equal(BadChunkId, GetLocus(handle, [2, 3], 0xCC));
         Assert.Equal(new byte[] { LocusLocalFast, LocusNotDownloaded }, ReadLoci(2));
-    }
-
-    [Fact]
-    public void GetLocus_PgmChunkCount_ReportsAllChunksAndStaysPermissivePastThem()
-    {
-        WritePgm(3);
-        var handle = InitializeAndOpen();
-
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0, 1, 2]));
-        Assert.Equal(new byte[] { LocusLocalFast, LocusLocalFast, LocusLocalFast }, ReadLoci(3));
-
-        // Assumed ids are not authoritative: an id past the count is not rejected.
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [9]));
-    }
-
-    [Fact]
-    public void GetLocus_PgmTakesPrecedenceOverChunkDefinitionsAndPaks()
-    {
-        WritePgm(2);
-        File.WriteAllText(
-            Path.Combine(_app0Root, "playgo-chunkdefs.xml"),
-            "<playgo default_chunk=\"5\"><chunk id=\"5\"/></playgo>");
-        File.WriteAllBytes(Path.Combine(_app0Root, "pakchunk7-PS5.pak"), []);
-        var handle = InitializeAndOpen();
-
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0, 1], 0xCC));
-        Assert.Equal(new byte[] { LocusLocalFast, LocusLocalFast }, ReadLoci(2));
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [7]));
-    }
-
-    [Theory]
-    [InlineData("BAD!", 4u)]
-    [InlineData("DMGP", 0u)]
-    public void GetLocus_InvalidPgm_FallsBackToAuthoritativeDefault(string magic, uint count)
-    {
-        WritePgm(count, magic);
-        var handle = InitializeAndOpen();
-
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0]));
-        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
-    }
-
-    [Fact]
-    public void GetLocus_TruncatedPgm_FallsBackToAuthoritativeDefault()
-    {
-        var cache = Directory.CreateDirectory(Path.Combine(_app0Root, "cache_ps5"));
-        File.WriteAllBytes(Path.Combine(cache.FullName, "playgo.pgm"), "DMGP"u8.ToArray());
-        var handle = InitializeAndOpen();
-
-        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
-    }
-
-    [Fact]
-    public void GetLocus_PakDiscoveryStillAppliesWithoutPgmOrSidecars()
-    {
-        File.WriteAllBytes(Path.Combine(_app0Root, "pakchunk4-PS5.pak"), []);
-        var handle = InitializeAndOpen();
-
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0, 4]));
-        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
     }
 
     [Theory]
@@ -272,6 +213,94 @@ public sealed class PlayGoExportsTests : IDisposable
         Assert.Equal(new byte[] { 0xA5 }, ReadLoci(1));
     }
 
+    [Fact]
+    public void GetLocus_PgmChunkCount_ReportsAllChunksAndStaysPermissivePastThem()
+    {
+        WritePgm(3);
+        var handle = InitializeAndOpen();
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0, 1, 2]));
+        Assert.Equal(new byte[] { LocusLocalFast, LocusLocalFast, LocusLocalFast }, ReadLoci(3));
+
+        // Assumed ids are not authoritative: an id past the count is not rejected.
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [9]));
+    }
+
+    [Fact]
+    public void GetLocus_ChunkDefinitionsTakePrecedenceOverPgm()
+    {
+        WritePgm(2);
+        File.WriteAllText(
+            Path.Combine(_app0Root, "playgo-chunkdefs.xml"),
+            "<playgo default_chunk=\"5\"><chunk id=\"5\"/></playgo>");
+        var handle = InitializeAndOpen();
+
+        // The title's own chunk list stays exact: the pgm count does not add chunk 1.
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [5]));
+        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
+        Assert.Equal((0ul, 0ul), GetProgress(handle, [5]));
+    }
+
+    [Fact]
+    public void GetLocus_PakChunksTakePrecedenceOverPgm()
+    {
+        WritePgm(2);
+        File.WriteAllBytes(Path.Combine(_app0Root, "pakchunk7-PS5.pak"), []);
+        var handle = InitializeAndOpen();
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0, 7]));
+        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
+    }
+
+    [Fact]
+    public void GetProgress_PgmChunks_ReportsAFullyInstalledTitle()
+    {
+        WritePgm(3);
+        var handle = InitializeAndOpen();
+
+        Assert.Equal((1ul, 1ul), GetProgress(handle, [0, 1, 2]));
+    }
+
+    [Fact]
+    public void GetProgress_WithoutPgm_ReportsZeroOfZero()
+    {
+        var handle = InitializeAndOpen();
+
+        Assert.Equal((0ul, 0ul), GetProgress(handle, [0]));
+    }
+
+    [Theory]
+    [InlineData("BAD!", 4u)]
+    [InlineData("DMGP", 0u)]
+    public void GetLocus_InvalidPgm_FallsBackToAuthoritativeDefault(string magic, uint count)
+    {
+        WritePgm(count, magic);
+        var handle = InitializeAndOpen();
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0]));
+        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
+    }
+
+    [Fact]
+    public void GetLocus_TruncatedPgm_FallsBackToAuthoritativeDefault()
+    {
+        var cache = Directory.CreateDirectory(Path.Combine(_app0Root, "cache_ps5"));
+        File.WriteAllBytes(Path.Combine(cache.FullName, "playgo.pgm"), "DMGP"u8.ToArray());
+        var handle = InitializeAndOpen();
+
+        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
+    }
+
+    [Fact]
+    public void GetLocus_PakDiscoveryStillAppliesWithoutPgmOrSidecars()
+    {
+        File.WriteAllBytes(Path.Combine(_app0Root, "pakchunk4-PS5.pak"), []);
+        var handle = InitializeAndOpen();
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [0, 4]));
+        Assert.Equal(BadChunkId, GetLocus(handle, [1]));
+    }
+
     public void Dispose()
     {
         PlayGoExports.ResetForTests();
@@ -328,6 +357,16 @@ public sealed class PlayGoExportsTests : IDisposable
 
         SetGetLocusArguments(handle, ChunkIdsAddress, (uint)chunkIds.Length, LociAddress);
         return PlayGoExports.PlayGoGetLocus(_ctx);
+    }
+
+    private (ulong Installed, ulong Total) GetProgress(uint handle, ushort[] chunkIds)
+    {
+        WriteChunkIds(chunkIds);
+        SetGetLocusArguments(handle, ChunkIdsAddress, (uint)chunkIds.Length, ProgressAddress);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, PlayGoExports.PlayGoGetProgress(_ctx));
+        var progress = new byte[sizeof(ulong) * 2];
+        Assert.True(_memory.TryRead(ProgressAddress, progress));
+        return (BinaryPrimitives.ReadUInt64LittleEndian(progress), BinaryPrimitives.ReadUInt64LittleEndian(progress.AsSpan(sizeof(ulong))));
     }
 
     private void WriteChunkIds(ushort[] chunkIds)

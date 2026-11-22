@@ -894,8 +894,8 @@ public static partial class AgcExports
 
         var payloadDwords = Math.Max(((uint)marker.Length + 4) / 4, 1);
         var packetDwords = payloadDwords + 1;
-        // A marker from a foreign DCB writer is skipped (null packet pointer) so it cannot
-        // reserve or overwrite the owner's unpublished inline packet.
+        // A marker from a thread other than the buffer's writer is skipped (null pointer): it must not reserve space inside
+        // that writer's unpublished inline packet.
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress, isMarker: true) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(packetDwords, ItNop, RPushMarker)))
         {

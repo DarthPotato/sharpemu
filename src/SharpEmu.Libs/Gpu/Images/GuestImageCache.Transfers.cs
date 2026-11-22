@@ -52,6 +52,31 @@ public sealed unsafe partial class GuestImageCache
         return size;
     }
 
+    // The leading bytes of the image's guest range its levels read. A streamed texture's image holds
+    // only the levels from FirstLevel, and a tiled chain lays those at the start of the range with
+    // level 0 last, so the mapped prefix is all the upload needs: it neither reads nor invents the
+    // rest. Every other image reads its whole range.
+    private static ulong GuestReadSize(in ImageDescription info, ColorTransferPlan plan)
+    {
+        if (info.FirstLevel == 0 || !plan.Valid || !plan.Tiled || plan.Tiles.Count == 0)
+        {
+            return info.Data.Size;
+        }
+
+        ulong end = 0;
+        foreach (var tile in plan.Tiles)
+        {
+            end = Math.Max(end, tile.TiledOffset + tile.TiledSize);
+        }
+
+        return Math.Min(end, info.Data.Size);
+    }
+
+    private static ulong GuestReadSize(CachedImage image, in ImageRequest request) =>
+        image.Description.FirstLevel == 0 || request.Role == ImageRole.DepthTarget || image.DepthOwner.IsValid
+            ? image.Description.Data.Size
+            : GuestReadSize(image.Description, PlanColorTransfer(image, request.Role, TransferDirection.Upload));
+
     private static ColorTransferPlan PlanColorTransfer(CachedImage image, ImageRole role, TransferDirection direction)
     {
         ref readonly var info = ref image.Description;
@@ -159,37 +184,6 @@ public sealed unsafe partial class GuestImageCache
         return plan;
     }
 
-    // Only the resident levels have host levels: guest level L lands on host level L - firstLevel.
-    // Each tile transfer belongs to the copy region at its index, so both lists drop the same entries;
-    // the remaining ones keep their linear offsets.
-    private static void KeepResidentLevels(ColorTransferPlan plan, uint firstLevel)
-    {
-        var kept = 0;
-        for (var index = 0; index < plan.Regions.Count; index++)
-        {
-            var region = plan.Regions[index];
-            if (region.ImageSubresource.MipLevel < firstLevel)
-            {
-                continue;
-            }
-
-            region.ImageSubresource.MipLevel -= firstLevel;
-            plan.Regions[kept] = region;
-            if (plan.Tiled)
-            {
-                plan.Tiles[kept] = plan.Tiles[index];
-            }
-
-            kept++;
-        }
-
-        plan.Regions.RemoveRange(kept, plan.Regions.Count - kept);
-        if (plan.Tiled)
-        {
-            plan.Tiles.RemoveRange(kept, plan.Tiles.Count - kept);
-        }
-    }
-
     // The regions run level by level, so the levels to drop are the last ones. A tile starts at the linear
     // offset of its first region (a volume tile spans several slices of one level).
     private static void DropLevelsWithoutHostLevel(ColorTransferPlan plan, uint hostLevels)
@@ -203,6 +197,39 @@ public sealed unsafe partial class GuestImageCache
         if (kept == plan.Regions.Count)
         {
             return;
+        }
+
+        plan.Regions.RemoveRange(kept, plan.Regions.Count - kept);
+        if (!plan.Tiled)
+        {
+            return;
+        }
+
+        var offsets = new HashSet<ulong>(plan.Regions.Count);
+        foreach (var region in plan.Regions)
+        {
+            offsets.Add(region.BufferOffset);
+        }
+
+        plan.Tiles.RemoveAll(tile => !offsets.Contains(tile.LinearOffset));
+    }
+
+    // Only the resident levels have host levels: guest level L lands on host level L - firstLevel.
+    // The levels before it drop from the front; their tile transfers go by linear offset, as in
+    // DropLevelsWithoutHostLevel, and the remaining ones keep their linear offsets.
+    private static void KeepResidentLevels(ColorTransferPlan plan, uint firstLevel)
+    {
+        var kept = 0;
+        for (var index = 0; index < plan.Regions.Count; index++)
+        {
+            var region = plan.Regions[index];
+            if (region.ImageSubresource.MipLevel < firstLevel)
+            {
+                continue;
+            }
+
+            region.ImageSubresource.MipLevel -= firstLevel;
+            plan.Regions[kept++] = region;
         }
 
         plan.Regions.RemoveRange(kept, plan.Regions.Count - kept);
@@ -590,10 +617,11 @@ public sealed unsafe partial class GuestImageCache
                 if (plan.Tiled) plan.Tiles.RemoveRange(0, checked((int)firstLayer));
             }
 
-            var linear = new TilerBufferSpan(source.Handle, sourceOffset, info.Data.Size);
+            var readSize = GuestReadSize(info, plan);
+            var linear = new TilerBufferSpan(source.Handle, sourceOffset, readSize);
             if (plan.Tiled)
             {
-                linear = _tiler.Detile(source.Handle, sourceOffset, info.Data.Size, plan.LinearSize, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(plan.Tiles));
+                linear = _tiler.Detile(source.Handle, sourceOffset, readSize, plan.LinearSize, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(plan.Tiles));
             }
 
             if (plan.SwapBgra16)
@@ -738,7 +766,9 @@ public sealed unsafe partial class GuestImageCache
                     : null;
                 var pieceHashes = piecePlan != null ? HashGuestPieces(image.Description.Data, piecePlan.Tiles) : null;
                 var backingBytes = SnapshotVolumeBacking(image);
-                var (source, sourceOffset) = _bufferCache.ObtainBufferForImage(image.Description.Data.Address, image.Description.Data.Size);
+                var readSize = GuestReadSize(image, request);
+                image.GuestReadSize = readSize;
+                var (source, sourceOffset) = _bufferCache.ObtainBufferForImage(image.Description.Data.Address, readSize);
                 sourceFinished = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 UploadFromBuffer(image, request, source, sourceOffset, backingBytes, firstLayer);
                 image.SetGuestPieceHashes(pieceHashes);

@@ -409,6 +409,9 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint StorageImageSwizzleCount { get; init; }
     // The program reads bindless heap records through descriptor set 1 (see BindlessHeap).
     public bool UsesBindlessHeap { get; init; }
+
+    // Where the elements of each heap view of the program are for the draw (HeapView), two dwords each.
+    public uint HeapViewCount { get; init; }
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
 
@@ -443,7 +446,9 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     public uint StorageImageSwizzlesDword => BufferStridesDword + (BufferStrideCount + 1) / 2;
 
-    public uint ShaderDataDwordCount => StorageImageSwizzlesDword + (StorageImageSwizzleCount + 1) / 2;
+    public uint HeapViewsDword => StorageImageSwizzlesDword + (StorageImageSwizzleCount + 1) / 2;
+
+    public uint ShaderDataDwordCount => HeapViewsDword + HeapViewCount * HeapView.DwordCount;
 
     public bool UsesPushData => PushDataStartDword != PushData.NoStart;
 
@@ -714,7 +719,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         var shaderDataDwords = memoryOffsetDword + (usesTableBlock ? 2u : (memoryOffsetCount + 3) / 4) + (usesBufferLengths ? memoryOffsetCount : 0) +
             (usesDispatchThreadLimits ? 3u : 0u) + mipStatisticsCount + (usesObjectId ? 1u : 0u) + (usesMeshDrawParameters ? 6u : 0u) +
             (usesTessellationData ? Gen5TessellationData.DwordCount : 0u) + callArgumentCount * 2 + callTargetCount * 2 +
-            (bufferStrideCount + 1) / 2 + (storageImageSwizzleCount + 1) / 2;
+            (bufferStrideCount + 1) / 2 + (storageImageSwizzleCount + 1) / 2 + info.HeapViewCount * HeapView.DwordCount;
         var pushStart = usesTessellationData ? PushData.NoStart
             : pushDataAtTop ? PushData.TopFor(pushDataStartDword, shaderDataDwords)
             : PushData.StartFor(pushDataStartDword, shaderDataDwords);
@@ -835,6 +840,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             BufferStrideCount = bufferStrideCount,
             StorageImageSwizzleCount = storageImageSwizzleCount,
             UsesBindlessHeap = info.UsesBindlessHeap,
+            HeapViewCount = info.HeapViewCount,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -862,6 +868,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         BufferStrideCount == other.BufferStrideCount &&
         StorageImageSwizzleCount == other.StorageImageSwizzleCount &&
         UsesBindlessHeap == other.UsesBindlessHeap &&
+        HeapViewCount == other.HeapViewCount &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));

@@ -117,7 +117,10 @@ public sealed partial class GpuCommandInterpreter
 
     public ulong DispatchIndirectArgumentsBase { get; private set; }
 
-    // The count is command-processor state, not a live pointer into reusable arguments.
+    // Persistent draw state (NUM_INSTANCES). Indirect draws update it for later draws as
+    // IndirectInstanceInherit says. The count is command-processor state, not a live pointer
+    // into reusable arguments: with All, a record resolved on the GPU passes its count on
+    // through the GPU instance register (GpuInstanceState), or is read when the packet executes.
     public uint InstanceCount { get; private set; } = 1;
     private ulong _instanceSourcePacket, _instanceSourceAddress, _instanceSourceSubmit;
     private uint _instanceSourceOpcode;

@@ -342,6 +342,115 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         harness.Shutdown();
     }
 
+    [Fact]
+    public void StencilStorage_OfAnotherDepthSurface_ResolvesToTheOwnerOfThatPlane()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        if (!_vulkan.StorageImageExtendedFormats || !_vulkan.SupportsDynamicRendering)
+        {
+            Assert.False(ReferenceShaders.Required, "Stencil storage tests need extended storage formats and dynamic rendering.");
+            return;
+        }
+        using var fatal = new FatalScope();
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var region = harness.MapBacked(0x200000, ReadWrite);
+        var depthAddressB = region + 0x100000;
+        var stencilAddressB = region + 0x180000;
+        CachedImage imageA = null!, imageB = null!;
+        CachedImage? storage = null;
+        presenter.Run(() =>
+        {
+            object Depth(ulong depthAddress, ulong stencilAddress)
+            {
+                var target = new GuestDepthTarget(depthAddress, depthAddress, 64, 64, 3, 0, 1f, false,
+                    Registers: RegisterWords.Depth(depthAddress, 64, 64, stencilBase: stencilAddress));
+                var depth = presenter.InvokeMethod("DiscoverDepthTarget", target)!;
+                presenter.InvokeMethod("AcquireDepthAttachment", depth, GuestDepthState.Default);
+                return depth;
+            }
+
+            // The surface that owns the plane is bound first; the other one is the current target.
+            var depthB = Depth(depthAddressB, stencilAddressB);
+            imageB = (CachedImage)GetFieldValue(depthB, "Image");
+            var depthA = Depth(region, region + 0x80000);
+            imageA = (CachedImage)GetFieldValue(depthA, "Image");
+            presenter.RenderHost.ResetBindings();
+
+            var shape = new ShaderImageShape(false, true, true, false, TextureNumericClass.Uint);
+            var texture = new GuestDrawTexture(stencilAddressB, 64, 64, 0, 0, [], false, true,
+                Descriptor: RegisterWords.Texture(stencilAddressB, GuestPixelFormat.Bits8UInt, 64, 64,
+                    type: GuestImageType.Color2DArray, tile: GuestTileMode.Depth, layers: 1, baseArray: 0), Shape: shape);
+            var binding = presenter.InvokeMethod("ResolveTexture", texture)!;
+            // The lookup handed back the bound surface, not the one owning the plane.
+            binding.GetType().GetField("ImageIdentifier")!.SetValue(binding, GetFieldValue(depthA, "ImageIdentifier"));
+            using (presenter.RenderHost.BeginPreparation())
+            {
+                storage = (CachedImage)presenter.InvokeMethod("AcquireStencilStorage", binding, imageA, true)!;
+            }
+
+            presenter.RenderHost.ResetBindings();
+        });
+
+        Assert.NotNull(storage);
+        Assert.Equal(Format.R8Uint, storage!.Backing.Format);
+        Assert.NotSame(imageA, imageB);
+        Assert.Empty(fatal.Messages);
+        harness.Finish();
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void StencilStorage_OfAViewSmallerThanItsAttachment_HasTheViewSize()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        if (!_vulkan.StorageImageExtendedFormats || !_vulkan.SupportsDynamicRendering)
+        {
+            Assert.False(ReferenceShaders.Required, "Stencil storage tests need extended storage formats and dynamic rendering.");
+            return;
+        }
+        using var fatal = new FatalScope();
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var region = harness.MapBacked(0x100000, ReadWrite);
+        var stencilAddress = region + 0x80000;
+        CachedImage image = null!;
+        CachedImage? storage = null;
+        presenter.Run(() =>
+        {
+            var target = new GuestDepthTarget(region, region, 64, 64, 3, 0, 1f, false,
+                Registers: RegisterWords.Depth(region, 64, 64, stencilBase: stencilAddress));
+            var depth = presenter.InvokeMethod("DiscoverDepthTarget", target)!;
+            presenter.InvokeMethod("AcquireDepthAttachment", depth, GuestDepthState.Default);
+            image = (CachedImage)GetFieldValue(depth, "Image");
+            presenter.RenderHost.ResetBindings();
+
+            // A dynamic-resolution pass binds only the top-left 32x32 of the 64x64 stencil plane.
+            var shape = new ShaderImageShape(false, true, true, false, TextureNumericClass.Uint);
+            var texture = new GuestDrawTexture(stencilAddress, 32, 32, 0, 0, [], false, true,
+                Descriptor: RegisterWords.Texture(stencilAddress, GuestPixelFormat.Bits8UInt, 32, 32,
+                    type: GuestImageType.Color2DArray, tile: GuestTileMode.Depth, layers: 1, baseArray: 0), Shape: shape);
+            var binding = presenter.InvokeMethod("ResolveTexture", texture)!;
+            binding.GetType().GetField("ImageIdentifier")!.SetValue(binding, GetFieldValue(depth, "ImageIdentifier"));
+            using (presenter.RenderHost.BeginPreparation())
+            {
+                storage = (CachedImage)presenter.InvokeMethod("AcquireStencilStorage", binding, image, true)!;
+                Assert.Equal(32u, storage.Backing.Extent.Width);
+                Assert.Equal(32u, storage.Backing.Extent.Height);
+            }
+
+            presenter.RenderHost.ResetBindings();
+        });
+
+        Assert.NotNull(storage);
+        Assert.Equal(Format.R8Uint, storage!.Backing.Format);
+        Assert.Empty(fatal.Messages);
+        harness.Finish();
+        harness.Shutdown();
+    }
+
     [Theory]
     [InlineData(true, 1u, false, 64u)]
     [InlineData(true, 2u, true, 64u)]
@@ -465,65 +574,6 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
             Assert.Equal(0.25f, BitConverter.ToSingle(depthBytes, offset));
         Assert.True(attachment.IsGpuModified);
         Assert.True(harness.ProxyAt(stencilAddress, attachment.Description.Stencil.Size).IsValid);
-        harness.Shutdown();
-    }
-
-    [Fact]
-    public void StencilStorage_OfAnotherDepthSurface_ResolvesToTheOwnerOfThatPlane()
-    {
-        if (!GatePrerequisites.Ready(_vulkan)) return;
-        if (!_vulkan.StorageImageExtendedFormats || !_vulkan.SupportsDynamicRendering)
-        {
-            Assert.False(ReferenceShaders.Required, "Stencil storage tests need extended storage formats and dynamic rendering.");
-            return;
-        }
-        using var fatal = new FatalScope();
-        using var presenter = new PresenterUnderTest(_vulkan);
-        presenter.LoadRenderingCommands();
-        var harness = presenter.Harness;
-        var region = harness.MapBacked(0x200000, ReadWrite);
-        var depthAddressB = region + 0x100000;
-        var stencilAddressB = region + 0x180000;
-        CachedImage imageA = null!, imageB = null!;
-        CachedImage? storage = null;
-        presenter.Run(() =>
-        {
-            object Depth(ulong depthAddress, ulong stencilAddress)
-            {
-                var target = new GuestDepthTarget(depthAddress, depthAddress, 64, 64, 3, 0, 1f, false,
-                    Registers: RegisterWords.Depth(depthAddress, 64, 64, stencilBase: stencilAddress));
-                var depth = presenter.InvokeMethod("DiscoverDepthTarget", target)!;
-                presenter.InvokeMethod("AcquireDepthAttachment", depth, GuestDepthState.Default);
-                return depth;
-            }
-
-            // The surface that owns the plane is bound first; the other one is the current target.
-            var depthB = Depth(depthAddressB, stencilAddressB);
-            imageB = (CachedImage)GetFieldValue(depthB, "Image");
-            var depthA = Depth(region, region + 0x80000);
-            imageA = (CachedImage)GetFieldValue(depthA, "Image");
-            presenter.RenderHost.ResetBindings();
-
-            var shape = new ShaderImageShape(false, true, true, false, TextureNumericClass.Uint);
-            var texture = new GuestDrawTexture(stencilAddressB, 64, 64, 0, 0, [], false, true,
-                Descriptor: RegisterWords.Texture(stencilAddressB, GuestPixelFormat.Bits8UInt, 64, 64,
-                    type: GuestImageType.Color2DArray, tile: GuestTileMode.Depth, layers: 1, baseArray: 0), Shape: shape);
-            var binding = presenter.InvokeMethod("ResolveTexture", texture)!;
-            // The lookup handed back the bound surface, not the one owning the plane.
-            binding.GetType().GetField("ImageIdentifier")!.SetValue(binding, GetFieldValue(depthA, "ImageIdentifier"));
-            using (presenter.RenderHost.BeginPreparation())
-            {
-                storage = (CachedImage)presenter.InvokeMethod("AcquireStencilStorage", binding, imageA, true)!;
-            }
-
-            presenter.RenderHost.ResetBindings();
-        });
-
-        Assert.NotNull(storage);
-        Assert.Equal(Format.R8Uint, storage!.Backing.Format);
-        Assert.NotSame(imageA, imageB);
-        Assert.Empty(fatal.Messages);
-        harness.Finish();
         harness.Shutdown();
     }
 

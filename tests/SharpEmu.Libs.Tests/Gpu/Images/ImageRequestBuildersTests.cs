@@ -423,6 +423,7 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
             Assert.Equal(3 * array.SliceStride + array.MipLayout[level].Offset + array.MipLayout[level].Size, array.LevelEnd(level));
         }
     }
+
     [Fact]
     public void Texture_MipWindowFollowsTheDescriptor()
     {

@@ -200,6 +200,10 @@ public sealed class ShaderResourceInfo
 
     public bool UsesBindlessHeap { get; set; }
 
+    // The heap views of those accesses (ShaderResourcePlan.HeapRecordSources); the layout carries where each one's
+    // elements are as shader data (BindingLayout.HeapViewsDword).
+    public uint HeapViewCount { get; set; }
+
     // Some image access reads its image or sampler through a linked callee's record argument (see CallRecordSelector).
     public bool UsesCallRecords { get; set; }
 
@@ -236,6 +240,7 @@ public sealed class ShaderResourceInfo
         UsesDeviceAddresses = UsesDeviceAddresses,
         UsesRuntimeDescriptors = UsesRuntimeDescriptors,
         UsesBindlessHeap = UsesBindlessHeap,
+        HeapViewCount = HeapViewCount,
         UsesCallRecords = UsesCallRecords,
         UsesCallMarks = UsesCallMarks,
         UsesDeviceAddressFallback = UsesDeviceAddressFallback,

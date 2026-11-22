@@ -315,7 +315,8 @@ internal sealed class StreamRunner
     public StreamRunner(int queueId = 0, RecordingCommandStreamHost? host = null, bool indirectInstanceInherit = false)
     {
         Host = host ?? new RecordingCommandStreamHost();
-        Interpreter = new GpuCommandInterpreter(Host, queueId, queueId == 0 ? 0 : GpuCommandInterpreter.ComputeQueueBase + queueId - 1) { IndirectInstanceInherit = indirectInstanceInherit };
+        Interpreter = new GpuCommandInterpreter(Host, queueId, queueId == 0 ? 0 : GpuCommandInterpreter.ComputeQueueBase + queueId - 1);
+        if (indirectInstanceInherit) Interpreter.IndirectInstanceInherit = GpuCommandInterpreter.IndirectInstanceInheritance.All;
     }
 
     public RecordingCommandStreamHost Host { get; }

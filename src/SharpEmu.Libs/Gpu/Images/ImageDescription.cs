@@ -110,6 +110,31 @@ public struct ImageDescription
         ? Extent
         : new Extent3D(Math.Max(Extent.Width >> (int)FirstLevel, 1u), Math.Max(Extent.Height >> (int)FirstLevel, 1u), Extent.Depth);
 
+    // The bytes of the guest range the image's levels occupy: the whole range, or for an image of
+    // resident levels only the span of those levels (the levels before FirstLevel are not part of
+    // the image and take no memory in the working-set accounting).
+    public readonly ulong HeldGuestSize
+    {
+        get
+        {
+            if (FirstLevel == 0)
+            {
+                return Data.Size;
+            }
+
+            var begin = ulong.MaxValue;
+            ulong end = 0;
+            for (var level = FirstLevel; level < FirstLevel + Resources.Levels && level < MaxLevels; level++)
+            {
+                var layout = MipLayout[(int)level];
+                begin = Math.Min(begin, layout.Offset);
+                end = Math.Max(end, layout.Offset + layout.Size);
+            }
+
+            return end > begin && end <= Data.Size ? end - begin : Data.Size;
+        }
+    }
+
     public static ImageDescription Create() => new()
     {
         HtileClearMask = uint.MaxValue,

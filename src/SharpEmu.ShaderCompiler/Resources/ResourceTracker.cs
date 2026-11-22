@@ -42,6 +42,7 @@ public sealed partial class ResourceTracker
     private readonly bool _bindlessNullDescriptors;
     private readonly SortedSet<uint> _nullBindlessPcs = new();
     private readonly bool _bindlessHeap;
+    private readonly bool _preferHeapRecords;
     private readonly bool _callRecordsEnabled;
     private readonly List<HeapRecordPlan> _heapRecords = [];
     private readonly List<HeapRecordPlan> _callRecords = [];
@@ -80,12 +81,14 @@ public sealed partial class ResourceTracker
         IReadOnlyList<HeapRecordAccess> HeapRecords,
         IReadOnlyList<CallRecordAccess> CallRecords);
 
-    private ResourceTracker(ShaderResourcePlan plan, bool bindlessNullDescriptors, bool bindlessHeap, bool callRecords, RuntimeDescriptorMode runtimeDescriptors)
+    private ResourceTracker(ShaderResourcePlan plan, bool bindlessNullDescriptors, bool bindlessHeap, bool callRecords, RuntimeDescriptorMode runtimeDescriptors,
+        bool preferHeapRecords)
     {
         _plan = plan;
         _runtimeDescriptors = runtimeDescriptors;
         _bindlessNullDescriptors = bindlessNullDescriptors;
         _bindlessHeap = bindlessHeap;
+        _preferHeapRecords = preferHeapRecords && bindlessHeap;
         _callRecordsEnabled = callRecords;
         _graph = plan.Graph;
         var roots = new List<ScalarValue>();
@@ -133,12 +136,20 @@ public sealed partial class ResourceTracker
     // record that the shader reads through descriptor set 1 (see BindlessHeap).
     // With callRecords, the images and samplers a callee linked with run-time arguments reads through its record are call
     // records (see CallRecordSelector), which descriptor set 1 holds.
+    // With preferHeapRecords (and the heap), a sampled image the heap can serve is planned as a heap record before the
+    // indirect-image planner may claim it as a table: a table binds every image it can select, so one that selects more than
+    // a draw may bind could not be materialized, while a heap record reads its descriptor at run time.
     public static Result Track(ShaderResourcePlan plan, bool callRecords = false, RuntimeDescriptorMode runtimeDescriptors = RuntimeDescriptorMode.Disabled,
-        bool bindlessNullDescriptors = false, bool bindlessHeap = false) =>
-        new ResourceTracker(plan, bindlessNullDescriptors, bindlessHeap, callRecords, runtimeDescriptors).Run();
+        bool bindlessNullDescriptors = false, bool bindlessHeap = false, bool preferHeapRecords = false) =>
+        new ResourceTracker(plan, bindlessNullDescriptors, bindlessHeap, callRecords, runtimeDescriptors, preferHeapRecords).Run();
 
     private Result Run()
     {
+        if (_preferHeapRecords)
+        {
+            PlanHeapRecords();
+        }
+
         PlanIndirectImages();
         PlanHeapRecords();
         PlanCallRecords();
@@ -756,7 +767,7 @@ public sealed partial class ResourceTracker
         // single source of truth instead of a narrower, ImageHandle-specific blanket ban.
         var badDword = 0u;
         var controlDependent = false;
-        if (nonContiguousImage || !ValidateSource(source, out badDword, out controlDependent))
+        if (!ValidateSource(source, out badDword, out controlDependent))
         {
             // A bindless image/sampler descriptor whose dwords resolve through a
             // control-dependent phi (e.g. a hash-table/linear-probe material lookup, as seen
@@ -832,7 +843,9 @@ public sealed partial class ResourceTracker
         return $"{value.Kind}#{value.Id}";
     }
 
-    // An image descriptor read from a scalar buffer must be made of contiguous four-dword runs.
+    // Whether an image descriptor read from a scalar buffer is made of contiguous four-dword runs. Any layout is valid when
+    // each word is a runtime value (the host evaluates the words one by one); a non-contiguous one with an SAndB32 hole reads
+    // as null.
     private bool IsContiguousScalarBufferRecord(DescriptorSource source)
     {
         if (!source.Dwords.Any(dword => dword.Kind == ScalarValueKind.ScalarBufferWord))
@@ -1762,6 +1775,7 @@ public sealed partial class ResourceTracker
             Heap = new HeapRecordSelector(heapSource, memoryIndices[0], first.Offset, (uint)width * sizeof(uint))
             {
                 Cube = !sampler && instruction?.Control is Gen5ImageControl { Dimension: 3 },
+                R128 = !sampler && instruction is { Control: Gen5ImageControl, Words.Count: > 0 } && ((instruction.Words[0] >> 15) & 1) != 0,
             },
         });
         _heapRecords.Add(new HeapRecordPlan
@@ -1816,7 +1830,8 @@ public sealed partial class ResourceTracker
         {
             var memory = _plan.Memory[index];
             if (memory.Kind != MemoryResourceKind.Image || _plan.Accesses[index]?.Handle is not { } handle ||
-                _indirectImages.Any(plan => ReferenceEquals(plan.Handle, handle)))
+                _indirectImages.Any(plan => ReferenceEquals(plan.Handle, handle)) ||
+                _preferHeapRecords && HeapRecordFor(handle, sampler: false) is not null)
             {
                 continue;
             }

@@ -733,6 +733,7 @@ public static partial class Gen5ShaderTranslator
             0x09 => "SWqmB32",
             0x0A => "SWqmB64",
             0x0B => "SBrevB32",
+            0x0C => "SBrevB64",
             0x0F => "SBcnt1I32B32",
             0x10 => "SBcnt1I32B64",
             0x13 => "SFF1I32B32",
@@ -1839,7 +1840,10 @@ public static partial class Gen5ShaderTranslator
         out string error)
     {
         var segment = (word >> 14) & 0x3;
-        var opcode = ((word >> 18) & 0x7F) | ((word & 1) << 7);
+        // GFX10 FLAT has a 7-bit opcode in bits 18..24. Bit 0 belongs to the
+        // offset; unlike MIMG it is not an opcode bit, so an odd offset must not
+        // change the opcode.
+        var opcode = (word >> 18) & 0x7F;
         sizeDwords = 2;
         error = string.Empty;
         var prefix = segment switch
@@ -2943,7 +2947,8 @@ public static partial class Gen5ShaderTranslator
                     sourceVectorRegister,
                     destinationVectorRegister,
                     usesFlatAddress ? uint.MaxValue : scalarAddress,
-                    SignExtend(word & 0x1FFF, 13),
+                    // GFX10 FLAT offsets are 12-bit signed; bit 12 is DLC.
+                    SignExtend(word & 0xFFF, 12),
                     globallyCoherent,
                     ((word >> 17) & 1) != 0,
                     usesFlatAddress);
@@ -2968,7 +2973,8 @@ public static partial class Gen5ShaderTranslator
                     "BufferStoreFormatXyzw" => 4u,
                     // The D16 forms hold two components in each register.
                     "BufferLoadFormatD16X" or "BufferLoadFormatD16Xy" or
-                    "BufferStoreFormatD16X" or "BufferStoreFormatD16Xy" => 1u,
+                    "BufferStoreFormatD16X" or "BufferStoreFormatD16Xy" or
+                    "BufferLoadFormatD16HiX" or "BufferStoreFormatD16HiX" => 1u,
                     "BufferLoadFormatD16Xyz" or "BufferLoadFormatD16Xyzw" or
                     "BufferStoreFormatD16Xyz" or "BufferStoreFormatD16Xyzw" => 2u,
                     "BufferLoadUbyte" or
