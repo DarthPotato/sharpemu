@@ -6,23 +6,27 @@ SPDX-License-Identifier: GPL-2.0-or-later
 # Ghost of Yōtei on SharpEmu (personal fork)
 
 > [!NOTE]
-> This is a personal fork of [SharpEmu](https://github.com/sharpemu/sharpemu) that works on one game: **Ghost of Yōtei** (PPSA26344, version 01.512.000). It is not an official SharpEmu build. Please don't report problems with it to the SharpEmu project. The work here is done with AI assistance (Claude Code and Codex).
+> This is a personal fork of [SharpEmu](https://github.com/sharpemu/sharpemu) that works on one game: **Ghost of Yōtei** (PPSA26344, versions 02.002.000 and 01.512.000). It is not an official SharpEmu build. Please don't report problems with it to the SharpEmu project. The work here is done with AI assistance (Claude Code and Codex).
 
-It builds on SharpEmu `main` and on foufouadi's `yotei-good` branch, which first got the game into menus and gameplay. The working branch is `yotei-merge`.
+It builds on SharpEmu `main` (merged up to 2026-11-20) and on foufouadi's `yotei-good` branch, which first got the game into menus and gameplay. The working branch is `yotei3`.
 
-## State (2026-11-12)
+## State (2026-11-22)
+
+![Ghost of Yōtei 02.002 in the open world on this fork, with SharpEmu's performance overlay: 11.7 fps, 90 ms a frame](yotei/screenshots/02002-open-world-overlay.png)
+
+*02.002.000 in the open world with SharpEmu's performance overlay (`--overlay=on --overlay-mode=full`), Ryzen 5 3600 + RTX 3080, default switches.*
 
 | | |
 |---|---|
-| Game version | 01.512.000 only (the two game-specific switches below check for it and do nothing on other versions) |
+| Game version | 02.002.000 and 01.512.000 (the game-specific switches below check for either and do nothing on other versions) |
 | Test machine | Ryzen 5 3600, RTX 3080 10 GB, 24 GB RAM, Windows 11 |
 | Gets to | menus and gameplay; saves load |
-| Frame rate | about **10.7 fps** standing in the open world, warm shader cache |
+| Frame rate | about **11.7 fps** on 02.002.000 and **12.3 fps** on 01.512.000, standing in the open world, warm shader cache |
 | Memory | about 15–16 GB of RAM and 9 GB of video memory while the game runs |
 
-Frame rate standing in the open world on this machine over time: about 4 fps (2026-10-25), 6.7 fps (11-08), 10 fps (11-11), 10.7 fps (11-12).
+Frame rate standing in the open world on this machine over time: about 4 fps (2026-10-25), 6.7 fps (11-08), 10 fps (11-11), 10.7 fps (11-12), 12.3 fps on 01.512 after merging SharpEmu main (11-22). On 02.002 the game runs at 5.9 fps at full detail and 11.7 fps with the default switches.
 
-The CPU is the limit. With every draw and compute dispatch dropped, the game's own code still needs about 30 ms a frame on this CPU, so roughly 34 fps is the ceiling here. The emulator's cost per draw and dispatch is what stands between 10.7 fps and that.
+The CPU is the limit. With every draw and compute dispatch dropped, the game's own code still needs about 30 ms a frame on this CPU, so roughly 34 fps is the ceiling here. The emulator's cost per draw and dispatch is what stands between about 12 fps and that.
 
 ## What is different from SharpEmu
 
@@ -30,26 +34,26 @@ On by default, each with a switch (environment variable) that turns it off:
 
 | Switch | Default | What it does |
 |---|---|---|
-| `SHARPEMU_YOTEI_LADDER=<0..21>` | 15 | The game has its own quality ladder (level of detail, number of sun shadow views, small shadow caster culling). Row 15 makes the game send about 45% fewer draws and dispatches per frame (+39% fps measured). `0` is full quality. Rows 16–21 stop drawing the player's body. |
+| `SHARPEMU_YOTEI_LADDER=<0..21>` | 15 | The game has its own quality ladder (level of detail, number of sun shadow views, small shadow caster culling). Row 15 makes the game send about 45% fewer draws and dispatches per frame (+39% fps measured on 01.512, +82% on 02.002). `0` is full quality. Rows 16–21 stop drawing the player's body. |
 | `SHARPEMU_YOTEI_RENDER_INDEX=<0..15>` | 15 | The size the game renders at before it upscales to 3840x2160: 0 is 3840x2160, 15 is 1920x1080. The game moves this by itself with load; holding 1920x1080 keeps it from climbing (3840x2160 measured 6.9 fps where 1920x1080 measured 10.1). `game` leaves the choice to the game. |
 | `SHARPEMU_FAST_FLOAT16=<0..2>` | 2 | Shader code that works in 16-bit floats (the upscaler's accumulate pass above all) uses the graphics card's own 16-bit arithmetic and one fused multiply-add, where the exact forms rebuilt the console's rounding and NaN bits step by step. Results can differ from the console in the last bit of a multiply-add or in a NaN payload; the picture looks the same. The accumulate pass went from 11.9 ms to 3.5 ms a frame (+7.5% fps measured). `0` restores the exact forms. Changing it rebuilds the shaders once, which can take 10–15 minutes on the "Warming up shaders" screen; the build is saved every two minutes, so it carries on where it stopped if the emulator is closed. |
 | `SHARPEMU_COMPUTE_TABLE_BLOCKS=1` | off | Restores the older buffer layout for compute shaders. Both layouts measured the same on this game. |
 | `SHARPEMU_YOTEI_RENDER_SIZE=<W>x<H>` | off | Renders below 1920x1080, for example `1280x720` (multiples of 8, down to 640x360). It measured no gain on the test machine, where the CPU sets the pace at 1920x1080 and below (1280x720 10.0 fps, 1920x1080 9.9, 2560x1440 9.2); it is meant for graphics cards that are the limit at 1920x1080. |
 
-The `YOTEI` switches only write data that the game's code reads: one number each for the first two, one pointer to a size table for the third. No game code and no game file is changed, and nothing is written unless the 01.512 code is found where it is expected.
+The `YOTEI` switches only write data that the game's code reads: one number each for the first two, one pointer to a size table for the third. No game code and no game file is changed, and nothing is written unless the 01.512 or 02.002 code is found where it is expected.
 
 Other work in this fork, in general emulator code: background pipeline compiles on several threads, a startup shader warm-up that covers every pipeline seen in earlier sessions, smaller shaders for the NVIDIA compiler, less locking and fewer system calls on paths every thread uses, and a set of measurement tools (`SHARPEMU_AB_TOGGLE_S` for in-run A/B comparisons, `SHARPEMU_MARKER_CENSUS` for draws per render pass, `SHARPEMU_LOG_VIDEOOUT_FPS` for a frame rate line every second).
 
 ## Running it
 
-You need your own dump of the game, version 01.512.000. No game files are included or provided.
+You need your own dump of the game, version 02.002.000 or 01.512.000, with a decrypted `eboot.bin`. No game files are included or provided.
 
-Test builds are on the [releases page](https://github.com/DarthPotato/sharpemu/releases): unzip into a new folder and drag the game's `eboot.bin` onto `run-yotei.bat`.
+Test builds are on the [releases page](https://github.com/DarthPotato/sharpemu/releases): unzip into a new folder and drag the game's `eboot.bin` onto `run-yotei.bat`. The tester instructions are in [`yotei/tester/README.txt`](yotei/tester/README.txt).
 
 From source (Windows, .NET SDK from `global.json`):
 
 ```powershell
-git clone -b yotei-merge https://github.com/DarthPotato/sharpemu.git
+git clone -b yotei3 https://github.com/DarthPotato/sharpemu.git
 cd sharpemu
 git submodule update --init --recursive
 dotnet build SharpEmu.slnx -c Release
@@ -65,7 +69,7 @@ The first run is very slow: every shader is compiled the first time it is needed
 - Low frame rate (see above).
 - Freezes the first time you reach a new place (first-time shader compiles); gone on later visits.
 - Lower detail than the console at the default settings: fewer shadows, shorter draw distance for small objects, 1920x1080 internal resolution.
-- Visual glitches: a bright patch near the player's feet, a somewhat too-bright scene, and occasional texture flicker when video memory is nearly full.
+- Visual glitches: a somewhat too-bright scene, and occasional texture flicker when video memory is nearly full.
 
 ---
 
