@@ -120,9 +120,10 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     private static void QueueRead(CacheHarness harness, ulong address) => harness.Worker.Run(() =>
         Assert.True(harness.Cache.TrySynchronizeCpuRead(address, 4, SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead)));
 
+    // The batch's GPU work completes before the hook runs: a read-ahead starts only once its writer has finished.
     private static void SubmitBatch(CacheHarness harness) => harness.Worker.Run(() =>
     {
-        harness.Scheduler.Flush();
+        harness.Scheduler.Finish();
         harness.Cache.OnBatchSubmitted();
     });
 
@@ -149,15 +150,15 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         harness.Shutdown();
     }
 
-    // Eager readbacks are off by default: a GPU write into a hot window starts none, and the next read still lands the
-    // newest bytes through its own download.
+    // Disabled eager readbacks start none for a GPU write into a hot window; the next read still lands
+    // the newest bytes through its own download.
     [Fact]
-    public void AHotWindowIsNotReadAheadUnlessEagerReadbacksAreEnabled()
+    public void AHotWindowIsNotReadAheadWhenEagerReadbacksAreDisabled()
     {
         if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
-        Assert.False(harness.Cache.EagerReadbacksEnabled);
+        Assert.Equal(Environment.GetEnvironmentVariable("SHARPEMU_EAGER_READBACKS") != "0", harness.Cache.EagerReadbacksEnabled);
         Attach(harness, _vulkan, eagerReadbacks: false);
         var address = harness.MapBacked(0x10000, ReadWrite);
         GpuWrite(harness, address, 0x01010101);
@@ -315,6 +316,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         harness.Shutdown();
     }
 
+    // Sixteen read-aheads run at a time; one more waits for a landing.
     [Fact]
     public void AReadAheadDeferredForASlotStartsLater()
     {
@@ -323,7 +325,8 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
         const ulong window = 0x80000;
-        const int windows = 5;
+        const int inFlight = 16;
+        const int windows = inFlight + 1;
         var address = harness.MapBacked(window * windows, ReadWrite);
         for (var index = 0; index < windows; index++)
         {
@@ -337,7 +340,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         }
 
         SubmitBatch(harness);
-        Assert.Equal(4, harness.Cache.EagerReadbacksStarted);
+        Assert.Equal(inFlight, harness.Cache.EagerReadbacksStarted);
 
         var deadline = DateTime.UtcNow.AddSeconds(10);
         while (harness.Cache.EagerReadbacksStarted < windows && DateTime.UtcNow < deadline)

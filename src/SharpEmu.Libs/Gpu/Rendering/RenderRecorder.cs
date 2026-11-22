@@ -36,6 +36,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
     private static readonly ThreadCounter _drawReplayMisses = new();
     private static readonly bool DrawReplayEnabled = Environment.GetEnvironmentVariable("SHARPEMU_DRAW_REPLAY") != "0";
     private readonly Dictionary<ShaderProgramInfo, bool> _replayablePrograms = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<ShaderProgramInfo, bool> _tableReplayablePrograms = new(ReferenceEqualityComparer.Instance);
     private bool _replayValid;
     private long _replaySequence;
     private ShaderStageResources _replayVertex;
@@ -122,7 +123,6 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         public readonly ImageView[] Views = new ImageView[RenderingState.ColorAttachmentCapacity];
         public readonly uint[] Slots = new uint[RenderingState.ColorAttachmentCapacity];
         public ImageView DepthView;
-        public bool DepthMetadataClear;
         public RenderingState Rendering;
     }
 
@@ -223,7 +223,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         if (state.Depth.HasTarget)
         {
             state.Depth.View = kept.DepthView;
-            state.Depth.MetadataClear = kept.DepthMetadataClear;
+            state.Depth.MetadataClear = false;
             _host.KeepDepthAttachment(in state.Depth);
         }
 
@@ -268,8 +268,26 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         }
 
         kept.DepthView = state.Depth.View;
-        kept.DepthMetadataClear = state.Depth.MetadataClear;
         kept.Rendering = state.Rendering;
+    }
+
+    private void BeginDrawRendering(ref DrawState state, bool reusedAttachments)
+    {
+        // Binding resources can end the scope after attachment reuse. Its metadata load clears
+        // already ran, so reopening the scope must preserve the pixels drawn since then.
+        if (reusedAttachments && _host.DrawScope.Scope != _inPlace.Token.Scope)
+        {
+            for (var index = 0; index < state.Rendering.ColorAttachmentCount; index++)
+            {
+                ref var color = ref state.Rendering.ColorAttachments[index];
+                color = color with { IsClear = false };
+            }
+
+            ref var depth = ref state.Rendering.DepthStencilAttachment;
+            depth = depth with { DepthClear = state.Depth.Target.State.DepthClearEnabled };
+        }
+
+        _host.BeginRendering(in state.Rendering);
     }
 
     private struct VertexBufferRange
@@ -638,7 +656,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         var vertexProgram = vertexInput.Stage.Program ?? throw _host.Fatal("The vertex stage has no program.");
         var pixelProgram = pixelBindings is null ? null : pixelInput.Stage.Program ?? throw _host.Fatal("The pixel stage has no program.");
         RenderExecutor.DropUnwrittenColorTargets(context, ref state, pixelProgram);
-        if (inPlace && TryRestoreAttachments(ref state))
+        var reusedAttachments = inPlace && TryRestoreAttachments(ref state);
+        if (reusedAttachments)
         {
             _inPlaceDraws.Increment();
         }
@@ -754,7 +773,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
         var imageSnapshot = _host.BeginImageSnapshot(pixelBindings);
         indirectMesh?.Prepare();
-        _host.BeginRendering(in state.Rendering);
+        BeginDrawRendering(ref state, reusedAttachments);
         if (MeshDrawTrace.Active) MeshDrawTrace.Write("rendering", $"width={state.Rendering.Width} height={state.Rendering.Height} layers={state.Rendering.Layers} colors={state.ColorCount}");
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (record.SetAutoDebug)
@@ -834,20 +853,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             return known;
         }
 
-        var layout = program.Bindings;
-        var reason = layout is null ? "no_layout"
-            : layout.UsesBindlessHeap ? "bindless"
-            : program.UsesDeviceAddresses ? "device_addresses"
-            : program.CallRecordCallees.Count != 0 || layout.CallTargetCount != 0 || layout.CallArgumentCount != 0 ? "calls"
-            : layout.UsesTessellationData ? "tessellation"
-            : program.Frontend is { RequiresOrderedImagePreparation: true } ? "frontend"
-            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.ShaderData) is not null ? "shader_data"
-            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.FlattenedResourceTable) is not null ? "flattened_table"
-            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.CallRecords) is not null ||
-              layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.CallMarks) is not null ? "call_records"
-            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.GlobalDataShare) is not null ? "gds"
-            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.DeviceAddressFallback) is not null ? "device_address_fallback"
-            : null;
+        var reason = UnreplayableReason(program);
         var replayable = reason is null;
         if (!replayable)
         {
@@ -856,6 +862,72 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
         _replayablePrograms[program] = replayable;
         return replayable;
+    }
+
+    // A compute program whose one replay refusal is its flattened table seals a replay basis too: a dispatch whose table
+    // alone differs replays with the table uploaded again and only that descriptor pushed.
+    private bool IsDispatchReplayable(ShaderProgramInfo? program)
+    {
+        if (IsReplayable(program))
+        {
+            return true;
+        }
+
+        if (program is null)
+        {
+            return false;
+        }
+
+        if (_tableReplayablePrograms.TryGetValue(program, out var known))
+        {
+            return known;
+        }
+
+        var replayable = program.Bindings?.Find(ShaderCompiler.Resources.DescriptorBindingKind.FlattenedResourceTable) is not null &&
+            UnreplayableReason(program, ignoreFlattenedTable: true) is null;
+        _tableReplayablePrograms[program] = replayable;
+        return replayable;
+    }
+
+    // Why a program cannot seal a replay basis, or null.
+    private static string? UnreplayableReason(ShaderProgramInfo program, bool ignoreFlattenedTable = false)
+    {
+        var layout = program.Bindings;
+        return layout is null ? "no_layout"
+            : layout.UsesBindlessHeap ? "bindless"
+            : program.UsesDeviceAddresses ? "device_addresses"
+            : program.CallRecordCallees.Count != 0 || layout.CallTargetCount != 0 || layout.CallArgumentCount != 0 ? "calls"
+            : layout.UsesTessellationData ? "tessellation"
+            : program.Frontend is { RequiresOrderedImagePreparation: true } ? "frontend"
+            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.ShaderData) is not null ? "shader_data"
+            : !ignoreFlattenedTable && layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.FlattenedResourceTable) is not null ? "flattened_table"
+            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.CallRecords) is not null ||
+              layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.CallMarks) is not null ? "call_records"
+            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.GlobalDataShare) is not null ? "gds"
+            : layout.Find(ShaderCompiler.Resources.DescriptorBindingKind.DeviceAddressFallback) is not null ? "device_address_fallback"
+            : null;
+    }
+
+    // StageInputMismatch's checks after the flattened table, for a stage whose table differs.
+    private static int StageInputMismatchAfterTable(in ShaderStageResources current, in ShaderStageResources kept)
+    {
+        var resources = current.Resources;
+        var keptResources = kept.Resources;
+        if (!ReferenceEquals(resources.DeviceAddressRanges, keptResources.DeviceAddressRanges) &&
+            !resources.DeviceAddressRanges.AsSpan().SequenceEqual(keptResources.DeviceAddressRanges))
+        {
+            return 6;
+        }
+
+        if (resources.Heaps.Length != 0 || keptResources.Heaps.Length != 0)
+        {
+            return 7;
+        }
+
+        return ReferenceEquals(resources.MipStatistics, keptResources.MipStatistics) ||
+            (resources.MipStatistics ?? []).AsSpan().SequenceEqual(keptResources.MipStatistics ?? [])
+            ? -1
+            : 8;
     }
 
     private static bool SameWordSets(uint[][] current, uint[][] kept)
@@ -1058,7 +1130,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         }
 
         _host.SetDynamicState(in record.Dynamic);
-        _host.BeginRendering(in state.Rendering);
+        BeginDrawRendering(ref state, reusedAttachments: true);
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (record.SetAutoDebug)
         {

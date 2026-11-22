@@ -576,6 +576,11 @@ internal sealed partial class ShaderProgramCache
         {
             if (strictShaders)
             {
+                if (_speculative)
+                {
+                    throw new GpuCommands.SerialResolveRequiredException("speculative strict rejection");
+                }
+
                 throw SubmissionScheduler.Fatal(exception.Message);
             }
 
@@ -592,6 +597,17 @@ internal sealed partial class ShaderProgramCache
 
     [ThreadStatic]
     private static ProgramSourceEntry? _lastEntry;
+
+    // A speculative resolve (a compute ticket worker) never raises a fatal, compiles or links: where the command thread would,
+    // it asks for the serial resolve instead, so a ticket made from bytes the guest is still writing only costs its refusal.
+    [ThreadStatic]
+    private static bool _speculative;
+
+    internal static bool SpeculativeResolve
+    {
+        get => _speculative;
+        set => _speculative = value;
+    }
 
     internal static ProgramSourceEntry? LastEntry => _lastEntry;
 
@@ -614,6 +630,11 @@ internal sealed partial class ShaderProgramCache
         {
             if (strictShaders)
             {
+                if (_speculative)
+                {
+                    throw new GpuCommands.SerialResolveRequiredException("speculative strict rejection");
+                }
+
                 throw SubmissionScheduler.Fatal(exception.Message);
             }
 
@@ -723,6 +744,11 @@ internal sealed partial class ShaderProgramCache
             throw new SerialResolveRequiredException("runtime image descriptors");
         if (entry.Plan.DeviceRecordCounts is { } counts && !counts.SupportsDescriptors(entry.Plan, inputs))
         {
+            if (_speculative)
+            {
+                throw new GpuCommands.SerialResolveRequiredException("speculative device record fallback");
+            }
+
             var handle = GetOrCompileCore(source, options.WithoutDeviceRecordCounts(), ref pushDataCursor, out stage, deferLinking);
             if (runtimeFallback is null)
             {
@@ -733,6 +759,11 @@ internal sealed partial class ShaderProgramCache
         }
 
         var hasShaderCalls = entry.HasShaderCalls;
+        if (hasShaderCalls && _speculative)
+        {
+            throw new GpuCommands.SerialResolveRequiredException("speculative shader calls");
+        }
+
         if (hasShaderCalls && !_compiler.LinkedShaderCallsSupported)
             throw new ShaderProgramRejectedException(
                 $"The backend does not support linked shader calls: backend={_compiler.BackendName} stage={source.Label} hash=0x{source.Hash:X16}.");
@@ -820,6 +851,11 @@ internal sealed partial class ShaderProgramCache
                     System.Diagnostics.Stopwatch.GetTimestamp() - started, materialized ? snapshot : null);
                 if (!materialized)
                 {
+                    if (_speculative)
+                    {
+                        throw new GpuCommands.SerialResolveRequiredException("speculative materialization failure");
+                    }
+
                     var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";
                     if (ResourceMaterializer.LastFailureDetail is { } detail)
                         message = message[..^1] + $" detail={detail}.";
@@ -1046,6 +1082,8 @@ internal sealed partial class ShaderProgramCache
             // A ready program serves while this one is prepared; it is never translated again for another specialization.
             if (runtimeFallback is not null)
                 throw new ShaderProgramPendingException();
+            if (_speculative)
+                throw new GpuCommands.SerialResolveRequiredException("speculative permutation compile");
             try
             {
                 permutation = MakePermutation(source, options, entry, specialization, pushDataCursor, key, sourceWasCached, snapshot,
@@ -3030,6 +3068,8 @@ internal sealed partial class ShaderProgramCache
             InstanceOffsetScalarRegister = entry.EmbeddedFetch?.InstanceOffsetScalarRegister ?? ShaderProgramInfo.NoScalarRegister,
             UsesDeviceAddresses = info.UsesDeviceAddresses,
             DeviceAddressReadsBounded = entry.Plan.DeviceAddressReadsBounded,
+            DeviceAddressReadsWindowed = entry.Plan.DeviceAddressReadsWindowed,
+            DeviceAddressWindowBytes = entry.Plan.DeviceAddressWindowBytes,
             ConstantStoreValue = FindConstantStoreValue(entry.Program),
             ImmediateConstantFill = ConstantFillDetector.DetectImmediate(entry.Program),
             HasBitwiseExclusiveOr = entry.HasBitwiseExclusiveOr,

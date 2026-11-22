@@ -169,6 +169,11 @@ public static partial class AgcExports
         // render thread takes the draw in order through JoinDeferredDraw.
         internal bool CanRecordDeferred(DeferredWork work)
         {
+            if (work is DeferredDispatch dispatch)
+            {
+                return CanRecordDeferredDispatch(dispatch);
+            }
+
             if (work is not DeferredDraw deferred)
             {
                 return true;
@@ -190,8 +195,13 @@ public static partial class AgcExports
             return deferred.SerialReason is null && deferred.Record is not null && ValidateDeferredReads(deferred);
         }
 
-        // At the stream position of a slice segment: whether a worker-resolved draw it recorded still holds.
-        internal bool ValidateDeferred(DeferredWork work) => work is not DeferredDraw deferred || ValidateDeferredReads(deferred, atJoin: true);
+        // At the stream position of a slice segment: whether a worker-resolved draw or dispatch it recorded still holds.
+        internal bool ValidateDeferred(DeferredWork work) => work switch
+        {
+            DeferredDraw deferred => ValidateDeferredReads(deferred, atJoin: true),
+            DeferredDispatch dispatch => dispatch.Cancelled || ValidateDispatchReads(dispatch),
+            _ => true,
+        };
 
         private bool ValidateDeferredReads(DeferredDraw deferred, bool atJoin = false) =>
             deferred.ValidateReads(_pipelines!.FrontendImageVersion, _host, atJoin);

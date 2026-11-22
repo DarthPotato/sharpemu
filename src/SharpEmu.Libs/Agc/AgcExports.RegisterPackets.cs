@@ -72,8 +72,7 @@ public static partial class AgcExports
                     packet[2 + index - startIndex] = registers[index].Value;
                 }
 
-                if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress) ||
-                    !TryWriteCommandDwords(ctx, commandAddress, packet[..(int)packetDwords]))
+                if (!TryEmitCommandDwords(ctx, commandBufferAddress, out var commandAddress, packet[..(int)packetDwords]))
                 {
                     return ReturnPointer(ctx, 0);
                 }
@@ -124,7 +123,21 @@ public static partial class AgcExports
         ulong commandAddress;
         using (AgcRegisterPacketProfile.Measure(AgcRegisterPacketProfile.Phase.PacketSetup))
         {
-            if (!TryEmitCommandDwords(ctx, commandBufferAddress, out _, Pm4(2, ItNop, RZero), CbSetShRegisterRangeMarker) ||
+            // The marker and the SET_SH_REG packet take one allocation, and the marker and header one write, when both
+            // packets fit without the buffer-full callback. Otherwise they are allocated apart, so a callback runs
+            // between them as it would for two separate packets.
+            if (TryAllocateFittingCommandDwords(ctx, commandBufferAddress, 2 + packetDwords, out var markerAddress))
+            {
+                if (!TryWriteCommandDwords(ctx, markerAddress, Pm4(2, ItNop, RZero), CbSetShRegisterRangeMarker,
+                        Pm4(packetDwords, ItSetShReg, 0), offset))
+                {
+                    AgcRegisterPacketProfile.RecordResult(false);
+                    return ReturnPointer(ctx, 0);
+                }
+
+                commandAddress = markerAddress + 8;
+            }
+            else if (!TryEmitCommandDwords(ctx, commandBufferAddress, out _, Pm4(2, ItNop, RZero), CbSetShRegisterRangeMarker) ||
                 !TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out commandAddress) ||
                 !TryWriteCommandDwords(ctx, commandAddress, Pm4(packetDwords, ItSetShReg, 0), offset))
             {

@@ -496,6 +496,11 @@ public static partial class AgcExports
         bool isMarker = false)
         => TryPrepareCommandDwords(ctx, commandBufferAddress, sizeDwords, true, out commandAddress, isMarker);
 
+    // Allocates only when the buffer has room without the guest's buffer-full callback. Otherwise the cursor stays where it
+    // was, and a caller that splits the same packets over several allocations runs the callback where those would.
+    private static bool TryAllocateFittingCommandDwords(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, out ulong commandAddress)
+        => TryPrepareCommandDwords(ctx, commandBufferAddress, sizeDwords, true, out commandAddress, callBufferFull: false);
+
     // Inline guest stores do not take the allocation lock. Remember the last ordinary
     // packet writer so a diagnostic marker from another guest thread cannot reserve or
     // overwrite that writer's unpublished inline packet. Ordinary exports can transfer a
@@ -540,7 +545,7 @@ public static partial class AgcExports
         (int)((commandBufferAddress * 0x9E3779B97F4A7C15UL) >> 58);
 
     private static bool TryPrepareCommandDwords(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, bool advanceCursor,
-        out ulong commandAddress, bool isMarker = false)
+        out ulong commandAddress, bool isMarker = false, bool callBufferFull = true)
     {
         var stripe = CommandBufferStripe(commandBufferAddress);
         var gate = _commandBufferLocks[stripe];
@@ -575,7 +580,7 @@ public static partial class AgcExports
             }
 
             return TryPrepareCommandDwordsLocked(ctx, commandBufferAddress, sizeDwords, advanceCursor, gate, stripe,
-                writers, isMarker, out commandAddress);
+                writers, isMarker, callBufferFull, out commandAddress);
         }
         finally
         {
@@ -620,7 +625,7 @@ public static partial class AgcExports
     }
 
     private static bool TryPrepareCommandDwordsLocked(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, bool advanceCursor,
-        object gate, int stripe, ConcurrentDictionary<ulong, CommandBufferWriter> writers, bool isMarker, out ulong commandAddress)
+        object gate, int stripe, ConcurrentDictionary<ulong, CommandBufferWriter> writers, bool isMarker, bool callBufferFull, out ulong commandAddress)
     {
         commandAddress = 0;
         if (sizeDwords == 0 ||
@@ -632,6 +637,11 @@ public static partial class AgcExports
         var remainingDwords = GetRemainingCommandDwords(cursorUp, cursorDown, reservedDwords);
         if (sizeDwords > remainingDwords)
         {
+            if (!callBufferFull)
+            {
+                return false;
+            }
+
             TraceAgc($"agc.cmd_alloc_full buf=0x{commandBufferAddress:X16} need={sizeDwords} remaining={remainingDwords} callback=0x{callback:X16}");
             var scheduler = GuestThreadExecution.Scheduler;
             ulong callbackResult = 0;
