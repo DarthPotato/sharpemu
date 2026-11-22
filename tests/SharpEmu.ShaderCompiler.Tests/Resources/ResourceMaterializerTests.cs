@@ -470,10 +470,11 @@ public sealed class ResourceMaterializerTests
         Assert.Equal(ImageNumericClass.Float, image.NumericClass);
     }
 
-    // A 16_SINT storage image the program only writes (as a shipped compute shader does) is compiled as
-    // unsigned bits: the stored low bits are the same.
+    // A 16_SINT storage image the program only writes (as a shipped compute shader does) keeps its signed
+    // class: through an R16_UINT view a negative value is out of range and NVIDIA stores 0xFFFF (upstream
+    // compiles it as unsigned bits; LayoutImageShaderTests.SignedStorageImage_StoresTheLowSixteenBits...).
     [Fact]
-    public void WriteOnlySignedStorageImage_IsCompiledAsUnsignedBits()
+    public void WriteOnlySixteenBitSignedStorageImage_KeepsItsSignedClass()
     {
         const uint format16Sint = 12;
         var instructions = new List<Gen5ShaderInstruction>();
@@ -487,7 +488,7 @@ public sealed class ResourceMaterializerTests
 
         Assert.True(ResourceMaterializer.Materialize(plan, Inputs([]), ref snapshot, ref specialization));
         var image = Assert.Single(ResourceMaterializer.ApplyTo(plan, specialization).Info.Images);
-        Assert.Equal(ImageNumericClass.Uint, image.NumericClass);
+        Assert.Equal(ImageNumericClass.Sint, image.NumericClass);
     }
 
     // Three images share one sampler; the packed and signed ones need point filtering,

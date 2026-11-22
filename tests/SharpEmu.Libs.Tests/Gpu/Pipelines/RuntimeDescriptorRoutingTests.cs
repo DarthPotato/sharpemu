@@ -219,19 +219,19 @@ public sealed class RuntimeDescriptorRoutingTests : IDisposable
         Assert.True(request.Resources.Info.UsesRuntimeDescriptors);
     }
 
+    // Without a runtime host nothing can serve the table, so its lookups read the null image (upstream's fallback)
+    // and the shader still compiles, without a runtime descriptor table.
     [Fact]
-    public void ATableThatCannotBeEnumeratedIsRejectedWithItsReasonWithoutARuntimeHost()
+    public void ATableThatCannotBeEnumeratedReadsTheNullImageWithoutARuntimeHost()
     {
         const uint declared = 200_000;
-        const string kind = "ImageCapacityExceeded";
-        const string detail = "selector probes exceed";
         _guest.Host.RuntimeImageDescriptorsSupported = false;
         WriteScene(materialCount: 200, declaredCount: declared);
 
-        Assert.False(TryCompile(out _, out var rejection));
+        Assert.True(TryCompile(out _, out var rejection), rejection);
 
-        Assert.Contains(kind, rejection);
-        Assert.Contains("detail=", rejection);
-        Assert.Contains(detail, rejection);
+        var request = Assert.Single(_guest.Compiler.Requests);
+        Assert.False(request.Resources.Info.UsesRuntimeDescriptors);
+        Assert.Null(request.Bindings.Find(DescriptorBindingKind.RuntimeDescriptorTable));
     }
 }

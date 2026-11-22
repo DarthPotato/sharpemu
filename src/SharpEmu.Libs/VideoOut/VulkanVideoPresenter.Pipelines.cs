@@ -227,10 +227,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             // Resource planning can inspect a dynamic descriptor before the draw has supplied a valid
             // guest address; the page tracker treats an invalid range as fatal, so refuse it on every thread.
+            // A compute ticket's worker refuses the ticket instead (RefuseOnTicketWorker), as for any read it cannot serve.
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 word = 0;
-                return false;
+                return RefuseOnTicketWorker("unreadable");
             }
 
             if (OnResolveWorker)

@@ -607,7 +607,10 @@ public sealed class GcnShaderTests
         Assert.Equal(layers - 1, translated.Depth);
         var shape = new ShaderImageShape(false, true, type == 11, false, false, TextureNumericClass.Float);
         var selected = frontend.ResolveTexture(normalized, shape, 0xBC600, 0);
-        Assert.Equal(levels - 1, selected.Request.Description.Resources.Levels);
+        // A GCN texture is converted into a whole linear chain, so the descriptor's mip 1 is a view into all levels.
+        Assert.Equal(levels, selected.Request.Description.Resources.Levels);
+        Assert.Equal(0u, selected.Request.Description.FirstLevel);
+        Assert.Equal(1u, selected.Request.View.BaseLevel);
         // Check the complete detiled backing separately from the descriptor view starting at mip 1.
         var wholeDescriptor = normalized.ToArray();
         wholeDescriptor[3] &= ~(0xFu << 12);

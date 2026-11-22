@@ -132,7 +132,7 @@ public sealed class TailLookaheadTests
             Item("Deferred"), Item("Call", true), Item("Deferred")];
         foreach (var item in items) Incoming(command).Add(item);
 
-        CommandType.GetMethod("FillUnits", Members)!.Invoke(command, [256]);
+        CommandType.GetMethod("FillUnits", Members)!.Invoke(command, null);
 
         var units = Field<IList>(command, "_units");
         Assert.Equal(items.Take(6), units.Cast<object>().Select(unit => unit.GetType().GetField("Item")!.GetValue(unit)));

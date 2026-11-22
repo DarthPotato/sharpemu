@@ -260,14 +260,14 @@ public sealed class ShaderPrewarmListTests : IDisposable
     // record, so it may only change with a deliberate format change. These are the values the recorded lists carry. The
     // pixel and graphics values are this fork's, not upstream's: PixelInputInfo has FrontFaceAllBits, Gen5PixelOutputBinding
     // has ObjectPrimitiveId, pixel records carry RuntimeDescriptors, and the depth bounds are dynamic state, not pipeline
-    // key fields.
+    // key fields. The graphics value also covers upstream's BaseVertexUserData (merged from upstream main).
     [Fact]
     public void TheSchemaFingerprintsKeepTheValuesOfTheRecordedLists()
     {
         Assert.Equal(0x24DB2A98u, ShaderPrewarmList.SchemaFingerprint);
         Assert.Equal(0x5F4DFCD6u, ShaderPrewarmList.PixelSchemaFingerprint);
         Assert.Equal(0x31C5863Bu, ShaderPrewarmList.VertexSchemaFingerprint);
-        Assert.Equal(0xB26C0131u, ShaderPrewarmList.GraphicsSchemaFingerprint);
+        Assert.Equal(0x27CD2497u, ShaderPrewarmList.GraphicsSchemaFingerprint);
     }
 
     private sealed class SchemaSample

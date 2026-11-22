@@ -2140,10 +2140,12 @@ public static partial class ResourceMaterializer
             var shaderSwizzle = runtimeSwizzle ? DescriptorConstants.IdentityImageSwizzle
                 : storage || conversionFormat != GuestImageFormat.Invalid ? descriptor[3] & 0xFFF : image.ShaderSwizzle;
             var numericClass = GuestImageFormat.SampledNumericClass(format);
-            // A signed-integer storage image the program only writes stores the low bits of each register, which are the
-            // same bits as unsigned: it is compiled and viewed as the unsigned format of its width (ImageRequestBuilders).
-            // A compute shader can write a 16_SINT image.
-            var rawSintStorage = storage && numericClass == ImageNumericClass.Sint && baseImage.Written && !baseImage.Read && !baseImage.Atomic;
+            // A write-only 32_SINT storage image stores the register bits unchanged, the same bits as unsigned: it is compiled
+            // as raw uint. A narrower sint image keeps its signed class and *_SINT view (9e151904): through the unsigned view
+            // of its width a negative value is out of range, which Vulkan leaves undefined and NVIDIA saturates (-5 stored
+            // 0xFFFF, LayoutImageShaderTests.SignedStorageImage_StoresTheLowSixteenBitsOfNegativeAndPositiveValues).
+            // Ghost of Yotei writes a 16_SINT image from a compute shader.
+            var rawSintStorage = storage && format == GuestImageFormat.Format32Sint && baseImage.Written && !baseImage.Read && !baseImage.Atomic;
             if (storage)
             {
                 if (numericClass == ImageNumericClass.Unsupported)
@@ -2151,7 +2153,7 @@ public static partial class ResourceMaterializer
                     return Fail($"storage image descriptor {index} uses unsupported format {format}");
                 }
 
-                // A write-only sint image is stored as raw bits through its uint view;
+                // A write-only 32-bit sint image is stored as raw bits through its uint view;
                 // every other sint storage image keeps its signed class (and *_SINT view).
                 // Atomics use the uint view; float min/max compare-exchange its bits.
                 if (rawSintStorage || (baseImage.Atomic && numericClass == ImageNumericClass.Float))
