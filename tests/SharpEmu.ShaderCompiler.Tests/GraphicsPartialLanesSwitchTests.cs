@@ -15,7 +15,8 @@ public sealed class GraphicsPartialLanesSwitchTests
     [Fact]
     public void PixelReadLaneKeepsMainsLoweringUnlessEnabled()
     {
-        Assert.Equal(Compile(enabled: false), Compile(enabled: null));
+        // The fork turns the ISA lane reads on by default (SHARPEMU_GRAPHICS_PARTIAL_LANES=0 turns them off).
+        Assert.Equal(Compile(enabled: true), Compile(enabled: null));
         Assert.NotEqual(Compile(enabled: false), Compile(enabled: true));
     }
 

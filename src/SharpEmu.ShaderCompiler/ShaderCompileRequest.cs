@@ -312,12 +312,13 @@ public sealed class ShaderCompileRequest
     public bool EnableGraphicsSubgroupOperations { get; init; } = true;
 
     // Graphics lane reads (DPP, DPP8, PERMLANE, V_READLANE) follow the ISA for lanes a partial host subgroup never
-    // launched, through a ballot and the guest EXEC mask. Off (main's lowering) unless SHARPEMU_GRAPHICS_PARTIAL_LANES=1:
-    // it changes every vertex and pixel shader with cross-lane operations, and was proven on Ghost of Yotei only.
+    // launched, through a ballot and the guest EXEC mask. Upstream keeps it off; this fork turns it on by default (upstream
+    // proved it on Ghost of Yotei, and it replaces the fork's own V_READLANE/permlane fixes, which remain the
+    // SHARPEMU_GRAPHICS_PARTIAL_LANES=0 path). It changes every vertex and pixel shader with cross-lane operations.
     public bool GraphicsPartialSubgroupLanes { get; init; } = DefaultGraphicsPartialSubgroupLanes;
 
     private static readonly bool DefaultGraphicsPartialSubgroupLanes =
-        Environment.GetEnvironmentVariable("SHARPEMU_GRAPHICS_PARTIAL_LANES") == "1";
+        Environment.GetEnvironmentVariable("SHARPEMU_GRAPHICS_PARTIAL_LANES") != "0";
 
     public bool MipStatisticsSubgroupReduction { get; init; }
 

@@ -33,6 +33,8 @@ public sealed class Gen5PartialSubgroupLaneTests
         {
             PixelOutputs = [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)],
             EnableGraphicsSubgroupOperations = true,
+            // These pin the fork's own lowering, the SHARPEMU_GRAPHICS_PARTIAL_LANES=0 path.
+            GraphicsPartialSubgroupLanes = false,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         var words = new uint[shader.Spirv.Length / 4];
