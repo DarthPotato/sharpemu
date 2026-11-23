@@ -23,18 +23,18 @@ public sealed class DescriptorPreparationPlanTests
     };
 
     [Theory]
-    [InlineData(null, true)]
-    [InlineData("", true)]
+    [InlineData(null, false)]
+    [InlineData("", false)]
     [InlineData("1", true)]
-    [InlineData("false", true)]
+    [InlineData("false", false)]
     [InlineData("0", false)]
-    public void SwitchDefaultsOnAndOnlyZeroRestoresOriginalPath(string? value, bool expected) =>
+    public void SwitchDefaultsOffAndOnlyOneEnablesTheForkPlans(string? value, bool expected) =>
         Assert.Equal(expected, DescriptorPreparationOptions.ParseFast(value));
 
     [Fact]
     public void ProcessSwitchGatesPlanCreation()
     {
-        var expected = Environment.GetEnvironmentVariable("SHARPEMU_DESC_PREP_FAST") != "0";
+        var expected = Environment.GetEnvironmentVariable("SHARPEMU_DESC_PREP_FAST") == "1";
         Assert.Equal(expected, DescriptorPreparationOptions.Fast);
         Assert.Equal(expected, DescriptorPreparationPlan.Create(Program(new BindingLayout())) is not null);
     }

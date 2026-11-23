@@ -12,7 +12,7 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 
 public sealed unsafe partial class RenderHostDeviceTests
 {
-    [Fact(Skip = "Fork: the fast stage check (DescriptorPreparationOptions.Fast) revalidates the memo before upstream's proven-tick shortcut, so _stageMemoProven stays 0 here; check [PERF][STAGE_MEMO] proven= in a game run before re-enabling.")]
+    [Fact(Skip = "Fork: _stageMemoProven stays 0 here even with SHARPEMU_DESC_PREP_FAST off; the cause is not identified yet (open item: check [PERF][STAGE_MEMO] proven= in a profiling run).")]
     public void StagePreparation_RecapturedBindingsSurviveSubmissionRecycling()
     {
         if (!Ready()) return;

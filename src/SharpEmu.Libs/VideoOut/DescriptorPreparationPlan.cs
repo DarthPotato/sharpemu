@@ -10,7 +10,9 @@ namespace SharpEmu.Libs.VideoOut;
 internal static class DescriptorPreparationOptions
 {
     internal static readonly bool Fast = ParseFast(Environment.GetEnvironmentVariable("SHARPEMU_DESC_PREP_FAST"));
-    internal static bool ParseFast(string? value) => value != "0";
+    // Off by default: upstream's stage preparation (proven memo ticks) measured the same in Ghost of Yotei 02.002
+    // (11.39 vs 11.40 fps). SHARPEMU_DESC_PREP_FAST=1 restores the fork's per-program plans until they are removed.
+    internal static bool ParseFast(string? value) => value == "1";
 }
 
 // Only immutable compiled-program facts live here. No guest contents, handles, mappings,
