@@ -62,6 +62,12 @@ internal sealed partial class RenderRecorder
         }
         var input = computeProgram.Input;
         var program = input.Stage.Program!;
+        // Measurement only (SHARPEMU_AB_SKIP_MARKER=hash:<hex>): drop this program's dispatches while the A/B toggle is on.
+        if (Diagnostics.MarkerCensus.SkipsProgram(program.Hash))
+        {
+            return;
+        }
+
         if (record.IndirectArgumentsAddress == 0)
         {
             bool consumed;

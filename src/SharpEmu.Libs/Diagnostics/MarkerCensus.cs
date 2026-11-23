@@ -17,7 +17,8 @@ namespace SharpEmu.Libs.Diagnostics;
 // "*" matches every path; a "draw:" or "dispatch:" prefix limits a text to that kind of item. Groups separated by
 // "|" take turns, one per on period (the fps line's abn=<period>, group = (period / 2) % groups), so one run measures
 // several passes. A text "groups:<X>x<Y>x<Z>" matches direct dispatches with those group counts under any path,
-// which singles out one compute pass that has no marker of its own. Nothing is dropped in the first SHARPEMU_AB_SKIP_START_S seconds (default 120): dropping
+// which singles out one compute pass that has no marker of its own. A text "hash:<16 hex digits>" matches the
+// dispatches of one compute program (the compute= hash of [PERF][GPU_PIPELINE]), checked where the dispatch is recorded. Nothing is dropped in the first SHARPEMU_AB_SKIP_START_S seconds (default 120): dropping
 // dispatches while the game loads ended a run.
 public static class MarkerCensus
 {
@@ -32,6 +33,7 @@ public static class MarkerCensus
 
     private const int MaximumGroups = 64;
     private const string SizePrefix = "groups:";
+    private const string HashPrefix = "hash:";
 
     private static readonly string[][] SkipGroups =
         (Environment.GetEnvironmentVariable("SHARPEMU_AB_SKIP_MARKER") ?? string.Empty)
@@ -189,6 +191,59 @@ public static class MarkerCensus
         }
     }
 
+    private static readonly (ulong Groups, ulong Hash)[] SkipHashes = ReadSkipHashes();
+
+    // True while the A/B toggle is on for a group that names this compute program's hash.
+    public static bool SkipsProgram(ulong hash)
+    {
+        if (SkipHashes.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (var (groups, skipHash) in SkipHashes)
+        {
+            if (skipHash == hash && SkipsNow(groups))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static (ulong Groups, ulong Hash)[] ReadSkipHashes()
+    {
+        var hashes = new List<(ulong Groups, ulong Hash)>();
+        for (var index = 0; index < SkipGroups.Length; index++)
+        {
+            foreach (var text in SkipGroups[index])
+            {
+                if (!text.StartsWith(HashPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var digits = text[HashPrefix.Length..];
+                if (digits.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                {
+                    digits = digits[2..];
+                }
+
+                if (ulong.TryParse(digits, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hash))
+                {
+                    hashes.Add((1UL << index, hash));
+                }
+                else
+                {
+                    Console.Error.WriteLine($"[PERF][MARKER_CENSUS] SHARPEMU_AB_SKIP_MARKER: \"{text}\" is not hash:<hex>; ignored.");
+                }
+            }
+        }
+
+        return [.. hashes];
+    }
+
     private static bool SkipsNow(ulong groups)
     {
         var period = SharpEmu.HLE.Diagnostics.AbToggle.Period;
@@ -246,7 +301,8 @@ public static class MarkerCensus
         foreach (var entry in texts)
         {
             var text = entry;
-            if (text.StartsWith(SizePrefix, StringComparison.OrdinalIgnoreCase))
+            if (text.StartsWith(SizePrefix, StringComparison.OrdinalIgnoreCase) ||
+                text.StartsWith(HashPrefix, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
