@@ -57,7 +57,6 @@ git clone -b yotei3 https://github.com/DarthPotato/sharpemu.git
 cd sharpemu
 git submodule update --init --recursive
 dotnet build SharpEmu.slnx -c Release
-$env:SHARPEMU_WAVE64_PAIRED = "0"
 $env:SHARPEMU_VK_PIPELINE_CACHE = "file"
 .\artifacts\bin\Release\net10.0\win-x64\SharpEmu.exe "D:\path\to\PPSA26344\eboot.bin"
 ```

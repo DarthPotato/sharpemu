@@ -12,7 +12,6 @@ if "%~1"=="" (
 cd /d "%~dp0"
 rem Keep the log of the session before this one.
 if exist sharpemu-log.txt move /y sharpemu-log.txt sharpemu-log-previous.txt >nul
-set SHARPEMU_WAVE64_PAIRED=0
 set SHARPEMU_VK_PIPELINE_CACHE=file
 set SHARPEMU_LOG_VIDEOOUT_FPS=1
 rem Optional second argument: the game folder (eboot.bin's own folder is used when it is not given).

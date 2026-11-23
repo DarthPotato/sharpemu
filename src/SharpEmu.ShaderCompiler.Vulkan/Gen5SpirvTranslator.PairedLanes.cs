@@ -10,13 +10,14 @@ public static partial class Gen5SpirvTranslator
     // workgroup paired runs on a single subgroup that executes both halves in turn, while emulated its halves run as two
     // subgroups side by side; with more than one wave the paired lowering is faster, because the emulated waves meet at
     // rendezvous counters. Ghost of Yotei 02.002 on an RTX 3080: one-wave kernels ran 23% and 34% faster emulated,
-    // 512- and 1024-thread workgroups 17% and 80% slower. Unset (or =1) pairs every workgroup, =small pairs only
-    // workgroups of more than one wave, =0 none. The one-wave split is opt-in because it has been measured on one title.
+    // 512- and 1024-thread workgroups 17% and 80% slower. Upstream pairs every workgroup unless asked; this fork defaults
+    // to the small split (unset or =small pairs only workgroups of more than one wave), which measured +7% fps over =0
+    // in that game's open world (12.71 vs 11.93). =1 pairs every workgroup, =0 none.
     public static bool PairsWave64Lanes(string? mode, ulong workgroupThreads) => mode switch
     {
         "0" => false,
-        "small" => workgroupThreads > 64,
-        _ => true,
+        "1" => true,
+        _ => workgroupThreads > 64,
     };
 
     private sealed partial class CompilationContext
