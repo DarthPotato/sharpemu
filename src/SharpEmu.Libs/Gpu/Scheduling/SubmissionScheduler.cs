@@ -919,6 +919,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         _command.End();
         buffers[deferred] = _command.Buffer;
+        var completedBefore = VideoOut.GpuBacklogProfile.Enabled ? RefreshCompletedTick() : 0;
         bool submitted;
         string failure;
         ulong tick;
@@ -972,6 +973,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 $"args={_command.DebugArg0},{_command.DebugArg1},{_command.DebugArg2},{_command.DebugArg3},0x{_command.DebugArg4:X16}");
         }
 
+        if (VideoOut.GpuBacklogProfile.Enabled) VideoOut.GpuBacklogProfile.NoteSubmit(tick, completedBefore);
         _submissionHistory[_nextSubmissionHistoryIndex] = new SubmissionTraceEntry(tick, _command.DebugOp, _command.DebugSubmitId,
             _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3, _command.DebugArg4);
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
@@ -1056,7 +1058,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
             if (gpuWaitTick != 0)
             {
-                _timeline.Wait(gpuWaitTick);
+                _timeline.Wait(gpuWaitTick, profileBacklog: false);
                 continue;
             }
 

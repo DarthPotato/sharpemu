@@ -38,7 +38,9 @@ public sealed class TickTimeline
         }
     }
 
-    public void Wait(ulong tick)
+    public void Wait(ulong tick) => Wait(tick, profileBacklog: true);
+
+    internal void Wait(ulong tick, bool profileBacklog)
     {
         if (IsTickComplete(tick))
         {
@@ -51,7 +53,7 @@ public sealed class TickTimeline
             return;
         }
 
-        var backlog = VideoOut.GpuBacklogProfile.Begin(tick, CompletedTick);
+        var backlog = profileBacklog ? VideoOut.GpuBacklogProfile.Begin(tick, CompletedTick) : default;
         if (!_device.TryWaitTimeline(tick, out var failure))
         {
             throw SubmissionScheduler.Fatal($"vkWaitSemaphores failed: {failure}, tick={tick}");

@@ -2017,6 +2017,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 var frameAtBegin = 0L;
                 if (!_relay.TryRunOnGpuQueue(() =>
                     {
+                        using var sourceScope = ReadbackSourceProfile.Begin(isWrite ? "GuestWrite" : "GuestRead");
                         beginStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                         pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending, markHot, waitForSlot, out slotsBusy);
                         completedAtBegin = _scheduler.CompletedTick;
@@ -2047,8 +2048,10 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
                 var gpuWaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 readback.Wait(pending.Ticket);
+                var gpuWaitTicks = System.Diagnostics.Stopwatch.GetTimestamp() - gpuWaitStarted;
+                NoteReadbackComparisonWait(pending.OwnOlder, pending.OwnComplete, gpuWaitTicks);
                 NoteGuestReadback(pending, completedAtBegin, frameAtBegin, beginStarted - beginPosted, beginEnded - beginStarted,
-                    System.Diagnostics.Stopwatch.GetTimestamp() - gpuWaitStarted, beginStarted);
+                    gpuWaitTicks, beginStarted);
                 var complete = false;
                 var completePosted = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (!_relay.TryRunOnGpuQueue(() => complete = CompleteReadMemoryOnGpu(pending, consumed: true)))
@@ -2067,8 +2070,12 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         }
 
         var onQueue = _relay.IsGpuQueueThread;
-        if (_relay.TryRunOnGpuQueue(() => _ = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: false, markHot: onQueue, waitForSlot: false,
-                out _, useEager: onQueue)))
+        if (_relay.TryRunOnGpuQueue(() =>
+            {
+                using var sourceScope = ReadbackSourceProfile.Begin(onQueue ? "Command" : isWrite ? "GuestWrite" : "GuestRead");
+                _ = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: false, markHot: onQueue, waitForSlot: false,
+                    out _, useEager: onQueue);
+            }))
         {
             return true;
         }
@@ -2103,6 +2110,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     // A window the guest read back is read ahead after its next GPU write, once that write's tick has completed: the copy
     // waits on nothing, and it usually lands before the guest reads the window again.
+    private static readonly bool AbEagerReadbacks = Environment.GetEnvironmentVariable("SHARPEMU_AB_EAGER_READBACKS") == "1";
+    private bool EagerReadbacksActive => EagerReadbacksEnabled && !(AbEagerReadbacks && SharpEmu.HLE.Diagnostics.AbToggle.On);
+
     internal bool EagerReadbacksEnabled { get; set; } =
         !string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_EAGER_READBACKS"), "0", StringComparison.Ordinal);
 
@@ -2175,7 +2185,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     private void NoteHotWindowWrite(GpuBuffer buffer, ulong guestAddress, ulong size)
     {
-        if (!EagerReadbacksEnabled || _hotWindows.Count == 0 || size == 0)
+        if (!EagerReadbacksActive || _hotWindows.Count == 0 || size == 0)
         {
             return;
         }
@@ -2224,7 +2234,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             }
         }
 
-        if (_eagerCandidates.Count != 0)
+        if (EagerReadbacksActive && _eagerCandidates.Count != 0)
         {
             StartEagerCandidates(_scheduler.Timeline.CompletedTick);
         }
@@ -2241,7 +2251,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         }
 
         var now = System.Diagnostics.Stopwatch.GetTimestamp();
-        var due = _eagerCandidates.Count != 0 && _scheduler.Timeline.CompletedTick >= _nextEagerTick;
+        var due = EagerReadbacksActive && _eagerCandidates.Count != 0 && _scheduler.Timeline.CompletedTick >= _nextEagerTick;
         if (!due && (_eagerDownloads.Count == 0 || now - _lastEagerPump < EagerLandCheckTicks))
         {
             return;
@@ -2253,7 +2263,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             _nextEagerTick = 0;
         }
 
-        if (_eagerCandidates.Count == 0)
+        if (!EagerReadbacksActive || _eagerCandidates.Count == 0)
         {
             return;
         }
@@ -2343,6 +2353,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     private EagerStart StartEagerReadback(HotWindow hot)
     {
+        using var sourceScope = ReadbackSourceProfile.Begin("Eager");
         if (FindOwner(hot.Address, hot.Size) is not { } buffer)
         {
             return EagerStart.Nothing;
@@ -2494,6 +2505,17 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     internal long StalePiecesKept { get; private set; }
 
+    private static long _readbackOwnOlder, _readbackOwnComplete, _readbackOwnOlderWait, _readbackOwnCompleteWait;
+
+    private static void NoteReadbackComparisonWait(bool ownOlder, bool ownComplete, long ticks)
+    {
+        if (ownOlder) Interlocked.Add(ref _readbackOwnOlderWait, ticks);
+        if (ownComplete) Interlocked.Add(ref _readbackOwnCompleteWait, ticks);
+    }
+
+    public static string TakeReadbackComparisonReport() => FormattableString.Invariant(
+        $"[PERF][READBACK_WRITER] own_older={Interlocked.Exchange(ref _readbackOwnOlder, 0)} own_complete={Interlocked.Exchange(ref _readbackOwnComplete, 0)} own_older_wait_ms={Interlocked.Exchange(ref _readbackOwnOlderWait, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F3} own_complete_wait_ms={Interlocked.Exchange(ref _readbackOwnCompleteWait, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F3}");
+
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
         $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_muted={Interlocked.Exchange(ref _reportedEagerMuted, 0)}");
 
@@ -2507,6 +2529,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         public required ulong GuestAddress { get; init; }
         public required ulong Size { get; init; }
         public required bool IsWrite { get; init; }
+        public bool OwnOlder { get; init; }
+        public bool OwnComplete { get; init; }
         public bool Eager { get; init; }
         public ulong HotKey { get; init; }
         public required GuestMemoryProfile.ReadbackSource Source { get; init; }
@@ -2545,6 +2569,18 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             copies = CollectReadbackWindow(buffer, guestAddress, size, out windowBegin, out windowEnd);
         }
 
+        var ownOlder = false;
+        var ownComplete = false;
+        if (copies.Count != 0 && RenderPhaseProfile.Enabled)
+        {
+            var ownTick = buffer.LastGpuWriteTickIn(buffer.Offset(guestAddress), size);
+            var windowTick = copies.Max(copy => copy.Buffer.LastGpuWriteTickIn(copy.SourceOffset, copy.Size));
+            ownOlder = ownTick < windowTick;
+            ownComplete = ownTick <= _scheduler.Timeline.CompletedTick;
+            if (ownOlder) Interlocked.Increment(ref _readbackOwnOlder);
+            if (ownComplete) Interlocked.Increment(ref _readbackOwnComplete);
+        }
+
         if (markHot && copies.Count != 0)
         {
             NoteHotReadback(guestAddress, size);
@@ -2573,6 +2609,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 GuestAddress = guestAddress,
                 Size = size,
                 IsWrite = isWrite,
+                OwnOlder = ownOlder,
+                OwnComplete = ownComplete,
                 Source = source,
                 Started = readbackStarted,
             };
@@ -2587,7 +2625,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         if (copies.Count != 0)
         {
             Interlocked.Increment(ref ReadbacksSynchronous);
+            var waitStarted = RenderPhaseProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DownloadBufferMemory(copies);
+            if (waitStarted != 0) NoteReadbackComparisonWait(ownOlder, ownComplete, System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted);
             _tracker.ClearGpuDirtyPages(windowBegin, windowEnd - windowBegin);
         }
 
