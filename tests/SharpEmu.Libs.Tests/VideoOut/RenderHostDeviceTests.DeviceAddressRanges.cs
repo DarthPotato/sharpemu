@@ -28,7 +28,7 @@ public sealed unsafe partial class RenderHostDeviceTests
             presenter.Run(() =>
             {
                 // The pooled stage last served a program whose call records named a written range.
-                var used = presenter.InvokeMethod("RentStage", stage, program, null)!;
+                var used = presenter.InvokeMethod("RentStage", stage, program)!;
                 var type = used.GetType();
                 type.GetProperty("CallRecordWords")!.SetValue(used, new uint[] { 1, 0, 0, 0 });
                 type.GetProperty("CallRecordRanges")!.SetValue(used, new DeviceAddressRange[] { new(uint.MaxValue, named, 0x1000, true, true) });

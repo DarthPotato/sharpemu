@@ -79,7 +79,7 @@ internal static partial class RenderPhaseProfile
         internal string TakeReport(double seconds, long frames, long phaseTicks, long materializationTicks, long materializationCalls)
         {
             static string Ms(long ticks) => (ticks * 1000.0 / Stopwatch.Frequency).ToString("F3", CultureInfo.InvariantCulture);
-            var text = new StringBuilder(FormattableString.Invariant($"[PERF][DESC_PREP] window_s={seconds:F1} frames={frames} fast={(DescriptorPreparationOptions.Fast ? 1 : 0)}"));
+            var text = new StringBuilder(FormattableString.Invariant($"[PERF][DESC_PREP] window_s={seconds:F1} frames={frames} fast=0"));
             long total = 0, inclusive = 0;
             for (var kind = 0; kind < (int)DescriptorMemoKind.Count; kind++)
             {

@@ -12,7 +12,7 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 
 public sealed unsafe partial class RenderHostDeviceTests
 {
-    [Fact(Skip = "Fork: _stageMemoProven stays 0 here even with SHARPEMU_DESC_PREP_FAST off; the cause is not identified yet (open item: check [PERF][STAGE_MEMO] proven= in a profiling run).")]
+    [Fact(Skip = "Fork: _stageMemoProven stays 0 here with default descriptor preparation; the cause is not identified yet (open item: check [PERF][STAGE_MEMO] proven= in a profiling run).")]
     public void StagePreparation_RecapturedBindingsSurviveSubmissionRecycling()
     {
         if (!Ready()) return;

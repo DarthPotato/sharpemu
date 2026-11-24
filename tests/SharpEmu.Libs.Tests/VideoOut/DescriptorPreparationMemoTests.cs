@@ -56,9 +56,9 @@ public sealed class DescriptorPreparationMemoTests(HeadlessVulkanFixture fixture
                     CallArguments = [0x56780000UL + value], CallTargets = [0xABCD0000UL + value],
                 };
                 var prepared = presenter.RenderHost.PrepareBindings(stage);
-                Assert.Equal(DescriptorPreparationOptions.Fast && value > 1, Memoized(prepared));
+                Assert.False(Memoized(prepared));
                 var expected = new uint[layout.ShaderDataDwordCount];
-                DescriptorShaderData.Write(stage, program, layout, expected, null, false);
+                DescriptorShaderData.Write(stage, program, layout, expected);
                 Assert.Equal(expected, (uint[])Property(prepared, "ShaderData")!);
             }
             var other = Program(layout);
@@ -81,7 +81,7 @@ public sealed class DescriptorPreparationMemoTests(HeadlessVulkanFixture fixture
             var first = presenter.RenderHost.PrepareBindings(new(program, new ResourceSnapshot { Samplers = [[0, 0, 0, 0]] }));
             var firstHandle = Assert.Single((Sampler[])Field(Property(first, "Descriptors")!, "Samplers")!);
             var second = presenter.RenderHost.PrepareBindings(new(program, new ResourceSnapshot { Samplers = [[1, 0, 0, 0]] }));
-            Assert.Equal(DescriptorPreparationOptions.Fast, Memoized(second));
+            Assert.False(Memoized(second));
             var secondHandle = Assert.Single((Sampler[])Field(Property(second, "Descriptors")!, "Samplers")!);
             Assert.NotEqual(firstHandle, secondHandle);
             var third = presenter.RenderHost.PrepareBindings(new(program, new ResourceSnapshot { Samplers = [[0, 0, 0, 0]] }));
@@ -104,7 +104,7 @@ public sealed class DescriptorPreparationMemoTests(HeadlessVulkanFixture fixture
             using var preparation = presenter.RenderHost.BeginPreparation();
             Assert.False(Memoized(presenter.RenderHost.PrepareBindings(new(program, new ResourceSnapshot(), 0x1111000012340000UL))));
             var second = presenter.RenderHost.PrepareBindings(new(program, new ResourceSnapshot(), 0x2222000056780000UL));
-            Assert.Equal(DescriptorPreparationOptions.Fast, Memoized(second));
+            Assert.False(Memoized(second));
             Assert.Equal(new uint[] { 0x56780000, 0x22220000 }, ((uint[])Property(second, "ShaderData")!)[..2]);
             Assert.True(Memoized(presenter.RenderHost.PrepareBindings(new(program, new ResourceSnapshot(), 0x2222000056780000UL))));
         });
@@ -155,7 +155,7 @@ public sealed class DescriptorPreparationMemoTests(HeadlessVulkanFixture fixture
             for (uint index = 1; index <= 1024; index++)
                 presenter.InvokeMethod("NoteStagePreparation", set, prepared, new ResourceSnapshot { Images = [[index]] }, 0UL);
             Assert.False((bool)Field(first, "Valid")!);
-            Assert.Equal(DescriptorPreparationOptions.Fast ? 1024 : 1, dictionary.Count);
+            Assert.Equal(1, dictionary.Count);
             Assert.DoesNotContain(first, dictionary.Values.Cast<object>());
             Assert.All(dictionary.Values.Cast<object>(), memo => Assert.True((bool)Field(memo, "Valid")!));
             for (uint index = 1025; index <= 3072; index++)

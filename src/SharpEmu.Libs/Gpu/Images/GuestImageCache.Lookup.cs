@@ -134,8 +134,6 @@ public sealed partial class GuestImageCache
         return true;
     }
 
-    internal readonly record struct RememberedStageImage(ResourceSlotIdentifier Image, GuestSpan Range, bool Touch);
-
     internal enum StagePreparationFailure { None, SlotGeneration, Unregistered, Parked, DepthOwner, Rebind, RangeInvalidated, HistoryOverflow }
 
     // Profiled legacy validation keeps its separate state and remembered-range locks.
@@ -192,36 +190,6 @@ public sealed partial class GuestImageCache
             return _lookupGeneration - generation > (ulong)LookupEventSlots ? StagePreparationFailure.HistoryOverflow : StagePreparationFailure.RangeInvalidated;
         if (!image.Registered) return StagePreparationFailure.Unregistered;
         if (image.Parked) return StagePreparationFailure.Parked;
-        return StagePreparationFailure.None;
-    }
-
-    // Same staleness, range-generation and recency checks as IsStaleImage followed by
-    // TryTouchRemembered, with one slot lookup per image and one lock for the stage.
-    // Workers retain their original snapshot/read-only path in RecordingHost.
-    internal bool TryTouchStagePreparation(ReadOnlySpan<RememberedStageImage> bindings, ref ulong generation) =>
-        TouchStagePreparation(bindings, ref generation) == StagePreparationFailure.None;
-
-    // Return the failing predicate directly; the success path does no diagnostic bookkeeping.
-    internal StagePreparationFailure TouchStagePreparation(ReadOnlySpan<RememberedStageImage> bindings, ref ulong generation)
-    {
-        if (bindings.IsEmpty) return StagePreparationFailure.None;
-        using var held = _lock.Hold();
-        var checkedGeneration = generation;
-        foreach (var binding in bindings)
-        {
-            var image = _slots.TryGet(binding.Image);
-            var failure = CheckStageImage(image, binding.Touch, generation, binding.Range);
-            if (failure != StagePreparationFailure.None) return failure;
-            if (binding.Touch)
-            {
-                // All ranges must be checked against the original generation, even when an
-                // earlier range has advanced successfully past unrelated lookup events.
-                image!.LastAccessTick = _scheduler.CurrentTick;
-                TouchImage(image);
-            }
-            checkedGeneration = binding.Touch ? _lookupGeneration : generation;
-        }
-        generation = checkedGeneration;
         return StagePreparationFailure.None;
     }
 

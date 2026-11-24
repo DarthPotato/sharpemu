@@ -85,7 +85,7 @@ public sealed class RuntimeDescriptorPreparationMemoTests(HeadlessVulkanFixture 
             Feedback(registry); // Sampler feedback must also be drained on a memo hit.
             image.Binding.NeedsRebind = true;
             var second = presenter.RenderHost.PrepareBindings(stage);
-            Assert.Equal(DescriptorPreparationOptions.Fast, Memoized(second));
+            Assert.False(Memoized(second));
             Assert.Equal(0, Property(registry, "PendingMisses"));
             Assert.Equal(1, Property(registry, "SamplerCount"));
             Assert.Equal(2, RuntimeImages(second).Count);
@@ -94,26 +94,7 @@ public sealed class RuntimeDescriptorPreparationMemoTests(HeadlessVulkanFixture 
             Assert.All(RuntimeImages(second).Cast<object>(), binding =>
                 Assert.NotEqual(0UL, ((Silk.NET.Vulkan.ImageView)Field(binding, "View")).Handle));
             Assert.False(image.Binding.NeedsRebind);
-            if (DescriptorPreparationOptions.Fast)
-            {
-                var ordinary = Program(new ShaderResourceInfo());
-                presenter.RenderHost.PrepareBindings(new(ordinary, new ResourceSnapshot()));
-                var ordinaryHit = presenter.RenderHost.PrepareBindings(new(ordinary, new ResourceSnapshot()));
-                var kept = (Array)presenter.GetField<object>("_keptTextureSets");
-                // Stand in for a live draw scope without recording a render pass. Even an
-                // identical ordinary memo cannot prove anything about the runtime set.
-                presenter.SetField("_renderingActive", true);
-                presenter.SetField("_renderingScopesBegun", 123L);
-                presenter.SetField("_keptTextureScope", presenter.RenderHost.DrawScope);
-                try
-                {
-                    kept.SetValue(Property(ordinaryHit, "Memo"), 1);
-                    Assert.True((bool)presenter.InvokeMethod("KeepsTextureSet", ordinaryHit)!);
-                    kept.SetValue(Property(second, "Memo"), 1);
-                    Assert.False((bool)presenter.InvokeMethod("KeepsTextureSet", second)!);
-                }
-                finally { presenter.SetField("_renderingActive", false); }
-            }
+
             presenter.InvokeMethod("DestroyRuntimeDescriptors");
         });
     }
@@ -144,10 +125,10 @@ public sealed class RuntimeDescriptorPreparationMemoTests(HeadlessVulkanFixture 
             var snapshot = new ResourceSnapshot { Images = images, Buffers = Buffers(address + 0x10000) };
             Assert.False(Memoized(presenter.RenderHost.PrepareBindings(new(program, snapshot))));
             var hit = presenter.RenderHost.PrepareBindings(new(program, snapshot));
-            Assert.Equal(DescriptorPreparationOptions.Fast, Memoized(hit));
+            Assert.False(Memoized(hit));
             var changedBuffer = presenter.RenderHost.PrepareBindings(new(program,
                 new ResourceSnapshot { Images = images, Buffers = Buffers(address + 0x20000) }));
-            Assert.Equal(DescriptorPreparationOptions.Fast, Memoized(changedBuffer));
+            Assert.False(Memoized(changedBuffer));
             var sources = ((BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer, ulong MappedSize)[])Property(changedBuffer, "BufferSources");
             Assert.Equal(address + 0x20000, Assert.Single(sources).Descriptor.Address);
 
@@ -207,7 +188,7 @@ public sealed class RuntimeDescriptorPreparationMemoTests(HeadlessVulkanFixture 
             {
                 var stage = new ShaderStageResources(program, new ResourceSnapshot());
                 Assert.False(Memoized(host.PrepareBindings(stage)));
-                Assert.Equal(DescriptorPreparationOptions.Fast, Memoized(host.PrepareBindings(stage)));
+                Assert.False(Memoized(host.PrepareBindings(stage)));
                 var registry = Registry(presenter, program);
                 if (pending) Feedback(registry);
                 else registry.GetType().GetProperty("TableDirty")!.SetValue(registry, true);
