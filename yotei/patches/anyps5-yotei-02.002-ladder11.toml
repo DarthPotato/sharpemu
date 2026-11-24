@@ -1,0 +1,143 @@
+# Ghost of Yotei PPSA26344 v02.002.000: quality ladder row 11 for AnyPS5's relinker (--patches).
+# The game keeps one int, the row of its own scalability ladder (row 0 = full quality; row 15 = LOD 0.1, three fewer sun
+# shadow views, small shadow casters culled; row 11 = LOD 0.2, two fewer sun shadow views). These 17 sites are every
+# instruction that reads it (movsxd r64, [rip+row], 7 bytes); each becomes mov r32, 11; nop, so the game uses row 11.
+# Measured on a Ryzen 5 3600 + RTX 3080 with AnyKyty yotei/best and 1080p output: 15.6 fps at row 0, 23.8 fps at row 15.
+# va = ELF virtual address in the unwrapped eboot (tools/unwrap_self.py eboot.bin eboot.elf). By DarthPotato.
+format = 1
+
+[[patch]]
+name     = "ladder_row11_c47c1b"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0xc47c1b
+expected = "4863058e654504"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_c4ec87"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0xc4ec87
+expected = "48630522f54404"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_c54904"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0xc54904
+expected = "486305a5984404"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_12388c7"
+description = "movsxd rcx, [rip+ladder_row] -> mov ecx, 11; nop"
+target   = "eboot.elf"
+va       = 0x12388c7
+expected = "48630de258e603"
+value    = "b90b0000006690"
+
+[[patch]]
+name     = "ladder_row11_123ae56"
+description = "movsxd rdx, [rip+ladder_row] -> mov edx, 11; nop"
+target   = "eboot.elf"
+va       = 0x123ae56
+expected = "4863155333e603"
+value    = "ba0b0000006690"
+
+[[patch]]
+name     = "ladder_row11_12697e8"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x12697e8
+expected = "486305c149e303"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_126a7b8"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x126a7b8
+expected = "486305f139e303"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_126b302"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x126b302
+expected = "486305a72ee303"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_126ba33"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x126ba33
+expected = "4863057627e303"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_126c0f3"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x126c0f3
+expected = "486305b620e303"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_126c5a3"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x126c5a3
+expected = "486305061ce303"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_13a8aae"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x13a8aae
+expected = "486305fb56cf03"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_13c2591"
+description = "movsxd rcx, [rip+ladder_row] -> mov ecx, 11; nop"
+target   = "eboot.elf"
+va       = 0x13c2591
+expected = "48630d18bccd03"
+value    = "b90b0000006690"
+
+[[patch]]
+name     = "ladder_row11_13c83a8"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x13c83a8
+expected = "486305015ecd03"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_15d44b3"
+description = "movsxd rdx, [rip+ladder_row] -> mov edx, 11; nop"
+target   = "eboot.elf"
+va       = 0x15d44b3
+expected = "486315f69cac03"
+value    = "ba0b0000006690"
+
+[[patch]]
+name     = "ladder_row11_16278ec"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x16278ec
+expected = "486305bd68a703"
+value    = "b80b0000006690"
+
+[[patch]]
+name     = "ladder_row11_1636736"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 11; nop"
+target   = "eboot.elf"
+va       = 0x1636736
+expected = "486305737aa603"
+value    = "b80b0000006690"

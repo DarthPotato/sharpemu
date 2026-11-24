@@ -10,7 +10,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 It builds on SharpEmu `main` (merged up to 2026-11-20) and on foufouadi's `yotei-good` branch, which first got the game into menus and gameplay. The working branch is `yotei3`.
 
-## State (2026-11-22)
+## State (2026-11-24)
 
 ![Ghost of Yōtei 02.002 in the open world on this fork, with SharpEmu's performance overlay: 11.7 fps, 90 ms a frame](yotei/screenshots/02002-open-world-overlay.png)
 
@@ -21,12 +21,26 @@ It builds on SharpEmu `main` (merged up to 2026-11-20) and on foufouadi's `yotei
 | Game version | 02.002.000 and 01.512.000 (the game-specific switches below check for either and do nothing on other versions) |
 | Test machine | Ryzen 5 3600, RTX 3080 10 GB, 24 GB RAM, Windows 11 |
 | Gets to | menus and gameplay; saves load |
-| Frame rate | about **11.7 fps** on 02.002.000 and **12.3 fps** on 01.512.000, standing in the open world, warm shader cache |
+| Frame rate | about **12.7 fps** on 02.002.000 (default switches), standing in the open world, warm shader cache |
 | Memory | about 15–16 GB of RAM and 9 GB of video memory while the game runs |
 
-Frame rate standing in the open world on this machine over time: about 4 fps (2026-10-25), 6.7 fps (11-08), 10 fps (11-11), 10.7 fps (11-12), 12.3 fps on 01.512 after merging SharpEmu main (11-22). On 02.002 the game runs at 5.9 fps at full detail and 11.7 fps with the default switches.
+Frame rate standing in the open world on this machine over time: about 4 fps (2026-10-25), 6.7 fps (11-08), 10 fps (11-11), 10.7 fps (11-12), 12.3 fps on 01.512 after merging SharpEmu main (11-22). On 02.002 the game runs at 6.8 fps at full detail and 12.7 fps with the default switches (11-23, after the wave64 "small" default).
 
 The CPU is the limit. With every draw and compute dispatch dropped, the game's own code still needs about 30 ms a frame on this CPU, so roughly 34 fps is the ceiling here. The emulator's cost per draw and dispatch is what stands between about 12 fps and that.
+
+## Benchmark against AnyKyty (2026-11-24)
+
+[AnyPS5](https://github.com/boykopovar/AnyPS5) runs PS5 games by relinking them into native programs; its AnyKyty branch uses a Kyty GPU core, and [Celegans12/AnyPS5-Ghost-of-Yotei](https://github.com/Celegans12/AnyPS5-Ghost-of-Yotei) (branch `yotei/best`) carries the Yōtei work. Both were run on the same machine (Ryzen 5 3600, RTX 3080), game 02.002.000, same save, same spot, standing in the open world, warm caches:
+
+| Settings | This fork | AnyKyty `yotei/best` |
+|---|---|---|
+| Full detail, render 1080p, output 4K | 6.8 fps | 8.1 fps |
+| Full detail, render and output 1080p | 7.3 fps | 15.6 fps |
+| Quality ladder row 15, render and output 1080p | 13.4 fps | **23.8 fps** |
+
+Output size and the ladder row are game byte patches on both (the 1080p output patch is shahulmubeen-a's 02.002 relinker patch; the ladder patch is this fork's, see below). At the settings a player would use, AnyKyty is about 1.8-2.1x faster here; this fork's frame is paced by its render thread's CPU work, so a smaller output barely helps it. Work on Yōtei moves to AnyKyty; this fork stays as it is, with its test builds and generic fixes.
+
+The quality-ladder patch (17 reads of the game's scalability row, set to row 15 or 11) is available for SharpEmu in PS-Game-Patch format and for AnyPS5 as a relinker patch.
 
 ## What is different from SharpEmu
 

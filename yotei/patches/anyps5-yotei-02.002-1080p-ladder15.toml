@@ -1,0 +1,183 @@
+# Ghost of Yotei PPSA26344 v02.002.000: fixed 1920x1080 output AND render size (shahulmubeen-a's 02.002 relinker patch,
+# AnyPS5 discussion #675, comment 19114360; same five sites as docs/yotei/yotei-1.008-1080p.toml in yotei/best).
+# va is the ELF virtual address in the unwrapped eboot (tools/unwrap_self.py eboot.bin eboot.elf).
+# Unwrapped eboot sha256 519f5661708514d04ab2dd3e6ce889f8d3b2b315d13eac3f4124edd656d96376 (fSELF sha256 7a1407ce...).
+format = 1
+
+[[patch]]
+name     = "out_size_init"
+description = "init: movabs rcx, (2160<<32)|3840 -> (1080<<32)|1920 (output/target size)"
+target   = "eboot.elf"
+va       = 0xdde5e5
+expected = "48b9000f000070080000"
+value    = "48b98007000038040000"
+
+[[patch]]
+name     = "out_width_check"
+description = "per-frame update: mov edx, 3840 -> 1920 (size differs -> reset path)"
+target   = "eboot.elf"
+va       = 0xde020b
+expected = "ba000f0000"
+value    = "ba80070000"
+
+[[patch]]
+name     = "out_height_check"
+description = "per-frame update: xor esi, 2160 -> 1080"
+target   = "eboot.elf"
+va       = 0xde021f
+expected = "81f670080000"
+value    = "81f638040000"
+
+[[patch]]
+name     = "out_size_reset"
+description = "reset path: movabs rdx, (2160<<32)|3840 -> (1080<<32)|1920"
+target   = "eboot.elf"
+va       = 0xde0271
+expected = "48ba000f000070080000"
+value    = "48ba8007000038040000"
+
+[[patch]]
+name     = "drs_table"
+description = "16-step dynamic-resolution table (w,h pairs, 3840x2160 .. 1920x1080) -> all 16 steps 1920x1080"
+target   = "eboot.elf"
+va       = 0x1af8190
+expected = "000f000070080000800e000028080000000e0000e0070000800d000098070000000d000050070000800c000008070000000c0000c0060000800b000078060000000b000030060000800a0000e8050000000a0000a00500008009000058050000000900001005000080080000c804000000080000800400008007000038040000"
+value    = "8007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000800700003804000080070000380400008007000038040000"
+
+# Ghost of Yotei 02.002 quality ladder row 15: every movsxd read of the ladder row (17 sites) loads 15 instead.
+
+[[patch]]
+name     = "ladder_row15_c47c1b"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0xc47c1b
+expected = "4863058e654504"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_c4ec87"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0xc4ec87
+expected = "48630522f54404"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_c54904"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0xc54904
+expected = "486305a5984404"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_12388c7"
+description = "movsxd rcx, [rip+ladder_row] -> mov ecx, 15; nop"
+target   = "eboot.elf"
+va       = 0x12388c7
+expected = "48630de258e603"
+value    = "b90f0000006690"
+
+[[patch]]
+name     = "ladder_row15_123ae56"
+description = "movsxd rdx, [rip+ladder_row] -> mov edx, 15; nop"
+target   = "eboot.elf"
+va       = 0x123ae56
+expected = "4863155333e603"
+value    = "ba0f0000006690"
+
+[[patch]]
+name     = "ladder_row15_12697e8"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x12697e8
+expected = "486305c149e303"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_126a7b8"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x126a7b8
+expected = "486305f139e303"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_126b302"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x126b302
+expected = "486305a72ee303"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_126ba33"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x126ba33
+expected = "4863057627e303"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_126c0f3"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x126c0f3
+expected = "486305b620e303"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_126c5a3"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x126c5a3
+expected = "486305061ce303"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_13a8aae"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x13a8aae
+expected = "486305fb56cf03"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_13c2591"
+description = "movsxd rcx, [rip+ladder_row] -> mov ecx, 15; nop"
+target   = "eboot.elf"
+va       = 0x13c2591
+expected = "48630d18bccd03"
+value    = "b90f0000006690"
+
+[[patch]]
+name     = "ladder_row15_13c83a8"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x13c83a8
+expected = "486305015ecd03"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_15d44b3"
+description = "movsxd rdx, [rip+ladder_row] -> mov edx, 15; nop"
+target   = "eboot.elf"
+va       = 0x15d44b3
+expected = "486315f69cac03"
+value    = "ba0f0000006690"
+
+[[patch]]
+name     = "ladder_row15_16278ec"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x16278ec
+expected = "486305bd68a703"
+value    = "b80f0000006690"
+
+[[patch]]
+name     = "ladder_row15_1636736"
+description = "movsxd rax, [rip+ladder_row] -> mov eax, 15; nop"
+target   = "eboot.elf"
+va       = 0x1636736
+expected = "486305737aa603"
+value    = "b80f0000006690"
