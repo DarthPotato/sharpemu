@@ -57,7 +57,7 @@ The 4K output size is a code constant. In 02.002 it appears as `movabs` at app+0
 | Full detail, render and output 1080p | 7.3 fps | 15.6 fps |
 | Ladder row 15, render and output 1080p | 13.4 fps | **23.8 fps** |
 
-Both emulators drew the same scene (AnyKyty: ~700 draws per frame at row 0, ~415 at row 15). AnyKyty used `KYTY_ASYNC_PIPELINES=0 KYTY_GPU_SPIN_US=0 KYTY_FALLBACKS=1`; 3–7 tessellation draws were skipped per run. A cold AnyKyty first run pushed committed memory close to 40 GB, so a growable page file is needed on a 24 GB machine.
+Both emulators drew the same scene (AnyKyty: ~700 draws per frame at row 0, ~415 at row 15). AnyKyty used `KYTY_ASYNC_PIPELINES=0 KYTY_GPU_SPIN_US=0 KYTY_FALLBACKS=1`; 3–7 tessellation draws were skipped per run. `KYTY_ASYNC_PIPELINES=0` is for measuring: a draw waits for its pipeline, so nothing pops in, but playing with it freezes for up to ~25 s whenever new shaders compile. For playing, keep AnyKyty's default `KYTY_ASYNC_PIPELINES=1` (background compiles, brief pop-in; `2` crashed). A cold AnyKyty first run pushed committed memory close to 40 GB, so a growable page file is needed on a 24 GB machine.
 
 ## 4. SharpEmu-side findings (generic)
 
