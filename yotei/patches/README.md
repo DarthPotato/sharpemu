@@ -1,5 +1,7 @@
 # Ghost of Yōtei performance patches
 
+**These patches now live in [DarthPotato/yotei-patches](https://github.com/DarthPotato/yotei-patches)**, together with the findings. The copies here are kept so older links keep working.
+
 All files are for game version **02.002.000** (PPSA26344). They change the game's code in memory or at relink time, never the game files on disk. Enable only one ladder patch at a time.
 
 | File | For | What it does |
