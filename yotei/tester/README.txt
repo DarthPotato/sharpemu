@@ -1,28 +1,31 @@
-Ghost of Yotei test build for SharpEmu (2026-11-22)
+Ghost of Yotei test build for SharpEmu (2026-11-23)
 ====================================================
 
 This is an experimental build from a personal fork of SharpEmu, a PS5
-emulator. It runs one game, Ghost of Yotei, at about 11-12 fps on the
+emulator. It runs one game, Ghost of Yotei, at about 12-13 fps on the
 machine it was made on, with rough graphics. It is not an official SharpEmu
 release. Please send feedback to the person who gave you this build, not
 to the SharpEmu project.
 
 Build: https://github.com/DarthPotato/sharpemu, branch yotei3,
-commit 5b83c559. Windows x64. Nothing to install.
+commit 0d87fbe9. Windows x64. Nothing to install.
 Licence: GPL. This build includes a GPL-3.0-or-later component (the
 package decompressor), so the program as distributed is GPL-3.0; see
 LICENSE.txt and the licenses folder.
 
-NEW IN THIS BUILD (compared with 2026-11-13)
-- Game version 02.002.000 is supported, and so is 01.512.000. The two
-  speed-ups (the game's quality ladder and the 1920x1080 hold) now work on
-  both versions.
-- Brought up to date with SharpEmu as of 2026-11-20. That includes
-  SharpEmu's own Ghost of Yotei fixes (terrain), faster command
-  processing, and a package installer (see 2b).
-- About 13% faster than the 2026-11-13 build on the same machine.
-- The bright patch near the player's feet is gone.
+NEW IN THIS BUILD (compared with 2026-11-22)
+- About 9% faster on 02.002.000 (about 12.7 fps instead of 11.7 on the
+  test machine). Most of it comes from running the game's cloth physics
+  shader the way the original hardware expects (wave64 "small" mode, now
+  the default; the launcher no longer sets SHARPEMU_WAVE64_PAIRED=0).
+- Shaders are smaller and compile somewhat faster.
+- Several parts now use SharpEmu's own implementation instead of this
+  fork's, with the same speed.
 - Shaders are built again on the first start (this build changed them).
+
+Earlier (2026-11-22): game version 02.002.000 support, merge with
+SharpEmu as of 2026-11-20, package installer (see 2b), the bright patch
+near the player's feet fixed.
 
 
 1. WHAT YOU NEED
@@ -121,8 +124,8 @@ From the second session on:
 
 Frame rate on the machine this was made on (Ryzen 5 3600, RTX 3080),
 standing still in the open world:
-    version 02.002.000   about 11.7 fps
-    version 01.512.000   about 12.3 fps
+    version 02.002.000   about 12.7 fps
+    version 01.512.000   about 12.3 fps (measured before this build)
 The CPU is the limit there, so a faster CPU should give more.
 
 
@@ -189,7 +192,7 @@ which ones you used.
     set SHARPEMU_YOTEI_LADDER=0
         Full detail. The default is a low row of the game's own quality
         ladder, which makes the game send about 45% fewer draws. Much
-        slower (about 6 fps instead of 11-12 on the test machine).
+        slower (about 6 fps instead of 12-13 on the test machine).
 
     set SHARPEMU_YOTEI_RENDER_INDEX=game
         Lets the game choose its internal resolution. The default holds
