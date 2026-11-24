@@ -61,8 +61,9 @@ public sealed unsafe partial class GuestImageCacheTests
         using var harness = new CacheHarness(_vulkan);
         var address = harness.MapBacked(0x20000, ReadWrite);
         var stencilAddress = address + 0x10000;
-        var color = LinearRequest(stencilAddress, 4, Format.R32Uint, GuestPixelFormat.Bits32UInt,
-            GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1);
+        // An 8-bit image can stand for the plane (a colour image of another texel size stays separate).
+        var color = LinearRequest(stencilAddress, 4, Format.R8Uint, GuestPixelFormat.Bits8UInt,
+            GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 1, 1);
         var colorIdentifier = harness.Acquire(ref color);
         var colorImage = harness.Image(colorIdentifier);
         var colorBacking = colorImage.Backing.Handle;

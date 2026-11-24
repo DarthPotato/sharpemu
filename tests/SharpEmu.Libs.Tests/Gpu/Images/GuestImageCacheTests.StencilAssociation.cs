@@ -105,6 +105,75 @@ public sealed partial class GuestImageCacheTests
         _vulkan.AssertNoValidationMessages();
     }
 
+    // Ghost of Yotei at 1080p places a half-size B10G11R11 target in the memory of a depth image's
+    // stencil plane (both 2 MiB). The colour image must not become the plane's proxy: a texture of
+    // it would then be redirected to the D32S8 owner and viewed as B10G11R11, an invalid view.
+    [Fact]
+    public unsafe void StencilAssociation_KeepsColorImageOfAnotherTexelSizeSeparate()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var depthAddress = address + 0xc000;
+        var planeAddress = address + 0xd000;
+        harness.Write(depthAddress, Bytes(0.75f, 0.5f, 0.25f, 1f));
+        harness.Write(planeAddress, [0x01, 0x02, 0x03, 0x04]);
+
+        // One B10G11R11 texel covers the four stencil bytes of a 4x1 depth image.
+        var color = LinearRequest(planeAddress, 4, Format.B10G11R11UfloatPack32, GuestPixelFormat.Bits10_11_11Float,
+            GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1);
+        color.View = color.View with { Mapping = new ComponentMapping(ComponentSwizzle.R, ComponentSwizzle.G, ComponentSwizzle.B, ComponentSwizzle.One) };
+        var colorId = harness.Acquire(ref color);
+        harness.Worker.Run(() =>
+        {
+            var image = harness.Image(colorId);
+            var command = new CommandBuffer(harness.Scheduler.Current.Handle);
+            image.Transition(AccessFlags.TransferWriteBit, null, command);
+            var value = new ClearColorValue(1f, 0.5f, 0.25f, 0f);
+            var range = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1);
+            _vulkan.Vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.General, &value, 1, &range);
+            harness.Images.MarkGpuWritten(colorId);
+        });
+        var colorBytes = harness.ReadImageBytes(harness.Image(colorId));
+
+        var depth = AsDepthTarget(LinearRequest(depthAddress, 16, Format.D32SfloatS8Uint,
+            GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(4, 1, 1), 1, 4, 1), Format.D32SfloatS8Uint);
+        depth.Description.Stencil = new GuestSpan(planeAddress, 4);
+        depth.View = depth.View with { Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+        var depthId = harness.Acquire(ref depth);
+        var proxy = harness.ProxyAt(planeAddress, 4);
+        Assert.True(proxy.IsValid);
+        Assert.NotEqual(colorId, proxy);
+        Assert.Equal(depthId, harness.Image(proxy).DepthOwner);
+        Assert.False(harness.Image(colorId).DepthOwner.IsValid);
+
+        // The texture lookup, owner redirection and view acquisition the presenter performs.
+        void SampleColor()
+        {
+            var texture = color;
+            var found = harness.Find(ref texture);
+            var resolution = new TextureRequestResolution(texture, false, Format.B10G11R11UfloatPack32,
+                ViewFormatRules.PackDestinationSelect(4, 5, 6, 1));
+            var owner = harness.Worker.Run(() => ImageRequestBuilders.ValidateTextureOwner(harness.Images, found, resolution));
+            Assert.Equal(colorId, owner);
+            var image = harness.Image(owner);
+            Assert.False(image.Description.IsDepth);
+            Assert.Equal(Format.B10G11R11UfloatPack32, image.Backing.Format);
+            var view = harness.Worker.Run(() => harness.Images.AcquireTextureView(owner, texture));
+            Assert.NotEqual(0ul, view.Handle);
+        }
+
+        SampleColor();
+        Assert.Equal(colorBytes, harness.ReadImageBytes(harness.Image(colorId)));
+
+        // A stencil write through the depth image keeps the plane on the proxy.
+        harness.MarkGpuWritten(depthId);
+        Assert.Equal(proxy, harness.ProxyAt(planeAddress, 4));
+        SampleColor();
+        harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
+    }
+
     [Fact]
     public unsafe void StencilAssociation_RecordedWriterSupersedesOrdinaryPlane()
     {

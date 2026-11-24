@@ -946,6 +946,11 @@ public sealed partial class GuestImageCache
         return replacementImageIdentifier;
     }
 
+    // A standalone image can become a stencil proxy when its format views the stencil aspect (texture lookups
+    // of a proxy view its depth owner in the request's format), or when it has no format of its own (a former proxy).
+    private static bool CanStandForStencilPlane(in ImageDescription image) =>
+        image.PixelFormat == Format.Undefined || ViewFormatRules.IsStencilViewFormat(image.PixelFormat);
+
     private ResourceSlotIdentifier AssociateStencilRange(ResourceSlotIdentifier depthImageIdentifier, GuestSpan stencil, bool restoreNativeStencil = false)
     {
         if (!ImageDescription.IsValidRange(stencil))
@@ -966,10 +971,12 @@ public sealed partial class GuestImageCache
             // whole depth extent from it. A proxy of another span or extent belongs to another surface
             // and stays; a standalone image of the span (a dynamic-resolution view of the plane may be
             // smaller than the depth image) becomes the proxy, and an image of another size (a texture
-            // reading part of the plane) is a separate resource.
+            // reading part of the plane) is a separate resource. So is a standalone image of the span in a
+            // format that cannot view stencil (Ghost of Yotei at 1080p places a half-size B10G11R11 target
+            // in the plane's memory): as a proxy, its texture lookups would view the depth image as colour.
             var owner = _slots.TryGet(imageIdentifier);
             if (owner != null && owner.Description.Data == stencil &&
-                (!owner.DepthOwner.IsValid || owner.Description.Extent.Equals(depth.Description.Extent)))
+                (owner.DepthOwner.IsValid ? owner.Description.Extent.Equals(depth.Description.Extent) : CanStandForStencilPlane(owner.Description)))
             {
                 association = imageIdentifier;
             }

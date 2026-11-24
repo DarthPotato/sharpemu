@@ -29,6 +29,8 @@ public sealed unsafe partial class GuestImageCache
         {
             var proxy = _slots.TryGet(candidate);
             if (proxy is null || proxy.Description.Data != image.Description.Stencil) continue;
+            // A colour image of the span that cannot stand for the plane stays separate there too.
+            if (!proxy.DepthOwner.IsValid && !CanStandForStencilPlane(proxy.Description)) continue;
             // AssociateStencilRange must select this same existing proxy, with no transfer.
             if (stencil.IsValid || proxy.DepthOwner != identifier || proxy.Parked || !proxy.Registered ||
                 !proxy.Description.Extent.Equals(image.Description.Extent))
