@@ -5005,8 +5005,6 @@ public static partial class Gen5SpirvTranslator
             valid = inRange;
             if (!control.FetchInactive)
             {
-                // The guest exec bit of the source lane, through a ballot of the host subgroup when there is one, so an
-                // absent partner lane reads as inactive (IsGuestLaneExecActive).
                 var sourceActive = _pairedMeshLanes
                     ? IsNotZero(ShufflePairedValue(_pairedActiveWords[0], _pairedActiveWords[1], safeTarget))
                     : IsGuestLaneExecActive(safeTarget);
@@ -6138,12 +6136,6 @@ public static partial class Gen5SpirvTranslator
                 var read = ReadGraphicsLane(sourceValue, selectedLane, out _);
                 StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, read));
             }
-            else if (_subgroupInvocationIdInput != 0 && ReadsGraphicsLanes)
-            {
-                // Without the opt-in ISA lane reads (SHARPEMU_GRAPHICS_PARTIAL_LANES), the fork's default
-                // SHARPEMU_GRAPHICS_READLANE read: the selected lane, or the highest present lane below it.
-                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, ReadPresentGraphicsLane(sourceValue, selectedLane)));
-            }
             else
             {
                 // Fallback: no subgroup ops, read current lane's value, or the
@@ -6152,43 +6144,6 @@ public static partial class Gen5SpirvTranslator
             }
 
             return true;
-        }
-
-        // A pixel or vertex wave runs as one 32-lane host subgroup. V_READLANE gives every lane the
-        // same scalar: reading the lane's own value instead made each invocation see a different
-        // "scalar", and a wave-wide reduction loop (DPP min, then readlane 31/63, then retire the
-        // lanes equal to the minimum) never emptied its lane mask and ran until the step guard.
-        // SHARPEMU_GRAPHICS_READLANE=0 restores the per-invocation read.
-        private static readonly bool GraphicsReadlaneEnabled =
-            Environment.GetEnvironmentVariable("SHARPEMU_GRAPHICS_READLANE") != "0";
-
-        private bool ReadsGraphicsLanes =>
-            GraphicsReadlaneEnabled && !_pairedLanes &&
-            _stage is Gen5SpirvStage.Pixel or Gen5SpirvStage.Vertex &&
-            _waveLowering is NativeWave32Lowering;
-
-        // The selected lane's value, or, when no host invocation sits in that lane (a fragment
-        // subgroup whose quads were never launched), the value of the highest present lane below
-        // it: a lane prefix (DPP row shifts) gathers toward the highest present lane. The choice
-        // depends only on the subgroup ballot, so every invocation reads the same lane.
-        private uint ReadPresentGraphicsLane(uint value, uint selectedLane)
-        {
-            var present = _module.AddInstruction(
-                SpirvOp.CompositeExtract,
-                _uintType,
-                _module.AddInstruction(SpirvOp.GroupNonUniformBallot, _uvec4Type, UInt(3), _module.ConstantBool(true)),
-                0);
-            var lane = BitwiseAnd(selectedLane, UInt(31));
-            var atOrBelow = BitwiseAnd(
-                present,
-                ShiftRightLogical(UInt(uint.MaxValue), _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(31), lane)));
-            var source = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                IsNotZero(atOrBelow),
-                Ext(75, _uintType, atOrBelow),
-                Ext(73, _uintType, present));
-            return ShuffleLane(value, source);
         }
 
         private bool TryGetFixedLane(Gen5Operand operand, out uint lane)
@@ -6288,31 +6243,6 @@ public static partial class Gen5SpirvTranslator
             }
 
             var sourceActive = IsGuestLaneExecActive(targetLane);
-            if (PermlaneAbsentLaneReadsOwnValue && _stage is Gen5SpirvStage.Pixel or Gen5SpirvStage.Vertex &&
-                FeedsIdempotentCombine(instruction, out var permuted))
-            {
-                // A wave reduction first enables every lane and pads the unused ones with the
-                // operation's identity, so on the console the partner always exists. A partly
-                // launched host subgroup has no invocation there: zero then became the minimum
-                // of a waterfall loop that no lane matched, and the loop ran to the step guard.
-                // For the reduction step right after this permute only, a missing partner reads
-                // as the lane's own source, the identity of an idempotent combine. The register
-                // itself keeps zero for every other reader.
-                if (_permuteIdentity == 0)
-                {
-                    _permuteIdentity = _module.AddGlobalVariable(
-                        _privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, 0));
-                    _interfaces.Add(_permuteIdentity);
-                    _module.AddName(_permuteIdentity, "permuteIdentity");
-                }
-
-                var identity = _module.AddInstruction(
-                    SpirvOp.Select, _uintType, IsGuestLanePresent(targetLane), UInt(0), value);
-                Store(_permuteIdentity, _module.AddInstruction(SpirvOp.Select, _uintType, sourceActive, shuffled, identity));
-                _permuteIdentityIndex = _emittingIndex + 1;
-                _permuteIdentityRegister = permuted;
-            }
-
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -6320,46 +6250,6 @@ public static partial class Gen5SpirvTranslator
                 shuffled,
                 UInt(0));
         }
-
-        private static readonly HashSet<string> IdempotentCombines =
-        [
-            "VMinU32", "VMinI32", "VMinF32", "VMaxU32", "VMaxI32", "VMaxF32", "VAndB32", "VOrB32",
-        ];
-
-        // True for an in-place reduction step: the instruction after this permute combines the
-        // permuted value with the permute's own source through min, max, and or or, writes the
-        // result back to that source, and has no modifier that would make the combine other
-        // than idempotent. Then the source is the identity for a missing partner.
-        // The next instruction must be in the same block, so no other path reaches it without
-        // this permute.
-        private bool FeedsIdempotentCombine(Gen5ShaderInstruction instruction, out uint permuted)
-        {
-            permuted = 0;
-            var instructions = _request.Program.Instructions;
-            if (instruction.Destinations.Count == 0 || instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
-                instruction.Sources.Count == 0 || instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister ||
-                _emittingIndex < 0 || _emittingIndex + 1 >= _emittingBlockEnd ||
-                !ReferenceEquals(instructions[_emittingIndex], instruction))
-                return false;
-            permuted = instruction.Destinations[0].Value;
-            var source = instruction.Sources[0].Value;
-            // A permute in place leaves no copy of the source to combine with.
-            if (permuted == source)
-                return false;
-            var next = instructions[_emittingIndex + 1];
-            var plain = next.Control is null ||
-                next.Control is Gen5Vop3Control { AbsoluteMask: 0, NegateMask: 0, OutputModifier: 0, OperandSelect: 0 };
-            var target = permuted;
-            return plain && IdempotentCombines.Contains(next.Opcode) &&
-                next.Sources.Count == 2 && next.Destinations.Count == 1 &&
-                next.Destinations[0] is { Kind: Gen5OperandKind.VectorRegister } written && written.Value == source &&
-                next.Sources.All(operand => operand.Kind == Gen5OperandKind.VectorRegister) &&
-                next.Sources.Any(operand => operand.Value == source) && next.Sources.Any(operand => operand.Value == target);
-        }
-
-        // SHARPEMU_PERMLANE_ABSENT_SELF=0 restores zero for a permute partner absent from the host subgroup.
-        private static readonly bool PermlaneAbsentLaneReadsOwnValue =
-            Environment.GetEnvironmentVariable("SHARPEMU_PERMLANE_ABSENT_SELF") != "0";
 
         private uint GetInt16Source(Gen5ShaderInstruction instruction, int sourceIndex, bool signed)
         {

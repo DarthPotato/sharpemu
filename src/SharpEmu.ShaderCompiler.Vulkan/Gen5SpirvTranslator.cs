@@ -1863,9 +1863,6 @@ public static partial class Gen5SpirvTranslator
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
                 var instruction = _request.Program.Instructions[index];
-                _emittingIndex = index;
-                _emittingBlockEnd = block.EndIndex;
-                if (_permuteIdentityIndex != index) _permuteIdentityIndex = -1;
                 if (_stage != Gen5SpirvStage.Mesh) _waveLowering.BeforeInstruction(instruction);
                 if (IsBranch(instruction.Opcode) || instruction.Opcode == "SEndpgm")
                 {
@@ -10841,20 +10838,7 @@ public static partial class Gen5SpirvTranslator
                 ? value
                 : Load(_uintType, ScalarPointer(register));
 
-        private uint LoadV(uint register) =>
-            _permuteIdentityIndex == _emittingIndex && register == _permuteIdentityRegister
-                ? Load(_uintType, _permuteIdentity)
-                : Load(_uintType, VectorPointer(register));
-
-        // The instruction being emitted by the block loop, and the end of its block.
-        private int _emittingIndex = -1;
-        private int _emittingBlockEnd = -1;
-
-        // A reduction step's permute leaves, for the combine right after it only, the value its
-        // register would hold if a missing partner read as the reduction's identity.
-        private int _permuteIdentityIndex = -1;
-        private uint _permuteIdentityRegister;
-        private uint _permuteIdentity;
+        private uint LoadV(uint register) => Load(_uintType, VectorPointer(register));
 
         private void StoreS(uint register, uint value)
         {
@@ -11266,17 +11250,18 @@ public static partial class Gen5SpirvTranslator
                         ? BitwiseAnd(lane, UInt(PairedHalfLaneCount - 1))
                         : lane);
 
-        // True when the host invocation behind a guest lane exists and is EXEC-active. A
-        // subgroup ballot has no bit for an absent or inactive invocation, so a partial
-        // graphics subgroup (fragment quads never launched) reads as inactive instead of
-        // the undefined result of shuffling from a lane that is not there. The lane is
-        // masked the same way ShuffleLane masks it, so both address the same invocation.
-        private uint IsGuestLaneExecActive(uint lane) =>
-            _subgroupInvocationIdInput == 0 ? Load(_boolType, _exec) : IsGuestLaneInBallot(lane, Load(_boolType, _exec));
+        // Preserve the compute-stage ballot handling; graphics fallback uses upstream's shuffled EXEC.
+        private uint IsGuestLaneExecActive(uint lane)
+        {
+            if (_stage is Gen5SpirvStage.Pixel or Gen5SpirvStage.Vertex)
+            {
+                var activeWord = _module.AddInstruction(
+                    SpirvOp.Select, _uintType, Load(_boolType, _exec), UInt(1), UInt(0));
+                return IsNotZero(ShuffleLane(activeWord, lane));
+            }
 
-        // True when a host invocation sits behind the guest lane at all, active or not.
-        private uint IsGuestLanePresent(uint lane) =>
-            _subgroupInvocationIdInput == 0 ? _module.ConstantBool(true) : IsGuestLaneInBallot(lane, _module.ConstantBool(true));
+            return _subgroupInvocationIdInput == 0 ? Load(_boolType, _exec) : IsGuestLaneInBallot(lane, Load(_boolType, _exec));
+        }
 
         private uint IsGuestLaneInBallot(uint lane, uint condition)
         {
